@@ -363,7 +363,7 @@ app.get('/events/:sessionId', (req, res) => {
   });
 });
 
-// SSE refresh endpoint - client can poke this to request updated track info
+// SSE refresh endpoint - triggers server to rebroadcast current state via SSE (pull/monadic)
 app.post('/refresh-sse', async (req, res) => {
   const sessionId = req.body.sessionId || 'master';
 
@@ -374,60 +374,27 @@ app.post('/refresh-sse', async (req, res) => {
 
     if (!session) {
       console.log(`🔄 No session found for refresh request: ${sessionId}`);
-      return res.status(404).json({
-        error: 'Session not found',
-        sessionId: sessionId
-      });
+      return res.status(404).json({ error: 'Session not found' });
     }
 
     if (!session.mixer || !session.mixer.isActive) {
       console.log(`🔄 Session ${sessionId} is not active, cannot refresh`);
-      return res.status(200).json({
-        message: 'Session inactive - no update to broadcast',
-        sessionId: sessionId,
-        active: false
-      });
+      return res.status(200).json({ ok: false, reason: 'inactive' });
     }
 
-    // Force broadcast current track info to all connected SSE clients
-    if (session.mixer.currentTrack &&
-        session.mixer.currentTrack.title &&
-        session.mixer.currentTrack.title.trim() !== '') {
-
-      console.log(`🔄 Force broadcasting current track info for session ${sessionId}`);
-      console.log(`🔄 Broadcasting to ${session.mixer.eventClients.size} connected SSE clients`);
-
+    // Trigger SSE broadcast if we have a valid track (just needs path)
+    if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
+      console.log(`🔄 Triggering SSE broadcast for session ${sessionId} (${session.mixer.eventClients.size} clients)`);
       session.mixer.broadcastTrackEvent();
-
-      res.status(200).json({
-        message: 'SSE refresh broadcast sent',
-        sessionId: sessionId,
-        currentTrack: {
-          title: session.mixer.currentTrack.title,
-          artist: session.mixer.currentTrack.artist,
-          duration: session.mixer.getAdjustedTrackDuration()
-        },
-        clientCount: session.mixer.eventClients.size,
-        active: true
-      });
-
+      res.status(200).json({ ok: true });
     } else {
-      console.log(`🔄 Session ${sessionId} has no valid current track to broadcast`);
-      res.status(200).json({
-        message: 'No valid track to broadcast',
-        sessionId: sessionId,
-        active: true,
-        currentTrack: null
-      });
+      console.log(`🔄 Session ${sessionId} has no valid track to broadcast`);
+      res.status(200).json({ ok: false, reason: 'no_track' });
     }
 
   } catch (error) {
     console.error('🔄 SSE refresh error:', error);
-    res.status(500).json({
-      error: 'SSE refresh failed',
-      message: error.message,
-      sessionId: sessionId
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -436,7 +403,6 @@ app.post('/refresh-sse-simple', async (req, res) => {
   console.log('🔄 Simple SSE refresh request from client');
 
   try {
-    // Use the same function as other endpoints to get master session
     const session = await getPreloadedMasterSession();
 
     if (!session) {
@@ -446,48 +412,22 @@ app.post('/refresh-sse-simple', async (req, res) => {
 
     if (!session.mixer || !session.mixer.isActive) {
       console.log('🔄 Master session is not active, cannot refresh');
-      return res.status(200).json({
-        message: 'Master session inactive - no update to broadcast',
-        active: false
-      });
+      return res.status(200).json({ ok: false, reason: 'inactive' });
     }
 
-    // Force broadcast current track info
-    if (session.mixer.currentTrack &&
-        session.mixer.currentTrack.title &&
-        session.mixer.currentTrack.title.trim() !== '') {
-
-      console.log(`🔄 Force broadcasting current track info for master session`);
-      console.log(`🔄 Broadcasting to ${session.mixer.eventClients.size} connected SSE clients`);
-
+    // Trigger SSE broadcast if we have a valid track (just needs path)
+    if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
+      console.log(`🔄 Triggering SSE broadcast for master session (${session.mixer.eventClients.size} clients)`);
       session.mixer.broadcastTrackEvent();
-
-      res.status(200).json({
-        message: 'SSE refresh broadcast sent',
-        currentTrack: {
-          title: session.mixer.currentTrack.title,
-          artist: session.mixer.currentTrack.artist,
-          duration: session.mixer.getAdjustedTrackDuration()
-        },
-        clientCount: session.mixer.eventClients.size,
-        active: true
-      });
-
+      res.status(200).json({ ok: true });
     } else {
-      console.log('🔄 Master session has no valid current track to broadcast');
-      res.status(200).json({
-        message: 'No valid track to broadcast',
-        active: true,
-        currentTrack: null
-      });
+      console.log('🔄 Master session has no valid track to broadcast');
+      res.status(200).json({ ok: false, reason: 'no_track' });
     }
 
   } catch (error) {
     console.error('🔄 Simple SSE refresh error:', error);
-    res.status(500).json({
-      error: 'SSE refresh failed',
-      message: error.message
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -963,31 +903,40 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 
 // Simplified next track endpoint - uses master session
 app.post('/next-track', (req, res) => {
-  const { trackSha, direction } = req.body;
+  const { trackMd5, direction } = req.body;
   const session = getMasterSession(); // Always use master session
 
-  if (!trackSha) {
-    return res.status(400).json({ error: 'Track SHA is required' });
+  if (!trackMd5) {
+    return res.status(400).json({ error: 'Track MD5 is required' });
   }
 
   try {
-    console.log(`🎯 User selected specific track: ${trackSha} (direction: ${direction})`);
+    console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
-    // Set the specific next track by SHA
+    // Set the specific next track by MD5
     if (session.mixer.setNextTrack) {
-      session.mixer.setNextTrack(trackSha);
+      session.mixer.setNextTrack(trackMd5);
     } else if (session.mixer.driftPlayer) {
       // Store the selected track MD5 for next transition
-      session.mixer.selectedNextTrackMd5 = trackSha;
+      session.mixer.selectedNextTrackMd5 = trackMd5;
       if (direction) {
         session.mixer.driftPlayer.currentDirection = direction;
       }
     }
 
+    // Calculate timing info for sync check
+    const duration = session.mixer.getAdjustedTrackDuration() * 1000; // Convert to ms
+    const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
+    const remaining = Math.max(0, duration - elapsed);
+
     res.json({
-      message: `Next track set to ${trackSha}`,
-      trackSha: trackSha,
-      direction: direction
+      // Acknowledgment
+      nextTrack: trackMd5,
+
+      // Sync state: current track + timing
+      currentTrack: session.mixer.currentTrack?.identifier || null,
+      duration: Math.round(duration),
+      remaining: Math.round(remaining)
     });
   } catch (error) {
     console.error('Next track selection error:', error);
@@ -998,36 +947,44 @@ app.post('/next-track', (req, res) => {
 // Update next track by specific MD5 for session (backward compatibility)
 app.post('/session/:sessionId/next-track', (req, res) => {
   const sessionId = req.params.sessionId;
-  const { trackSha, direction } = req.body;
+  const { trackMd5, direction } = req.body;
   const session = audioSessions.get(sessionId);
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  if (!trackSha) {
-    return res.status(400).json({ error: 'Track SHA is required' });
+  if (!trackMd5) {
+    return res.status(400).json({ error: 'Track MD5 is required' });
   }
 
   try {
-    console.log(`🎯 User selected specific track: ${trackSha} (direction: ${direction}) for session ${sessionId}`);
+    console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction}) for session ${sessionId}`);
 
-    // Set the specific next track by SHA
+    // Set the specific next track by MD5
     if (session.mixer.setNextTrack) {
-      session.mixer.setNextTrack(trackSha);
+      session.mixer.setNextTrack(trackMd5);
     } else if (session.mixer.driftPlayer) {
       // Store the selected track MD5 for next transition
-      session.mixer.selectedNextTrackMd5 = trackSha;
+      session.mixer.selectedNextTrackMd5 = trackMd5;
       if (direction) {
         session.mixer.driftPlayer.currentDirection = direction;
       }
     }
 
+    // Calculate timing info for sync check
+    const duration = session.mixer.getAdjustedTrackDuration() * 1000; // Convert to ms
+    const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
+    const remaining = Math.max(0, duration - elapsed);
+
     res.json({
-      message: `Next track set to ${trackSha}`,
-      trackSha: trackSha,
-      direction: direction,
-      sessionId: sessionId
+      // Acknowledgment
+      nextTrack: trackMd5,
+
+      // Sync state: current track + timing
+      currentTrack: session.mixer.currentTrack?.identifier || null,
+      duration: Math.round(duration),
+      remaining: Math.round(remaining)
     });
   } catch (error) {
     console.error('Next track selection error:', error);

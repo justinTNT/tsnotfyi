@@ -48,6 +48,9 @@
   let selectedNextTrackSha = null; // Track which next track card is currently selected
   let currentDimensionTrackIndex = 0; // Track current index for the selected dimension
 
+  // Heartbeat state (minimal - use latestCurrentTrack and latestExplorerData for actual data)
+  let heartbeatTimeout = null;        // Timer for 60s heartbeat
+
   // ====== 3D Visualization Setup ======
   const SPARKLE_COUNT = 124;
   const NUM_LONG = 60;
@@ -1051,16 +1054,7 @@
 
                   // Update server with the new selection
                   const track = direction.sampleTracks[0].track || direction.sampleTracks[0];
-                  fetch(`/next-track`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                          trackSha: track.identifier,
-                          direction: direction.key
-                      })
-                  }).catch(err => {
-                      console.error('Failed to select track:', err);
-                  });
+                  sendNextTrack(track.identifier, direction.key, 'user');
               });
       }
 
@@ -1098,24 +1092,11 @@
       };
 
       // Send the new next track selection to the server
-      fetch(`/next-track`, {
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-              trackSha: firstTrack.identifier,
-              direction: newNextDirectionKey
-          })
-      }).then(() => {
-          console.log(`✅ Server updated with new next track: ${firstTrack.title}`);
+      sendNextTrack(firstTrack.identifier, newNextDirectionKey, 'user');
 
-          // Redraw all cards with the new next track assignment
-          // This will maintain positions but swap the content and styling
-          redrawDimensionCardsWithNewNext(newNextDirectionKey);
-      }).catch(err => {
-          console.error('Failed to update next track:', err);
-      });
+      // Redraw all cards with the new next track assignment
+      // This will maintain positions but swap the content and styling
+      redrawDimensionCardsWithNewNext(newNextDirectionKey);
   }
 
   // Update the colors of stacked cards to preview other tracks in the direction
@@ -1886,14 +1867,7 @@
       selectedNextTrackSha = nextTrack.identifier;
 
       // Update server
-      fetch(`/next-track`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-              trackSha: nextTrack.identifier,
-              direction: directionKey
-          })
-      }).catch(err => console.error('Failed to cycle track:', err));
+      sendNextTrack(nextTrack.identifier, directionKey, 'user');
 
       // Refresh UI
       refreshCardsWithNewSelection();
@@ -2033,14 +2007,7 @@
       console.log(`🔄 Updated selection to first track of ${usingOppositeDirection ? 'OPPOSITE' : 'ORIGINAL'} stack (${displayDimensionKey}): ${trackToShow.title} (${trackToShow.identifier})`);
 
       // Notify server of the new track selection
-      fetch(`/next-track`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-              trackSha: trackToShow.identifier,
-              direction: displayDimensionKey
-          })
-      }).catch(err => console.error('Failed to update server with reversed track:', err));
+      sendNextTrack(trackToShow.identifier, displayDimensionKey, 'user');
 
       // Clear stored original colors so they get recalculated for the new direction
       delete currentCard.dataset.originalBorderColor;
@@ -2689,6 +2656,206 @@ function setupRecoveryGuard(originalTrackDuration) {
     }, recoveryTimeoutMs);
 }
 
+// ====== Heartbeat & Sync System ======
+
+// Unified next-track communication (handles user selection, heartbeat, and manual refresh)
+async function sendNextTrack(trackMd5 = null, direction = null, source = 'user') {
+    // source: 'user' | 'heartbeat' | 'manual_refresh'
+
+    // Clear existing heartbeat
+    if (heartbeatTimeout) {
+        clearTimeout(heartbeatTimeout);
+        heartbeatTimeout = null;
+    }
+
+    // Use existing data if not provided (heartbeat/refresh case)
+    const md5ToSend = trackMd5 || latestExplorerData?.nextTrack?.track?.identifier || selectedNextTrackSha;
+    const dirToSend = direction || latestExplorerData?.nextTrack?.directionKey;
+
+    if (!md5ToSend) {
+        console.warn('⚠️ sendNextTrack: No track MD5 available, skipping');
+        scheduleHeartbeat(10000); // Retry in 10s
+        return;
+    }
+
+    console.log(`📤 sendNextTrack (${source}): ${md5ToSend.substring(0,8)}... via ${dirToSend || 'unknown'}`);
+
+    try {
+        const response = await fetch('/next-track', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                trackMd5: md5ToSend,
+                direction: dirToSend
+            })
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const data = await response.json();
+        // data = { nextTrack, currentTrack, duration, remaining }
+
+        console.log(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
+
+        // Analyze response and take appropriate action
+        analyzeAndAct(data, source);
+
+    } catch (error) {
+        console.error('❌ sendNextTrack failed:', error);
+        // Set shorter retry timeout
+        scheduleHeartbeat(10000); // Retry in 10s
+    }
+}
+
+function analyzeAndAct(data, source) {
+    const { nextTrack, currentTrack, duration, remaining } = data;
+
+    if (!data || !currentTrack) {
+        console.warn('⚠️ Invalid server response');
+        scheduleHeartbeat(60000);
+        return;
+    }
+
+    // Check 1: Current track MD5 mismatch
+    const currentMd5 = latestCurrentTrack?.identifier;
+    const currentTrackMismatch = currentMd5 && currentTrack !== currentMd5;
+
+    if (currentTrackMismatch) {
+        console.log(`🔄 CURRENT TRACK MISMATCH! Expected ${currentMd5?.substring(0,8)}, got ${currentTrack?.substring(0,8)}`);
+        fullResync();
+        return;
+    }
+
+    // Check 2: Next track MD5 mismatch
+    const expectedNextMd5 = latestExplorerData?.nextTrack?.track?.identifier || selectedNextTrackSha;
+    const nextTrackMismatch = expectedNextMd5 && nextTrack !== expectedNextMd5;
+
+    if (nextTrackMismatch) {
+        console.log(`🔄 NEXT TRACK MISMATCH! Expected ${expectedNextMd5?.substring(0,8)}, got ${nextTrack?.substring(0,8)}`);
+
+        // Check if the server's next track is in our current neighborhood
+        if (isTrackInNeighborhood(nextTrack)) {
+            console.log(`✅ Server's next track found in local neighborhood - promoting to next track stack`);
+            promoteTrackToNextStack(nextTrack);
+            scheduleHeartbeat(60000);
+        } else {
+            console.log(`❌ Server's next track NOT in neighborhood - need full resync`);
+            fullResync();
+            return;
+        }
+    }
+
+    // Check 3: Timing drift (just update, don't panic)
+    // TODO: Could update progress bar here if we implement one
+
+    // All checks passed
+    console.log(`✅ Sync confirmed (${source})`);
+    scheduleHeartbeat(60000);
+}
+
+function isTrackInNeighborhood(trackMd5) {
+    if (!latestExplorerData || !latestExplorerData.directions) {
+        return false;
+    }
+
+    // Search through all directions' sample tracks
+    for (const [dirKey, direction] of Object.entries(latestExplorerData.directions)) {
+        if (direction.sampleTracks) {
+            const found = direction.sampleTracks.some(sample => {
+                const track = sample.track || sample;
+                return track.identifier === trackMd5;
+            });
+            if (found) {
+                console.log(`🔍 Track ${trackMd5.substring(0,8)} found in direction: ${dirKey}`);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function promoteTrackToNextStack(trackMd5) {
+    if (!latestExplorerData || !latestExplorerData.directions) {
+        console.warn('⚠️ No explorer data to promote track from');
+        return;
+    }
+
+    // Find which direction contains this track
+    let foundDirection = null;
+    let foundTrack = null;
+
+    for (const [dirKey, direction] of Object.entries(latestExplorerData.directions)) {
+        if (direction.sampleTracks) {
+            const trackData = direction.sampleTracks.find(sample => {
+                const track = sample.track || sample;
+                return track.identifier === trackMd5;
+            });
+
+            if (trackData) {
+                foundDirection = dirKey;
+                foundTrack = trackData.track || trackData;
+                break;
+            }
+        }
+    }
+
+    if (!foundDirection || !foundTrack) {
+        console.error('❌ Track not found in any direction, cannot promote');
+        return;
+    }
+
+    console.log(`🎯 Promoting track from ${foundDirection} to next track stack`);
+
+    // Use existing function to swap next track direction
+    swapNextTrackDirection(foundDirection);
+
+    // Update selected track state
+    selectedNextTrackSha = trackMd5;
+}
+
+function scheduleHeartbeat(delayMs = 60000) {
+    if (heartbeatTimeout) {
+        clearTimeout(heartbeatTimeout);
+    }
+
+    heartbeatTimeout = setTimeout(() => {
+        console.log('💓 Heartbeat triggered');
+        sendNextTrack(null, null, 'heartbeat');
+    }, delayMs);
+
+    console.log(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
+}
+
+async function fullResync() {
+    console.log('🔄 Full resync triggered - calling /refresh-sse');
+
+    try {
+        const endpoint = sessionId ? '/refresh-sse' : '/refresh-sse-simple';
+        const body = sessionId ? JSON.stringify({ sessionId }) : '{}';
+
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body
+        });
+
+        const result = await response.json();
+
+        if (result.ok) {
+            console.log('✅ Resync broadcast triggered, waiting for SSE update...');
+            // SSE event will update UI
+            scheduleHeartbeat(60000);
+        } else {
+            console.warn('⚠️ Resync failed:', result.reason);
+            scheduleHeartbeat(10000); // Retry sooner
+        }
+    } catch (error) {
+        console.error('❌ Resync error:', error);
+        scheduleHeartbeat(10000); // Retry sooner
+    }
+}
+
 // Request SSE refresh from the backend
 async function requestSSERefresh() {
     try {
@@ -2776,8 +2943,8 @@ function setupManualRefreshButton() {
             refreshButton.classList.add('refreshing');
 
             try {
-                // Use the same refresh function as zombie detection
-                await requestSSERefresh();
+                // Use heartbeat system for manual refresh
+                await sendNextTrack(null, null, 'manual_refresh');
 
                 // Keep spinning animation for a bit longer to show it worked
                 setTimeout(() => {
