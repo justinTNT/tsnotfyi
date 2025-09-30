@@ -2178,7 +2178,7 @@
           card.dataset.directionKey = directionKey;
       }
 
-      const dimension = latestExplorerData.directions[directionKey];
+      const direction = latestExplorerData.directions[directionKey];
       const directionType = getDirectionType(directionKey);
 
       // Get matching colors and variant
@@ -2209,7 +2209,7 @@
       }
 
       // Reset to simple direction content
-      const directionName = dimension?.isOutlier ? "Outlier" : formatDirectionName(directionKey);
+      const directionName = direction?.isOutlier ? "Outlier" : formatDirectionName(directionKey);
       const labelContent = `<div class="dimension-label">${directionName}</div>`;
 
       card.innerHTML = `
@@ -2698,7 +2698,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
         console.log(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
 
         // Analyze response and take appropriate action
-        analyzeAndAct(data, source);
+        analyzeAndAct(data, source, md5ToSend);
 
     } catch (error) {
         console.error('❌ sendNextTrack failed:', error);
@@ -2707,7 +2707,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     }
 }
 
-function analyzeAndAct(data, source) {
+function analyzeAndAct(data, source, sentMd5) {
     const { nextTrack, currentTrack, duration, remaining } = data;
 
     if (!data || !currentTrack) {
@@ -2733,6 +2733,15 @@ function analyzeAndAct(data, source) {
     if (nextTrackMismatch) {
         console.log(`🔄 NEXT TRACK MISMATCH! Expected ${expectedNextMd5?.substring(0,8)}, got ${nextTrack?.substring(0,8)}`);
 
+        // If this is what we just sent, it's a confirmation not a mismatch - just update our state
+        if (sentMd5 && nextTrack === sentMd5) {
+            console.log(`✅ Server confirmed our selection - updating local state only`);
+            selectedNextTrackSha = nextTrack;
+            scheduleHeartbeat(60000);
+            return;
+        }
+
+        // Otherwise, server picked something different (only happens on heartbeat/auto-transition)
         // Check if the server's next track is in our current neighborhood
         if (isTrackInNeighborhood(nextTrack)) {
             console.log(`✅ Server's next track found in local neighborhood - promoting to next track stack`);
