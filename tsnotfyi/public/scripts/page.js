@@ -356,7 +356,6 @@
       // Separate outliers from regular directions
       const outlierDirections = allDirections.filter(d =>
           d.key.includes('outlier') ||
-          d.key.includes('entropy') ||
           d.key.includes('unknown') ||
           getDirectionType(d.key) === 'outlier'
       );
