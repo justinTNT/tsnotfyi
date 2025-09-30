@@ -1,4 +1,5 @@
 const express = require('express');
+const session = require('express-session');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -122,11 +123,25 @@ async function createPreloadedSession(prefix) {
 // Start preloading initialization
 initializeWithPreloading();
 
-// Serve static files
+// Serve static files and middleware
+app.use(express.json());
+
+// Session middleware (infrastructure only - not changing behavior yet)
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'tsnotfyi-dev-secret-change-in-production',
+  resave: false,
+  saveUninitialized: true, // Create session for every visitor
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    httpOnly: true,
+    secure: false // Set to true in production with HTTPS
+  },
+  name: 'tsnotfyi.sid' // Custom session cookie name
+}));
+
 app.use(express.static('public'));
 app.use( '/images', express.static('images') );
 app.use( '/Volumes', express.static('/Volumes', { fallthrough: false }) );
-app.use(express.json());
 
 // Get master session (uses preloaded sessions for instant response)
 app.post('/create-session', async (req, res) => {
@@ -217,11 +232,32 @@ function getOrCreateSession(sessionId) {
   return getMasterSession();
 }
 
+// Helper: Get audio session for a request (uses Express session infrastructure)
+// For now, still returns master session - infrastructure only, no behavior change
+function getAudioSessionForRequest(req) {
+  const expressSessionId = req.session?.id;
+
+  // Log session ID for verification
+  if (expressSessionId) {
+    console.log(`🆔 Request from Express session: ${expressSessionId.substring(0, 8)}...`);
+  }
+
+  // If URL has explicit session ID, use that (existing named session behavior)
+  if (req.params.sessionId) {
+    console.log(`🆔 Using URL-based session: ${req.params.sessionId}`);
+    return audioSessions.get(req.params.sessionId) || masterSession;
+  }
+
+  // For now, always return master session (no behavior change)
+  // In future: map expressSessionId to individual audio sessions
+  return masterSession;
+}
+
 // Simplified stream endpoint - uses master session
 app.get('/stream', (req, res) => {
   console.log(`🔥 DEBUG: Stream request received (simplified endpoint)`);
 
-  const session = getMasterSession(); // Always use master session
+  const session = getAudioSessionForRequest(req); // Use helper (still returns master)
   console.log(`Client connecting to master stream: ${session.sessionId}`);
 
   // Update last access time
@@ -904,7 +940,7 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 // Simplified next track endpoint - uses master session
 app.post('/next-track', (req, res) => {
   const { trackMd5, direction } = req.body;
-  const session = getMasterSession(); // Always use master session
+  const session = getAudioSessionForRequest(req); // Use helper (still returns master)
 
   if (!trackMd5) {
     return res.status(400).json({ error: 'Track MD5 is required' });
