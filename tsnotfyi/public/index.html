@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Stream</title>
+    <link href="fonts/inter.css" rel="stylesheet">
+    <link href="fonts/jetbrains-mono.css" rel="stylesheet">
+    <script src="scripts/d3.v7.min.js"></script>
+    <script src="scripts/three.min.js"></script>
+    <link href="scripts/styles.css" rel="stylesheet">
+    <script src="scripts/tools.js"></script>
+    <script src="scripts/tubes.js"></script>
+</head>
+<body>
+    <!-- Background layer -->
+    <div id="background"></div>
+
+    <!-- 3D visualization scene -->
+    <div id="scene"></div>
+
+    <!-- Now Playing Card -->
+    <div id="nowPlayingCard">
+        <div class="card">
+            <div class="panel">
+                <div class="photo" id="cardPhoto"></div>
+                <span class="rim"></span>
+                <div class="bottom"></div>
+                <div class="label">
+                    <h2 id="cardDirection">Journey</h2>
+                    <h3 id="cardTitle">Loading...</h3>
+                    <h4 id="cardArtist"></h4>
+                    <h5 id="cardAlbum"></h5>
+                    <p id="cardMeta"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Dimension Cards in Circular Layout -->
+    <div id="dimensionCards"></div>
+
+    <!-- Full-screen click catcher -->
+    <div id="clickCatcher">
+        <div class="hint">sound explorer</div>
+    </div>
+
+    <!-- Custom volume control -->
+    <div id="volumeControl">
+        <div id="volumeBar"></div>
+    </div>
+
+
+    <!-- Search icon for fzf activation -->
+    <div id="searchIcon" title="Fuzzy search tracks">
+        <span id="searchIconText">?</span>
+    </div>
+
+    <!-- Direction key overlay text -->
+    <div id="directionKeyOverlay">
+        <span class="directionKeyText" id="dkt1"></span>
+        <span class="directionKeyText" id="dkt2"></span>
+    </div>
+
+    <!-- Manual refresh button -->
+    <div id="refreshButton" title="Refresh session if stuck">
+        <div class="refresh-icon">⟳</div>
+    </div>
+
+    <!-- Fuzzy search interface -->
+    <div id="fzfSearch" class="hidden">
+        <div class="fzf-container">
+            <input type="text" id="fzfInput" placeholder=" 🔍 fuzzy search tracks..." autocomplete="off" spellcheck="false">
+            <div id="fzfResults" class="fzf-results"></div>
+            <div class="fzf-hint">type to search • ESC to close • ENTER to jump to track • ↑↓ to navigate</div>
+        </div>
+    </div>
+
+    <!-- Fullscreen progress bar -->
+    <div id="fullscreenProgress">
+        <div id="progressWipe"></div>
+    </div>
+
+    <audio id="audio"></audio>
+
+    <script src="scripts/page.js"></script>
+    </script>
+</body>
+</html>

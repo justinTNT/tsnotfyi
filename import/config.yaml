@@ -1,0 +1,144 @@
+library: ~/.config/beets/library.db
+
+plugins: chroma xtractor duplicates fromfilename inline export fetchart lastgenre info play smartplaylist mbsync discogs
+
+ui:
+  color: no
+
+paths: 
+  default: $albumartist/$album%aunique{}/$track $title # DO NOT let beets rename/move anything
+
+fromfilename: # For paths like Artist/Album/Track.mp3
+    album_file_naming: $albumartist/$album/$track $title
+    force: yes
+
+import:
+  log: ~/.config/beets/beets.log
+  incremental: yes     # remember what we've done
+  timid: no
+  quiet_fallback: asis
+  default_action: asis
+  none_rec_action: asis
+  duplicate_action: keep
+  autotag: yes
+  link: no
+  hardlink: no
+  move: no
+  copy: no
+  write: no
+  # move: yes            # beets will move accepted files into `directory`
+  # write: yes           # write tags into files
+
+xtractor:
+  auto: no
+  dry-run: no
+  write: yes
+  threads: 1
+  force: yes
+  quiet: no
+  keep_output: yes
+  keep_profiles: yes
+  output_path: /Users/tsnotfyi/Documents
+  essentia_extractor: /opt/homebrew/bin/essentia_streaming_extractor_music
+  low_level_targets:
+          file_path:
+              path: metadata.file_path  # Store original path
+              type: string
+              required: yes
+
+  extractor_profile:
+    highlevel:
+      svm_models:
+        - /Users/tsnotfyi/Documents/essentia/danceability.history
+        - /Users/tsnotfyi/Documents/essentia/gender.history
+        - /Users/tsnotfyi/Documents/essentia/genre_rosamerica.history
+        - /Users/tsnotfyi/Documents/essentia/mood_acoustic.history
+        - /Users/tsnotfyi/Documents/essentia/mood_aggressive.history
+        - /Users/tsnotfyi/Documents/essentia/mood_electronic.history
+        - /Users/tsnotfyi/Documents/essentia/mood_happy.history
+        - /Users/tsnotfyi/Documents/essentia/mood_sad.history
+        - /Users/tsnotfyi/Documents/essentia/mood_party.history
+        - /Users/tsnotfyi/Documents/essentia/mood_relaxed.history
+        - /Users/tsnotfyi/Documents/essentia/voice_instrumental.history
+        - /Users/tsnotfyi/Documents/essentia/moods_mirex.history
+
+fetchart:
+  sources: coverart discogs itunes amazon filesystem
+  auto: yes                 # fetch art automatically during import
+  cautious: true            # don’t grab poor matches
+  maxwidth: 1200            # keep file size reasonable
+  minwidth: 300             # skip tiny, useless images
+  store_source: yes         # keep as cover.jpg in album folder
+  enforce_ratio: no         # don’t reject slightly non-square covers
+  cover_names: cover folder front  # recognised as existing covers
+  force: no                 # don't overwrite if one of the recognised files above already exists
+
+embedart:
+  auto: no                  # don’t embed into files
+
+lastgenre:
+  canonical: yes
+  source: track
+
+duplicates:
+  keys: mb_albumartist, album, bitrate, format
+  full: yes
+  tiebreak:
+    items: [bitrate, filesize, year]
+
+zero:
+  fields: comment grouping
+  update_database: yes
+
+discogs:
+  user_token: "bFtjySJptZxHBqGYRyJpBFBtHwKKdOOJoAIOVqgX"
+
+# Flexible field: relative path after /Volumes/
+item_fields:
+  tranche: (path.decode("utf-8","ignore") if isinstance(path, bytes) else path).split('/')[3]
+  md5path: |
+          import hashlib
+          return hashlib.md5(path.decode("utf-8").encode('utf-8')).hexdigest()
+
+
+chroma:
+  auto: no
+
+acousticbrainz:
+    auto: yes
+    force: no
+    tags: [mood_happy, mood_sad, mood_aggressive, mood_relaxed, danceability, energy, valence, arousal]
+
+musicbrainz:
+    extra_tags: [ label, external_ids, mood, genre, style, remixer, producer ]
+    external_ids:
+        discogs: yes
+        spotify: yes
+        bandcamp: yes
+        beatport: yes
+        deezer: yes
+        tidal: yes
+
+# Make more matches count as “strong” so they’re auto-applied
+match:
+  strong_rec_thresh: 0.5
+
+smartplaylist:
+  relative_to: /Users/tsnotfyi/Music/
+  playlist_dir: /Users/tsnotfyi/Music/playlists
+  playlists:
+    - name: "new-this-week.m3u"
+      query: "added:-7d.."
+    - name: "all-noise.m3u"
+      query: "genre:Noise"
+    - name: "unlistened.m3u"
+      query: "play_count:0"
+    - name: "90s.m3u"
+      query: "year:1990..1999"
+    - name: "possible-duplicates.m3u"
+      query: "duplicate:true"
+    - name: "unidentified.m3u"
+      query: "acoustid_id::''"
+    - name: "upgrade-candidates.m3u"
+      query: "duplicate:true format:MP3 bitrate:-192"
+

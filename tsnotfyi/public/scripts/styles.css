@@ -1,0 +1,1064 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    color-scheme: dark;
+}
+
+body {
+    background: #000;
+    color: #0a0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    overflow: hidden;
+    cursor: pointer;
+    height: 100vh;
+}
+
+#background {
+    position: fixed;
+    inset: 0;
+    background: linear-gradient(135deg, #336, #678);
+    opacity: 0.45;
+    background-size: 260%;
+    background-position-y: -300px;
+    background-position-x: -1000px;
+    z-index: -2;
+}
+
+#scene {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+}
+
+#clickCatcher {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: rgba(0, 0, 0, 0.8);
+    z-index: 1000;
+    backdrop-filter: blur(2px);
+    transition: opacity 0.8s ease-out;
+}
+
+#clickCatcher.fadeOut {
+    opacity: 0;
+    pointer-events: none;
+}
+
+#volumeControl {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 100px;
+    height: 20px;
+    background: rgba(17, 17, 17, 0.9);
+    border: 1px solid #0a0;
+    cursor: grab;
+    display: none;
+    z-index: 2000;
+    backdrop-filter: blur(4px);
+}
+
+#volumeBar {
+    height: 100%;
+    background: #0a0;
+    width: 85%;
+    transition: width 0.1s;
+}
+
+/* Stack size indicator positioned over card top-right corner */
+.stack-size-indicator {
+    position: absolute;
+    top: 30px;
+    right: -50px;
+    width: 50px;
+    height: 50px;
+    background: #0a0; /* Volume bar green */
+    border-radius: 25px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 15; /* Above card content but below reverse button */
+    opacity: 0.8;
+    transition: opacity 0.3s ease, transform 0.2s ease;
+    cursor: pointer;
+    user-select: none;
+}
+
+.stack-size-indicator:hover {
+    opacity: 1.0;
+    transform: scale(1.05);
+}
+
+.stack-size-indicator:active {
+    opacity: 1.0;
+    transform: scale(0.95);
+}
+
+.stack-size-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1em;
+    color: #fff; /* White text */
+    font-weight: bold;
+    user-select: none;
+}
+
+/* Search icon for fzf activation */
+#searchIcon {
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 40px;
+    height: 40px;
+    background: rgba(17, 17, 17, 0.9);
+    border: 1px solid #0a0;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: all 0.3s ease;
+    z-index: 2000;
+    user-select: none;
+    backdrop-filter: blur(4px);
+}
+
+#searchIcon:hover {
+    opacity: 0.8;
+    background: rgba(17, 17, 17, 1.0);
+    border-color: #0f0;
+    transform: scale(1.1);
+}
+
+#searchIcon:active {
+    transform: scale(0.95);
+    opacity: 1.0;
+}
+
+#searchIconText {
+    font-size: 20px;
+    font-weight: bold;
+    color: #0a0;
+    font-family: 'JetBrains Mono', monospace;
+    transition: color 0.3s ease;
+}
+
+#searchIcon:hover #searchIconText {
+    color: #0f0;
+}
+
+/* JSON metadata overlay with terminal styling and 3D depth */
+#directionKeyOverlay {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    transform: translateX(23%) translateY(-53%) rotateX(23deg) rotateZ(23deg) translateZ(-666px);
+    z-index: 1; /* Behind cards but above background */
+    pointer-events: none;
+    transition: opacity 0.5s ease, transform 0.5s ease;
+    perspective: 1000px;
+}
+
+#directionKeyOverlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-50%) rotateY(-8deg) rotateX(2deg) translateZ(-400px);
+}
+
+.directionKeyText {
+    position: absolute;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+    font-weight: 400;
+    color: #0a0; /* Volume bar green */
+    opacity: 0.3;
+    letter-spacing: 0.02em;
+    line-height: 1.4;
+    user-select: none;
+    white-space: pre-wrap;
+    background: rgba(0, 0, 0, 0.05);
+    padding: 1rem;
+    border-radius: 4px;
+    border: 1px solid rgba(0, 170, 0, 0.1);
+    backdrop-filter: blur(2px);
+    max-width: 500px;
+    max-height: 70vh;
+    overflow-y: auto;
+    box-shadow:
+        0 0 20px rgba(0, 170, 0, 0.05),
+        0 0 40px rgba(0, 170, 0, 0.02);
+}
+
+#dkt1 {
+    text-align: left;
+    top: 0;
+    left: 0;
+    font-size: 0.7rem
+}
+
+#dkt2 {
+    text-align: right;
+    bottom: 0;
+    right: 0;
+    font-size: 1.7rem;
+}
+
+/* Custom scrollbar for JSON metadata overlay */
+#directionKeyText::-webkit-scrollbar {
+    width: 8px;
+}
+
+#directionKeyText::-webkit-scrollbar-track {
+    background: rgba(0, 170, 0, 0.05);
+    border-radius: 4px;
+}
+
+#directionKeyText::-webkit-scrollbar-thumb {
+    background: rgba(0, 170, 0, 0.2);
+    border-radius: 4px;
+}
+
+#directionKeyText::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 170, 0, 0.3);
+}
+
+/* Manual refresh button */
+#refreshButton {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    width: 40px;
+    height: 40px;
+    background: rgba(17, 17, 17, 0.9);
+    border: 1px solid #0a0;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.4;
+    transition: all 0.3s ease;
+    z-index: 2000;
+    user-select: none;
+    backdrop-filter: blur(4px);
+}
+
+#refreshButton:hover {
+    opacity: 0.8;
+    background: rgba(17, 17, 17, 1.0);
+    border-color: #0f0;
+    transform: scale(1.1);
+}
+
+#refreshButton:active {
+    transform: scale(0.95);
+    opacity: 1.0;
+}
+
+#refreshButton.refreshing {
+    opacity: 1.0;
+    background: rgba(0, 170, 0, 0.2);
+    border-color: #0f0;
+}
+
+#refreshButton.refreshing .refresh-icon {
+    animation: spin 1s linear infinite;
+}
+
+.refresh-icon {
+    font-size: 20px;
+    font-weight: bold;
+    color: #0a0;
+    transition: color 0.3s ease;
+}
+
+#refreshButton:hover .refresh-icon {
+    color: #0f0;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Fuzzy search interface */
+#fzfSearch {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(8px);
+    z-index: 3000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 1;
+    transition: opacity 0.2s ease-in-out;
+}
+
+#fzfSearch.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.fzf-container {
+    width: min(90vw, 800px);
+    max-height: 70vh;
+    background: rgba(17, 17, 17, 0.95);
+    border: 1px solid #0a0;
+    border-radius: 8px;
+    backdrop-filter: blur(4px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#fzfInput {
+    width: 100%;
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 16px 20px;
+    font-size: 40px;
+    color: #0f0;
+    font-family: 'JetBrains Mono', monospace;
+    border-bottom: 1px solid rgba(0, 170, 0, 0.3);
+}
+
+#fzfInput::placeholder {
+    color: rgba(0, 170, 0, 0.6);
+}
+
+.fzf-results {
+    flex: 1;
+    overflow-y: auto;
+    max-height: 400px;
+    padding: 0;
+}
+
+.fzf-result-item {
+    padding: 12px 20px;
+    border-bottom: 1px solid rgba(0, 170, 0, 0.1);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.fzf-result-item:hover,
+.fzf-result-item.selected {
+    background: rgba(0, 170, 0, 0.15);
+    border-color: rgba(0, 170, 0, 0.3);
+}
+
+.fzf-result-item.selected {
+    border-left: 3px solid #0a0;
+}
+
+.fzf-result-primary {
+    color: #0f0;
+    font-weight: 500;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fzf-result-secondary {
+    color: rgba(0, 170, 0, 0.7);
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fzf-result-meta {
+    color: rgba(0, 170, 0, 0.5);
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.fzf-hint {
+    padding: 10px 20px;
+    background: rgba(0, 170, 0, 0.05);
+    border-top: 1px solid rgba(0, 170, 0, 0.2);
+    font-size: 12px;
+    color: rgba(0, 170, 0, 0.6);
+    font-family: 'JetBrains Mono', monospace;
+    text-align: center;
+}
+
+.fzf-no-results {
+    padding: 40px 20px;
+    text-align: center;
+    color: rgba(0, 170, 0, 0.5);
+    font-style: italic;
+}
+
+.fzf-loading {
+    padding: 40px 20px;
+    text-align: center;
+    color: rgba(0, 170, 0, 0.7);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* Custom scrollbar for fzf results */
+.fzf-results::-webkit-scrollbar {
+    width: 6px;
+}
+
+.fzf-results::-webkit-scrollbar-track {
+    background: rgba(0, 170, 0, 0.1);
+}
+
+.fzf-results::-webkit-scrollbar-thumb {
+    background: rgba(0, 170, 0, 0.3);
+    border-radius: 3px;
+}
+
+.fzf-results::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 170, 0, 0.5);
+}
+
+/* Fullscreen progress bar with gradient wipe */
+#fullscreenProgress {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 2; /* Behind UI elements but above background */
+    opacity: 0;
+    transition: opacity 0.5s ease;
+}
+
+#fullscreenProgress.active {
+    opacity: 1;
+}
+
+#progressWipe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg,
+        rgba(255, 255, 255, 0.08) 0%,
+        rgba(255, 255, 255, 0.12) 50%,
+        rgba(255, 255, 255, 0.08) 100%);
+    transition: none; /* Animation will be handled by JavaScript */
+}
+
+#progressFill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(69deg, #093, #1c5);
+    border-radius: 9px;
+    transition: width 0.1s linear;
+}
+
+audio {
+    display: none;
+}
+
+.hint {
+    font-size: 1.5em;
+    opacity: 0.7;
+    text-align: center;
+    text-shadow: 0 0 10px #0a0;
+}
+
+/* Now Playing Card - positioned left side in 3D space */
+#nowPlayingCard {
+    position: fixed;
+    left: 2rem;
+    top: 50%;
+    transform: translateY(-50%) translateX(-2000px) translateZ(-3000px) perspective(1000px) rotateY(15deg) rotateX(-5deg) scale(0.1);
+    z-index: 100;
+    transition: all 1.2s cubic-bezier(0.16, 1, 0.3, 1); /* Hyperbolic easing */
+    opacity: 0;
+}
+
+#nowPlayingCard.visible {
+    transform: translateY(-50%) perspective(1000px) rotateY(15deg) rotateX(-5deg) scale(1);
+    opacity: 1;
+}
+
+#nowPlayingCard.flip {
+    transform: translateY(-50%) perspective(1000px) rotateY(195deg) rotateX(-5deg) scale(1);
+}
+
+/* Card Frame */
+.card {
+    width: 300px;
+    aspect-ratio: 3/5;
+    background: #fff;
+    border-radius: 1.8rem;
+    padding: 16px;
+    box-sizing: border-box;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* Inner panel with color variations */
+.panel {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background: #3a39ff;
+    border-radius: 1.6rem;
+    overflow: hidden;
+}
+
+.panel.red-variant {
+    background: linear-gradient(135deg, #422, #310);
+}
+
+.panel.green-variant {
+    background: linear-gradient(135deg, #242, #031);
+}
+
+.panel.yellow-variant {
+    background: linear-gradient(135deg, #442, #321);
+}
+
+.panel.blue-variant {
+    background: linear-gradient(135deg, #224, #013);
+}
+
+
+/* Image div with mask */
+.photo {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, #1a0, #051); /* Fallback gradient */
+    z-index: 1;
+    /* Ellipse mask */
+    -webkit-mask: radial-gradient(140% 130% at 39% -9%, #000 60%, transparent 61%);
+            mask: radial-gradient(140% 130% at 39% -9%, #000 60%, transparent 61%);
+}
+
+/* Negative direction general photo mask - horizontally flipped */
+.negative-direction .photo {
+    -webkit-mask: radial-gradient(140% 130% at 61% -9%, #000 60%, transparent 61%);
+            mask: radial-gradient(140% 130% at 61% -9%, #000 60%, transparent 61%);
+}
+
+/* White rim (thin elliptical ring) - default positive direction */
+.rim {
+    position: absolute;
+    inset: -3px; /* Extended for 3D rotation coverage */
+    z-index: 2;
+    background: #fff;
+    border-radius: 2.1rem; /* Larger radius to match extended coverage */
+    -webkit-mask: radial-gradient(140% 130% at 39% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+            mask: radial-gradient(140% 130% at 39% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+}
+
+/* Negative direction rim - curves opposite direction (horizontally flipped) */
+.dimension-card.negative-direction .rim {
+    -webkit-mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+            mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+}
+
+/* Footer band - simplified to avoid gradient conflicts */
+.bottom {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 28%;
+    z-index: 3;
+}
+
+/* Text on top */
+.label {
+    position: absolute;
+    left: 16px; right: 16px; bottom: 12px;
+    color: #fff;
+    z-index: 4;
+    line-height: 1.2;
+}
+.label h2 { margin: 0 0 .2rem 0; font-size: 0.7rem; font-weight: 600; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace; }
+.label h3 { margin: 0 0 .3rem 0; font-size: 1rem; font-weight: 700; }
+.label h4 { margin: 0 0 .2rem 0; font-size: 0.9rem; font-weight: 500; opacity: 0.9; }
+.label h5 { margin: 0 0 .4rem 0; font-size: 0.8rem; font-weight: 400; opacity: 0.8; }
+.label p { margin: 0; opacity: .9; font-size: .75rem; }
+
+/* Dimension Cards Container */
+#dimensionCards {
+    position: fixed;
+    right: 0;
+    top: 50%;
+    width: 90vw;
+    height: 60vw;
+    max-width: 900px;
+    max-height: 700px;
+    transform: translateY(-50%);
+    z-index: 50;
+    pointer-events: none;
+}
+
+/* Individual Dimension Card */
+.dimension-card {
+    position: absolute;
+    width: 200px;
+    aspect-ratio: 3/5;
+    border: none;
+    border-radius: 1.8rem;
+    padding: 10px;
+    box-sizing: border-box;
+    /* Clean shadow without glow */
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+    transition: box-shadow 0.3s ease;
+    transform-style: preserve-3d;
+    transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+    opacity: 0;
+    transform: translateZ(-1500px) scale(0.3);
+    cursor: pointer;
+    pointer-events: auto;
+}
+
+
+.dimension-card.visible {
+    opacity: 1;
+}
+
+/* Inactive state for direction cards after 20s of inactivity */
+.dimension-card:not(.track-detail-card).inactive {
+    transform: translate(-50%, -50%) translateZ(-1500px) scale(0.5) rotateX(45deg);
+    transition: transform 2s ease-out;
+}
+
+/* Inactivity tilt state for direction cards after 10s inactivity in first half */
+.dimension-card:not(.track-detail-card).inactive-tilt {
+    transform: translate(-50%, -50%) translateZ(-1200px) rotateX(45deg);
+    transition: transform 3s ease-out, opacity 3s ease-out;
+}
+
+/* Midpoint tilt state for direction cards when track reaches halfway point */
+.dimension-card:not(.track-detail-card).midpoint-tilt {
+    transform: translate(-50%, -50%) translateZ(-1200px) scale(0.5) rotateX(45deg);
+    transition: transform 1s ease-out;
+}
+
+/* Interaction locked state */
+.dimension-card.interaction-locked {
+    cursor: not-allowed;
+    filter: saturate(0.3);
+}
+
+/* Heavily stacked inactive cards should be more transparent */
+.dimension-card.stacked.heavily-stacked.visible.inactive > .panel {
+    opacity: 0.5;
+}
+
+/* Return to attention on activity */
+.dimension-card:not(.track-detail-card).active {
+    transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateX(0deg);
+    transition: transform 0.5s ease-out;
+}
+
+.dimension-card:hover {
+    transform: translate(-50%, -50%) translateZ(0) scale(1);
+    z-index: 200; /* Bring hovered card to front */
+    /* Enhanced shadow on hover */
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.8);
+}
+
+/* Next track cards should be at least as big as current track (300px) */
+.dimension-card.next-track {
+    width: 260px; /* Smaller than current track */
+    transform: translate(-50%, -40%) translateZ(-800px) scale(1.5);
+}
+
+.dimension-card.next-track.visible {
+    opacity: 1;
+}
+
+.dimension-card.next-track:hover {
+    transform: translate(-50%, -50%) translateZ(100px) scale(1.1);
+    z-index: 300; /* Higher than regular cards */
+    /* No glow for next track cards - only shadow */
+    box-shadow: 0 24px 48px rgba(0, 0, 0, 0.8);
+}
+
+/* Stacked card depth indication using pseudo-elements */
+
+/* Visual stacking for cards with multiple samples */
+.dimension-card.stacked {
+    position: relative;
+}
+
+.dimension-card.stacked::before {
+    content: '';
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    right: -1px;
+    bottom: -1px;
+    background: var(--border-color, #ccc);
+    border-radius: 1.8rem;
+    box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4);
+    z-index: -1;
+    opacity: 0.9;
+}
+
+.dimension-card.stacked::after {
+    content: '';
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    right: -1px;
+    bottom: -1px;
+    background: var(--border-color, #ccc);
+    border-radius: 1.8rem;
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+    z-index: -2;
+    opacity: 0.7;
+}
+
+/* For heavily stacked cards (3+), make the cards behind more visible */
+.dimension-card.heavily-stacked::before {
+    opacity: 1.0;
+}
+
+.dimension-card.heavily-stacked::after {
+    opacity: 0.85;
+}
+
+/* Dimension card panels with full visual treatment */
+.dimension-card .panel {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    border-radius: 1.6rem;
+    overflow: hidden;
+}
+
+/* Dimension card photo with gradient */
+.dimension-card .photo {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, #555, #333);
+    z-index: 1;
+    -webkit-mask: radial-gradient(140% 130% at 39% -9%, #000 60%, transparent 61%);
+            mask: radial-gradient(140% 130% at 39% -9%, #000 60%, transparent 61%);
+}
+
+/* Negative direction photo mask - horizontally flipped */
+.dimension-card.negative-direction .photo {
+    -webkit-mask: radial-gradient(140% 130% at 61% -9%, #000 60%, transparent 61%);
+            mask: radial-gradient(140% 130% at 61% -9%, #000 60%, transparent 61%);
+}
+
+/* Dimension card rim */
+.dimension-card .rim {
+    position: absolute;
+    inset: -3px; /* Extended for 3D rotation coverage */
+    z-index: 2;
+    background: var(--border-color, #fff); /* Use custom property with white fallback */
+    border-radius: 2.1rem; /* Larger radius to match extended coverage */
+    /* Subtle glow effect using border color */
+    box-shadow:
+        0 0 15px rgba(255, 255, 255, 0.1),
+        0 0 30px var(--glow-color, rgba(255, 255, 255, 0.05)),
+        0 0 45px var(--glow-color, rgba(255, 255, 255, 0.02));
+    -webkit-mask: radial-gradient(140% 130% at 39% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+            mask: radial-gradient(140% 130% at 39% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+}
+
+/* Negative direction dimension card rim - horizontally flipped */
+.dimension-card.negative-direction .rim {
+    -webkit-mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+            mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+}
+
+/* Dimension card bottom band */
+.dimension-card .bottom {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 28%;
+    z-index: 3;
+}
+
+/* Dimension card label */
+.dimension-card .label {
+    position: absolute;
+    left: 16px; right: 16px; bottom: 12px;
+    color: #fff;
+    z-index: 4;
+    line-height: 1.2;
+    text-align: center;
+}
+
+/* Next track stack label - left justified */
+.dimension-card.next-track .label {
+    text-align: left;
+}
+
+.dimension-card .dimension-label {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 210;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+    text-transform: uppercase;
+}
+
+/* Uno Reverse Card Indicator */
+.uno-reverse {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 32px;
+    height: 32px;
+    z-index: 15;
+    opacity: 0.8;
+    transition: all 0.3s ease;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 3em;
+    rotate: 45deg;
+    color: #fff;
+    text-shadow:
+        1px 1px 0 #000,
+        -1px -1px 0 #000,
+        1px -1px 0 #000,
+        -1px 1px 0 #000;
+    pointer-events: auto;
+}
+
+.uno-reverse::after {
+    content: "⇄";
+}
+
+.uno-reverse.reversed {
+    transform: rotate(90deg);
+}
+
+/* Next track Uno Reverse styling */
+.uno-reverse.next-track-reverse {
+    opacity: 0.7;
+    cursor: pointer;
+    transition:
+        transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+        opacity 0.2s ease;
+}
+
+.uno-reverse.next-track-reverse:hover {
+    opacity: 1;
+    transition: opacity 0.2s ease;
+}
+
+.uno-reverse.next-track-reverse:active {
+    opacity: 0.8;
+}
+
+.uno-reverse.disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.uno-reverse.enabled {
+    cursor: pointer;
+}
+
+.uno-reverse.enabled:hover {
+    opacity: 1;
+    transition: opacity 0.2s ease;
+}
+
+.uno-reverse.enabled:active {
+    opacity: 0.8;
+}
+
+/* Bidirectional card flip animation */
+.dimension-card.bidirectional {
+    transition: transform 0.3s ease;
+}
+
+/* Outlier card styling - Orange (default) */
+.dimension-card.outlier {
+    border: 1px solid #ff6b35;
+    background: linear-gradient(135deg, #2a1810 0%, #3d2418 50%, #2a1810 100%);
+    box-shadow: 0 8px 32px rgba(255, 107, 53, 0.3), inset 0 1px 0 rgba(255, 107, 53, 0.2);
+}
+
+/* Red variation - Rhythmic directions */
+.dimension-card.red-variant {
+    border: 1px solid #e74c3c;
+    background: linear-gradient(135deg, #2a1818 0%, #3d1f1f 50%, #2a1818 100%);
+    box-shadow: 0 8px 32px rgba(231, 76, 60, 0.3), inset 0 1px 0 rgba(231, 76, 60, 0.2);
+}
+
+/* Green variation - Tonal directions */
+.dimension-card.green-variant {
+    border: 1px solid #27ae60;
+    background: linear-gradient(135deg, #182a1a 0%, #1f3d22 50%, #182a1a 100%);
+    box-shadow: 0 8px 32px rgba(39, 174, 96, 0.3), inset 0 1px 0 rgba(39, 174, 96, 0.2);
+}
+
+/* Blue variation - Spectral directions */
+.dimension-card.blue-variant {
+    border: 1px solid #3498db;
+    background: linear-gradient(135deg, #18222a 0%, #1f2f3d 50%, #18222a 100%);
+    box-shadow: 0 8px 32px rgba(52, 152, 219, 0.3), inset 0 1px 0 rgba(52, 152, 219, 0.2);
+}
+
+.dimension-card.outlier::before {
+    content: "⚡";
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    font-size: 1.5rem;
+    color: #ff6b35;
+    z-index: 10;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.dimension-card.outlier:hover {
+    border-color: #ff8c5a;
+    box-shadow: 0 12px 48px rgba(255, 107, 53, 0.4), inset 0 1px 0 rgba(255, 107, 53, 0.3);
+}
+
+.dimension-card.red-variant::before {
+    content: "🎵";
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    font-size: 1.5rem;
+    color: #e74c3c;
+    z-index: 10;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.dimension-card.red-variant:hover {
+    border-color: #ec7063;
+    box-shadow: 0 12px 48px rgba(231, 76, 60, 0.4), inset 0 1px 0 rgba(231, 76, 60, 0.3);
+}
+
+.dimension-card.green-variant::before {
+    content: "🎹";
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    font-size: 1.5rem;
+    color: #27ae60;
+    z-index: 10;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.dimension-card.green-variant:hover {
+    border-color: #52c882;
+    box-shadow: 0 12px 48px rgba(39, 174, 96, 0.4), inset 0 1px 0 rgba(39, 174, 96, 0.3);
+}
+
+.dimension-card.blue-variant::before {
+    content: "🌊";
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    font-size: 1.5rem;
+    color: #3498db;
+    z-index: 10;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
+}
+
+.dimension-card.blue-variant:hover {
+    border-color: #5dade2;
+    box-shadow: 0 12px 48px rgba(52, 152, 219, 0.4), inset 0 1px 0 rgba(52, 152, 219, 0.3);
+}
+
+/* ARROWS (each arrow is: circular arc (::before) + triangle head (::after)) */
+.arrow {
+    position: absolute;
+    inset: 0;
+    display: block;
+    z-index: 1;
+    transform: rotate(25deg);
+    pointer-events: none;
+}
+
+/* common arc */
+.arrow::before {
+    content: "";
+    position: absolute;
+    width: 68%;
+    height: 68%;
+    left: 16%;
+    top: 16%;
+    border: 1px solid #fff;
+    border-right-color: transparent;
+    border-bottom-color: transparent;
+    border-radius: 50%;
+}
+
+/* common head */
+.arrow::after {
+    content: "";
+    position: absolute;
+    width: 0;
+    height: 0;
+    border: 1px solid transparent;
+    border-left-color: #fff;
+}
+
+/* top-right pointing arrow */
+.arrow.a::before {
+    transform: rotate(-8deg);
+}
+.arrow.a::after {
+    left: 66%;
+    top: 6%;
+    transform: rotate(12deg);
+}
+
+/* bottom-left pointing arrow (mirror/offset) */
+.arrow.b {
+    transform: rotate(205deg);
+}
+.arrow.b::before {
+    transform: rotate(-8deg);
+}
+.arrow.b::after {
+    left: 66%;
+    top: 6%;
+    transform: rotate(12deg);
+}
+
+/* Card flip animation */
+.dimension-card.flipping {
+    animation: cardFlip 0.6s ease-in-out;
+}
+
+@keyframes cardFlip {
+    0% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
+    50% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(90deg); }
+    100% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
+}
