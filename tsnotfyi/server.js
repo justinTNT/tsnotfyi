@@ -2,7 +2,6 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
-const AudioMixer = require('./audio-mixer');
 const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
 const sqlite3 = require('sqlite3').verbose();
@@ -143,100 +142,7 @@ app.post('/create-session', async (req, res) => {
   });
 });
 
-// API: Create named session
-app.post('/api/session/create', async (req, res) => {
-  const { sessionName, options = {} } = req.body;
-
-  if (!sessionName) {
-    return res.status(400).json({ error: 'sessionName is required' });
-  }
-
-  console.log(`🎯 API: Creating named session '${sessionName}'`);
-
-  try {
-    // Check if session already exists
-    if (audioSessions.has(sessionName)) {
-      return res.status(409).json({
-        error: 'Session already exists',
-        sessionId: sessionName,
-        webUrl: `/session/${sessionName}`,
-        streamUrl: `/stream/${sessionName}`
-      });
-    }
-
-    // TODO: When we restore session management, create actual session here
-    // const session = await createPreloadedSession(`named_${sessionName}`);
-    // session.sessionId = sessionName;
-    // session.isNamed = true;
-    // session.allowCommands = true;
-    // session.options = options;
-    // audioSessions.set(sessionName, session);
-
-    console.log(`✨ API: Named session '${sessionName}' created (TODO: actual implementation)`);
-
-    res.json({
-      sessionId: sessionName,
-      type: 'named',
-      allowCommands: true,
-      webUrl: `/session/${sessionName}`,
-      streamUrl: `/stream/${sessionName}`,
-      eventsUrl: `/events/${sessionName}`,
-      created: new Date().toISOString(),
-      todo: 'Actual session creation pending full session management restoration'
-    });
-
-  } catch (error) {
-    console.error('API session creation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// API: Create follower session
-app.post('/api/session/follow', async (req, res) => {
-  const { sessionName, followerName } = req.body;
-
-  if (!sessionName) {
-    return res.status(400).json({ error: 'sessionName is required' });
-  }
-
-  const followerId = followerName || `follower_${sessionName}_${Date.now()}`;
-  console.log(`👁️ API: Creating follower '${followerId}' for session '${sessionName}'`);
-
-  try {
-    // TODO: When we restore session management, verify target session exists
-    // if (!audioSessions.has(sessionName)) {
-    //   return res.status(404).json({ error: 'Target session not found' });
-    // }
-
-    // TODO: Create actual follower session
-    // const followerSession = {
-    //   sessionId: followerId,
-    //   type: 'follower',
-    //   followingSession: sessionName,
-    //   allowCommands: false,
-    //   mixer: null, // Followers observe, don't control
-    //   created: new Date()
-    // };
-    // audioSessions.set(followerId, followerSession);
-
-    console.log(`👁️ API: Follower '${followerId}' created (TODO: actual implementation)`);
-
-    res.json({
-      sessionId: followerId,
-      type: 'follower',
-      followingSession: sessionName,
-      allowCommands: false,
-      webUrl: `/session/${sessionName}?mode=follow`,
-      eventsUrl: `/events/${sessionName}`, // Followers listen to main session events
-      created: new Date().toISOString(),
-      todo: 'Actual follower session creation pending full session management restoration'
-    });
-
-  } catch (error) {
-    console.error('API follower creation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+// NOTE: Multi-session API endpoints removed - see SESSIONS_ROADMAP.md for reintroduction plan
 
 // Get preloaded master session (instant response)
 async function getPreloadedMasterSession() {
@@ -341,73 +247,7 @@ app.get('/stream/:sessionId', (req, res) => {
   session.mixer.addClient(res);
 });
 
-// Create named session endpoint
-app.get('/session/create/:sessionName', async (req, res) => {
-  const sessionName = req.params.sessionName;
-  console.log(`🎯 Creating named session: ${sessionName}`);
-
-  try {
-    // TODO: When we restore full session management, create actual named sessions
-    // For now, with master session pattern, redirect to master session but preserve intent
-
-    // Check if session already exists
-    let session = audioSessions.get(sessionName);
-    if (session) {
-      console.log(`🔄 Named session '${sessionName}' already exists, redirecting to it`);
-    } else {
-      console.log(`✨ Creating new named session: ${sessionName}`);
-      // TODO: Create actual independent session when we restore session management
-      // session = await createPreloadedSession(`named_${sessionName}`);
-      // session.sessionId = sessionName;
-      // session.isNamed = true;
-      // session.allowCommands = true;
-      // audioSessions.set(sessionName, session);
-
-      // For now, just redirect to master session with session name in URL
-      console.log(`🔄 Master session pattern: redirecting to /session/${sessionName}`);
-    }
-
-    res.redirect(`/session/${sessionName}`);
-  } catch (error) {
-    console.error('Named session creation error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Follow named session endpoint (read-only)
-app.get('/session/follow/:sessionName', async (req, res) => {
-  const sessionName = req.params.sessionName;
-  console.log(`👁️ Following named session: ${sessionName}`);
-
-  try {
-    // TODO: When we restore full session management, create follower sessions
-    // Follower sessions can receive events but cannot send commands
-
-    let session = audioSessions.get(sessionName);
-    if (!session) {
-      // TODO: When session management is restored, this should fail
-      // For now, create a placeholder or redirect to master
-      console.log(`❓ Named session '${sessionName}' not found, creating follower placeholder`);
-
-      // TODO: Create follower session when we restore session management
-      // const followerSessionId = `follower_${sessionName}_${Date.now()}`;
-      // const followerSession = {
-      //   sessionId: followerSessionId,
-      //   followingSession: sessionName,
-      //   isFollower: true,
-      //   allowCommands: false, // Key difference - followers can't send commands
-      //   mixer: null // Followers don't have their own mixer, they just observe
-      // };
-      // audioSessions.set(followerSessionId, followerSession);
-    }
-
-    // For now, redirect to the session page but mark as follower
-    res.redirect(`/session/${sessionName}?mode=follow`);
-  } catch (error) {
-    console.error('Session follow error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+// NOTE: Named session creation endpoints removed - see SESSIONS_ROADMAP.md for reintroduction plan
 
 // Session page
 app.get('/session/:sessionId', (req, res) => {
@@ -416,20 +256,17 @@ app.get('/session/:sessionId', (req, res) => {
   const isFollowMode = req.query.mode === 'follow';
 
   if (!session) {
-    // TODO: When we restore session management, this should create or fail appropriately
-    // For now, serve the page anyway - master session pattern will handle it
     console.log(`⚠️ Session '${sessionId}' not found, serving page anyway (master session pattern)`);
   }
 
-  // TODO: When session management is restored, pass session type to frontend
-  // This could be done via query params or session metadata
   if (isFollowMode) {
     console.log(`👁️ Serving session page in follow mode for: ${sessionId}`);
   } else {
     console.log(`🎮 Serving session page in control mode for: ${sessionId}`);
   }
 
-  res.sendFile(path.join(__dirname, 'public', 'minimal.html'));
+  // TODO: Create minimal.html for lightweight session view, or build session-specific UI
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 
@@ -860,7 +697,7 @@ app.get('/search', (req, res) => {
           path: decodedPath,
           filename: filename,
           directory: directory,
-          segments: pathParts[3..],  // ignore tranche, year, month
+          segments: pathParts.slice(3),  // ignore tranche, year, month
           albumCover: metadata.album.artpath || '/images/albumcover.png',
           title: metadata.title || filename,
           artist: metadata.artist || segments.pathArtist || '',
