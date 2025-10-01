@@ -1,3 +1,40 @@
+// helpers: small utilities that are kind of independent but not really
+
+  function variantFromDirectionType(directionType) {
+      const variantMap = {
+          rhythmic_core: 'red-variant',
+          rhythmic_pca: 'red-variant',
+          tonal_core: 'green-variant',
+          tonal_pca: 'green-variant',
+          spectral_core: 'blue-variant',
+          spectral_pca: 'blue-variant',
+          outlier: 'yellow-variant'
+      };
+      return variantMap[directionType] || 'yellow-variant';
+  }
+
+  // Categorize direction into 7 distinct types for color coding
+  function getDirectionType(directionKey) {
+      // 7 categories: Core vs PCA for rhythmic/tonal/spectral, plus outliers
+      if (directionKey.includes('rhythmic_pc') || (directionKey.includes('pc') && directionKey.includes('rhythmic'))) {
+          return 'rhythmic_pca'; // Rhythmic PCA directions
+      } else if (directionKey.includes('rhythmic') || directionKey.includes('bpm') || directionKey.includes('dance') || directionKey.includes('onset')) {
+          return 'rhythmic_core'; // Core rhythmic features
+      } else if (directionKey.includes('tonal_pc') || (directionKey.includes('pc') && directionKey.includes('tonal'))) {
+          return 'tonal_pca'; // Tonal PCA directions
+      } else if (directionKey.includes('tonal') || directionKey.includes('chord') || directionKey.includes('tuning') || directionKey.includes('fifths')) {
+          return 'tonal_core'; // Core tonal features
+      } else if (directionKey.includes('spectral_pc') || (directionKey.includes('pc') && directionKey.includes('spectral'))) {
+          return 'spectral_pca'; // Spectral PCA directions
+      } else if (directionKey.includes('spectral') || directionKey.includes('centroid') || directionKey.includes('rolloff') || directionKey.includes('flatness')) {
+          return 'spectral_core'; // Core spectral features
+      } else {
+          return 'outlier'; // Outliers, entropy, crest, and miscellaneous
+      }
+  }
+
+
+
   // Format direction names for display using meaningful lexicon
   function formatDirectionName(directionKey) {
       // Safety check for undefined directionKey

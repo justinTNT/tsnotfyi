@@ -1279,7 +1279,6 @@ class DriftAudioMixer {
         diversityScore: diversityScore,
         isOutlier: isOutlier,
         splitRatio: totalNeighborhoodSize > 0 ? (trackCount / totalNeighborhoodSize) : 0,
-        searchType: 'legacy' // Mark as legacy search
       };
 
       // Group outliers separately as requested
@@ -1308,7 +1307,6 @@ class DriftAudioMixer {
         sampleTracks: [],
         diversityScore: 0,
         isOutlier: true,
-        searchType: 'legacy',
         error: error.message
       };
     }

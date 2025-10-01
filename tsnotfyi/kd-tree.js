@@ -126,7 +126,7 @@ class MusicalKDTree {
                     this.loadCalibrationSettings()
                 ]).then(() => {
                     console.log(`Loaded ${this.tracks.length} tracks`);
-                    console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} discriminators`);
+                    console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
                     this.buildTree();
                     console.log('KD-tree constructed');
                     resolve();
