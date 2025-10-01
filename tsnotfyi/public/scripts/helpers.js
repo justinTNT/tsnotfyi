@@ -3,6 +3,11 @@
 //  *) updateCardWithTrackDetails
 //  *) createDirectionCard
 
+  // tool-let to create all the styling for album covers
+  const photoStyle = (albumCover) =>
+    `background: url('${albumCover}'); background-size: 120%; background-position-x: 45%`
+
+
   // Stack indicators are now implemented via CSS pseudo-elements
 
   function createTrackDetailCard(direction, track, positionIndex, totalDimensions, isSelected, trackIndex, totalTracks) {

@@ -84,7 +84,7 @@
       photo.style.background =
 		  state.previousNextTrack?.identifier === trackData.identifier
 		  ? state.previousNextTrack.albumCover
-		  : trackData.albumCover;
+		  : `url('${trackData.albumCover}')`;
 
       // Randomly assign panel color variant
       const panel = document.querySelector('.panel');
@@ -410,72 +410,6 @@
       }, index * 150 + 1000);
   }
 
-
-  // tool to create all the styling for album covers
-  const photoStyle = (albumCover) =>
-    `background: url('${albumCover}'); background-size: 120%; background-position-x: 45%`
-
-
-  function updateSelectedTrackInStack(directionKey, newSelectedIndex) {
-      // Find all cards for this dimension
-      const dimensionCards = document.querySelectorAll(`[data-direction-key="${directionKey}"]`);
-      if (dimensionCards.length === 0) return;
-
-      // Find the current selected card (the one with scale 1.0) and new selected track
-      let currentSelectedCard = null;
-      let newSelectedCard = null;
-
-      dimensionCards.forEach(card => {
-          const cardIndex = parseInt(card.dataset.trackIndex);
-          if (card.style.transform.includes('scale(1)')) {
-              currentSelectedCard = card;
-          }
-          if (cardIndex === newSelectedIndex) {
-              newSelectedCard = card;
-          }
-      });
-
-      if (!newSelectedCard || newSelectedCard === currentSelectedCard) return;
-
-      // Simple content and visual swap
-      const newTrackMd5 = newSelectedCard.dataset.trackMd5;
-      const currentTrackContent = currentSelectedCard.querySelector('.label').innerHTML;
-      const newTrackContent = newSelectedCard.querySelector('.label').innerHTML;
-
-      // Also swap the visual styling (photo background and panel colors)
-      const currentPhoto = currentSelectedCard.querySelector('.photo');
-      const newPhoto = newSelectedCard.querySelector('.photo');
-      const currentPanel = currentSelectedCard.querySelector('.panel');
-      const newPanel = newSelectedCard.querySelector('.panel');
-
-      // Swap photo backgrounds
-      const currentPhotoStyle = currentPhoto.style.background;
-      const newPhotoStyle = newPhoto.style.background;
-
-      // Swap panel color classes
-      const currentPanelClasses = Array.from(currentPanel.classList);
-      const newPanelClasses = Array.from(newPanel.classList);
-
-      // Update the front card's content and styling
-      currentSelectedCard.querySelector('.label').innerHTML = newTrackContent;
-      currentSelectedCard.dataset.trackMd5 = newTrackMd5;
-      currentSelectedCard.dataset.trackIndex = newSelectedIndex;
-      currentPhoto.style.background = newPhotoStyle;
-
-      // Replace panel classes
-      currentPanel.className = 'panel';
-      newPanelClasses.forEach(cls => {
-          if (cls !== 'panel') currentPanel.classList.add(cls);
-      });
-
-      // Update the clicked card to show what was previously selected
-      newSelectedCard.querySelector('.label').innerHTML = currentTrackContent;
-      newPhoto.style.background = currentPhotoStyle;
-      newPanel.className = 'panel';
-      currentPanelClasses.forEach(cls => {
-          if (cls !== 'panel') newPanel.classList.add(cls);
-      });
-  }
 
 
   // Swap the roles: make a direction the new next track stack, demote current next track to regular direction
@@ -1318,7 +1252,7 @@
       state.stackIndex = nextIndex;
 
       // Update selection
-      selectedIdentifier = nextTrack.identifier;
+      state.selectedIdentifier = nextTrack.identifier;
 
       // Update server
       sendNextTrack(nextTrack.identifier, directionKey, 'user');
@@ -1367,6 +1301,7 @@
           // Try embedded opposite direction first, then fallback to directions lookup
           if (baseDirection?.oppositeDirection) {
               displayDirection = baseDirection.oppositeDirection;
+              displayDirection.hasOpposite = true;
               displayDimensionKey = baseDirection.oppositeDirection.key || displayDimensionKey;
               console.log(`🔄 Using embedded opposite direction data: ${displayDimensionKey}`);
           } else if (displayDirection) {
