@@ -1101,9 +1101,23 @@ class DriftAudioMixer {
       }
     });
 
+
+    Object.entries(explorerData.directions).forEach(([key, data]) => {
+        console.log(`🚫🚫BEFORE🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`)
+    });
+
     // ⚖️ BIDIRECTIONAL PRIORITIZATION: Make larger stack primary, smaller stack opposite
     // Do this AFTER final sampling so we prioritize based on actual final track counts
     explorerData.directions = this.prioritizeBidirectionalDirections(explorerData.directions);
+
+    Object.entries(explorerData.directions).forEach(([key, data]) => {
+      if (data.oppositeDirection) {
+        const opKey = data.oppositeDirection.key;
+        console.log(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length}, ${data.oppositeDirection.sampleTracks.length} ${opKey}`);
+      } else {
+        console.log(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`);
+      }
+    });
 
     // Calculate diversity scores and select next track
     explorerData.diversityMetrics = this.calculateExplorerDiversityMetrics(explorerData.directions, totalNeighborhoodSize);
@@ -1636,56 +1650,66 @@ class DriftAudioMixer {
         const baseKey = positiveMatch[1];
         const negativeKey = `${baseKey}_negative`;
 
-        if (directions[negativeKey]) {
-          // Found a bidirectional pair
-          const positiveData = directionData;
-          const negativeData = directions[negativeKey];
-          const positiveCount = positiveData.sampleTracks?.length || 0;
-          const negativeCount = negativeData.sampleTracks?.length || 0;
+        const positiveData = directionData;
+        const negativeData = directions[negativeKey] || directionData.oppositeDirection;
 
-          console.log(`⚖️ BIDIRECTIONAL PAIR: ${baseKey} - positive:${positiveCount} vs negative:${negativeCount}`);
+        if (negativeData) {
+          const parseCount = (direction) => {
+            const raw = direction?.trackCount;
+            const numeric = typeof raw === 'number' ? raw : Number(raw);
+            if (!Number.isFinite(numeric) || numeric <= 0) {
+              return direction?.sampleTracks?.length || 0;
+            }
+            return numeric;
+          };
+
+          const positiveSamples = positiveData.sampleTracks?.length || 0;
+          const negativeSamples = negativeData.sampleTracks?.length || 0;
+          const positiveCount = parseCount(positiveData);
+          const negativeCount = parseCount(negativeData);
+
+          console.log(`⚖️ BIDIRECTIONAL PAIR: ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
 
           let primaryDirection, oppositeDirection, primaryKey, oppositeKey;
 
-          if (positiveCount > negativeCount) {
-            // Positive has more tracks - make it primary
+          if (positiveSamples > negativeSamples || (positiveSamples === negativeSamples && positiveCount >= negativeCount)) {
             primaryDirection = positiveData;
             oppositeDirection = negativeData;
             primaryKey = directionKey;
             oppositeKey = negativeKey;
-          } else if (negativeCount > positiveCount) {
-            // Negative has more tracks - make it primary
+          } else if (negativeSamples > positiveSamples || (negativeSamples === positiveSamples && negativeCount > positiveCount)) {
             primaryDirection = negativeData;
             oppositeDirection = positiveData;
             primaryKey = negativeKey;
             oppositeKey = directionKey;
           } else {
-            // Equal size - prefer positive if equal (as requested)
-            console.log(`⚖️ Equal sizes (${positiveCount}), preferring positive for ${baseKey}`);
+            console.log(`⚖️ Equal sizes (${positiveSamples} samples), preferring positive for ${baseKey}`);
             primaryDirection = positiveData;
             oppositeDirection = negativeData;
             primaryKey = directionKey;
             oppositeKey = negativeKey;
           }
 
-          // Create the primary direction with embedded opposite
           finalDirections[primaryKey] = {
             ...primaryDirection,
             hasOpposite: true,
             oppositeDirection: {
               ...oppositeDirection,
-              key: oppositeKey
+              key: oppositeKey,
+              hasOpposite: true
             }
           };
 
           console.log(`⚖️ PRIMARY: ${primaryKey} (${primaryDirection.sampleTracks?.length || 0} tracks) with embedded opposite ${oppositeKey} (${oppositeDirection.sampleTracks?.length || 0} tracks)`);
 
-          // Mark both keys as processed
           processedKeys.add(directionKey);
           processedKeys.add(negativeKey);
         } else {
-          // No negative counterpart found - add as regular direction
-          finalDirections[directionKey] = directionData;
+          console.log(`⚖️ BIDIRECTIONAL PAIR: nothing found for negative ${negativeKey}`);
+          finalDirections[directionKey] = {
+            ...directionData,
+            hasOpposite: directionData.oppositeDirection ? true : directionData.hasOpposite
+          };
           processedKeys.add(directionKey);
         }
       } else if (negativeMatch) {
@@ -1693,21 +1717,69 @@ class DriftAudioMixer {
         const positiveKey = `${baseKey}_positive`;
 
         if (directions[positiveKey]) {
-          // This will be handled when we encounter the positive key
           return;
+        }
+
+        const positiveData = directionData.oppositeDirection || directions[positiveKey];
+        if (positiveData) {
+          console.log(`⚖️ NEGATIVE MATCH using embedded positive for ${baseKey}`);
+
+          const parseCount = (direction) => {
+            const raw = direction?.trackCount;
+            const numeric = typeof raw === 'number' ? raw : Number(raw);
+            if (!Number.isFinite(numeric) || numeric <= 0) {
+              return direction?.sampleTracks?.length || 0;
+            }
+            return numeric;
+          };
+
+          const positiveSamples = positiveData.sampleTracks?.length || 0;
+          const negativeSamples = directionData.sampleTracks?.length || 0;
+          const positiveCount = parseCount(positiveData);
+          const negativeCount = parseCount(directionData);
+
+          console.log(`⚖️ BIDIRECTIONAL PAIR (negative first): ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
+
+          let primaryDirection, oppositeDirection, primaryKey, oppositeKey;
+          if (negativeSamples > positiveSamples || (negativeSamples === positiveSamples && negativeCount >= positiveCount)) {
+            primaryDirection = directionData;
+            oppositeDirection = positiveData;
+            primaryKey = directionKey;
+            oppositeKey = positiveKey;
+          } else {
+            primaryDirection = positiveData;
+            oppositeDirection = directionData;
+            primaryKey = positiveKey;
+            oppositeKey = directionKey;
+          }
+
+          finalDirections[primaryKey] = {
+            ...primaryDirection,
+            hasOpposite: true,
+            oppositeDirection: {
+              ...oppositeDirection,
+              key: oppositeKey,
+              hasOpposite: true
+            }
+          };
+
+          processedKeys.add(directionKey);
+          processedKeys.add(positiveKey);
         } else {
-          // No positive counterpart found - add as regular direction
-          finalDirections[directionKey] = directionData;
+          console.log(`⚖️ BIDIRECTIONAL PAIR: nothing found for positive ${positiveKey}`);
+          finalDirections[directionKey] = {
+            ...directionData,
+            hasOpposite: directionData.oppositeDirection ? true : directionData.hasOpposite
+          };
           processedKeys.add(directionKey);
         }
       } else {
-        // Not a bidirectional direction - add as regular direction
         finalDirections[directionKey] = directionData;
         processedKeys.add(directionKey);
       }
     });
 
-    console.log(`⚖️ BIDIRECTIONAL PRIORITIZATION: Processed ${Object.keys(directions).length} directions -> ${Object.keys(finalDirections).length} final directions`);
+    console.log(`⚖️ BIDIRECTIONAL PRIORITIZATION: Processed ${Object.keys(directions).length} dimensions -> ${Object.keys(finalDirections).length} final dimensions`);
     return finalDirections;
   }
 

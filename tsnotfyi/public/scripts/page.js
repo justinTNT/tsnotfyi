@@ -31,21 +31,25 @@
     previousNextTrack: null,        // this one's just for metadata
     usingOppositeDirection: false,  // Simple reverse state: just track if current dimension is using opposite direction
     journeyMode: true,              // drive the main ui - turn off for fzf, etc
-    selectedIdentifier: null,     // which next track card is currently selected
+    selectedIdentifier: null,       // which next track card is currently selected
     stackIndex: 0,                  // index in the stack for the current selected dimension
     forceLayout: null,
     isStarted: false,
     progressAnimation: null,
-    heartbeatTimeout: null          // Timer for 60s heartbeat (use latestCurrentTrack and latestExplorerData)
+    heartbeatTimeout: null,         // Timer for 60s heartbeat (use latestCurrentTrack and latestExplorerData)
+    renderer: null,
+    camera: null,
+    scene: null,
+    baseDirectionKey: null,
   };
 
   const elements = {
-	  clickCatcher:        document.getElementById('clickCatcher');
-          volumeControl:       document.getElementById('volumeControl');
-          volumeBar:           document.getElementById('volumeBar');
-          fullscreenProgress:  document.getElementById('fullscreenProgress');
-	  progressWipe:        document.getElementById('progressWipe');
-          audio:               document.getElementById('audio');
+	  clickCatcher:        document.getElementById('clickCatcher'),
+          volumeControl:       document.getElementById('volumeControl'),
+          volumeBar:           document.getElementById('volumeBar'),
+          fullscreenProgress:  document.getElementById('fullscreenProgress'),
+	  progressWipe:        document.getElementById('progressWipe'),
+          audio:               document.getElementById('audio')
   }
   elements.audio.volume = 0.85;
 
@@ -81,36 +85,44 @@
       updateSelectedTubes(trackData);
 
       const photo = document.getElementById('cardPhoto');
-      photo.style.background =
-		  state.previousNextTrack?.identifier === trackData.identifier
-		  ? state.previousNextTrack.albumCover
-		  : `url('${trackData.albumCover}')`;
+      const cover =
+	  state.previousNextTrack?.identifier === trackData.identifier
+	  ? state.previousNextTrack?.albumCover
+	  : trackData.albumCover;
+      photo.style.background = `url('${cover}')`
 
       // Randomly assign panel color variant
       const panel = document.querySelector('.panel');
       const variants = ['red-variant', 'green-variant', 'yellow-variant', 'blue-variant'];
       // Remove existing variants
       variants.forEach(v => panel.classList.remove(v));
+
       // Add random variant
-      const variant =
+      panel.classList.add(
 		  state.previousNextTrack?.identifier === trackData.identifier
-		  ? state.previousNextTrack.variant
-		  : variants[Math.floor(Math.random() * variants.length)];
-      panel.classList.add(randomVariant);
+		  ? state.previousNextTrack?.variant
+		  : variants[Math.floor(Math.random() * variants.length)]
+      );
 
       // Show card with zoom-in animation
       const card = document.getElementById('nowPlayingCard');
       card.classList.add('visible');
-
   }
 
 
 
+function createDimensionCards(explorerData) {
+      const normalizeTracks = (direction) => {
+          if (!direction || !Array.isArray(direction.sampleTracks)) return;
+          direction.sampleTracks = direction.sampleTracks.map(entry => entry.track || entry);
+          if (direction.oppositeDirection) {
+              normalizeTracks(direction.oppositeDirection);
+          }
+      };
 
-  function createDimensionCards(explorerData) {
       // Store for later redraw
-      const NxTk = state.latestExplorerData.nextTrack;
-      if (NxTk && (explorerData.nextTrack.identifier !== NxTk.identifier))
+      const NxTk = state.latestExplorerData?.nextTrack;
+      if (NxTk && (explorerData.nextTrack.identifier !== NxTk.identifier)) {
           state.previousNextTrack = {
 	      identifier: NxTk.identifier,
 	      albumCover: NxTk.albumCover,
@@ -118,6 +130,8 @@
           };
       }
       state.latestExplorerData = explorerData;
+
+      Object.values(explorerData.directions || {}).forEach(normalizeTracks);
 
       // Run comprehensive duplicate analysis on new data
       performDuplicateAnalysis(explorerData, "createDimensionCards");
@@ -387,7 +401,8 @@
 
   function createNextTrackCardStack(direction, index, total, nextTrackData, container) {
       // Get all sample tracks for this direction
-      const sampleTracks = direction.sampleTracks || [];
+      direction.sampleTracks = (direction.sampleTracks || []).map(entry => entry.track || entry);
+      const sampleTracks = direction.sampleTracks;
       // Use global selection state, default to first track if none selected
       const selectedTrackIndex = state.selectedIdentifier
           ? sampleTracks.findIndex(trackObj => {
@@ -480,8 +495,8 @@
 
   // Refresh cards with new selection state (seamlessly, no blinking)
   function refreshCardsWithNewSelection() {
-      if (!state.latestExplorerData || !selectedIdentifier) return;
-      console.log('🔄 Seamlessly updating selection:', selectedIdentifier);
+      if (!state.latestExplorerData || !state.selectedIdentifier) return;
+      console.log('🔄 Seamlessly updating selection:', state.selectedIdentifier);
 
       // Find the selected card first
       const allTrackCards = document.querySelectorAll('.dimension-card.track-detail-card.next-track');
@@ -490,7 +505,7 @@
 
       // First pass: identify the selected card
       allTrackCards.forEach(card => {
-          if (card.dataset.trackMd5 === selectedIdentifier) {
+          if (card.dataset.trackMd5 === state.selectedIdentifier) {
               selectedCard = card;
               selectedDimensionKey = card.dataset.directionKey;
           }
@@ -503,7 +518,7 @@
           const cardTrackMd5 = card.dataset.trackMd5;
           const directionKey = card.dataset.directionKey;
           const trackIndex = parseInt(card.dataset.trackIndex) || 0;
-          const isSelectedCard = (cardTrackMd5 === selectedIdentifier);
+          const isSelectedCard = (cardTrackMd5 === state.selectedIdentifier);
           const isSameDimension = (directionKey === selectedDimensionKey);
 
           // Find the track data for this card
@@ -657,75 +672,68 @@
       if (!state.isStarted) return;
       if (!state.journeyMode) return;
 
+      const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
+          .map(c => ({
+              element: c,
+              key: c.dataset.directionKey,
+              position: parseInt(c.dataset.clockPosition) || 12
+          }))
+          .sort((a, b) => a.position - b.position);
+
+      const occupiedPositions = new Set(clockCards.map(c => c.position));
+
+      const card = document.querySelector(`[data-direction-key="${directionKey}"].next-track`);
+      let nextPosition =
+          card.dataset.originalClockPosition
+          ? parseInt(card.dataset.originalClockPosition)
+          : 1;
+
       switch (e.key) {
           case '+':
               elements.audio.volume = Math.min(1, elements.audio.volume + 0.1);
               elements.volumeBar.style.width = (elements.audio.volume * 100) + '%';
               e.preventDefault();
               break;
+
           case '-':
               elements.audio.volume = Math.max(0, elements.audio.volume - 0.1);
               elements.volumeBar.style.width = (elements.audio.volume * 100) + '%';
               e.preventDefault();
               break;
-          case 'ArrowRight':
-              // rotate the wheel clockwise
-              const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
-                  .map(c => ({
-                      element: c,
-                      key: c.dataset.directionKey,
-                      position: parseInt(c.dataset.clockPosition) || 12
-                  }))
-                  .sort((a, b) => a.position - b.position);
 
-              // Find first available empty position on the clock face
-              const occupiedPositions = new Set(clockCards.map(c => c.position));
-
-              let nextPosition = card.dataset.originalClockPosition ? parseInt(card.dataset.originalClockPosition) : 1;
-
-              // Find first available gap in positions 1-12
-              const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 11, 12];
-              for (const index of [nextPosition..nextPosition+12) {
-                  const posFromIndex = (index%12)+1;
-                  if (occupiedPositions.has(posFromIndex) {
+          case 'ArrowRight': // rotate the wheel clockwise
+              for (i = nextPosition + 1; i <= nextPosition + 12; i++) {
+                  const posFromIndex = (i+11)%12+1;
+                  if (occupiedPositions.has(posFromIndex)) {
                       nextPosition = posFromIndex;
                       break;
                   }
+	      }
 
               swapNextTrackDirection(clockCards[nextPosition - 1].key);
               e.preventDefault();
               break;
-          case 'ArrowLeft':
-              // rotate the wheel counter-clockwise
-              const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
-                  .map(c => ({
-                      element: c,
-                      key: c.dataset.directionKey,
-                      position: parseInt(c.dataset.clockPosition) || 12
-                  }))
-                  .sort((a, b) => a.position - b.position);
 
-              const occupiedPositions = new Set(clockCards.map(c => c.position));
-              let nextPosition = card.dataset.originalClockPosition ? parseInt(card.dataset.originalClockPosition) : 1;
-
-              // Find first available gap in positions 12-1
-              const availablePositions = [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-              for (const index of [nextPosition..nextPosition+12) {
-                  const posFromIndex = 12 - (index%12);
-                  if (occupiedPositions.has(posFromIndex) {
+          case 'ArrowLeft': // rotate the wheel counter-clockwise
+              for (i = nextPosition-1; i >= nextPosition - 12; i--) {
+                  const posFromIndex = (i-1)%12 + 1;
+                  if (occupiedPositions.has(posFromIndex)) {
                       nextPosition = posFromIndex;
                       break;
                   }
+              }
 
               swapNextTrackDirection(clockCards[nextPosition - 1].key);
               e.preventDefault();
               break;
+
           case 'ArrowDown':
               // deal another card from the pack
-              const key =  state.latestExplorerData.nextTrack.directionKey;
-              cycleStackContents(key, state.stackIndex);
+              const directionKey =  state.latestExplorerData.nextTrack.directionKey;
+              cycleStackContents(directionKey, state.stackIndex);
               e.preventDefault();
               break;
+
           case 'ArrowUp':
               // flip a reversable next track stack
 
@@ -748,6 +756,7 @@
                   }
               e.preventDefault();
               break;
+
           case 'Escape':
               // Seek behavior: halfway in first wipe, 5 secs before crossfade in second wipe
               // Since audio is streamed, requires server-side cooperation
@@ -873,7 +882,8 @@
       }
   });
 
-  animateBeams();
+  animateBeams(sceneInit());
+
 
   // ====== Inactivity Management ======
   let inactivityTimer = null;
@@ -1108,18 +1118,13 @@
               console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
               console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
 
-              // Clear any previous zombie session guards - new track started successfully
-              clearZombieSessionGuard();
-
+              // new track started successfully
               updateNowPlayingCard(data.currentTrack, data.driftState);
               createDimensionCards(data.explorer);
 
               // Start progress bar animation for track duration
               if (data.currentTrack.duration) {
                   startProgressAnimation(data.currentTrack.duration);
-
-                  // Set up zombie session detection - request SSE refresh if no new track after 1.5x expected duration
-                  setupZombieSessionGuard(data.currentTrack.duration);
               }
           }
 
@@ -1274,8 +1279,9 @@
       console.log(`🔄 Reset track index to 0 for opposite direction`);
 
       // Redraw using the specific dimension we're working with, not the current playing track
-      console.log(`🔄 About to call redrawNextTrackStack with currentDimensionKey: ${currentDimensionKey}`);
-      redrawNextTrackStack(currentDimensionKey);
+      const baseKey = state.baseDirectionKey || currentDimensionKey;
+      console.log(`🔄 About to call redrawNextTrackStack with baseDirectionKey: ${baseKey}`);
+      redrawNextTrackStack(baseKey);
       console.log(`🔄 Finished calling redrawNextTrackStack`);
   }
 
@@ -1284,6 +1290,7 @@
       if (!state.latestExplorerData?.nextTrack) return;
 
       const baseDimensionKey = specifiedDimensionKey || state.latestExplorerData.nextTrack.directionKey;
+      state.baseDirectionKey = baseDimensionKey;
       const baseDirection = state.latestExplorerData.directions[baseDimensionKey];
 
       let displayDimensionKey, displayDirection; // Determine which direction data to use based on reverse state
@@ -1371,17 +1378,16 @@
           return;
       }
 
-      // Get the tracks from the direction data we already have
-      const displayTracks = displayDirection.sampleTracks || [];
+      const displayTracks = (displayDirection.sampleTracks || []).map(entry => entry.track || entry);
       if (displayTracks.length === 0) {
           console.error(`🔄 No tracks found for direction ${displayDimensionKey}`);
           return;
       }
 
-      const trackToShow = displayTracks[0].track || displayTracks[0];
+      const trackToShow = displayTracks[0];
 
       console.log(`🔄 TRACK SELECTION DEBUG:`, {
-          state.usingOppositeDirection,
+          usingOppositeDirection: state.usingOppositeDirection,
           baseDimensionKey,
           displayDimensionKey,
           displayTracksCount: displayTracks.length,
@@ -1549,16 +1555,11 @@
   function resetCardToDirectionDisplay(card, directionKey) {
       console.log(`🔄 Resetting card ${directionKey} to direction display`);
 
-      if (!state.latestExplorerData?.directions[directionKey]) {
-          console.error(`🔄 No direction data found for ${directionKey}`);
-          return;
-      }
-
       // IMPORTANT: Reset reverse state and restore original face
       console.log(`🔄 Restoring original face for ${directionKey} (removing any reversed state)`);
 
       // Remove reversed classes and restore original direction
-      card.classList.remove('reversed', 'negative-direction');
+      card.classList.remove('reversed');
 
       // Clear any stored opposite direction state
       if (card.dataset.directionKey !== directionKey) {
@@ -1566,11 +1567,33 @@
           card.dataset.directionKey = directionKey;
       }
 
-      const direction = state.latestExplorerData.directions[directionKey];
-      const directionType = getDirectionType(directionKey);
+      const explorerDirections = state.latestExplorerData?.directions || {};
+      let direction = explorerDirections[directionKey];
+
+      if (!direction) {
+          for (const [baseKey, baseDirection] of Object.entries(explorerDirections)) {
+              if (baseDirection.oppositeDirection?.key === directionKey) {
+                  direction = {
+                      ...baseDirection.oppositeDirection,
+                      hasOpposite: baseDirection.oppositeDirection.hasOpposite === true || baseDirection.hasOpposite === true
+                  };
+                  console.log(`🔄 Found embedded direction data for ${directionKey} inside ${baseKey}.oppositeDirection`);
+                  break;
+              }
+          }
+      }
+
+      if (!direction) {
+          console.error(`🔄 No direction data found for ${directionKey}`);
+          console.error(`🔄 Available directions:`, Object.keys(explorerDirections));
+          return;
+      }
+
+      const resolvedKey = direction.key || directionKey;
+      const directionType = getDirectionType(resolvedKey);
 
       // Get matching colors and variant
-      const colors = getDirectionColor(directionType, directionKey);
+      const colors = getDirectionColor(directionType, resolvedKey);
       const colorVariant = variantFromDirectionType(directionType);
 
 
@@ -1585,13 +1608,19 @@
           console.log(`🔄 Cleared reversed rim styling for ${directionKey}`);
       }
 
+      const intrinsicNegative = isNegativeDirection(resolvedKey);
+      card.classList.toggle('negative-direction', intrinsicNegative);
+
       // Reset to simple direction content
-      const directionName = direction?.isOutlier ? "Outlier" : formatDirectionName(directionKey);
+      const directionName = direction?.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
+      const sample = Array.isArray(direction.sampleTracks) ? direction.sampleTracks[0] : null;
+      const sampleTrack = sample?.track || sample || {};
+      const albumCover = sampleTrack.albumCover || sample?.albumCover || '';
       const labelContent = `<div class="dimension-label">${directionName}</div>`;
 
       card.innerHTML = `
           <div class="panel ${colorVariant}">
-              <div class="photo" style="${photoStyle(direction.sampleTracks[0].albumCover)}"></div>
+              <div class="photo" style="${photoStyle(albumCover)}"></div>
               <span class="rim"></span>
               <div class="bottom"></div>
               <div class="label">
@@ -1601,6 +1630,10 @@
       `;
 
       console.log(`🔄 Card ${directionKey} reset to simple direction display`);
+
+      if (state.baseDirectionKey === directionKey) {
+          state.baseDirectionKey = null;
+      }
   }
 
   // Convert a direction card into a next track stack (add track details and indicators)
@@ -1638,6 +1671,8 @@
           console.error(`🔄 No sample tracks found for ${directionKey}`);
           return;
       }
+
+      state.baseDirectionKey = directionKey;
 
       // Update the main card content with track details
       const card = document.querySelector(`[data-direction-key="${directionKey}"]`);
@@ -1772,73 +1807,6 @@
       }, 2000);
   });
 
-  // ====== Resize Handler ======
-  addEventListener('resize', () => {
-      renderer.setSize(innerWidth, innerHeight);
-      camera.aspect = innerWidth / innerHeight;
-      camera.updateProjectionMatrix();
-  });
-
-
-// ====== Zombie Session Detection & Recovery ======
-
-let zombieGuardTimer = null;
-let lastTrackStartTime = null;
-
-// Set up guardrail to detect zombie sessions
-function setupZombieSessionGuard(trackDuration) {
-    // Clear any existing zombie guard
-    if (zombieGuardTimer) {
-        clearTimeout(zombieGuardTimer);
-        zombieGuardTimer = null;
-    }
-
-    // Record when this track started
-    lastTrackStartTime = Date.now();
-
-    // Set up timer for 1.5x the track duration
-    const guardTimeoutMs = trackDuration * 1500; // 1.5x duration in milliseconds
-
-    console.log(`🛡️ Zombie session guard set for ${(guardTimeoutMs/1000).toFixed(1)}s (1.5x track duration of ${trackDuration}s)`);
-
-    zombieGuardTimer = setTimeout(() => {
-        const elapsedMs = Date.now() - lastTrackStartTime;
-        const elapsedSec = elapsedMs / 1000;
-
-        console.log(`🧟 Zombie session detected! Track should have ended after ${trackDuration}s, but ${elapsedSec.toFixed(1)}s have passed`);
-        console.log(`🛡️ Requesting SSE refresh to recover zombie session`);
-
-        // Request SSE refresh to wake up the backend
-        requestSSERefresh();
-
-        // Set up another guard in case the first refresh doesn't work
-        setupRecoveryGuard(trackDuration);
-
-    }, guardTimeoutMs);
-}
-
-// Set up secondary recovery guard after first refresh attempt
-function setupRecoveryGuard(originalTrackDuration) {
-    // Give it another 30 seconds after refresh request
-    const recoveryTimeoutMs = 30000;
-
-    console.log(`🛡️ Setting up recovery guard for additional 30s`);
-
-    setTimeout(() => {
-        const totalElapsedMs = Date.now() - lastTrackStartTime;
-        const totalElapsedSec = totalElapsedMs / 1000;
-
-        console.log(`🧟 Recovery failed! Total time elapsed: ${totalElapsedSec.toFixed(1)}s (expected: ${originalTrackDuration}s)`);
-        console.log(`🛡️ Final recovery attempt - forcing SSE refresh`);
-
-        // Final recovery attempt
-        requestSSERefresh();
-
-        // Optionally show user notification
-        console.log('🚨 Session appears to be stuck - tried to recover automatically');
-
-    }, recoveryTimeoutMs);
-}
 
 // ====== Heartbeat & Sync System ======
 
@@ -1859,6 +1827,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     if (!md5ToSend) {
         console.warn('⚠️ sendNextTrack: No track MD5 available, skipping');
         scheduleHeartbeat(10000); // Retry in 10s
+        fullResync();
         return;
     }
 
@@ -2114,15 +2083,6 @@ async function requestSSERefresh() {
     }
 }
 
-// Clear zombie guard when new track starts (called from track_started event handler)
-function clearZombieSessionGuard() {
-    if (zombieGuardTimer) {
-        console.log('🛡️ Clearing zombie session guard - new track started');
-        clearTimeout(zombieGuardTimer);
-        zombieGuardTimer = null;
-    }
-    lastTrackStartTime = Date.now();
-}
 
 // Manual refresh button functionality
 function setupManualRefreshButton() {
@@ -2160,7 +2120,7 @@ function setupManualRefreshButton() {
 document.addEventListener('DOMContentLoaded', function () {
     setupManualRefreshButton();
     state.journeyMode = false;
-    setupFzfSearch( function() { state.journeMode = true } );
+    setupFzfSearch( function() { state.journeyMode = true } );
 });
 
 // Check if stream endpoint is reachable
@@ -2192,5 +2152,3 @@ async function checkStreamEndpoint() {
         checkSessionStatus();
     }
 }
-
-

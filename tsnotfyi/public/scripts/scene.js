@@ -1,37 +1,39 @@
   // ====== 3D Visualization Setup ======
-  const SPARKLE_COUNT = 124;
-  const NUM_LONG = 60;
-  const NUM_LAT = 80;
-  const NUM_LAT_OTHER = 69;
-  const TUBE_RADIUS = 0.005;
-  const PATH_RES = 123;
-  const RADIAL_SEG = 53;
-  const BASE_PULSE_HZ = 0.23;
-  const SEL_PULSE_HZ = 1.23;
 
-  let RADIUS_SCALE = 0.6;
-  let RADIUS_SCALE_TARGET = 0.6;
+  function rejig() {
+      let fuzzyCameraFactor = 1 + Math.random() * Math.random() / 3;
+      state.camera.position.set(-4 * fuzzyCameraFactor, 7 * fuzzyCameraFactor, -11 * fuzzyCameraFactor);
+      state.camera.updateProjectionMatrix();
+  }
 
   // Initialize renderer
-  const mount = document.getElementById('scene');
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-  renderer.setSize(innerWidth, innerHeight);
-  renderer.setClearColor(0x000000, 0);
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  mount.appendChild(renderer.domElement);
+  function sceneInit() {
+    const mount = document.getElementById('scene');
+    state.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    state.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    state.renderer.setSize(innerWidth, innerHeight);
+    state.renderer.setClearColor(0x000000, 0);
+    state.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    mount.appendChild(state.renderer.domElement);
 
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
-  makeCurves(scene);
-  setUsefulBeams();
+    state.scene = new THREE.Scene();
+    state.camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
 
-  let fuzzyCameraFactor = 1 + Math.random() * Math.random() / 3;
-  let rejig = () => camera.position.set(-4 * fuzzyCameraFactor, 8 * fuzzyCameraFactor, -11 * fuzzyCameraFactor);
-  rejig();
+    // ====== Resize Handler ======
+    addEventListener('resize', () => {
+      state.renderer.setSize(innerWidth, innerHeight);
+      state.camera.aspect = innerWidth / innerHeight;
+      state.camera.updateProjectionMatrix();
+    });
 
-  const hemi = new THREE.HemisphereLight(0x66ccff, 0x080808, 0.5);
-  scene.add(hemi);
+    rejig();
+
+    makeCurves();
+    setUsefulBeams();
+
+    const hemi = new THREE.HemisphereLight(0x66ccff, 0x080808, 0.5);
+    state.scene.add(hemi);
+  }
 
 
 

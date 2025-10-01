@@ -75,8 +75,13 @@
 
       const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
 
-      // Server provides hasOpposite flag directly - no complex client-side detection needed
-      const hasOpposite = direction.hasOpposite === true;
+      const explorerDirections = state.latestExplorerData?.directions || {};
+      const oppositeKey = getOppositeDirection(direction.key);
+      const hasOpposite =
+          direction.hasOpposite === true ||
+          !!direction.oppositeDirection ||
+          (oppositeKey ? !!explorerDirections[oppositeKey] : false) ||
+          Object.values(explorerDirections).some(dir => dir.oppositeDirection?.key === direction.key);
       const unoReverseHtml = hasOpposite && isSelected ? `
           <div class="uno-reverse enabled">^</div>
       ` : '';
@@ -124,6 +129,7 @@
                       if (oppositeKey) {
                           state.latestExplorerData.directions[oppositeKey] = {
                               ...currentDirection.oppositeDirection,
+                              hasOpposite: true,
                               key: oppositeKey
                           };
 
@@ -143,33 +149,24 @@
 
   // Update card content with track details
   function updateCardWithTrackDetails(card, track, direction, preserveColors = false) {
-      console.log(`🎨 updateCardWithTrackDetails called`);
-      console.log(`🎨 Card element:`, card);
-      console.log(`🎨 Track data:`, track);
-      console.log(`🎨 Dimension data:`, direction);
-      console.log(`🎨 Updating card with track details: ${track?.title} by ${track?.artist}`);
       const duration = (track.duration || track.length) ?
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
 
       const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
 
-      // Server provides hasOpposite flag directly
-      const hasOpposite = direction.hasOpposite === true;
+      const explorerDirections = state.latestExplorerData?.directions || {};
+      const oppositeKey = getOppositeDirection(direction.key);
+      const hasOpposite =
+          direction.hasOpposite === true ||
+          !!direction.oppositeDirection ||
+          (oppositeKey ? !!explorerDirections[oppositeKey] : false) ||
+          Object.values(explorerDirections).some(dir => dir.oppositeDirection?.key === direction.key);
 
       // 🎯 DEBUG: Detailed reverse icon availability check
       const directionData = state.latestExplorerData.directions[direction.key];
-      const oppositeKey = getOppositeDirection(direction.key);
       const oppositeExists = oppositeKey && state.latestExplorerData.directions[oppositeKey];
 
-      console.log(`🔄 REVERSE ICON DEBUG for ${direction.key}:`, {
-          hasOpposite: hasOpposite,
-          hasOppositeFlag: directionData?.hasOpposite,
-          oppositeDirection: directionData?.oppositeDirection ? 'present' : 'missing',
-          calculatedOppositeKey: oppositeKey,
-          oppositeExistsInDirections: oppositeExists,
-          isOutlier: directionData?.isOutlier
-      });
       const unoReverseHtml = hasOpposite ? `
           <div class="uno-reverse next-track-reverse enabled"></div>
       ` : '';
@@ -178,6 +175,7 @@
       // Always define directionType for later use
       const directionType = getDirectionType(direction.key);
       card.dataset.directionType = directionType;
+      const intrinsicNegative = isNegativeDirection(direction.key);
 
       let borderColor, glowColor;
 
@@ -215,8 +213,6 @@
           }
       }
 
-      console.log(`🎨 FINAL COLORS for ${direction.key}: border=${borderColor}, glow=${glowColor}${preserveColors ? ' (preserved)' : ' (calculated)'}`)
-
       // Apply the final colors
       card.style.setProperty('--border-color', borderColor);
       card.style.setProperty('--glow-color', glowColor);
@@ -225,38 +221,30 @@
       card.dataset.borderColor = borderColor;
       card.dataset.glowColor = glowColor;
 
-      console.log(`🎨 Applied colors: border=${borderColor}, glow=${glowColor}, reversed=${state.usingOppositeDirection}`);
-      console.log(`🎨 Updated data attributes: data-border-color=${card.dataset.borderColor}, data-glow-color=${card.dataset.glowColor}`);
-
-      // Also update rim based on reversed state
-      const rim = card.querySelector('.rim');
-      if (rim && state.usingOppositeDirection) {
-          // Apply reversed rim gradient (inverted)
-          const rimStyle = `conic-gradient(from 180deg, ${glowColor}, ${borderColor}, ${glowColor})`;
-          console.log(`🔄 Setting reversed rim style: ${rimStyle}`);
-          rim.style.background = rimStyle;
-      } else if (rim && !state.usingOppositeDirection) {
-          // Apply normal rim gradient based on direction type
-          const isNegative = isNegativeDirection(direction.key);
-          if (isNegative) {
-              rim.style.background = `conic-gradient(from 180deg, ${glowColor}, ${borderColor}, ${glowColor})`;
-          } else {
-              rim.style.background = `conic-gradient(${borderColor}, ${glowColor}, ${borderColor})`;
+      const computeRimBackground = () => {
+          if (intrinsicNegative) {
+              return `conic-gradient(from 180deg, ${glowColor}, ${borderColor}, ${glowColor})`;
           }
-          console.log(`🔄 Setting original rim style for ${direction.key}`);
-      }
+          return `conic-gradient(${borderColor}, ${glowColor}, ${borderColor})`;
+      };
+
+      const applyRimBackground = (rimEl) => {
+          if (!rimEl) return;
+          const rimStyle = computeRimBackground();
+          rimEl.style.background = rimStyle;
+      };
+
+      applyRimBackground(card.querySelector('.rim'));
 
       // Preserve existing panel classes (color variants)
       const existingPanel = card.querySelector('.panel');
       let panelClasses = 'panel';
       if (existingPanel) {
           panelClasses = existingPanel.className;
-          console.log(`🎨 Preserving existing panel classes: ${panelClasses}`);
       } else {
           // Generate panel class from direction type if no existing panel
           const variantClass = variantFromDirectionType(directionType);
           panelClasses = `panel ${variantClass}`;
-          console.log(`🎨 Generated new panel classes: ${panelClasses}`);
       }
 
       const newHTML = `
@@ -275,11 +263,12 @@
           </div>
       `;
 
-      console.log(`🎨 Setting card innerHTML to:`, newHTML);
       card.innerHTML = newHTML;
-      console.log(`🎨 Card innerHTML updated successfully`);
 
-      console.log(`🎨 Preserved ${directionType} colors in metadata upgrade: ${direction.key} (${borderColor}, ${glowColor})`);
+      const shouldUseNegativeMask = intrinsicNegative;
+      card.classList.toggle('negative-direction', shouldUseNegativeMask);
+
+      applyRimBackground(card.querySelector('.rim'));
 
       // Add click handler for Uno Reverse if present
       if (hasOpposite) {
@@ -287,16 +276,7 @@
 
           // Set reversed icon state and rim direction
           if (unoReverse) {
-              if (state.usingOppositeDirection) {
-                  unoReverse.classList.add('reversed');
-                  card.classList.add('negative-direction'); // Flip rim mask
-                  console.log(`🔄 Added reversed class and negative-direction class for ${direction.key}`);
-              } else {
-                  unoReverse.classList.remove('reversed');
-                  card.classList.remove('negative-direction'); // Reset rim mask
-                  console.log(`🔄 Removed reversed class and negative-direction class for ${direction.key}`);
-              }
-
+              unoReverse.classList.toggle('reversed', state.usingOppositeDirection);
               unoReverse.addEventListener('click', (e) => {
                   e.stopPropagation();
                   console.log(`🔄 Reverse icon clicked for ${direction.key}`);
@@ -567,5 +547,3 @@
 
       return card;
   }
-
-

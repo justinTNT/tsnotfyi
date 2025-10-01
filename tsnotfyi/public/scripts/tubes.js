@@ -1,5 +1,17 @@
   // ====== Build Visualization Beams ======
   const beams = [];
+  const TUBE_RADIUS = 0.005;
+  let RADIUS_SCALE = 0.8;
+  let RADIUS_SCALE_TARGET = 0.6;
+  const SPARKLE_COUNT = 124;
+  const NUM_LONG = 60;
+  const NUM_LAT = 80;
+  const NUM_LAT_OTHER = 69;
+  const PATH_RES = 123;
+  const RADIAL_SEG = 53;
+  const BASE_PULSE_HZ = 0.23;
+  const SEL_PULSE_HZ = 1.23;
+
 
   // ====== Sparkle Systems ======
   const sparkleSystems = new Map();
@@ -20,7 +32,7 @@
       if (!sys) {
           const g = new THREE.Group();
           g.renderOrder = 2;
-          scene.add(g);
+          state.scene.add(g);
           sys = { group: g, meta: [] };
 
           for (let i = 0; i < SPARKLE_COUNT; i++) {
@@ -135,7 +147,7 @@
               s.mesh.scale.setScalar(glint * (0.7 + 0.9 * tw2));
           }
       });
-      renderer.render(scene, camera);
+      state.renderer.render(state.scene, state.camera);
   }
 
 
@@ -262,7 +274,7 @@
 
   function makeCurves() {
       const beamsGroup = new THREE.Group();
-      scene.add(beamsGroup);
+      state.scene.add(beamsGroup);
 
       const tubes = [];
 

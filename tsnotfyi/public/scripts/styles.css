@@ -20,11 +20,8 @@ body {
 #background {
     position: fixed;
     inset: 0;
-    background: linear-gradient(135deg, #336, #678);
-    opacity: 0.45;
-    background-size: 260%;
-    background-position-y: -300px;
-    background-position-x: -1000px;
+    background: linear-gradient(135deg, #235, #453);
+    opacity: 0.3;
     z-index: -2;
 }
 
