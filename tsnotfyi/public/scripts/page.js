@@ -758,6 +758,10 @@ function createDimensionCards(explorerData) {
               break;
 
           case 'Escape':
+              e.preventDefault();
+              break;
+
+          case '\t':
               // Seek behavior: halfway in first wipe, 5 secs before crossfade in second wipe
               // Since audio is streamed, requires server-side cooperation
               if (!elements.audio || !elements.audio.duration) {
@@ -2119,7 +2123,6 @@ function setupManualRefreshButton() {
 // Initialize manual refresh button when page loads
 document.addEventListener('DOMContentLoaded', function () {
     setupManualRefreshButton();
-    state.journeyMode = false;
     setupFzfSearch( function() { state.journeyMode = true } );
 });
 
