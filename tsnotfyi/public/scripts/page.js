@@ -719,6 +719,9 @@ function createDimensionCards(explorerData) {
       if (!state.isStarted) return;
       if (!state.journeyMode) return;
 
+      const directionKey = state.latestExplorerData.nextTrack.directionKey;
+      if (!directionKey) return;
+
       const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
           .map(c => ({
               element: c,
@@ -729,10 +732,11 @@ function createDimensionCards(explorerData) {
 
       const occupiedPositions = new Set(clockCards.map(c => c.position));
 
-      const card = document.querySelector(`[data-direction-key="${directionKey}"].next-track`);
-      let nextPosition =
-          card.dataset.originalClockPosition
-          ? parseInt(card.dataset.originalClockPosition)
+      const nextTrackCard = document.querySelector(`.dimension-card.next-track[data-direction-key="${directionKey}"]`);
+      if (!nextTrackCard) return;
+
+      let nextPosition = nextTrackCard.dataset.originalClockPosition
+          ? parseInt(nextTrackCard.dataset.originalClockPosition)
           : 1;
 
       switch (e.key) {

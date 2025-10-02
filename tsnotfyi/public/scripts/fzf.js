@@ -21,8 +21,6 @@ function setupFzfSearch(cleanupCallback) {
         return;
     }
 
-    state.journeyMode = false;
-
     // Global keyboard shortcut to open fzf (Ctrl+K or Cmd+K)
     document.addEventListener('keydown', (e) => {
         // Open fzf with Ctrl+K or Cmd+K
@@ -108,6 +106,7 @@ function openFzfSearch() {
     if (fzfSearch && fzfInput) {
         fzfState.isVisible = true;
         fzfSearch.classList.remove('hidden');
+        state.journeyMode = false;
 
         // Focus input and clear previous search
         fzfInput.value = '';
@@ -139,7 +138,9 @@ function closeFzfSearch() {
         console.log('🔍 Closed fuzzy search interface');
     }
 
-   onExit(); // exit fzf mode
+   if (typeof onExit === 'function') {
+       onExit();
+   }
 }
 
 // Perform fuzzy search request
@@ -285,5 +286,4 @@ function clearFzfResults() {
     fzfState.currentResults = [];
     fzfState.selectedIndex = 0;
 }
-
 
