@@ -289,6 +289,93 @@ body {
     to { transform: rotate(360deg); }
 }
 
+/* Connection health indicator */
+#connectionHealth {
+    position: fixed;
+    top: 20px;
+    left: 20px;
+    width: 40px;
+    height: 40px;
+    background: rgba(17, 17, 17, 0.9);
+    border: 1px solid #0a0;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.4;
+    transition: all 0.3s ease;
+    z-index: 2000;
+    user-select: none;
+    backdrop-filter: blur(4px);
+}
+
+#connectionHealth:hover {
+    opacity: 0.8;
+    background: rgba(17, 17, 17, 1.0);
+    transform: scale(1.1);
+}
+
+#connectionHealth.healthy {
+    border-color: #0a0;
+}
+
+#connectionHealth.degraded {
+    border-color: #ff0;
+    opacity: 0.6;
+}
+
+#connectionHealth.error {
+    border-color: #f00;
+    opacity: 0.8;
+    animation: pulse 1s ease-in-out infinite;
+}
+
+.health-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #0a0;
+    transition: background 0.3s ease;
+}
+
+#connectionHealth.degraded .health-dot {
+    background: #ff0;
+}
+
+#connectionHealth.error .health-dot {
+    background: #f00;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.8; }
+    50% { opacity: 1.0; }
+}
+
+/* Connection status tooltip */
+.connection-tooltip {
+    position: absolute;
+    top: 50px;
+    left: 0;
+    background: rgba(17, 17, 17, 0.95);
+    border: 1px solid #0a0;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #0a0;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+    z-index: 2001;
+    backdrop-filter: blur(4px);
+}
+
+#connectionHealth:hover .connection-tooltip {
+    opacity: 1;
+}
+
 /* Fuzzy search interface */
 #fzfSearch {
     position: fixed;

@@ -43,6 +43,53 @@
     baseDirectionKey: null,
   };
 
+  // Connection health management
+  const connectionHealth = {
+    sse: {
+      status: 'connecting',
+      lastMessage: Date.now(),
+      reconnectAttempts: 0,
+      reconnectDelay: 2000,
+      maxReconnectDelay: 30000,
+      stuckTimeout: null,
+    },
+    audio: {
+      status: 'connecting',
+      reconnectAttempts: 0,
+      reconnectDelay: 2000,
+      maxReconnectDelay: 30000,
+      maxAttempts: 10,
+    },
+    currentEventSource: null,
+  };
+
+  // Update connection health UI
+  function updateConnectionHealthUI() {
+    const healthIndicator = document.getElementById('connectionHealth');
+    const sseStatus = document.getElementById('sseStatus');
+    const audioStatus = document.getElementById('audioStatus');
+
+    if (!healthIndicator) return;
+
+    // Update status text
+    if (sseStatus) sseStatus.textContent = connectionHealth.sse.status;
+    if (audioStatus) audioStatus.textContent = connectionHealth.audio.status;
+
+    // Determine overall health
+    const sseOk = connectionHealth.sse.status === 'connected';
+    const audioOk = connectionHealth.audio.status === 'connected';
+
+    healthIndicator.classList.remove('healthy', 'degraded', 'error');
+
+    if (sseOk && audioOk) {
+      healthIndicator.classList.add('healthy');
+    } else if (sseOk || audioOk) {
+      healthIndicator.classList.add('degraded');
+    } else {
+      healthIndicator.classList.add('error');
+    }
+  }
+
   const elements = {
 	  clickCatcher:        document.getElementById('clickCatcher'),
           volumeControl:       document.getElementById('volumeControl'),
@@ -1097,53 +1144,107 @@ function createDimensionCards(explorerData) {
 
   // ====== Session Management ======
 
-  // Server-Sent Events for real-time track updates
-  const eventsUrl = sessionId ? `/events/${sessionId}` : '/events';
-  console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
-  console.log(`🔌 Session ID for SSE: ${sessionId || 'master'}`);
-  const eventSource = new EventSource(eventsUrl);
+  // Smart SSE connection with health monitoring and reconnection
+  function connectSSE() {
+    const eventsUrl = sessionId ? `/events/${sessionId}` : '/events';
+    console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
 
-  eventSource.onopen = () => {
-      console.log('📡 Connected to stream events');
-  };
+    // Close existing connection if any
+    if (connectionHealth.currentEventSource) {
+      connectionHealth.currentEventSource.close();
+    }
 
-  eventSource.onmessage = (event) => {
+    const eventSource = new EventSource(eventsUrl);
+    connectionHealth.currentEventSource = eventSource;
+
+    eventSource.onopen = () => {
+      console.log('📡 SSE connected');
+      connectionHealth.sse.status = 'connected';
+      connectionHealth.sse.reconnectAttempts = 0;
+      connectionHealth.sse.reconnectDelay = 2000;
+      connectionHealth.sse.lastMessage = Date.now();
+      updateConnectionHealthUI();
+
+      // Monitor for stuck connection (no messages for 60s)
+      if (connectionHealth.sse.stuckTimeout) {
+        clearTimeout(connectionHealth.sse.stuckTimeout);
+      }
+      connectionHealth.sse.stuckTimeout = setTimeout(() => {
+        console.warn('📡 SSE stuck - no messages for 60s, forcing reconnect');
+        connectionHealth.sse.status = 'reconnecting';
+        updateConnectionHealthUI();
+        eventSource.close();
+        setTimeout(() => connectSSE(), 1000);
+      }, 60000);
+    };
+
+    eventSource.onmessage = (event) => {
+      connectionHealth.sse.lastMessage = Date.now();
+
       try {
-          const data = JSON.parse(event.data);
-          console.log('📡 Event:', data.type, data);
+        const data = JSON.parse(event.data);
+        console.log('📡 Event:', data.type, data);
 
-          // Ignore events from other sessions
-          if (data.session && data.session.sessionId && data.session.sessionId !== sessionId) {
-              console.log(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${sessionId})`);
-              return;
+        // Ignore events from other sessions
+        if (data.session && data.session.sessionId && data.session.sessionId !== sessionId) {
+          console.log(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${sessionId})`);
+          return;
+        }
+
+        if (data.type === 'track_started') {
+          console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
+          console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
+
+          // New track started - ensure audio is connected
+          if (connectionHealth.audio.status !== 'connected') {
+            console.log('🔄 SSE received track but audio disconnected, reconnecting audio...');
+            reconnectAudio();
           }
 
-          if (data.type === 'track_started') {
-              console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
-              console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
+          updateNowPlayingCard(data.currentTrack, data.driftState);
+          createDimensionCards(data.explorer);
 
-              // new track started successfully
-              updateNowPlayingCard(data.currentTrack, data.driftState);
-              createDimensionCards(data.explorer);
-
-              // Start progress bar animation for track duration
-              if (data.currentTrack.duration) {
-                  startProgressAnimation(data.currentTrack.duration);
-              }
+          if (data.currentTrack.duration) {
+            startProgressAnimation(data.currentTrack.duration);
           }
+        }
 
-          if (data.type === 'flow_options') {
-              console.log('🌟 Flow options available:', Object.keys(data.flowOptions));
-          }
+        if (data.type === 'flow_options') {
+          console.log('🌟 Flow options available:', Object.keys(data.flowOptions));
+        }
 
-          if (data.type === 'direction_change') {
-              console.log(`🔄 Flow changed to: ${data.direction}`);
-          }
+        if (data.type === 'direction_change') {
+          console.log(`🔄 Flow changed to: ${data.direction}`);
+        }
 
       } catch (e) {
-          console.log('📡 Raw event:', event.data);
+        console.log('📡 Raw event:', event.data);
       }
-  };
+    };
+
+    eventSource.onerror = (error) => {
+      console.log('📡 SSE error:', error);
+      connectionHealth.sse.status = 'reconnecting';
+      updateConnectionHealthUI();
+
+      // EventSource auto-reconnects, but track attempts
+      connectionHealth.sse.reconnectAttempts++;
+      connectionHealth.sse.reconnectDelay = Math.min(
+        connectionHealth.sse.reconnectDelay * 1.5,
+        connectionHealth.sse.maxReconnectDelay
+      );
+
+      // If stuck reconnecting, force recreate
+      if (connectionHealth.sse.reconnectAttempts > 5) {
+        console.log('📡 SSE stuck reconnecting, forcing new connection');
+        eventSource.close();
+        setTimeout(() => connectSSE(), connectionHealth.sse.reconnectDelay);
+      }
+    };
+  }
+
+  // Initialize SSE connection
+  connectSSE();
 
     // Comprehensive duplicate detection system
   function performDuplicateAnalysis(explorerData, context = "unknown") {
@@ -1794,22 +1895,70 @@ function createDimensionCards(explorerData) {
       }
   }
 
-  eventSource.onerror = (error) => {
-      console.log('📡 SSE error:', error);
-  };
+  // Smart audio reconnection with exponential backoff
+  function reconnectAudio() {
+    if (connectionHealth.audio.reconnectAttempts >= connectionHealth.audio.maxAttempts) {
+      console.error('🎵 Max audio reconnect attempts reached');
+      connectionHealth.audio.status = 'failed';
+      updateConnectionHealthUI();
+      return;
+    }
 
-  setInterval(() => {
-      const statusUrl = sessionId ? `/status/${sessionId}` : '/status';
-      fetch(statusUrl).catch(() => {});
-  }, 30000);
+    connectionHealth.audio.reconnectAttempts++;
+    connectionHealth.audio.status = 'reconnecting';
+    updateConnectionHealthUI();
 
-  // Auto-reload on stream errors
-  elements.audio.addEventListener('error', () => {
-      setTimeout(() => {
-          elements.audio.load();
-          if (state.isStarted) elements.audio.play().catch(() => {});
-      }, 2000);
+    const delay = connectionHealth.audio.reconnectDelay;
+    console.log(`🎵 Audio reconnecting in ${delay}ms (attempt ${connectionHealth.audio.reconnectAttempts}/${connectionHealth.audio.maxAttempts})`);
+
+    setTimeout(() => {
+      elements.audio.load();
+      if (state.isStarted) {
+        elements.audio.play().then(() => {
+          connectionHealth.audio.status = 'connected';
+          connectionHealth.audio.reconnectAttempts = 0;
+          connectionHealth.audio.reconnectDelay = 2000;
+          updateConnectionHealthUI();
+        }).catch((err) => {
+          console.error('🎵 Audio play failed:', err);
+          // Exponential backoff
+          connectionHealth.audio.reconnectDelay = Math.min(
+            connectionHealth.audio.reconnectDelay * 2,
+            connectionHealth.audio.maxReconnectDelay
+          );
+          reconnectAudio();
+        });
+      }
+    }, delay);
+  }
+
+  // Audio error handler with smart reconnection
+  elements.audio.addEventListener('error', (e) => {
+    const mediaError = elements.audio.error;
+    console.error('🎵 Audio error:', mediaError?.code, mediaError?.message);
+
+    connectionHealth.audio.status = 'error';
+    updateConnectionHealthUI();
+
+    // Only reconnect for network errors
+    if (mediaError?.code === MediaError.MEDIA_ERR_NETWORK) {
+      reconnectAudio();
+    }
   });
+
+  // Audio success handler
+  elements.audio.addEventListener('playing', () => {
+    connectionHealth.audio.status = 'connected';
+    connectionHealth.audio.reconnectAttempts = 0;
+    connectionHealth.audio.reconnectDelay = 2000;
+    updateConnectionHealthUI();
+  });
+
+  // Periodic status check (optional, for monitoring)
+  setInterval(() => {
+    const statusUrl = sessionId ? `/status/${sessionId}` : '/status';
+    fetch(statusUrl).catch(() => {});
+  }, 30000);
 
 
 // ====== Heartbeat & Sync System ======

@@ -315,17 +315,17 @@ class DriftAudioMixer {
   async selectNextFromCandidates() {
     try {
       // PRIORITY: Check if user has selected a specific track
-      if (this.selectedNextTrackSha) {
-        console.log(`🎯 User selected track takes priority: ${this.selectedNextTrackSha}`);
-        const userSelectedTrack = this.radialSearch.kdTree.getTrack(this.selectedNextTrackSha);
+      if (this.selectedNextTrackMd5) {
+        console.log(`🎯 User selected track takes priority: ${this.selectedNextTrackMd5}`);
+        const userSelectedTrack = this.radialSearch.kdTree.getTrack(this.selectedNextTrackMd5);
         if (userSelectedTrack) {
           console.log(`✅ Using user-selected track: ${userSelectedTrack.title} by ${userSelectedTrack.artist}`);
           // Clear the selection after using it
-          this.selectedNextTrackSha = null;
+          this.selectedNextTrackMd5 = null;
           return userSelectedTrack;
         } else {
-          console.error(`❌ User-selected track not found: ${this.selectedNextTrackSha}`);
-          this.selectedNextTrackSha = null; // Clear invalid selection
+          console.error(`❌ User-selected track not found: ${this.selectedNextTrackMd5}`);
+          this.selectedNextTrackMd5 = null; // Clear invalid selection
         }
       }
 

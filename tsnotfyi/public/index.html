@@ -65,6 +65,15 @@
         <span class="directionKeyText" id="dkt2"></span>
     </div>
 
+    <!-- Connection health indicator -->
+    <div id="connectionHealth" class="healthy" title="Connection status">
+        <div class="health-dot"></div>
+        <div class="connection-tooltip">
+            <div>SSE: <span id="sseStatus">connected</span></div>
+            <div>Audio: <span id="audioStatus">connected</span></div>
+        </div>
+    </div>
+
     <!-- Manual refresh button -->
     <div id="refreshButton" title="Refresh session if stuck">
         <div class="refresh-icon">⟳</div>

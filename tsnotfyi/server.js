@@ -468,8 +468,8 @@ app.post('/refresh-sse-simple', async (req, res) => {
 });
 
 
-// SHA-based journey endpoints
-// Start journey from specific track: /md5
+// MD5-based journey endpoints
+// Start journey from specific track: /md5 (SSE-driven)
 app.get('/:md5', async (req, res, next) => {
   const md5 = req.params.md5;
 
@@ -479,7 +479,7 @@ app.get('/:md5', async (req, res, next) => {
   }
 
   const sessionId = md5; // Use MD5 as session ID
-  console.log(`🎯 Starting journey from track MD5: ${md5} (session: ${sessionId})`);
+  console.log(`🎯 Starting SSE-driven journey from track MD5: ${md5} (session: ${sessionId})`);
 
   try {
     // Create or get session with MD5-based ID
@@ -491,56 +491,30 @@ app.get('/:md5', async (req, res, next) => {
       audioSessions.set(sessionId, session);
     }
 
-    // Set the specific track as the starting point
-    if (session.mixer.setNextTrack) {
-      session.mixer.setNextTrack(md5);
-    } else if (session.mixer.driftPlayer) {
-      session.mixer.selectedNextTrackMd5 = md5;
+    // Get the track from the database
+    const track = session.mixer.radialSearch.kdTree.getTrack(md5);
+    if (!track) {
+      return res.status(404).json({ error: 'Track not found' });
     }
 
-    // Force immediate transition to the specified track
-    if (session.mixer.triggerGaplessTransition) {
-      session.mixer.triggerGaplessTransition();
-    }
+    // Seed the session with this track (streaming starts when client connects)
+    session.mixer.currentTrack = track;
+    session.mixer.trackStartTime = Date.now();
 
-    // Wait for the track to be loaded and ready before serving the page
-    console.log('🎯 Waiting for track to be loaded and ready...');
-    let attempts = 0;
-    const maxAttempts = 20; // 10 seconds max wait
+    console.log(`🎯 Session seeded with: ${track.title} by ${track.artist}`);
 
-    while (attempts < maxAttempts) {
-      if (session.mixer.currentTrack &&
-          session.mixer.currentTrack.title &&
-          session.mixer.currentTrack.title.trim() !== '' &&
-          session.mixer.isActive) {
-        console.log(`🎯 Track ready: ${session.mixer.currentTrack.title}`);
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms
-      attempts++;
-    }
-
-    if (attempts >= maxAttempts) {
-      console.log('⚠️ Timeout waiting for track to load, serving page anyway');
-    }
-
-    // Instead of redirecting, serve the main page with the starting track data injected
+    // Serve the main page with the session ID injected (SSE will handle the rest)
     const htmlPath = path.join(__dirname, 'public', 'index.html');
     let html = fs.readFileSync(htmlPath, 'utf8');
 
-    // Inject starting track data into the page
     const scriptInjection = `
     <script>
-        window.startingTrackMd5 = '${md5}';
         window.sessionId = '${sessionId}';
-        console.log('🎯 Starting with track MD5:', window.startingTrackMd5);
-        console.log('🎯 Using session ID:', window.sessionId);
+        console.log('🎯 Starting SSE-driven session:', window.sessionId);
     </script>
     `;
 
-    // Insert the script before the closing </head> tag
     html = html.replace('</head>', scriptInjection + '\n</head>');
-
     res.send(html);
   } catch (error) {
     console.error('MD5 journey start error:', error);
@@ -548,7 +522,7 @@ app.get('/:md5', async (req, res, next) => {
   }
 });
 
-// Contrived journey: start at md51 with only md52 as next option
+// Contrived journey: start at md51 with md52 preloaded as next (SSE-driven)
 app.get('/:md51/:md52', async (req, res, next) => {
   const { md51, md52 } = req.params;
 
@@ -558,7 +532,7 @@ app.get('/:md51/:md52', async (req, res, next) => {
   }
 
   const sessionId = `${md51}_${md52}`; // Use combined MD5s as session ID
-  console.log(`🎯 Contrived journey: ${md51} → ${md52} (session: ${sessionId})`);
+  console.log(`🎯 SSE-driven contrived journey: ${md51} → ${md52} (session: ${sessionId})`);
 
   try {
     // Create or get session with combined MD5-based ID
@@ -566,25 +540,41 @@ app.get('/:md51/:md52', async (req, res, next) => {
     if (!session) {
       console.log(`Creating new contrived session: ${sessionId}`);
       session = await createPreloadedSession(`contrived_${md51.substring(0, 4)}_${md52.substring(0, 4)}`);
-      session.sessionId = sessionId; // Override with combined SHAs
+      session.sessionId = sessionId; // Override with combined MD5s
       audioSessions.set(sessionId, session);
     }
 
-    // Set up the contrived sequence
-    if (session.mixer.setContrivedSequence) {
-      session.mixer.setContrivedSequence(md51, md52);
-    } else if (session.mixer.driftPlayer) {
-      // Store both tracks for the contrived journey
-      session.mixer.selectedNextTrackMd5 = md51;
-      session.mixer.contrivedNextTrackMd5 = md52;
+    // Get both tracks from the database
+    const track1 = session.mixer.radialSearch.kdTree.getTrack(md51);
+    const track2 = session.mixer.radialSearch.kdTree.getTrack(md52);
+
+    if (!track1) {
+      return res.status(404).json({ error: `First track not found: ${md51}` });
+    }
+    if (!track2) {
+      return res.status(404).json({ error: `Second track not found: ${md52}` });
     }
 
-    // Force transition to start the sequence
-    if (session.mixer.triggerGaplessTransition) {
-      session.mixer.triggerGaplessTransition();
-    }
+    // Seed session with track1 and preload track2 (streaming starts when client connects)
+    session.mixer.currentTrack = track1;
+    session.mixer.trackStartTime = Date.now();
+    session.mixer.selectedNextTrackMd5 = md52; // Preload second track
 
-    res.redirect(`/session/${sessionId}`);
+    console.log(`🎯 Contrived journey seeded: ${track1.title} → ${track2.title}`);
+
+    // Serve the main page with the session ID injected (SSE will handle the rest)
+    const htmlPath = path.join(__dirname, 'public', 'index.html');
+    let html = fs.readFileSync(htmlPath, 'utf8');
+
+    const scriptInjection = `
+    <script>
+        window.sessionId = '${sessionId}';
+        console.log('🎯 Starting SSE-driven contrived journey:', window.sessionId);
+    </script>
+    `;
+
+    html = html.replace('</head>', scriptInjection + '\n</head>');
+    res.send(html);
   } catch (error) {
     console.error('Contrived journey error:', error);
     res.status(500).json({ error: error.message });
@@ -1079,18 +1069,27 @@ app.get('/health', (req, res) => {
 // Clean up inactive sessions
 setInterval(() => {
   const now = new Date();
-  const timeout = 30 * 60 * 1000; // 30 minutes (much longer)
+  const timeout = 60 * 60 * 1000; // 60 minutes (longer for smart reconnection)
 
   for (const [sessionId, session] of audioSessions) {
-    // Don't clean up sessions with active audio streaming
-    const hasActiveClients = session.mixer.clients && session.mixer.clients.size > 0;
+    // Don't clean up sessions with active connections or recent activity
+    const hasActiveAudioClients = session.mixer.clients && session.mixer.clients.size > 0;
+    const hasActiveEventClients = session.mixer.eventClients && session.mixer.eventClients.size > 0;
     const isActiveStreaming = session.mixer.isActive;
+    const hasRecentActivity = (now - session.lastAccess) < timeout;
 
-    if (!hasActiveClients && !isActiveStreaming && now - session.lastAccess > timeout) {
-      console.log(`Cleaning up inactive session: ${sessionId}`);
-      session.mixer.destroy();
-      audioSessions.delete(sessionId);
+    // Keep session alive if:
+    // 1. Has active audio clients, OR
+    // 2. Has active SSE clients (frontend monitoring), OR
+    // 3. Is actively streaming, OR
+    // 4. Had recent activity (within timeout)
+    if (hasActiveAudioClients || hasActiveEventClients || isActiveStreaming || hasRecentActivity) {
+      continue; // Keep session alive
     }
+
+    console.log(`🧹 Cleaning up inactive session: ${sessionId} (idle: ${Math.round((now - session.lastAccess) / 60000)}m)`);
+    session.mixer.destroy();
+    audioSessions.delete(sessionId);
   }
 }, 60 * 1000); // Check every minute
 
