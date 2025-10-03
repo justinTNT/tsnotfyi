@@ -32,6 +32,13 @@ class DriftAudioMixer {
     this.seenTrackArtists = new Set(); // Artists from seen tracks
     this.seenTrackAlbums = new Set(); // Albums from seen tracks
 
+    // Cleanup callback supplied by session manager
+    this.onIdle = null;
+    this.cleanupTimer = null;
+
+    // Explorer configuration
+    this.explorerResolution = 'magnifying_glass';
+
     // Audio configuration
     this.sampleRate = 44100;
     this.channels = 2;
@@ -267,36 +274,8 @@ class DriftAudioMixer {
 
   // Start aggressive neighborhood caching based on current exploration data
   async startNeighborhoodCaching() {
-    try {
-      // Get current exploration data to find neighborhood tracks
-      const explorerData = await this.getExplorerDataForCurrentTrack();
-
-      if (explorerData && explorerData.directions) {
-        // Extract all sample track paths from all directions
-        const neighborhoodPaths = [];
-
-        Object.values(explorerData.directions).forEach(direction => {
-          if (direction.sampleTracks) {
-            direction.sampleTracks.forEach(track => {
-              if (track.path) {
-                neighborhoodPaths.push(track.path);
-              }
-            });
-          }
-        });
-
-        if (neighborhoodPaths.length > 0) {
-          console.log(`🏭 Starting aggressive caching for ${neighborhoodPaths.length} neighborhood tracks`);
-
-          // Start background caching of all neighborhood tracks
-          this.audioMixer.preCacheNeighborhood(neighborhoodPaths, 'background');
-        } else {
-          console.log('📍 No neighborhood tracks found for caching');
-        }
-      }
-    } catch (error) {
-      console.warn(`⚠️ Neighborhood caching failed: ${error.message}`);
-    }
+    // Background neighborhood caching disabled to reduce upfront decode load.
+    return;
   }
 
   // Get exploration data for current track (reuse existing logic)
@@ -532,6 +511,12 @@ class DriftAudioMixer {
     });
 
     this.clients.add(response);
+    this.pendingClientBootstrap = false;
+
+    if (this.cleanupTimer) {
+      clearTimeout(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
 
     // Start drift if this is the first client
     if (this.clients.size === 1 && !this.isActive) {
@@ -562,7 +547,19 @@ class DriftAudioMixer {
     console.log(`🎵 Starting drift streaming for session: ${this.sessionId}`);
     this.isActive = true;
 
-    this.startDriftPlayback();
+    // If the mixer is already streaming (preload) just start serving clients
+    if (this.audioMixer?.engine?.isStreaming) {
+      console.log('🎵 Mixer already streaming from preload; keeping current track');
+      return;
+    }
+
+    // Respect any pre-seeded track (e.g., contrived MD5 journey)
+    if (this.currentTrack && this.currentTrack.path) {
+      console.log(`🎵 Using pre-seeded track for session start: ${this.currentTrack.title || this.currentTrack.identifier}`);
+      this.playCurrentTrack();
+    } else {
+      this.startDriftPlayback();
+    }
   }
 
   // Set up stream piping for current process
@@ -581,6 +578,10 @@ class DriftAudioMixer {
     if (this.currentProcess) {
       this.currentProcess.kill('SIGKILL');
       this.currentProcess = null;
+    }
+
+    if (!this.pendingClientBootstrap && typeof this.onIdle === 'function' && this.clients.size === 0 && this.eventClients.size === 0) {
+      this.onIdle();
     }
   }
 
@@ -602,12 +603,21 @@ class DriftAudioMixer {
   addEventClient(eventClient) {
     console.log(`📡 Event client connected to session: ${this.sessionId}`);
     this.eventClients.add(eventClient);
+
+    if (this.cleanupTimer) {
+      clearTimeout(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
   }
 
   // Remove event client
   removeEventClient(eventClient) {
     console.log(`📡 Event client disconnected from session: ${this.sessionId}`);
     this.eventClients.delete(eventClient);
+
+    if (!this.pendingClientBootstrap && !this.isActive && this.clients.size === 0 && this.eventClients.size === 0 && typeof this.onIdle === 'function') {
+      this.onIdle();
+    }
   }
 
   // Broadcast event to all SSE clients
@@ -809,7 +819,7 @@ class DriftAudioMixer {
   }
 
   // Enhanced comprehensive track event for SSE with full exploration data
-  async broadcastTrackEvent() {
+  async broadcastTrackEvent(force = false) {
     console.log(`📡 broadcastTrackEvent called, eventClients: ${this.eventClients.size}`);
 
     if (this.eventClients.size === 0) {
@@ -828,7 +838,7 @@ class DriftAudioMixer {
     // THROTTLE: Prevent runaway broadcasting - only broadcast if track actually changed
     const currentTrackId = this.currentTrack.identifier;
 
-    if (this._lastBroadcastTrackId === currentTrackId) {
+    if (!force && this._lastBroadcastTrackId === currentTrackId) {
       console.log(`📡 Skipping duplicate broadcast for same track: ${currentTrackId}`);
       return;
     }
@@ -867,6 +877,22 @@ class DriftAudioMixer {
             error: true,
             message: 'PCA/Core search failed - Legacy fallback disabled',
             originalError: explorerError.message
+          }
+        };
+      }
+
+      // Ensure nextTrack information exists for UI consumption
+      if (!explorerData.nextTrack && this.nextTrack) {
+        console.log('📊 No explorer nextTrack, falling back to prepared next track');
+        explorerData.nextTrack = {
+          directionKey: this.nextTrack.directionKey || this.nextTrack.nextTrackDirection || null,
+          direction: this.nextTrack.nextTrackDirection || null,
+          track: {
+            identifier: this.nextTrack.identifier,
+            title: this.nextTrack.title,
+            artist: this.nextTrack.artist,
+            duration: this.nextTrack.length || this.nextTrack.duration || null,
+            albumCover: this.nextTrack.albumCover || null
           }
         };
       }
@@ -999,16 +1025,25 @@ class DriftAudioMixer {
     console.log(`📊 Track has PCA data:`, !!currentTrackData.pca);
 
     let totalNeighborhood;
+    const resolution = this.explorerResolution || 'magnifying_glass';
+    console.log(`📊 Using explorer resolution: ${resolution}`);
+
     try {
       totalNeighborhood = this.radialSearch.kdTree.pcaRadiusSearch(
-        currentTrackData, 'magnifying_glass', 'primary_d', 1000
+        currentTrackData, resolution, 'primary_d', 1000
       );
       console.log(`📊 PCA radius search returned: ${totalNeighborhood.length} tracks`);
     } catch (pcaError) {
       console.error('📊 PCA radius search failed:', pcaError);
       // Fallback to legacy radius search
       console.log('📊 Falling back to legacy radius search');
-      totalNeighborhood = this.radialSearch.kdTree.radiusSearch(currentTrackData, 0.25, null, 1000);
+      const radiusFallback = {
+        microscope: 0.03,
+        magnifying_glass: 0.07,
+        binoculars: 0.11
+      };
+      const legacyRadius = radiusFallback[resolution] || 0.25;
+      totalNeighborhood = this.radialSearch.kdTree.radiusSearch(currentTrackData, legacyRadius, null, 1000);
       console.log(`📊 Legacy radius search returned: ${totalNeighborhood.length} tracks`);
     }
 
@@ -1122,8 +1157,25 @@ class DriftAudioMixer {
     // Calculate diversity scores and select next track
     explorerData.diversityMetrics = this.calculateExplorerDiversityMetrics(explorerData.directions, totalNeighborhoodSize);
     explorerData.nextTrack = await this.selectNextTrackFromExplorer(explorerData);
+    explorerData.resolution = this.explorerResolution;
 
     return explorerData;
+  }
+
+  setExplorerResolution(resolution) {
+    const validResolutions = ['microscope', 'magnifying_glass', 'binoculars'];
+    if (!validResolutions.includes(resolution)) {
+      throw new Error(`Invalid explorer resolution: ${resolution}`);
+    }
+
+    if (this.explorerResolution === resolution) {
+      console.log(`🔍 Explorer resolution already ${resolution}, no change`);
+      return false;
+    }
+
+    console.log(`🔍 Updating explorer resolution: ${this.explorerResolution} → ${resolution}`);
+    this.explorerResolution = resolution;
+    return true;
   }
 
   // Explore a specific PCA direction
@@ -1132,7 +1184,8 @@ class DriftAudioMixer {
 
     try {
       const searchConfig = {
-        resolution: 'magnifying_glass' // Default to 5% precision, no limit to get all candidates
+        resolution: this.explorerResolution || 'magnifying_glass',
+        limit: 40
       };
 
       const candidates = await this.radialSearch.getPCADirectionalCandidates(

@@ -831,10 +831,10 @@ class AdvancedAudioMixer {
     const fadeProgress = this.engine.crossfadePosition / totalCrossfadeBytes;
 
     if (fadeProgress >= 1.0) {
-      // Crossfade complete, switch to next track
-      this.completeCrossfade();
+      // Crossfade complete, finalize transition and keep streaming seamlessly
       this.handleTrackEnd();
-      return this.getNextTrackChunk() || this.getCurrentTrackChunk();
+      const chunk = this.getCurrentTrackChunk();
+      return chunk && chunk.length > 0 ? chunk : null;
     }
 
     // Calculate clean cosine curve volumes (smooth S-curve)
@@ -1007,9 +1007,10 @@ class AdvancedAudioMixer {
 
     if (this.engine.nextTrack.buffer) {
       this.completeCrossfade();
-    } else {
-      this.stopStreaming();
+      return;
     }
+
+    this.stopStreaming();
   }
 
   // Force immediate transition (for testing)

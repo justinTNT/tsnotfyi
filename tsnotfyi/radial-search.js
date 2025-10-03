@@ -329,9 +329,9 @@ class RadialSearchService {
         }
 
         const settings = {
-            microscope: { emoji: '🔬', description: '2% precision search', percentage: '~2%' },
-            magnifying_glass: { emoji: '🔍', description: '4% precision search', percentage: '~4%' },
-            binoculars: { emoji: '🔭', description: '8% broader search', percentage: '~8%' }
+            microscope: { emoji: '🔬', description: '3% precision search', percentage: '~3%' },
+            magnifying_glass: { emoji: '🔍', description: '7% precision search', percentage: '~7%' },
+            binoculars: { emoji: '🔭', description: '11% broader search', percentage: '~11%' }
         };
 
         // Add calibration data if available
