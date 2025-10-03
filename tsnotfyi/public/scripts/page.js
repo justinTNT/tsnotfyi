@@ -1315,7 +1315,7 @@ function createDimensionCards(explorerData) {
 
   // Smart SSE connection with health monitoring and reconnection
   function connectSSE() {
-  const eventsUrl = state.eventsEndpoint || (state.sessionId ? `/events/${state.sessionId}` : '/events');
+    const eventsUrl = state.eventsEndpoint || (state.sessionId ? `/events/${state.sessionId}` : '/events');
     console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
 
     // Close existing connection if any
@@ -1392,6 +1392,7 @@ function createDimensionCards(explorerData) {
             state.manualNextTrackOverride = false;
             const inferredTrack = data.explorer?.nextTrack?.track?.identifier || data.explorer?.nextTrack?.identifier || null;
             state.selectedIdentifier = inferredTrack;
+            updateRadiusControlsUI();
           }
 
           console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);

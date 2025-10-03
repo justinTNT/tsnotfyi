@@ -632,7 +632,11 @@ app.get('/:md51/:md52', async (req, res, next) => {
     // Seed session with track1 and preload track2 (streaming starts when client connects)
     session.mixer.currentTrack = track1;
     session.mixer.trackStartTime = Date.now();
-    session.mixer.selectedNextTrackMd5 = md52; // Preload second track
+    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
+      session.mixer.handleUserSelectedNextTrack(md52, { debounceMs: 0 });
+    } else {
+      session.mixer.selectedNextTrackMd5 = md52; // Fallback for legacy mixers
+    }
 
     console.log(`🎯 Contrived journey seeded: ${track1.title} → ${track2.title}`);
 
@@ -1031,7 +1035,9 @@ app.post('/next-track', (req, res) => {
     console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
     // Set the specific next track by MD5
-    if (session.mixer.setNextTrack) {
+    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
+      session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
+    } else if (typeof session.mixer.setNextTrack === 'function') {
       session.mixer.setNextTrack(trackMd5);
     } else if (session.mixer.driftPlayer) {
       // Store the selected track MD5 for next transition
@@ -1079,7 +1085,9 @@ app.post('/session/:sessionId/next-track', (req, res) => {
     console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction}) for session ${sessionId}`);
 
     // Set the specific next track by MD5
-    if (session.mixer.setNextTrack) {
+    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
+      session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
+    } else if (typeof session.mixer.setNextTrack === 'function') {
       session.mixer.setNextTrack(trackMd5);
     } else if (session.mixer.driftPlayer) {
       // Store the selected track MD5 for next transition

@@ -87,6 +87,15 @@ class DriftAudioMixer {
       this.fallbackToNoise();
     };
 
+    // User override handling
+    this.selectedNextTrackMd5 = null;
+    this.userSelectionDebounceMs = 400; // milliseconds to coalesce rapid selections
+    this.pendingUserSelectionTimer = null;
+    this.isUserSelectionPending = false;
+
+    // Track preparation coordination
+    this.pendingPreparationPromise = null;
+
     console.log(`Created drift audio mixer for session: ${sessionId}`);
   }
 
@@ -213,34 +222,143 @@ class DriftAudioMixer {
     }
   }
 
+  handleUserSelectedNextTrack(trackMd5, options = {}) {
+    if (!trackMd5) {
+      console.warn('⚠️ Ignoring user track override without a trackMd5');
+      return;
+    }
+
+    const { direction = null, debounceMs = this.userSelectionDebounceMs } = options;
+
+    if (direction) {
+      this.driftPlayer.currentDirection = direction;
+    }
+
+    if (this.nextTrack && this.nextTrack.identifier === trackMd5) {
+      console.log('🎯 User-selected track already prepared; keeping existing preload');
+      this.selectedNextTrackMd5 = null;
+      this.isUserSelectionPending = false;
+      return;
+    }
+
+    this.selectedNextTrackMd5 = trackMd5;
+    this.isUserSelectionPending = true;
+
+    const effectiveDelay = Number.isFinite(debounceMs) ? Math.max(0, debounceMs) : this.userSelectionDebounceMs;
+
+    if (this.pendingUserSelectionTimer) {
+      clearTimeout(this.pendingUserSelectionTimer);
+    }
+
+    if (effectiveDelay > 0) {
+      console.log(`🕓 Debouncing user-selected track override for ${effectiveDelay}ms`);
+      this.pendingUserSelectionTimer = setTimeout(() => {
+        this.pendingUserSelectionTimer = null;
+        this.applyUserSelectedTrackOverride();
+      }, effectiveDelay);
+    } else {
+      this.pendingUserSelectionTimer = null;
+      this.applyUserSelectedTrackOverride();
+    }
+  }
+
+  applyUserSelectedTrackOverride() {
+    if (!this.selectedNextTrackMd5) {
+      this.isUserSelectionPending = false;
+      return;
+    }
+
+    const mixerStatus = (this.audioMixer && typeof this.audioMixer.getStatus === 'function')
+      ? this.audioMixer.getStatus()
+      : null;
+
+    if (mixerStatus?.isCrossfading) {
+      console.log('⏳ Crossfade in progress; deferring user-selected override until fade completes');
+      if (this.pendingUserSelectionTimer) {
+        clearTimeout(this.pendingUserSelectionTimer);
+      }
+      this.pendingUserSelectionTimer = setTimeout(() => {
+        this.pendingUserSelectionTimer = null;
+        this.applyUserSelectedTrackOverride();
+      }, 750);
+      return;
+    }
+
+    if (this.nextTrack && this.nextTrack.identifier === this.selectedNextTrackMd5) {
+      console.log('🎯 User-selected track already prepared after debounce; no refresh needed');
+      this.selectedNextTrackMd5 = null;
+      this.isUserSelectionPending = false;
+      return;
+    }
+
+    if (this.audioMixer && typeof this.audioMixer.clearNextTrackSlot === 'function') {
+      this.audioMixer.clearNextTrackSlot();
+    }
+
+    this.nextTrack = null;
+
+    this.prepareNextTrackForCrossfade({ forceRefresh: true, reason: 'user-selection' });
+  }
+
   // Prepare next track for crossfading
-  async prepareNextTrackForCrossfade() {
-    try {
-      const nextTrack = await this.selectNextFromCandidates();
-      if (nextTrack) {
-        console.log(`🎯 Preparing next track for crossfade: ${nextTrack.title}`);
+  async prepareNextTrackForCrossfade(options = {}) {
+    const { forceRefresh = false, reason = 'auto' } = options;
+
+    if (this.pendingPreparationPromise) {
+      if (!forceRefresh) {
+        console.log('⏳ Next track preparation already in progress; skipping duplicate call');
+        return this.pendingPreparationPromise;
+      }
+
+      console.log('⏳ Force refresh requested; waiting for current preparation to finish');
+      try {
+        await this.pendingPreparationPromise;
+      } catch (err) {
+        console.warn(`⚠️ Previous preparation ended with error before force refresh: ${err?.message || err}`);
+      }
+    }
+
+    if (this.isUserSelectionPending && !forceRefresh) {
+      console.log('⏳ Skipping auto next-track preparation while user selection is pending');
+      return;
+    }
+
+    const preparation = (async () => {
+      try {
+        const nextTrack = await this.selectNextFromCandidates();
+        if (!nextTrack) {
+          console.log('❌ No next track selected for crossfade preparation');
+          return;
+        }
+
+        console.log(`🎯 Preparing next track for crossfade (${reason}): ${nextTrack.title}`);
         console.log(`🔧 DEBUG: Next track path: ${nextTrack.path}`);
         console.log(`🔧 DEBUG: Current this.nextTrack: ${this.nextTrack?.title || 'null'}`);
 
-        // Check if we already have this track prepared (avoid duplicate processing)
-        if (this.nextTrack && this.nextTrack.identifier === nextTrack.identifier) {
+        if (!forceRefresh && this.nextTrack && this.nextTrack.identifier === nextTrack.identifier) {
           console.log(`⚠️ Same next track already prepared, skipping duplicate processing: ${nextTrack.title}`);
           return;
         }
 
-        // Load into next slot
         const nextTrackInfo = await this.audioMixer.loadTrack(nextTrack.path, 'next');
         console.log(`📊 Next track analysis: BPM=${nextTrackInfo.bpm}, Key=${nextTrackInfo.key}`);
 
-        // Update current track reference for next transition
         this.nextTrack = nextTrack;
         console.log(`✅ Next track prepared successfully: ${nextTrack.title}`);
-      } else {
-        console.log(`❌ No next track selected for crossfade preparation`);
+      } catch (error) {
+        console.error('❌ Failed to prepare next track:', error);
+        console.error('❌ Error details:', error.stack);
       }
-    } catch (error) {
-      console.error('❌ Failed to prepare next track:', error);
-      console.error('❌ Error details:', error.stack);
+    })();
+
+    this.pendingPreparationPromise = preparation;
+
+    try {
+      await preparation;
+    } finally {
+      if (this.pendingPreparationPromise === preparation) {
+        this.pendingPreparationPromise = null;
+      }
     }
   }
 
@@ -301,10 +419,12 @@ class DriftAudioMixer {
           console.log(`✅ Using user-selected track: ${userSelectedTrack.title} by ${userSelectedTrack.artist}`);
           // Clear the selection after using it
           this.selectedNextTrackMd5 = null;
+          this.isUserSelectionPending = false;
           return userSelectedTrack;
         } else {
           console.error(`❌ User-selected track not found: ${this.selectedNextTrackMd5}`);
           this.selectedNextTrackMd5 = null; // Clear invalid selection
+          this.isUserSelectionPending = false;
         }
       }
 
@@ -2348,6 +2468,14 @@ class DriftAudioMixer {
   destroy() {
     console.log(`🧹 Destroying drift mixer for session: ${this.sessionId}`);
     this.stopStreaming();
+
+    if (this.pendingUserSelectionTimer) {
+      clearTimeout(this.pendingUserSelectionTimer);
+      this.pendingUserSelectionTimer = null;
+    }
+
+    this.pendingPreparationPromise = null;
+    this.isUserSelectionPending = false;
 
     // Destroy advanced mixer
     this.audioMixer.destroy();
