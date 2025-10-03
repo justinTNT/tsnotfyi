@@ -12,6 +12,32 @@ const port = 3001;
 const pidFile = path.join(__dirname, 'server.pid');
 
 
+async function persistAudioSessionBinding(req, sessionId) {
+  if (!req || !req.session) {
+    return;
+  }
+
+  if (req.session.audioSessionId === sessionId) {
+    return;
+  }
+
+  req.session.audioSessionId = sessionId;
+
+  if (typeof req.session.save !== 'function') {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    req.session.save((err) => {
+      if (err) {
+        console.error('⚠️ Failed to persist express session binding:', err);
+      }
+      resolve();
+    });
+  });
+}
+
+
 // Singleton protection - prevent multiple server instances
 function checkSingleton() {
   if (fs.existsSync(pidFile)) {
@@ -54,9 +80,6 @@ function checkSingleton() {
 // Check singleton before starting
 checkSingleton();
 
-// Master session - one active session per server
-let masterSession = null;
-let nextSessionPreloaded = null; // Pre-loaded session ready to become master
 const audioSessions = new Map(); // Keep for backward compatibility
 const ephemeralSessions = new Map(); // One-off MD5 journey sessions
 
@@ -105,43 +128,35 @@ const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
   }
 });
 
-// Preloading initialization function
-async function initializeWithPreloading() {
+async function initializeServices() {
   try {
     await radialSearch.initialize();
-
-    // Create and preload master session immediately
-    console.log('🚀 Preloading master session on server startup...');
-    const preloadedMaster = await createPreloadedSession('startup_master');
-    masterSession = preloadedMaster;
-
-    // Immediately create the next preloaded session
-    console.log('🔄 Preparing next session for instant switchover...');
-    nextSessionPreloaded = await createPreloadedSession('preload_next');
-
-    console.log('✅ Server fully preloaded and ready for instant responses');
+    console.log('✅ Radial search service initialized');
   } catch (err) {
-    console.error('Failed to initialize with preloading:', err);
+    console.error('Failed to initialize services:', err);
   }
 }
 
-// Create a fully preloaded session with first track ready
-async function createPreloadedSession(prefix, options = {}) {
-  const { autoStart = true, register = true } = options;
-  const sessionId = `${prefix}_` + crypto.randomBytes(4).toString('hex');
-  console.log(`🎯 Creating preloaded session: ${sessionId}`);
+async function createSession(options = {}) {
+  const {
+    sessionId = `session_${crypto.randomBytes(4).toString('hex')}`,
+    autoStart = true,
+    register = true,
+    ephemeral = false
+  } = options;
+
+  console.log(`🎯 Creating session: ${sessionId}`);
 
   const mixer = new DriftAudioMixer(sessionId, radialSearch);
   mixer.pendingClientBootstrap = true;
 
-  // Preload the first track and get it ready to crossfade
-  try {
-    if (autoStart) {
+  if (autoStart) {
+    try {
       await mixer.startDriftPlayback();
-      console.log(`✅ Session ${sessionId} preloaded with first track ready`);
+      console.log(`✅ Session ${sessionId} started with initial track`);
+    } catch (error) {
+      console.error(`❌ Failed to start session ${sessionId}:`, error);
     }
-  } catch (error) {
-    console.error(`❌ Failed to preload session ${sessionId}:`, error);
   }
 
   const session = {
@@ -149,17 +164,20 @@ async function createPreloadedSession(prefix, options = {}) {
     mixer,
     created: new Date(),
     lastAccess: new Date(),
-    isPreloaded: autoStart
+    isEphemeral: ephemeral
   };
 
   if (register) {
-    registerSession(sessionId, session);
+    registerSession(sessionId, session, { ephemeral });
+    if (ephemeral) {
+      attachEphemeralCleanup(sessionId, session);
+    }
   }
+
   return session;
 }
 
-// Start preloading initialization
-initializeWithPreloading();
+initializeServices();
 
 // Serve static files and middleware
 app.use(express.json());
@@ -181,180 +199,121 @@ app.use(express.static('public'));
 app.use( '/images', express.static('images') );
 app.use( '/Volumes', express.static('/Volumes', { fallthrough: false }) );
 
-// Get master session (uses preloaded sessions for instant response)
+// Create a new session on demand
 app.post('/create-session', async (req, res) => {
-  const masterSess = await getPreloadedMasterSession();
-
-  console.log(`🎯 Returning preloaded master session: ${masterSess.sessionId}`);
-
-  res.json({
-    sessionId: masterSess.sessionId,
-    streamUrl: `/stream/${masterSess.sessionId}`,
-    webUrl: `/session/${masterSess.sessionId}`,
-    preloaded: true
-  });
+  try {
+    const session = await createSession();
+    res.json({
+      sessionId: session.sessionId,
+      streamUrl: '/stream',
+      webUrl: '/'
+    });
+  } catch (error) {
+    console.error('Failed to create session:', error);
+    res.status(500).json({ error: 'Failed to create session' });
+  }
 });
 
-// NOTE: Multi-session API endpoints removed - see SESSIONS_ROADMAP.md for reintroduction plan
+async function getSessionForRequest(req, { createIfMissing = true } = {}) {
+  if (req.params && req.params.sessionId) {
+    const requestedId = req.params.sessionId;
+    let session = getSessionById(requestedId);
 
-// Get preloaded master session (instant response)
-async function getPreloadedMasterSession() {
-  if (!masterSession) {
-    console.log('⚠️ Master session not ready, falling back to quick creation');
-    const sessionId = 'emergency_master_' + crypto.randomBytes(4).toString('hex');
-    const mixer = new DriftAudioMixer(sessionId, radialSearch);
+    if (!session && createIfMissing) {
+      session = await createSession({ sessionId: requestedId });
+    }
 
-    masterSession = {
-      sessionId,
-      mixer,
-      created: new Date(),
-      lastAccess: new Date(),
-      isPreloaded: false
-    };
+    if (session) {
+      session.lastAccess = new Date();
+      await persistAudioSessionBinding(req, session.sessionId);
+    }
 
-    registerSession(sessionId, masterSession);
-
-    // Start drift playback asynchronously
-    mixer.startDriftPlayback().catch(err => {
-      console.error('Emergency session drift startup failed:', err);
-    });
+    return session;
   }
 
-  // Update access time
-  masterSession.lastAccess = new Date();
+  const expressSession = req.session;
+  if (expressSession) {
+    const existingId = expressSession.audioSessionId;
+    let session = existingId ? getSessionById(existingId) : null;
 
-  // Immediately prepare the next session if we just consumed the preloaded one
-  if (masterSession.isPreloaded && !nextSessionPreloaded) {
-    console.log('🔄 Master session consumed, preparing next preloaded session...');
+    if (!session && createIfMissing) {
+      session = await createSession();
+    }
 
-    // Asynchronously prepare the next session (don't block the response)
-    createPreloadedSession('next_preload').then(session => {
-      nextSessionPreloaded = session;
-      console.log('✅ Next preloaded session ready');
-    }).catch(err => {
-      console.error('Failed to prepare next session:', err);
-    });
+    if (session) {
+      session.lastAccess = new Date();
+      await persistAudioSessionBinding(req, session.sessionId);
+    }
+
+    return session;
   }
 
-  return masterSession;
-}
-
-// Get or create the master session (legacy/backward compatibility)
-function getMasterSession() {
-  if (!masterSession) {
-    const sessionId = 'compat_master_' + crypto.randomBytes(4).toString('hex');
-    console.log(`🎯 Creating backward compatibility master session: ${sessionId}`);
-
-    const mixer = new DriftAudioMixer(sessionId, radialSearch);
-    masterSession = {
-      sessionId,
-      mixer,
-      created: new Date(),
-      lastAccess: new Date(),
-      isPreloaded: false
-    };
-
-    // Also store in map for backward compatibility
-    registerSession(sessionId, masterSession);
-    console.log(`🎯 Master session ${sessionId} created and ready`);
-  }
-
-  masterSession.lastAccess = new Date();
-  return masterSession;
-}
-
-// Helper function to get or create session (backward compatibility)
-function getOrCreateSession(sessionId) {
-  if (!sessionId) {
-    return getMasterSession();
-  }
-
-  const session = getSessionById(sessionId);
-  if (!session) {
-    console.warn(`⚠️ Requested session ${sessionId} not found`);
+  if (!createIfMissing) {
     return null;
   }
 
+  const session = await createSession();
   session.lastAccess = new Date();
+  await persistAudioSessionBinding(req, session.sessionId);
   return session;
 }
 
-// Helper: Get audio session for a request (uses Express session infrastructure)
-// For now, still returns master session - infrastructure only, no behavior change
-function getAudioSessionForRequest(req) {
-  const expressSessionId = req.session?.id;
-
-  // Log session ID for verification
-  if (expressSessionId) {
-    console.log(`🆔 Request from Express session: ${expressSessionId.substring(0, 8)}...`);
-  }
-
-  // If URL has explicit session ID, use that (existing named session behavior)
-  if (req.params.sessionId) {
-    console.log(`🆔 Using URL-based session: ${req.params.sessionId}`);
-    return getSessionById(req.params.sessionId) || masterSession;
-  }
-
-  // For now, always return master session (no behavior change)
-  // In future: map expressSessionId to individual audio sessions
-  return masterSession;
-}
-
-// Simplified stream endpoint - uses master session
-app.get('/stream', (req, res) => {
+// Simplified stream endpoint - resolves session from request context
+app.get('/stream', async (req, res) => {
   console.log(`🔥 DEBUG: Stream request received (simplified endpoint)`);
 
-  const session = getAudioSessionForRequest(req); // Use helper (still returns master)
-  console.log(`Client connecting to master stream: ${session.sessionId}`);
+  try {
+    const session = await getSessionForRequest(req);
 
-  // Update last access time
-  session.lastAccess = new Date();
+    if (!session) {
+      console.log('⚠️ No session available for stream request');
+      return res.status(404).json({ error: 'Session not found' });
+    }
 
-  // Add client to mixer
-  session.mixer.addClient(res);
+    console.log(`Client connecting to stream: ${session.sessionId}`);
+
+    await persistAudioSessionBinding(req, session.sessionId);
+    if (req.method === 'HEAD') {
+      return res.end();
+    }
+
+    session.mixer.addClient(res);
+  } catch (error) {
+    console.error('Stream connection error:', error);
+    res.status(500).json({ error: 'Failed to attach to stream' });
+  }
 });
 
 // Stream endpoint - this is where browsers connect for audio (backward compatibility)
 app.get('/stream/:sessionId', (req, res) => {
-  const sessionId = req.params.sessionId;
-  console.log(`🔥 DEBUG: Stream request received for session: ${sessionId}`);
-
-  const session = getOrCreateSession(sessionId);
-  if (!session) {
-    console.log(`⚠️ Stream session ${sessionId} not found`);
-    return res.status(404).json({ error: 'Session not found' });
-  }
-
-  console.log(`Client connecting to stream: ${session.sessionId}`);
-
-  // Add client to mixer
-  session.mixer.addClient(res);
+  console.log(`⚠️ Deprecated stream URL requested: /stream/${req.params.sessionId}`);
+  res.status(410).json({ error: 'Session-specific stream URLs have been removed. Connect to /stream instead.' });
 });
 
 // NOTE: Named session creation endpoints removed - see SESSIONS_ROADMAP.md for reintroduction plan
 
-// Session page
-app.get('/session/:sessionId', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = getSessionById(sessionId);
+// Legacy session route – create/attach then redirect to root
+app.get('/session/:sessionId', async (req, res) => {
+  const requestedId = req.params.sessionId;
   const isFollowMode = req.query.mode === 'follow';
 
-  if (!session) {
-    console.log(`⚠️ Session '${sessionId}' not found, serving page anyway (master session pattern)`);
+  try {
+    const session = await getSessionForRequest(req, { createIfMissing: true });
+
+    if (session) {
+      await persistAudioSessionBinding(req, session.sessionId);
+    }
+
+    console.log(`${isFollowMode ? '👁️' : '🎮'} Legacy session request for ${requestedId}; redirecting to '/'`);
+  } catch (error) {
+    console.error('Failed to resolve session for legacy /session/:sessionId route:', error);
   }
 
-  if (isFollowMode) {
-    console.log(`👁️ Serving session page in follow mode for: ${sessionId}`);
-  } else {
-    console.log(`🎮 Serving session page in control mode for: ${sessionId}`);
-  }
-
-  // TODO: Create minimal.html for lightweight session view, or build session-specific UI
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.redirect(302, isFollowMode ? '/?mode=follow' : '/');
 });
 
 
-// Simplified events endpoint - uses master session
+// Simplified events endpoint - resolves session from request context
 app.get('/events', async (req, res) => {
   console.log(`📡 SSE connection attempt (simplified endpoint) - headers:`, req.headers.accept);
 
@@ -368,15 +327,23 @@ app.get('/events', async (req, res) => {
       'Access-Control-Allow-Headers': 'Cache-Control'
     });
 
-    const session = await getPreloadedMasterSession(); // Use preloaded master session
+    const session = await getSessionForRequest(req);
+
+    if (!session) {
+      console.log('⚠️ Unable to create or locate session for SSE request');
+      res.write('data: {"type":"error","message":"session_unavailable"}\n\n');
+      return res.end();
+    }
+
+    await persistAudioSessionBinding(req, session.sessionId);
 
     // Send initial connection event
     res.write('data: {"type":"connected","sessionId":"' + session.sessionId + '"}\n\n');
 
-    console.log(`📡 Found master session, adding SSE client`);
-    console.log(`📡 Master session currently has ${session.mixer.eventClients.size} SSE clients before adding`);
+    console.log(`📡 Found session ${session.sessionId}, adding SSE client`);
+    console.log(`📡 Session currently has ${session.mixer.eventClients.size} SSE clients before adding`);
     session.mixer.addEventClient(res);
-    console.log(`📡 Master session now has ${session.mixer.eventClients.size} SSE clients after adding`);
+    console.log(`📡 Session now has ${session.mixer.eventClients.size} SSE clients after adding`);
 
     // Send current track info ONLY if session is actively streaming a valid track
     if (session.mixer.currentTrack &&
@@ -404,59 +371,21 @@ app.get('/events', async (req, res) => {
 
 // Server-Sent Events endpoint for real-time updates (backward compatibility)
 app.get('/events/:sessionId', (req, res) => {
-  const sessionId = req.params.sessionId;
-
-  console.log(`📡 SSE connection attempt for session: ${sessionId}`);
-
-  const session = getOrCreateSession(sessionId);
-  if (!session) {
-    console.log(`⚠️ SSE session ${sessionId} not found`);
-    return res.status(404).json({ error: 'Session not found' });
-  }
-
-  // Set up SSE headers
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Cache-Control'
-  });
-
-  // Send initial connection event
-  res.write('data: {"type":"connected","sessionId":"' + session.sessionId + '"}\n\n');
-
-  console.log(`📡 Found session ${session.sessionId}, adding SSE client`);
-  console.log(`📡 Session ${session.sessionId} currently has ${session.mixer.eventClients.size} SSE clients before adding`);
-  session.mixer.addEventClient(res);
-  console.log(`📡 Session ${session.sessionId} now has ${session.mixer.eventClients.size} SSE clients after adding`);
-
-  // Send current track info ONLY if session is actively streaming a valid track
-  if (session.mixer.currentTrack &&
-      session.mixer.isActive &&
-      session.mixer.currentTrack.title &&
-      session.mixer.currentTrack.title.trim() !== '') {
-    console.log('📡 Sending current track info to new SSE client');
-    session.mixer.broadcastTrackEvent(true);
-  } else {
-    console.log('📡 No valid current track to broadcast, skipping initial track event');
-  }
-
-  // Handle client disconnect
-  req.on('close', () => {
-    if (session && session.mixer.removeEventClient) {
-      session.mixer.removeEventClient(res);
-    }
-  });
+  console.log(`⚠️ Deprecated SSE URL requested: /events/${req.params.sessionId}`);
+  res.status(410).json({ error: 'Session-specific SSE URLs have been removed. Connect to /events instead.' });
 });
 
 // SSE refresh endpoint - triggers server to rebroadcast current state via SSE (pull/monadic)
 app.post('/refresh-sse', async (req, res) => {
-  const sessionId = req.body.sessionId || 'master';
+  const sessionId = req.body.sessionId || req.session?.audioSessionId;
 
   console.log(`🔄 SSE refresh request from client for session: ${sessionId}`);
 
   try {
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Session ID is required' });
+    }
+
     const session = getSessionById(sessionId);
 
     if (!session) {
@@ -485,30 +414,29 @@ app.post('/refresh-sse', async (req, res) => {
   }
 });
 
-// Simplified SSE refresh endpoint (uses master session)
+// Simplified SSE refresh endpoint (requests session from context)
 app.post('/refresh-sse-simple', async (req, res) => {
   console.log('🔄 Simple SSE refresh request from client');
 
   try {
-    const session = await getPreloadedMasterSession();
+    const session = await getSessionForRequest(req, { createIfMissing: false });
 
     if (!session) {
-      console.log('🔄 No master session found for refresh request');
-      return res.status(404).json({ error: 'Master session not found' });
+      console.log('🔄 No session associated with request');
+      return res.status(404).json({ error: 'Session not found' });
     }
 
     if (!session.mixer || !session.mixer.isActive) {
-      console.log('🔄 Master session is not active, cannot refresh');
+      console.log(`🔄 Session ${session.sessionId} is not active, cannot refresh`);
       return res.status(200).json({ ok: false, reason: 'inactive' });
     }
 
-    // Trigger SSE broadcast if we have a valid track (just needs path)
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering SSE broadcast for master session (${session.mixer.eventClients.size} clients)`);
+      console.log(`🔄 Triggering SSE broadcast for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       session.mixer.broadcastTrackEvent(true);
       res.status(200).json({ ok: true });
     } else {
-      console.log('🔄 Master session has no valid track to broadcast');
+      console.log(`🔄 Session ${session.sessionId} has no valid track to broadcast`);
       res.status(200).json({ ok: false, reason: 'no_track' });
     }
 
@@ -537,13 +465,8 @@ app.get('/:md5', async (req, res, next) => {
     let session = getSessionById(sessionId);
     if (!session) {
       console.log(`Creating new session for MD5: ${sessionId}`);
-      session = await createPreloadedSession(`md5_${md5.substring(0, 8)}`, { autoStart: false, register: false });
-      session.sessionId = sessionId; // Override with full MD5
-      session.isEphemeral = true;
-      registerSession(sessionId, session, { ephemeral: true });
+      session = await createSession({ sessionId, autoStart: false, ephemeral: true });
     }
-
-    attachEphemeralCleanup(sessionId, session);
 
     // Ensure mixer is idle before seeding manual track
     if (session.mixer.stopStreaming) {
@@ -566,19 +489,9 @@ app.get('/:md5', async (req, res, next) => {
 
     console.log(`🎯 Session seeded with: ${track.title} by ${track.artist}`);
 
-    // Serve the main page with the session ID injected (SSE will handle the rest)
-    const htmlPath = path.join(__dirname, 'public', 'index.html');
-    let html = fs.readFileSync(htmlPath, 'utf8');
+    await persistAudioSessionBinding(req, session.sessionId);
 
-    const scriptInjection = `
-    <script>
-        window.sessionId = '${sessionId}';
-        console.log('🎯 Starting SSE-driven session:', window.sessionId);
-    </script>
-    `;
-
-    html = html.replace('</head>', scriptInjection + '\n</head>');
-    res.send(html);
+    return res.redirect('/');
   } catch (error) {
     console.error('MD5 journey start error:', error);
     res.status(500).json({ error: error.message });
@@ -602,13 +515,8 @@ app.get('/:md51/:md52', async (req, res, next) => {
     let session = getSessionById(sessionId);
     if (!session) {
       console.log(`Creating new contrived session: ${sessionId}`);
-      session = await createPreloadedSession(`contrived_${md51.substring(0, 4)}_${md52.substring(0, 4)}`, { autoStart: false, register: false });
-      session.sessionId = sessionId; // Override with combined MD5s
-      session.isEphemeral = true;
-      registerSession(sessionId, session, { ephemeral: true });
+      session = await createSession({ sessionId, autoStart: false, ephemeral: true });
     }
-
-    attachEphemeralCleanup(sessionId, session);
 
     if (session.mixer.stopStreaming) {
       session.mixer.stopStreaming();
@@ -640,19 +548,9 @@ app.get('/:md51/:md52', async (req, res, next) => {
 
     console.log(`🎯 Contrived journey seeded: ${track1.title} → ${track2.title}`);
 
-    // Serve the main page with the session ID injected (SSE will handle the rest)
-    const htmlPath = path.join(__dirname, 'public', 'index.html');
-    let html = fs.readFileSync(htmlPath, 'utf8');
+    await persistAudioSessionBinding(req, session.sessionId);
 
-    const scriptInjection = `
-    <script>
-        window.sessionId = '${sessionId}';
-        console.log('🎯 Starting SSE-driven contrived journey:', window.sessionId);
-    </script>
-    `;
-
-    html = html.replace('</head>', scriptInjection + '\n</head>');
-    res.send(html);
+    return res.redirect('/');
   } catch (error) {
     console.error('Contrived journey error:', error);
     res.status(500).json({ error: error.message });
@@ -768,25 +666,19 @@ app.get('/search', (req, res) => {
 });
 
 // Main page - serves a UI with 3D visualization
-app.get('/', (req, res) => {
+app.get('/', async (req, res) => {
+  try {
+    await getSessionForRequest(req);
+  } catch (error) {
+    console.error('Failed to initialise session for root request:', error);
+  }
+
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Simplified status endpoint - uses master session
-app.get('/status', (req, res) => {
-  const session = getMasterSession(); // Always use master session
-
-  res.json({
-    ...session.mixer.getStats(),
-    created: session.created,
-    lastAccess: session.lastAccess
-  });
-});
-
-// Session status (backward compatibility)
-app.get('/status/:sessionId', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = getSessionById(sessionId);
+// Simplified status endpoint - resolves session from request context
+app.get('/status', async (req, res) => {
+  const session = await getSessionForRequest(req);
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
@@ -797,6 +689,12 @@ app.get('/status/:sessionId', (req, res) => {
     created: session.created,
     lastAccess: session.lastAccess
   });
+});
+
+// Session status (backward compatibility)
+app.get('/status/:sessionId', (req, res) => {
+  console.log(`⚠️ Deprecated status URL requested: /status/${req.params.sessionId}`);
+  res.status(410).json({ error: 'Session-specific status URLs have been removed. Query /status instead.' });
 });
 
 // Radial search endpoints
@@ -900,9 +798,8 @@ app.post('/pca/explore', async (req, res) => {
 });
 
 // Reset drift for a session
-app.post('/session/:sessionId/reset-drift', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = getSessionById(sessionId);
+app.post('/session/reset-drift', async (req, res) => {
+  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
@@ -921,11 +818,15 @@ app.post('/session/:sessionId/reset-drift', (req, res) => {
   }
 });
 
+app.post('/session/:sessionId/reset-drift', (req, res) => {
+  console.log(`⚠️ Deprecated reset-drift URL requested: /session/${req.params.sessionId}/reset-drift`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/reset-drift instead.' });
+});
+
 // User directional command
-app.post('/session/:sessionId/flow/:direction', (req, res) => {
-  const sessionId = req.params.sessionId;
+app.post('/session/flow/:direction', async (req, res) => {
   const direction = req.params.direction;
-  const session = getSessionById(sessionId);
+  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
@@ -945,17 +846,21 @@ app.post('/session/:sessionId/flow/:direction', (req, res) => {
   }
 });
 
+app.post('/session/:sessionId/flow/:direction', (req, res) => {
+  console.log(`⚠️ Deprecated flow URL requested: /session/${req.params.sessionId}/flow/${req.params.direction}`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/flow/:direction instead.' });
+});
+
 // Force immediate track change (test command)
-app.post('/session/:sessionId/force-next', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = getSessionById(sessionId);
+app.post('/session/force-next', async (req, res) => {
+  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
 
   try {
-    console.log(`🎮 Force next track for session ${sessionId}`);
+    console.log(`🎮 Force next track for session ${session.sessionId}`);
 
     if (session.mixer.triggerGaplessTransition) {
       session.mixer.triggerGaplessTransition();
@@ -969,11 +874,15 @@ app.post('/session/:sessionId/force-next', (req, res) => {
   }
 });
 
+app.post('/session/:sessionId/force-next', (req, res) => {
+  console.log(`⚠️ Deprecated force-next URL requested: /session/${req.params.sessionId}/force-next`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/force-next instead.' });
+});
+
 // Zoom mode commands (microscope, magnifying glass, binoculars)
-app.post('/session/:sessionId/zoom/:mode', (req, res) => {
-  const sessionId = req.params.sessionId;
+app.post('/session/zoom/:mode', async (req, res) => {
   const mode = req.params.mode;
-  const session = getSessionById(sessionId);
+  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
@@ -985,7 +894,7 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
   }
 
   try {
-    console.log(`🔍 Zoom mode ${mode} for session ${sessionId}`);
+    console.log(`🔍 Zoom mode ${mode} for session ${session.sessionId}`);
 
     if (!session.mixer.setExplorerResolution) {
       return res.status(400).json({ error: 'Session does not support zoom controls' });
@@ -1012,7 +921,7 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
     res.json({
       message: `${emoji} ${mode} mode activated`,
       mode,
-      sessionId,
+      sessionId: session.sessionId,
       resolution: session.mixer.explorerResolution,
       broadcast: changed
     });
@@ -1022,13 +931,22 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
   }
 });
 
-// Simplified next track endpoint - uses master session
-app.post('/next-track', (req, res) => {
+app.post('/session/:sessionId/zoom/:mode', (req, res) => {
+  console.log(`⚠️ Deprecated zoom URL requested: /session/${req.params.sessionId}/zoom/${req.params.mode}`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/zoom/:mode instead.' });
+});
+
+// Simplified next track endpoint - resolves session from request context
+app.post('/next-track', async (req, res) => {
   const { trackMd5, direction } = req.body;
-  const session = getAudioSessionForRequest(req); // Use helper (still returns master)
+  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!trackMd5) {
     return res.status(400).json({ error: 'Track MD5 is required' });
+  }
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
   }
 
   try {
@@ -1052,12 +970,15 @@ app.post('/next-track', (req, res) => {
     const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
     const remaining = Math.max(0, duration - elapsed);
 
+    const currentTrackId = session.mixer.currentTrack?.identifier || null;
+    console.log(`📤 /next-track response: currentTrack=${currentTrackId?.substring(0,8)}, nextTrack=${trackMd5.substring(0,8)}, remaining=${Math.round(remaining)}ms`);
+
     res.json({
       // Acknowledgment
       nextTrack: trackMd5,
 
       // Sync state: current track + timing
-      currentTrack: session.mixer.currentTrack?.identifier || null,
+      currentTrack: currentTrackId,
       duration: Math.round(duration),
       remaining: Math.round(remaining)
     });
@@ -1067,79 +988,33 @@ app.post('/next-track', (req, res) => {
   }
 });
 
-// Update next track by specific MD5 for session (backward compatibility)
 app.post('/session/:sessionId/next-track', (req, res) => {
-  const sessionId = req.params.sessionId;
-  const { trackMd5, direction } = req.body;
-  const session = getSessionById(sessionId);
-
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-
-  if (!trackMd5) {
-    return res.status(400).json({ error: 'Track MD5 is required' });
-  }
-
-  try {
-    console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction}) for session ${sessionId}`);
-
-    // Set the specific next track by MD5
-    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
-      session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
-    } else if (typeof session.mixer.setNextTrack === 'function') {
-      session.mixer.setNextTrack(trackMd5);
-    } else if (session.mixer.driftPlayer) {
-      // Store the selected track MD5 for next transition
-      session.mixer.selectedNextTrackMd5 = trackMd5;
-      if (direction) {
-        session.mixer.driftPlayer.currentDirection = direction;
-      }
-    }
-
-    // Calculate timing info for sync check
-    const duration = session.mixer.getAdjustedTrackDuration() * 1000; // Convert to ms
-    const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
-    const remaining = Math.max(0, duration - elapsed);
-
-    res.json({
-      // Acknowledgment
-      nextTrack: trackMd5,
-
-      // Sync state: current track + timing
-      currentTrack: session.mixer.currentTrack?.identifier || null,
-      duration: Math.round(duration),
-      remaining: Math.round(remaining)
-    });
-  } catch (error) {
-    console.error('Next track selection error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  console.log(`⚠️ Deprecated next-track URL requested: /session/${req.params.sessionId}/next-track`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /next-track instead.' });
 });
 
 // Create brand new random journey session (ephemeral)
 app.post('/session/random', async (req, res) => {
   try {
-    const session = await createPreloadedSession('random_journey', { autoStart: true, register: false });
+    const session = await createSession({ autoStart: true, ephemeral: true });
     const mixer = session.mixer;
 
-    if (mixer) {
-      mixer.pendingClientBootstrap = true;
+    const publicSessionId = mixer.currentTrack?.identifier || session.sessionId;
+    if (publicSessionId !== session.sessionId) {
+      unregisterSession(session.sessionId);
+      session.sessionId = publicSessionId;
+      session.mixer.sessionId = publicSessionId;
+      registerSession(publicSessionId, session, { ephemeral: true });
+      attachEphemeralCleanup(publicSessionId, session);
     }
 
-    // Promote to public session id
-    const publicSessionId = mixer.currentTrack.identifier + '_' + crypto.randomBytes(4).toString('hex');
-    session.sessionId = publicSessionId;
-    session.mixer.sessionId = publicSessionId;
-    session.isEphemeral = true;
-    session.isPreloaded = false;
-    registerSession(publicSessionId, session, { ephemeral: true });
-    attachEphemeralCleanup(publicSessionId, session);
+    await persistAudioSessionBinding(req, publicSessionId);
 
     res.json({
       sessionId: publicSessionId,
-      streamUrl: `/stream/${publicSessionId}`,
-      eventsUrl: `/events/${publicSessionId}`,
+      streamUrl: '/stream',
+      eventsUrl: '/events',
+      webUrl: '/',
       currentTrack: mixer.currentTrack ? {
         identifier: mixer.currentTrack.identifier,
         title: mixer.currentTrack.title,
@@ -1268,4 +1143,18 @@ server.on('error', (err) => {
     console.error('Server error:', err);
     process.exit(1);
   }
+});
+app.post('/session/seek', async (req, res) => {
+  const session = await getSessionForRequest(req, { createIfMissing: false });
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  res.status(501).json({ error: 'Seek control not implemented for this session' });
+});
+
+app.post('/session/:sessionId/seek', (req, res) => {
+  console.log(`⚠️ Deprecated seek URL requested: /session/${req.params.sessionId}/seek`);
+  res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/seek instead.' });
 });

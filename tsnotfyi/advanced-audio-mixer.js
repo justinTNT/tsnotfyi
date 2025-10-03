@@ -831,11 +831,9 @@ class AdvancedAudioMixer {
     const fadeProgress = this.engine.crossfadePosition / totalCrossfadeBytes;
 
     if (fadeProgress >= 1.0) {
-      // Crossfade complete, switch to next track
+      // Crossfade complete, finalize transition and keep streaming seamlessly
       this.completeCrossfade();
-      this.handleTrackEnd();
 
-      // Get chunk from the newly set current track
       const chunk = this.getCurrentTrackChunk();
       return chunk && chunk.length > 0 ? chunk : null;
     }

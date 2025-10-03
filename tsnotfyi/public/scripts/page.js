@@ -19,33 +19,56 @@ const state = {
     eventsEndpoint: null,
     currentResolution: 'magnifying',
     manualNextTrackOverride: false,
-    nextTrackAnimationTimer: null
+    nextTrackAnimationTimer: null,
+    manualNextDirectionKey: null,
+    playbackStartTimestamp: null,
+    playbackDurationSeconds: 0
   };
 window.state = state;
 
 (function hydrateStateFromLocation() {
-  const rawPath = window.location.pathname || '/';
-  const trimmedPath = rawPath.replace(/\/+$/, '');
-  const segments = trimmedPath.split('/').filter(Boolean);
-
-  if (!state.sessionId && segments.length > 0) {
-    state.sessionId = segments[segments.length - 1];
-  }
-
-  if (!state.streamUrl) {
-    state.streamUrl = state.sessionId ? `/stream/${state.sessionId}` : '/stream';
-  }
-
-  if (!state.eventsEndpoint) {
-    state.eventsEndpoint = state.sessionId ? `/events/${state.sessionId}` : '/events';
-  }
-
-  window.sessionId = state.sessionId;
+  state.streamUrl = '/stream';
+  state.eventsEndpoint = '/events';
   window.streamUrl = state.streamUrl;
   window.eventsUrl = state.eventsEndpoint;
 })();
 
 const RADIUS_MODES = ['microscope', 'magnifying', 'binoculars'];
+
+function explorerContainsTrack(explorerData, identifier) {
+  if (!explorerData || !identifier) return false;
+
+  const nextTrack = explorerData.nextTrack;
+  if (nextTrack) {
+    const candidate = nextTrack.track || nextTrack;
+    if (candidate && candidate.identifier === identifier) {
+      return true;
+    }
+  }
+
+  const directions = explorerData.directions || {};
+  for (const direction of Object.values(directions)) {
+    const samples = direction?.sampleTracks || [];
+    for (const sample of samples) {
+      const track = sample.track || sample;
+      if (track?.identifier === identifier) {
+        return true;
+      }
+    }
+
+    const opposite = direction?.oppositeDirection;
+    if (opposite && Array.isArray(opposite.sampleTracks)) {
+      for (const sample of opposite.sampleTracks) {
+        const track = sample.track || sample;
+        if (track?.identifier === identifier) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
 
 function normalizeResolution(resolution) {
   if (!resolution) return null;
@@ -77,17 +100,12 @@ function updateRadiusControlsUI() {
 function triggerZoomMode(mode) {
   const normalizedMode = normalizeResolution(mode) || 'magnifying';
 
-  if (!state.sessionId) {
-    console.warn('⚠️ No sessionId for zoom request');
-    return;
-  }
-
   state.currentResolution = normalizedMode;
   updateRadiusControlsUI();
 
   const endpointMode = normalizedMode === 'magnifying' ? 'magnifying' : normalizedMode;
 
-  fetch(`/session/${state.sessionId}/zoom/${endpointMode}`, {
+  fetch(`/session/zoom/${endpointMode}`, {
     method: 'POST'
   }).then(response => {
     if (!response.ok) {
@@ -98,6 +116,7 @@ function triggerZoomMode(mode) {
     const returnedResolution = normalizeResolution(result.resolution) || normalizedMode;
     state.currentResolution = returnedResolution;
     state.manualNextTrackOverride = false;
+    state.manualNextDirectionKey = null;
     updateRadiusControlsUI();
     if (typeof rejig === 'function') {
       rejig();
@@ -129,7 +148,7 @@ function initializeApp() {
 
   // ====== Audio Streaming Setup ======
 
-  console.log(`🆔 Effective session ID: ${state.sessionId ?? 'master'}`);
+  console.log('🆔 Using cookie-managed audio session');
 
   // Connection health management
   const connectionHealth = {
@@ -178,13 +197,16 @@ function initializeApp() {
     }
   }
 
+  const LOCKOUT_THRESHOLD_SECONDS = 30;
+
   const elements = {
 	  clickCatcher:        document.getElementById('clickCatcher'),
           volumeControl:       document.getElementById('volumeControl'),
           volumeBar:           document.getElementById('volumeBar'),
           fullscreenProgress:  document.getElementById('fullscreenProgress'),
 	  progressWipe:        document.getElementById('progressWipe'),
-          audio:               document.getElementById('audio')
+          audio:               document.getElementById('audio'),
+          playbackClock:       document.getElementById('playbackClock')
   }
   elements.audio.volume = 0.85;
 
@@ -238,6 +260,16 @@ function initializeApp() {
 
 
 
+var cache = document.createElement("CACHE");
+cache.style = "position:absolute;z-index:-1000;opacity:0;";
+document.body.appendChild(cache);
+function preloadImage(url) {
+    var img = new Image();
+    img.src = url;
+    img.style = "position:absolute";
+    cache.appendChild(img);
+}
+
 function createDimensionCards(explorerData) {
       const normalizeTracks = (direction) => {
           if (!direction || !Array.isArray(direction.sampleTracks)) return;
@@ -247,13 +279,17 @@ function createDimensionCards(explorerData) {
           }
       };
 
+      const previousExplorerData = state.latestExplorerData;
       // Store for later redraw
-      const NxTk = state.latestExplorerData?.nextTrack;
-      if (NxTk && (explorerData.nextTrack.identifier !== NxTk.identifier)) {
+      const previousNext = previousExplorerData?.nextTrack;
+      const previousNextId = previousNext?.track?.identifier || previousNext?.identifier || null;
+      const incomingNextId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
+
+      if (previousNext && previousNextId && incomingNextId && incomingNextId !== previousNextId) {
           state.previousNextTrack = {
-	      identifier: NxTk.identifier,
-	      albumCover: NxTk.albumCover,
-              variant: variantFromDirectionType(getDirectionType(NxTk.directionKey))
+	      identifier: previousNextId,
+	      albumCover: previousNext.albumCover,
+              variant: variantFromDirectionType(getDirectionType(previousNext.directionKey))
           };
       }
       state.latestExplorerData = explorerData;
@@ -272,9 +308,17 @@ function createDimensionCards(explorerData) {
       }
 
       const nextTrackId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
-      const manualOverrideActive = state.manualNextTrackOverride && state.selectedIdentifier && nextTrackId === state.selectedIdentifier;
+      const selectionStillPresent = state.selectedIdentifier ? explorerContainsTrack(explorerData, state.selectedIdentifier) : false;
+      const manualOverrideActive = state.manualNextTrackOverride && selectionStillPresent;
+
+      if (manualOverrideActive && previousNext && previousNextId) {
+          console.log('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
+          explorerData.nextTrack = previousNext;
+          state.latestExplorerData = explorerData;
+      }
+
       if (manualOverrideActive) {
-          console.log('🎯 Manual next track override active; preserving existing cards');
+          console.log('🎯 Manual next track override active; preserving existing cards (selection still present)');
           if (state.nextTrackAnimationTimer) {
               clearTimeout(state.nextTrackAnimationTimer);
               state.nextTrackAnimationTimer = null;
@@ -421,11 +465,15 @@ function createDimensionCards(explorerData) {
       directions.forEach((direction, index) => {
           // Server provides only primary directions - trust the hasOpposite flag for reverse capability
           const hasReverse = direction.hasOpposite === true;
-          const trackCount = direction.sampleTracks?.length || 0;
+          const tracks = direction.sampleTracks || [];
+          const trackCount = tracks.length;
+          for (t in tracks) preloadImage(t.albumCover);
 
           console.log(`🎯 Creating direction card ${index}: ${direction.key} (${trackCount} tracks)${hasReverse ? ' with reverse' : ''}`);
           if (hasReverse) {
-              const oppositeCount = direction.oppositeDirection?.sampleTracks?.length || 0;
+              const oppositeTracks = direction.oppositeDirection?.sampleTracks || [];
+              const oppositeCount = oppositeTracks.length;
+              for (t in oppositeTracks) preloadImage(t.albumCover);
               console.log(`🔄 Reverse available: ${oppositeCount} tracks in opposite direction`);
           }
 
@@ -940,13 +988,7 @@ function createDimensionCards(explorerData) {
                   console.log('🎮 ESC pressed in second wipe - requesting seek to crossfade point');
               }
 
-                      if (!state.sessionId) {
-                          console.warn('⚠️ No sessionId for seek request');
-                          e.preventDefault();
-                          break;
-                      }
-
-                      fetch(`/session/${state.sessionId}/seek`, {
+                      fetch('/session/seek', {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
@@ -1024,12 +1066,8 @@ function createDimensionCards(explorerData) {
           case '1':
               // Microscope - ultra close examination
               console.log('🔬 Key 1: Microscope mode');
-              if (!state.sessionId) {
-                  console.warn('⚠️ No sessionId for zoom request');
-                  return;
-              }
 
-              fetch(`/session/${state.sessionId}/zoom/microscope`, {
+              fetch('/session/zoom/microscope', {
                   method: 'POST'
               }).catch(err => console.error('Microscope request failed:', err));
               e.preventDefault();
@@ -1039,11 +1077,7 @@ function createDimensionCards(explorerData) {
           case '2':
               // Magnifying glass - detailed examination
               console.log('🔍 Key 2: Magnifying glass mode');
-              if (!state.sessionId) {
-                  console.warn('⚠️ No sessionId for zoom request');
-                  return;
-              }
-              fetch(`/session/${state.sessionId}/zoom/magnifying`, {
+              fetch('/session/zoom/magnifying', {
                   method: 'POST'
               }).catch(err => console.error('Magnifying request failed:', err));
               e.preventDefault();
@@ -1053,11 +1087,7 @@ function createDimensionCards(explorerData) {
           case '3':
               // Binoculars - wide exploration
               console.log('🔭 Key 3: Binoculars mode');
-              if (!state.sessionId) {
-                  console.warn('⚠️ No sessionId for zoom request');
-                  return;
-              }
-              fetch(`/session/${state.sessionId}/zoom/binoculars`, {
+              fetch('/session/zoom/binoculars', {
                   method: 'POST'
               }).catch(err => console.error('Binoculars request failed:', err));
               e.preventDefault();
@@ -1073,7 +1103,7 @@ function createDimensionCards(explorerData) {
   let inactivityTimer = null;
   let lastActivityTime = Date.now();
   let cardsInactiveTilted = false; // Track if cards are already tilted from inactivity
-  let midpointReached = false; // Track if we've hit the midpoint
+  let midpointReached = false; // Track if we've hit the lockout threshold
   let cardsLocked = false; // Track if card interactions are locked
 
   function markActivity() {
@@ -1150,6 +1180,45 @@ function createDimensionCards(explorerData) {
       }
   }
 
+  function formatTimecode(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 0) {
+          return '--:--';
+      }
+      const wholeSeconds = Math.floor(seconds);
+      const minutes = Math.floor(wholeSeconds / 60);
+      const secs = wholeSeconds % 60;
+      return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  }
+
+  function updatePlaybackClockDisplay(forceSeconds = null) {
+      if (!elements.playbackClock) return;
+
+      if (!state.playbackStartTimestamp || state.playbackDurationSeconds <= 0) {
+          elements.playbackClock.textContent = '--:--';
+          return;
+      }
+
+      const elapsedSeconds = forceSeconds !== null
+          ? forceSeconds
+          : Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
+      const clampedElapsed = Math.min(elapsedSeconds, state.playbackDurationSeconds);
+      elements.playbackClock.textContent = formatTimecode(clampedElapsed);
+  }
+
+  function clearPlaybackClock() {
+      state.playbackStartTimestamp = null;
+      state.playbackDurationSeconds = 0;
+      updatePlaybackClockDisplay(null);
+  }
+
+  function shouldLockInteractions(elapsedSeconds, totalDuration) {
+      if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
+          return false;
+      }
+      const remaining = Math.max(totalDuration - elapsedSeconds, 0);
+      return remaining <= LOCKOUT_THRESHOLD_SECONDS;
+  }
+
   function startProgressAnimationFromPosition(durationSeconds, startPositionSeconds = 0, options = {}) {
       const resync = !!options.resync;
 
@@ -1176,17 +1245,23 @@ function createDimensionCards(explorerData) {
           markActivity();
       }
 
-      console.log(`🎬 Starting progress animation for ${durationSeconds}s from position ${startPositionSeconds}s - First half: browsing, Second half: locked in`);
+      console.log(`🎬 Starting progress animation for ${durationSeconds}s from position ${startPositionSeconds}s – lockout begins with ${LOCKOUT_THRESHOLD_SECONDS}s remaining`);
 
       const safeDuration = Math.max(durationSeconds, 0.001);
       const clampedStartPosition = Math.min(Math.max(startPositionSeconds, 0), safeDuration);
       const initialProgress = clampedStartPosition / safeDuration;
       const remainingDuration = Math.max((safeDuration - clampedStartPosition) * 1000, 0); // ms
 
+      state.playbackDurationSeconds = safeDuration;
+      state.playbackStartTimestamp = Date.now() - clampedStartPosition * 1000;
+
       renderProgressBar(initialProgress);
+      updatePlaybackClockDisplay(clampedStartPosition);
+
+      const initialShouldLock = shouldLockInteractions(clampedStartPosition, safeDuration);
 
       if (resync) {
-          if (initialProgress >= 0.5) {
+          if (initialShouldLock) {
               if (!midpointReached || !cardsLocked) {
                   triggerMidpointActions();
               }
@@ -1201,7 +1276,7 @@ function createDimensionCards(explorerData) {
               cardsInactiveTilted = false;
           }
       } else {
-          if (!midpointReached && initialProgress >= 0.5) {
+          if (!midpointReached && initialShouldLock) {
               triggerMidpointActions();
               midpointReached = true;
               cardsLocked = true;
@@ -1210,6 +1285,7 @@ function createDimensionCards(explorerData) {
 
       if (remainingDuration <= 0) {
           renderProgressBar(1);
+          updatePlaybackClockDisplay(safeDuration);
           return;
       }
 
@@ -1221,8 +1297,10 @@ function createDimensionCards(explorerData) {
           const progress = Math.min(initialProgress + elapsedProgress * (1 - initialProgress), 1);
 
           renderProgressBar(progress);
+          updatePlaybackClockDisplay();
 
-          if (!midpointReached && progress >= 0.5) {
+          const elapsedSeconds = progress * safeDuration;
+          if (!midpointReached && shouldLockInteractions(elapsedSeconds, safeDuration)) {
               triggerMidpointActions();
               midpointReached = true;
               cardsLocked = true;
@@ -1231,6 +1309,7 @@ function createDimensionCards(explorerData) {
           if (progress >= 1) {
               clearInterval(state.progressAnimation);
               state.progressAnimation = null;
+              updatePlaybackClockDisplay(safeDuration);
           }
       }, 100); // Update every 100ms for smooth animation
   }
@@ -1247,10 +1326,11 @@ function createDimensionCards(explorerData) {
       midpointReached = false;
       cardsLocked = false;
       console.log('🛑 Stopped progress animation');
+      clearPlaybackClock();
   }
 
   function triggerMidpointActions() {
-      console.log('🎯 MIDPOINT REACHED - Locking in selection');
+      console.log(`🎯 Locking in selection - ${LOCKOUT_THRESHOLD_SECONDS}s or less remaining`);
 
       // Clear inactivity timer - no longer needed in second half
       if (inactivityTimer) {
@@ -1315,7 +1395,7 @@ function createDimensionCards(explorerData) {
 
   // Smart SSE connection with health monitoring and reconnection
   function connectSSE() {
-    const eventsUrl = state.eventsEndpoint || (state.sessionId ? `/events/${state.sessionId}` : '/events');
+    const eventsUrl = state.eventsEndpoint || '/events';
     console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
 
     // Close existing connection if any
@@ -1366,19 +1446,30 @@ function createDimensionCards(explorerData) {
           }
         }
 
-        const data = raw;
-        console.log('📡 Event:', data.type, data);
+       const data = raw;
+       console.log('📡 Event:', data.type, data);
+
+        if (data.type === 'connected' && data.sessionId && !state.sessionId) {
+          state.sessionId = data.sessionId;
+          console.log(`🆔 SSE assigned session: ${state.sessionId}`);
+        }
 
         // Ignore events from other sessions
-        if (data.session && data.session.sessionId && data.session.sessionId !== state.sessionId) {
+        if (state.sessionId && data.session && data.session.sessionId && data.session.sessionId !== state.sessionId) {
           console.log(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${state.sessionId})`);
           return;
+        }
+
+        if (!state.sessionId && data.session && data.session.sessionId) {
+          state.sessionId = data.session.sessionId;
+          console.log(`🆔 Session discovered from payload: ${state.sessionId}`);
         }
 
         if (data.type === 'track_started') {
           const previousTrackId = state.latestCurrentTrack?.identifier || null;
           const currentTrackId = data.currentTrack?.identifier || null;
           const isSameTrack = previousTrackId && currentTrackId && previousTrackId === currentTrackId;
+          const inferredTrack = data.explorer?.nextTrack?.track?.identifier || data.explorer?.nextTrack?.identifier || null;
 
           const rawResolution = data.explorer?.resolution;
           const normalizedResolution = normalizeResolution(rawResolution);
@@ -1389,14 +1480,38 @@ function createDimensionCards(explorerData) {
           }
 
           if (!isSameTrack) {
-            state.manualNextTrackOverride = false;
-            const inferredTrack = data.explorer?.nextTrack?.track?.identifier || data.explorer?.nextTrack?.identifier || null;
-            state.selectedIdentifier = inferredTrack;
-            updateRadiusControlsUI();
+            if (state.manualNextTrackOverride) {
+              const selectionVisible = state.selectedIdentifier && explorerContainsTrack(data.explorer, state.selectedIdentifier);
+
+              if (selectionVisible) {
+                console.log('🎯 Manual override: selection present in explorer payload; keeping user choice pinned');
+              } else {
+                console.log('🎯 Manual override: selection not yet in payload; waiting before repainting to avoid flicker');
+              }
+            } else {
+              state.selectedIdentifier = inferredTrack;
+              console.log(`🔄 SSE: New track started, accepting server next track: ${inferredTrack?.substring(0,8)}`);
+              updateRadiusControlsUI();
+            }
+          } else {
+            // Same track still playing - preserve manual selection if active
+            if (state.manualNextTrackOverride && state.selectedIdentifier) {
+              console.log(`🎯 SSE: Same track playing, preserving manual selection: ${state.selectedIdentifier?.substring(0,8)}`);
+            }
           }
 
           console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
           console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
+
+          if (state.manualNextTrackOverride && currentTrackId && currentTrackId === state.selectedIdentifier) {
+            console.log('🎯 Manual override satisfied by playback; releasing override lock');
+            state.manualNextTrackOverride = false;
+            state.manualNextDirectionKey = null;
+            if (inferredTrack) {
+              state.selectedIdentifier = inferredTrack;
+              updateRadiusControlsUI();
+            }
+          }
 
           // New track started - ensure audio is connected
           if (connectionHealth.audio.status === 'error' || connectionHealth.audio.status === 'failed') {
@@ -2315,8 +2430,7 @@ function createDimensionCards(explorerData) {
 
   // Periodic status check (optional, for monitoring)
   setInterval(() => {
-    const statusUrl = state.sessionId ? `/status/${state.sessionId}` : '/status';
-    fetch(statusUrl).catch(() => {});
+    fetch('/status').catch(() => {});
   }, 30000);
 
 
@@ -2333,8 +2447,19 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     }
 
     // Use existing data if not provided (heartbeat/refresh case)
-    const md5ToSend = trackMd5 || state.latestExplorerData?.nextTrack?.track?.identifier || state.selectedIdentifier;
-    const dirToSend = direction || state.latestExplorerData?.nextTrack?.directionKey;
+    const manualOverrideActive = state.manualNextTrackOverride && state.selectedIdentifier;
+
+    const md5ToSend = trackMd5
+        || (manualOverrideActive ? state.selectedIdentifier : state.latestExplorerData?.nextTrack?.track?.identifier)
+        || state.selectedIdentifier;
+
+    let dirToSend = direction
+        || (manualOverrideActive ? state.manualNextDirectionKey : state.latestExplorerData?.nextTrack?.directionKey)
+        || null;
+
+    if (manualOverrideActive && !dirToSend) {
+        dirToSend = state.manualNextDirectionKey;
+    }
 
     if (!md5ToSend) {
         console.warn('⚠️ sendNextTrack: No track MD5 available, skipping');
@@ -2347,6 +2472,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
 
     if (source === 'user') {
         state.manualNextTrackOverride = true;
+        state.manualNextDirectionKey = dirToSend;
         if (state.nextTrackAnimationTimer) {
             clearTimeout(state.nextTrackAnimationTimer);
             state.nextTrackAnimationTimer = null;
@@ -2519,14 +2645,19 @@ async function fullResync() {
     console.log('🔄 Full resync triggered - calling /refresh-sse');
 
     try {
-        const endpoint = state.sessionId ? '/refresh-sse' : '/refresh-sse-simple';
-        const body = state.sessionId ? JSON.stringify({ sessionId: state.sessionId }) : '{}';
-
-        const response = await fetch(endpoint, {
+        const response = await fetch('/refresh-sse', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: body
+            body: state.sessionId ? JSON.stringify({ sessionId: state.sessionId }) : '{}'
         });
+
+        // Check for 404 - session no longer exists (server restart)
+        if (response.status === 404) {
+            console.error('🚨 Session not found on server - session was destroyed (likely server restart)');
+            console.log('🔄 Reloading page to get new session...');
+            window.location.reload();
+            return;
+        }
 
         const result = await response.json();
 
@@ -2536,6 +2667,14 @@ async function fullResync() {
             scheduleHeartbeat(60000);
         } else {
             console.warn('⚠️ Resync failed:', result.reason);
+
+            // If session doesn't exist, reload
+            if (result.error === 'Session not found' || result.error === 'Master session not found') {
+                console.log('🔄 Session lost, reloading page...');
+                window.location.reload();
+                return;
+            }
+
             scheduleHeartbeat(10000); // Retry sooner
         }
     } catch (error) {
@@ -2547,14 +2686,11 @@ async function fullResync() {
 // Request SSE refresh from the backend
 async function requestSSERefresh() {
     try {
-        console.log(`🔄 Sending SSE refresh request to backend for session: ${state.sessionId || 'master'}...`);
-
-        // Use the specific session refresh endpoint if we have a session ID
-        const endpoint = state.sessionId ? '/refresh-sse' : '/refresh-sse-simple';
+        console.log('🔄 Sending SSE refresh request to backend...');
         const requestBody = {
             reason: 'zombie_session_recovery',
             clientTime: Date.now(),
-            lastTrackStart: lastTrackStartTime
+            lastTrackStart: state.latestCurrentTrack?.startTime || null
         };
 
         // Add session ID if we have one
@@ -2562,7 +2698,7 @@ async function requestSSERefresh() {
             requestBody.sessionId = state.sessionId;
         }
 
-        const response = await fetch(endpoint, {
+        const response = await fetch('/refresh-sse', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -2673,9 +2809,6 @@ async function checkStreamEndpoint() {
         // Try refresh button as recovery
         console.log('🔄 Attempting SSE refresh as recovery...');
         requestSSERefresh();
-
-        // Also check if we can create a session
-        checkSessionStatus();
     }
 }
 

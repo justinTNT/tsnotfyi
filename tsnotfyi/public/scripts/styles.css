@@ -72,21 +72,40 @@ body {
     transition: width 0.1s;
 }
 
-#radiusControls {
+.diagnostic-bar {
     position: fixed;
-    bottom: 20px;
-    right: 132px;
+    bottom: 15px;
+    right: 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 12px;
+    border: 1px solid #0a0;
+    border-radius: 20px;
+    background: rgba(17, 17, 17, 0.85);
+    backdrop-filter: blur(6px);
+    z-index: 2000;
+}
+
+#radiusControls {
     display: flex;
     gap: 6px;
-    z-index: 2000;
+}
+
+.playback-clock {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: #9f9;
+    letter-spacing: 0.05em;
+    min-width: 52px;
+    text-align: right;
 }
 
 .radius-button {
     width: 32px;
     height: 32px;
-    border-radius: 6px;
-    border: 1px solid #0a0;
-    background: #050;
+    border-radius: 16px;
+    border: 0px solid #050;
     color: #0a0;
     display: flex;
     align-items: center;
@@ -97,15 +116,14 @@ body {
 }
 
 .radius-button:hover {
-    background: #062;
     color: #9f9;
     transform: translateY(-1px);
 }
 
 .radius-button.active {
-    background: #0a0;
+    background: #050;
     color: #020;
-    box-shadow: 0 0 10px rgba(0, 170, 0, 0.6);
+    box-shadow: 0 0 10px rgba(0, 60, 0, 0.6);
 }
 
 /* Stack size indicator positioned over card top-right corner */
