@@ -1473,9 +1473,10 @@ function createDimensionCards(explorerData) {
 
           const rawResolution = data.explorer?.resolution;
           const normalizedResolution = normalizeResolution(rawResolution);
-          if (normalizedResolution && normalizedResolution !== state.currentResolution) {
+          const resolutionChanged = normalizedResolution && normalizedResolution !== state.currentResolution;
+          if (resolutionChanged) {
             state.currentResolution = normalizedResolution;
-            console.log(`🔍 Explorer resolution now: ${state.currentResolution}`);
+            console.log(`🔍 Explorer resolution changed to: ${state.currentResolution}`);
             updateRadiusControlsUI();
           }
 
@@ -1494,8 +1495,16 @@ function createDimensionCards(explorerData) {
               updateRadiusControlsUI();
             }
           } else {
-            // Same track still playing - preserve manual selection if active
-            if (state.manualNextTrackOverride && state.selectedIdentifier) {
+            // Same track still playing
+            if (resolutionChanged) {
+              // Resolution changed - surrender previous selection and accept new explorer data
+              console.log(`🔍 Resolution changed for same track - surrendering selection, accepting fresh explorer data`);
+              state.manualNextTrackOverride = false;
+              state.manualNextDirectionKey = null;
+              state.selectedIdentifier = inferredTrack;
+              updateRadiusControlsUI();
+            } else if (state.manualNextTrackOverride && state.selectedIdentifier) {
+              // No resolution change - preserve manual selection
               console.log(`🎯 SSE: Same track playing, preserving manual selection: ${state.selectedIdentifier?.substring(0,8)}`);
             }
           }

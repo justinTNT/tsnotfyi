@@ -1,5 +1,10 @@
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
+
+// Load configuration
+const configPath = path.join(__dirname, 'tsnotfyi-config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
 class KDTreeNode {
     constructor(point, dimension, left = null, right = null) {
@@ -11,7 +16,7 @@ class KDTreeNode {
 }
 
 class MusicalKDTree {
-    constructor(dbPath = path.join(process.env.HOME, 'project/dev/manual.db')) {
+    constructor(dbPath = config.database.path.replace('~', process.env.HOME)) {
         this.dbPath = dbPath;
         this.db = null;
         this.root = null;
@@ -439,6 +444,50 @@ class MusicalKDTree {
         }
     }
 
+    // Compute minimum meaningful delta for a specific dimension on this track
+    // Uses binary search to find the delta that crosses the inner radius threshold
+    computeMinimumDeltaForDimension(currentTrack, dimension) {
+        if (!currentTrack.pca || !this.calibrationSettings.magnifying_glass?.primary_d) {
+            return 0; // No threshold if no PCA data
+        }
+
+        const pcaSettings = this.calibrationSettings.magnifying_glass.primary_d;
+        const innerRadius = pcaSettings.inner_radius;
+        const baseValue = currentTrack.features[dimension];
+
+        if (baseValue === undefined) return 0;
+
+        // Binary search for the delta that crosses inner radius
+        let low = 0;
+        let high = Math.abs(baseValue) * 2 + 10; // Generous upper bound
+        let minDelta = 0;
+
+        for (let iter = 0; iter < 15; iter++) { // 15 iterations gives ~0.003% precision
+            const testDelta = (low + high) / 2;
+
+            // Create virtual track with this delta
+            const virtualTrack = {
+                ...currentTrack,
+                features: { ...currentTrack.features, [dimension]: baseValue + testDelta },
+                pca: { ...currentTrack.pca }
+            };
+
+            // Calculate primary_d distance
+            const distance = this.calculatePCADistance(currentTrack, virtualTrack, 'primary_d');
+
+            if (distance >= innerRadius) {
+                // This delta crosses the threshold - try smaller
+                minDelta = testDelta;
+                high = testDelta;
+            } else {
+                // Delta too small - try larger
+                low = testDelta;
+            }
+        }
+
+        return minDelta;
+    }
+
     // Get directional candidates (Stage 1 of radial search algorithm)
     getDirectionalCandidates(currentTrackId, direction, weights = null, ignoreDimensions = []) {
         const currentTrack = this.tracks.find(t => t.identifier === currentTrackId);
@@ -466,10 +515,23 @@ class MusicalKDTree {
         const directionDim = this.getDirectionDimension(direction);
         const currentValue = currentTrack.features[directionDim];
 
+        // Compute minimum meaningful delta for this dimension on this track
+        const minimumDelta = this.computeMinimumDeltaForDimension(currentTrack, directionDim);
+
         const directionalCandidates = neighborhood.filter(result => {
             const candidateValue = result.track.features[directionDim];
-            return this.isInDirection(currentValue, candidateValue, direction);
+            const delta = Math.abs(candidateValue - currentValue);
+
+            // Must be in the right direction AND exceed minimum delta
+            const inDirection = this.isInDirection(currentValue, candidateValue, direction);
+            const exceedsThreshold = delta >= minimumDelta;
+
+            return inDirection && exceedsThreshold;
         });
+
+        if (minimumDelta > 0) {
+            console.log(`🎯 Directional filter: ${directionDim} minimum delta = ${minimumDelta.toFixed(3)} (excluded ${neighborhood.length - directionalCandidates.length} tracks too close)`);
+        }
 
         // Calculate D-minus-i similarity (all dimensions except navigation dimension)
         const activeDimensions = this.dimensions.filter(dim =>
@@ -490,7 +552,8 @@ class MusicalKDTree {
             candidates: candidates.slice(0, 20),
             totalAvailable: directionalCandidates.length,
             dimension: directionDim,
-            currentValue: currentValue
+            currentValue: currentValue,
+            minimumDelta: minimumDelta
         };
     }
 

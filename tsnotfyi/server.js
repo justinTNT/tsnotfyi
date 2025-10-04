@@ -7,9 +7,13 @@ const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
 const sqlite3 = require('sqlite3').verbose();
 
+// Load configuration
+const configPath = path.join(__dirname, 'tsnotfyi-config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
 const app = express();
-const port = 3001;
-const pidFile = path.join(__dirname, 'server.pid');
+const port = config.server.port;
+const pidFile = path.join(__dirname, config.server.pidFile);
 
 
 async function persistAudioSessionBinding(req, sessionId) {
@@ -119,7 +123,7 @@ function attachEphemeralCleanup(sessionId, session) {
 const radialSearch = new RadialSearchService();
 
 // Initialize database connection
-const dbPath = path.join(__dirname, '../results.db');
+const dbPath = config.database.path.replace('~', process.env.HOME);
 const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
   if (err) {
     console.error('Database connection failed:', err.message);
@@ -184,15 +188,15 @@ app.use(express.json());
 
 // Session middleware (infrastructure only - not changing behavior yet)
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'tsnotfyi-dev-secret-change-in-production',
+  secret: process.env.SESSION_SECRET || config.session.secret,
   resave: false,
   saveUninitialized: true, // Create session for every visitor
   cookie: {
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    maxAge: config.session.maxAge,
     httpOnly: true,
-    secure: false // Set to true in production with HTTPS
+    secure: config.session.cookieSecure
   },
-  name: 'tsnotfyi.sid' // Custom session cookie name
+  name: config.session.cookieName
 }));
 
 app.use(express.static('public'));

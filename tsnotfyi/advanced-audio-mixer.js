@@ -1,15 +1,20 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
+
+// Load configuration
+const configPath = path.join(__dirname, 'tsnotfyi-config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
 class AdvancedAudioMixer {
   constructor(options = {}) {
-    this.sampleRate = options.sampleRate || 44100;
-    this.channels = options.channels || 2;
-    this.bitRate = options.bitRate || 192;
+    this.sampleRate = options.sampleRate || config.audio.sampleRate;
+    this.channels = options.channels || config.audio.channels;
+    this.bitRate = options.bitRate || config.audio.bitRate;
 
     // Neighborhood mixdown cache - aggressive caching within current exploration area
     this.mixdownCache = new Map(); // trackPath -> { buffer, bpm, key, analysis, timestamp }
-    this.maxCacheSize = 20; // Cache up to 20 processed tracks
+    this.maxCacheSize = config.cache.maxMixdownCacheSize;
     this.cacheHits = 0;
     this.cacheMisses = 0;
 
@@ -35,7 +40,7 @@ class AdvancedAudioMixer {
       isStreaming: false,
       isCrossfading: false,
       crossfadePosition: 0,
-      crossfadeDuration: 2.5, // seconds - clean cosine curve
+      crossfadeDuration: config.audio.crossfadeDuration,
 
       // Stream control
       streamTimer: null,
@@ -44,7 +49,7 @@ class AdvancedAudioMixer {
       streamingStartTime: null, // Wall-clock time when streaming actually started
 
       // Audio processing
-      silenceThreshold: 0.005,
+      silenceThreshold: config.audio.silenceThreshold,
       pitchShiftRatio: 1.0,
       tempoAdjustment: 1.0,
 
@@ -70,7 +75,7 @@ class AdvancedAudioMixer {
   calculateStreamingParams() {
     // Calculate streaming parameters for smooth playback
     this.engine.bytesPerSecond = this.sampleRate * this.channels * 2; // 16-bit PCM
-    this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond / 25); // ~40ms chunks
+    this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond / config.audio.chunkDivisor); // ~40ms chunks
 
     console.log(`📊 Streaming: ${this.engine.chunkSize} bytes per chunk at ${this.sampleRate}Hz`);
   }
@@ -521,6 +526,11 @@ class AdvancedAudioMixer {
   streamTick() {
     if (!this.engine.currentTrack.buffer || !this.onData) {
       return;
+    }
+
+    // Skip processing if no clients are listening (avoid zombie streaming)
+    if (this.hasClients && !this.hasClients()) {
+      return; // Nobody listening - don't waste CPU
     }
 
     // Apply gradual tempo adjustment if enabled

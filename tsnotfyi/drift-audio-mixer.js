@@ -1,7 +1,12 @@
 const fs = require('fs');
 const { spawn } = require('child_process');
+const path = require('path');
 const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
+
+// Load configuration
+const configPath = path.join(__dirname, 'tsnotfyi-config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
 const CROSSFADE_GUARD_MS = 6000;
 
@@ -29,6 +34,9 @@ class DriftAudioMixer {
     this.seenArtists = new Set(); // Track artists from played tracks
     this.seenAlbums = new Set(); // Track albums from played tracks
 
+    // Session-level explorer data cache for layered search
+    this.explorerDataCache = new Map(); // key: 'trackMd5_resolution' -> explorerData
+
     // Track exposure: tracks the user has actually SEEN (displayed on top of stacks or selected)
     this.seenTracks = new Set(); // Track IDs that were displayed (top of stack OR selected as next track)
     this.seenTrackArtists = new Set(); // Artists from seen tracks
@@ -42,9 +50,9 @@ class DriftAudioMixer {
     this.explorerResolution = 'magnifying_glass';
 
     // Audio configuration
-    this.sampleRate = 44100;
-    this.channels = 2;
-    this.bitRate = 192; // kbps
+    this.sampleRate = config.audio.sampleRate;
+    this.channels = config.audio.channels;
+    this.bitRate = config.audio.bitRate;
 
     // Initialize advanced audio mixer
     this.audioMixer = new AdvancedAudioMixer({
@@ -56,6 +64,11 @@ class DriftAudioMixer {
     // Set up mixer callbacks
     this.audioMixer.onData = (chunk) => {
       this.broadcastToClients(chunk);
+    };
+
+    // Provide client count checker to avoid streaming to nobody
+    this.audioMixer.hasClients = () => {
+      return this.clients.size > 0;
     };
 
     this.audioMixer.onTrackStart = (reason) => {
@@ -734,9 +747,9 @@ class DriftAudioMixer {
 
     const ffmpegArgs = [
       '-f', 'lavfi',
-      '-i', 'anoisesrc=color=brown:sample_rate=44100:duration=3600', // 1 hour of brown noise
-      '-ac', '2',
-      '-ar', '44100',
+      '-i', `anoisesrc=color=brown:sample_rate=${config.audio.sampleRate}:duration=3600`, // 1 hour of brown noise
+      '-ac', config.audio.channels.toString(),
+      '-ar', config.audio.sampleRate.toString(),
       '-b:a', '32k',
       '-filter:a', 'volume=0.05,highpass=f=100,lowpass=f=4000',
       '-f', 'mp3',
@@ -1334,6 +1347,17 @@ class DriftAudioMixer {
       throw new Error('No current track for explorer data');
     }
 
+    // Check session-level cache first
+    const resolution = this.explorerResolution || 'magnifying_glass';
+    const cacheKey = `${this.currentTrack.identifier}_${resolution}`;
+
+    if (this.explorerDataCache.has(cacheKey)) {
+      console.log(`🚀 Explorer cache HIT: ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (${this.explorerDataCache.size} cached)`);
+      return this.explorerDataCache.get(cacheKey);
+    }
+
+    console.log(`📊 Computing explorer data for ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (cache miss)`);
+
     const currentTrackData = this.radialSearch.kdTree.getTrack(this.currentTrack.identifier);
     if (!currentTrackData || !currentTrackData.pca) {
       // Fallback to legacy exploration if no PCA data
@@ -1485,6 +1509,10 @@ class DriftAudioMixer {
     explorerData.diversityMetrics = this.calculateExplorerDiversityMetrics(explorerData.directions, totalNeighborhoodSize);
     explorerData.nextTrack = await this.selectNextTrackFromExplorer(explorerData);
     explorerData.resolution = this.explorerResolution;
+
+    // Cache the computed explorer data for this session
+    this.explorerDataCache.set(cacheKey, explorerData);
+    console.log(`💾 Cached explorer data for ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (cache size: ${this.explorerDataCache.size})`);
 
     return explorerData;
   }
