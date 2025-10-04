@@ -17,7 +17,8 @@ const state = {
     baseDirectionKey: null,
     streamUrl: '/stream',
     eventsEndpoint: '/events',
-     streamUrlBase: '/stream',
+    streamUrlBase: '/stream',
+    eventsEndpointBase: '/events',
     currentResolution: 'magnifying',
     manualNextTrackOverride: false,
     nextTrackAnimationTimer: null,
@@ -27,14 +28,17 @@ const state = {
     lastTrackUpdateTs: 0,
     pendingInitialTrackTimer: null,
     pendingResyncCheckTimer: null,
+    pendingAudioConfirmTimer: null,
     creatingNewSession: false,
     remainingCounts: {}
   };
 window.state = state;
 
 (function hydrateStateFromLocation() {
-  state.streamUrl = '/stream';
-  state.eventsEndpoint = '/events';
+  state.streamUrlBase = '/stream';
+  state.eventsEndpointBase = '/events';
+  state.streamUrl = state.streamUrlBase;
+  state.eventsEndpoint = state.eventsEndpointBase;
   window.streamUrl = state.streamUrl;
   window.eventsUrl = state.eventsEndpoint;
 })();
@@ -86,6 +90,44 @@ function normalizeResolution(resolution) {
     return value;
   }
   return value;
+}
+
+function composeStreamEndpoint(sessionId, cacheBust = false) {
+  const base = state.streamUrlBase || '/stream';
+  const params = [];
+  if (sessionId) {
+    params.push(`session=${encodeURIComponent(sessionId)}`);
+  }
+  if (cacheBust !== false) {
+    const value = cacheBust === true ? Date.now() : cacheBust;
+    params.push(`t=${value}`);
+  }
+  if (!params.length) {
+    return base;
+  }
+  return `${base}?${params.join('&')}`;
+}
+
+function composeEventsEndpoint(sessionId) {
+  const base = state.eventsEndpointBase || '/events';
+  if (!sessionId) {
+    return base;
+  }
+  return `${base}?session=${encodeURIComponent(sessionId)}`;
+}
+
+function syncStreamEndpoint(sessionId, { cacheBust = false } = {}) {
+  const url = composeStreamEndpoint(sessionId, cacheBust);
+  state.streamUrl = url;
+  window.streamUrl = url;
+  return url;
+}
+
+function syncEventsEndpoint(sessionId) {
+  const url = composeEventsEndpoint(sessionId);
+  state.eventsEndpoint = url;
+  window.eventsUrl = url;
+  return url;
 }
 
 function updateRadiusControlsUI() {
@@ -340,11 +382,15 @@ function createDimensionCards(explorerData, options = {}) {
 
       const nextTrackId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
       const selectionStillPresent = state.selectedIdentifier ? explorerContainsTrack(explorerData, state.selectedIdentifier) : false;
+      const currentTrackUnchanged = explorerData.currentTrack?.identifier === state.latestCurrentTrack?.identifier;
+      const manualOverrideHydrated = Boolean(state.manualNextTrackOverride && currentTrackUnchanged && selectionStillPresent);
+      const manualOverridePending = Boolean(state.manualNextTrackOverride && currentTrackUnchanged && !selectionStillPresent);
 
       const overridePinnedButMissing = Boolean(
           state.manualNextTrackOverride &&
           state.selectedIdentifier &&
-          !selectionStillPresent
+          !selectionStillPresent &&
+          !currentTrackUnchanged
       );
 
       if (overridePinnedButMissing) {
@@ -361,7 +407,17 @@ function createDimensionCards(explorerData, options = {}) {
           state.selectedIdentifier = fallbackIdentifier;
       }
 
-      const manualOverrideActive = state.manualNextTrackOverride && selectionStillPresent;
+      if (manualOverridePending) {
+          console.log('🎯 Manual override pending hydration; deferring explorer refresh');
+          if (state.nextTrackAnimationTimer) {
+              clearTimeout(state.nextTrackAnimationTimer);
+              state.nextTrackAnimationTimer = null;
+          }
+          state.usingOppositeDirection = false;
+          return;
+      }
+
+      const manualOverrideActive = manualOverrideHydrated;
 
       if (manualOverrideActive && previousNext && previousNextId) {
           console.log('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
@@ -375,8 +431,12 @@ function createDimensionCards(explorerData, options = {}) {
               clearTimeout(state.nextTrackAnimationTimer);
               state.nextTrackAnimationTimer = null;
           }
+          state.usingOppositeDirection = false;
           return;
       }
+
+      // Reset reverse state when rendering fresh explorer data
+      state.usingOppositeDirection = false;
 
       if (!skipExitAnimation) {
           const exitingCards = container.querySelectorAll('.dimension-card');
@@ -413,8 +473,23 @@ function createDimensionCards(explorerData, options = {}) {
                   };
                   card.addEventListener('transitionend', onTransitionEnd);
                   card.addEventListener('animationend', onTransitionEnd);
+
+                  const computed = window.getComputedStyle(card);
+                  const baseTransform = card.style.transform || computed.transform || '';
+                  const exitTransform = baseTransform && baseTransform !== 'none'
+                      ? `${baseTransform} translateZ(-1200px) scale(0.2)`
+                      : 'translateZ(-1200px) scale(0.2)';
+
                   card.classList.add('card-exit');
                   card.style.pointerEvents = 'none';
+                  card.style.willChange = 'transform, opacity';
+                  card.style.transition = 'transform 0.6s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.45s ease';
+                  card.style.opacity = computed.opacity || '1';
+
+                  requestAnimationFrame(() => {
+                      card.style.opacity = '0';
+                      card.style.transform = exitTransform;
+                  });
               });
               return;
           }
@@ -634,91 +709,6 @@ function createDimensionCards(explorerData, options = {}) {
           refreshCardsWithNewSelection();
       }, 100);
   }
-
-  function redrawDimensionCardsWithNewNext(newNextDirectionKey) {
-      if (!state.latestExplorerData) return;
-
-      // Update the stored explorer data to track the new next direction
-      const stack = state.latestExplorerData.directions[newNextDirectionKey];
-      state.latestExplorerData.nextTrack = {
-          directionKey: newNextDirectionKey,
-          direction:    stack.direction,
-          track:        stack.sampleTracks[0]
-      };
-
-      // Remove ALL existing track detail cards (both old next track stacks and any other detail cards)
-      document.querySelectorAll('.track-detail-card').forEach(card => card.remove());
-
-      // Recreate the card stack for the new next direction immediately
-      const container = document.getElementById('dimensionCards');
-      const directions = Object.entries(state.latestExplorerData.directions).map(([key, directionInfo]) => ({
-          key: key,
-          name: directionInfo.direction || key,
-          trackCount: directionInfo.trackCount,
-          description: directionInfo.description,
-          diversityScore: directionInfo.diversityScore,
-          sampleTracks: directionInfo.sampleTracks || []
-      }));
-
-      const targetDimension = directions.find(d => d.key === newNextDirectionKey);
-      if (targetDimension) {
-          const dimensionIndex = directions.findIndex(d => d.key === newNextDirectionKey);
-          // Create immediately without animation delay
-          const sampleTracks = targetDimension.sampleTracks || [];
-          // Use global selection state, default to first track if none selected
-          const selectedTrackIndex = state.selectedIdentifier
-              ? sampleTracks.findIndex(trackObj => {
-                  const track = trackObj.track || trackObj;
-                  return track.identifier === state.selectedIdentifier;
-                })
-              : 0;
-          const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
-
-          sampleTracks.forEach((trackObj, trackIndex) => {
-              const track = trackObj.track || trackObj;
-              const isSelectedTrack = trackIndex === finalSelectedTrackIndex;
-              const card = createTrackDetailCard(targetDimension, track, dimensionIndex, directions.length, isSelectedTrack, trackIndex, sampleTracks.length, swapStackContents);
-              container.appendChild(card);
-              // Make visible immediately - no delay
-              card.classList.add('visible');
-          });
-      }
-  }
-
-  function createNextTrackCardStack(direction, index, total, nextTrackData, container) {
-      // Get all sample tracks for this direction
-      direction.sampleTracks = (direction.sampleTracks || []).map(entry => entry.track || entry);
-      const sampleTracks = direction.sampleTracks;
-      // Use global selection state, default to first track if none selected
-      const selectedTrackIndex = state.selectedIdentifier
-          ? sampleTracks.findIndex(trackObj => {
-              const track = trackObj.track || trackObj;
-              return track.identifier === state.selectedIdentifier;
-            })
-          : 0;
-      const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
-
-      const directionKey = direction.key || nextTrackData?.directionKey || direction.directionKey || `direction_${index}`;
-      if (!state.remainingCounts) {
-          state.remainingCounts = {};
-      }
-      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - finalSelectedTrackIndex - 1);
-
-      // Create selected card (front, fully visible)
-      const selectedTrack = sampleTracks[finalSelectedTrackIndex];
-      const selectedCard = createTrackDetailCard(direction, selectedTrack.track || selectedTrack, index, total, true, 0, sampleTracks.length, swapStackContents);
-      container.appendChild(selectedCard);
-      selectedCard.dataset.trackIndex = String(finalSelectedTrackIndex);
-      selectedCard.dataset.totalTracks = String(sampleTracks.length);
-
-      // Stack depth indication is now handled via CSS pseudo-elements on the main card
-
-      // Stagger animation for selected card
-      setTimeout(() => {
-          selectedCard.classList.add('visible');
-      }, index * 150 + 1000);
-  }
-
 
 
   // Swap the roles: make a direction the new next track stack, demote current next track to regular direction
@@ -1570,7 +1560,7 @@ function createDimensionCards(explorerData, options = {}) {
 
   // Smart SSE connection with health monitoring and reconnection
   function connectSSE() {
-    const eventsUrl = state.eventsEndpoint || '/events';
+    const eventsUrl = syncEventsEndpoint(state.sessionId);
     console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
 
     // Close existing connection if any
@@ -1661,9 +1651,18 @@ eventSource.onopen = () => {
        const data = raw;
        console.log('📡 Event:', data.type, data);
 
-        if (data.type === 'connected' && data.sessionId && !state.sessionId) {
+        if (data.type === 'connected' && data.sessionId) {
+          const previousSession = state.sessionId;
           state.sessionId = data.sessionId;
-          console.log(`🆔 SSE assigned session: ${state.sessionId}`);
+          if (previousSession && previousSession !== data.sessionId) {
+            console.warn(`🆔 SSE reported session change ${previousSession} → ${data.sessionId}`);
+          } else if (!previousSession) {
+            console.log(`🆔 SSE assigned session: ${state.sessionId}`);
+          }
+          syncEventsEndpoint(state.sessionId);
+          if (!state.streamUrl || !state.streamUrl.includes('session=')) {
+            syncStreamEndpoint(state.sessionId);
+          }
         }
 
         // Ignore events from other sessions
@@ -1689,6 +1688,29 @@ eventSource.onopen = () => {
           if (resolutionChanged) {
             state.currentResolution = normalizedResolution;
             console.log(`🔍 Explorer resolution changed to: ${state.currentResolution}`);
+            updateRadiusControlsUI();
+          }
+
+          const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
+          const manualConflict = state.manualNextTrackOverride && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId;
+
+          if (manualConflict) {
+            console.warn('🛰️ ACTION override-diverged', {
+              manualSelection: manualSelectionId,
+              playing: currentTrackId,
+              manualDirection: state.manualNextDirectionKey,
+              serverSuggestedNext: inferredTrack || null
+            });
+
+            state.manualNextTrackOverride = false;
+            state.manualNextDirectionKey = null;
+            if (inferredTrack) {
+              state.selectedIdentifier = inferredTrack;
+            } else if (currentTrackId) {
+              state.selectedIdentifier = currentTrackId;
+            } else {
+              state.selectedIdentifier = null;
+            }
             updateRadiusControlsUI();
           }
 
@@ -1893,53 +1915,6 @@ eventSource.onopen = () => {
       };
   }
 
-// Cycle through stack contents for back card clicks
-  function cycleStackContents(directionKey, currentTrackIndex) {
-      const stack = state.latestExplorerData.directions[directionKey];
-      if (!stack) return;
-
-      const sampleTracks = stack.sampleTracks || [];
-      if (sampleTracks.length <= 1) return;
-
-      // 🃏 FOCUSED DEBUG: Check this specific stack during cycling
-      console.log(`🃏 CYCLE: Checking ${directionKey} stack during cycling...`);
-      const stackAnalysis = { directions: { [directionKey]: { sampleTracks } } };
-      performDuplicateAnalysis(stackAnalysis, `cycling-${directionKey}`);
-
-      // Move to next track in stack, wrapping around
-      const nextIndex = (currentTrackIndex + 1) % sampleTracks.length;
-      const nextTrack = sampleTracks[nextIndex].track || sampleTracks[nextIndex];
-
-      console.log(`🔄 Cycling stack: from index ${currentTrackIndex} to ${nextIndex}, track: ${nextTrack.title}`);
-
-      // Update global track index
-      state.stackIndex = nextIndex;
-
-      // Update selection
-      state.selectedIdentifier = nextTrack.identifier;
-      if (!state.remainingCounts) {
-          state.remainingCounts = {};
-      }
-      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - nextIndex - 1);
-
-      const centerCard = document.querySelector('.dimension-card.next-track.selected')
-          || document.querySelector('.dimension-card.next-track');
-      if (centerCard) {
-          centerCard.dataset.trackMd5 = nextTrack.identifier;
-          centerCard.dataset.trackIndex = nextIndex;
-          centerCard.dataset.totalTracks = String(sampleTracks.length);
-          const directionData = state.latestExplorerData?.directions?.[directionKey];
-          if (directionData && typeof updateStackSizeIndicator === 'function') {
-              updateStackSizeIndicator(directionData, centerCard, nextIndex);
-          }
-      }
-
-      // Update server
-      sendNextTrack(nextTrack.identifier, directionKey, 'user');
-
-      // Refresh UI
-      refreshCardsWithNewSelection();
-  }
 
   // Swap stack contents between current and opposite direction
   function swapStackContents(currentDimensionKey, oppositeDimensionKey) {
@@ -1959,6 +1934,8 @@ eventSource.onopen = () => {
       redrawNextTrackStack(baseKey);
       console.log(`🔄 Finished calling redrawNextTrackStack`);
   }
+
+  window.swapStackContents = swapStackContents;
 
   // Redraw the next track stack respecting the reverse flag
   function redrawNextTrackStack(specifiedDimensionKey = null) {
@@ -3055,6 +3032,7 @@ async function createNewJourneySession(reason = 'unknown') {
     }
 
     state.creatingNewSession = true;
+    const previousSessionId = state.sessionId;
 
     try {
         console.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
@@ -3080,15 +3058,16 @@ async function createNewJourneySession(reason = 'unknown') {
         const result = await response.json();
 
         const streamBase = result.streamUrl || '/stream';
+        const eventsBase = result.eventsUrl || '/events';
+        const newSessionId = result.sessionId || null;
         const cacheBuster = Date.now();
-        const newStreamUrl = `${streamBase}?session=${encodeURIComponent(result.sessionId || '')}&t=${cacheBuster}`;
 
-        state.sessionId = result.sessionId || null;
-        state.streamUrl = newStreamUrl;
         state.streamUrlBase = streamBase;
-        state.eventsEndpoint = result.eventsUrl || '/events';
-        window.streamUrl = state.streamUrl;
-        window.eventsUrl = state.eventsEndpoint;
+        state.eventsEndpointBase = eventsBase;
+        state.sessionId = newSessionId;
+
+        const newStreamUrl = syncStreamEndpoint(newSessionId, { cacheBust: cacheBuster });
+        syncEventsEndpoint(newSessionId);
 
         if (streamElement) {
             streamElement.src = newStreamUrl;
@@ -3133,6 +3112,68 @@ async function createNewJourneySession(reason = 'unknown') {
             });
         }
 
+        if (state.pendingAudioConfirmTimer) {
+            clearTimeout(state.pendingAudioConfirmTimer);
+            state.pendingAudioConfirmTimer = null;
+        }
+
+        if (state.sessionId) {
+            state.pendingAudioConfirmTimer = setTimeout(async () => {
+                state.pendingAudioConfirmTimer = null;
+                try {
+                    const snapshot = await fetch('/sessions/now-playing', { cache: 'no-store' });
+                    if (!snapshot.ok) {
+                        throw new Error(`HTTP ${snapshot.status}`);
+                    }
+
+                    const payload = await snapshot.json();
+                    const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+                    const activeNew = sessions.find(entry => entry.sessionId === state.sessionId);
+                    const activePrev = previousSessionId ? sessions.find(entry => entry.sessionId === previousSessionId) : null;
+
+                    const newHasClient = activeNew && Number(activeNew.clients) > 0;
+                    const prevHasClient = activePrev && Number(activePrev.clients) > 0;
+
+                    if (!newHasClient && prevHasClient) {
+                        console.warn('🛰️ ACTION session-audio-revert: new session missing audio clients, reverting to previous active stream', {
+                            newSession: state.sessionId,
+                            previousSession: previousSessionId,
+                            previousClients: activePrev.clients
+                        });
+
+                        state.sessionId = previousSessionId;
+                        syncEventsEndpoint(previousSessionId);
+                        const restoredStreamUrl = syncStreamEndpoint(previousSessionId, { cacheBust: Date.now() });
+
+                        if (connectionHealth.currentEventSource) {
+                            connectionHealth.currentEventSource.close();
+                            connectionHealth.currentEventSource = null;
+                        }
+                        connectionHealth.sse.status = 'reconnecting';
+                        updateConnectionHealthUI();
+                        connectSSE();
+
+                        if (elements.audio) {
+                            elements.audio.src = restoredStreamUrl;
+                            elements.audio.load();
+                            elements.audio.play().catch(err => {
+                                console.error('🎵 Audio play failed during session revert:', err);
+                            });
+                        }
+
+                        scheduleHeartbeat(5000);
+                    } else if (newHasClient) {
+                        console.log('🛰️ ACTION session-audio-confirmed: audio client attached to new session', {
+                            session: state.sessionId,
+                            clients: activeNew.clients
+                        });
+                    }
+                } catch (error) {
+                    console.error('❌ session audio confirmation failed:', error);
+                }
+            }, 4000);
+        }
+
         scheduleHeartbeat(5000);
     } catch (error) {
         console.error('❌ Failed to create new journey session:', error);
@@ -3140,6 +3181,55 @@ async function createNewJourneySession(reason = 'unknown') {
     } finally {
         state.creatingNewSession = false;
     }
+}
+
+async function verifyExistingSessionOrRestart(reason = 'unknown') {
+    if (!state.sessionId) {
+        await createNewJourneySession(reason);
+        return;
+    }
+
+    try {
+        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+        const entry = sessions.find(session => session.sessionId === state.sessionId);
+
+        if (entry && entry.md5) {
+            const clientCount = Number(entry.clients) || 0;
+            const elapsedMs = Number.isFinite(entry.elapsedMs) ? entry.elapsedMs : null;
+            const durationMs = Number.isFinite(entry.durationMs) ? entry.durationMs : null;
+            const stillPlaying = clientCount > 0 || (
+                elapsedMs !== null && durationMs !== null && elapsedMs <= durationMs + 15000
+            );
+
+            if (stillPlaying) {
+                console.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting session');
+
+                if (connectionHealth.currentEventSource) {
+                    connectionHealth.currentEventSource.close();
+                    connectionHealth.currentEventSource = null;
+                }
+
+                connectionHealth.sse.status = 'reconnecting';
+                updateConnectionHealthUI();
+                syncStreamEndpoint(state.sessionId);
+                syncEventsEndpoint(state.sessionId);
+                connectSSE();
+
+                scheduleHeartbeat(10000);
+                return;
+            }
+        }
+    } catch (error) {
+        console.error('❌ verifyExistingSessionOrRestart failed:', error);
+    }
+
+    await createNewJourneySession(reason);
 }
 
 async function requestSSERefresh() {
@@ -3173,7 +3263,20 @@ async function requestSSERefresh() {
             console.log('✅ SSE refresh request successful:', result);
 
             if (result.ok === false) {
-                console.warn(`🔄 SSE refresh reported issue: ${result.reason || 'unknown'}`);
+                const reason = result.reason || 'unknown';
+                console.warn(`🔄 SSE refresh reported issue: ${reason}`);
+
+                if (reason === 'inactive') {
+                    console.warn('🔄 SSE refresh indicates inactive session; verifying stream state');
+                    if (result.streamAlive === false) {
+                        await createNewJourneySession('refresh_inactive');
+                    } else {
+                        await verifyExistingSessionOrRestart('refresh_inactive');
+                    }
+                } else if (reason === 'no_track') {
+                    console.warn('🔄 SSE refresh returned no track; scheduling quick heartbeat');
+                    scheduleHeartbeat(5000);
+                }
                 return;
             }
 

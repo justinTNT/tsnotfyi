@@ -215,7 +215,23 @@
           ? totalTracksFromDataset
           : (sampleTracks.length || tracksToCount.length || 0);
 
-      let remainingCount = Math.max(0, totalTracks - (Number.isFinite(matchedIndex) ? matchedIndex + 1 : 1));
+      if (!window.state.remainingCounts) {
+          window.state.remainingCounts = {};
+      }
+
+      let remainingCount;
+      if (Number.isFinite(matchedIndex)) {
+          remainingCount = Math.max(0, totalTracks - matchedIndex - 1);
+      } else if (window.state.remainingCounts.hasOwnProperty(directionKey)) {
+          remainingCount = Math.max(0, Number(window.state.remainingCounts[directionKey]));
+      } else if (window.state.stackIndex && directionKey === window.state.latestExplorerData?.nextTrack?.directionKey) {
+          const idx = Number(window.state.stackIndex);
+          remainingCount = Math.max(0, totalTracks - idx - 1);
+      } else {
+          remainingCount = Math.max(0, totalTracks - 1);
+      }
+
+      window.state.remainingCounts[directionKey] = remainingCount;
 
       if (!Number.isFinite(matchedIndex)) {
           const stored = window.state?.remainingCounts ? window.state.remainingCounts[directionKey] : undefined;
@@ -511,7 +527,55 @@
       });
   }
 
+  // Cycle through stack contents for back card clicks
+  function cycleStackContents(directionKey, currentTrackIndex) {
+      const stack = state.latestExplorerData.directions[directionKey];
+      if (!stack) return;
+
+      const sampleTracks = stack.sampleTracks || [];
+      if (sampleTracks.length <= 1) return;
+
+      // 🃏 FOCUSED DEBUG: Check this specific stack during cycling
+      console.log(`🃏 CYCLE: Checking ${directionKey} stack during cycling...`);
+      const stackAnalysis = { directions: { [directionKey]: { sampleTracks } } };
+      performDuplicateAnalysis(stackAnalysis, `cycling-${directionKey}`);
+
+      // Move to next track in stack, wrapping around
+      const nextIndex = (currentTrackIndex + 1) % sampleTracks.length;
+      const nextTrack = sampleTracks[nextIndex].track || sampleTracks[nextIndex];
+
+      console.log(`🔄 Cycling stack: from index ${currentTrackIndex} to ${nextIndex}, track: ${nextTrack.title}`);
+
+      // Update global track index
+      state.stackIndex = nextIndex;
+
+      // Update selection
+      state.selectedIdentifier = nextTrack.identifier;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - nextIndex - 1);
+
+      const centerCard = document.querySelector('.dimension-card.next-track.selected')
+          || document.querySelector('.dimension-card.next-track');
+      if (centerCard) {
+          centerCard.dataset.trackMd5 = nextTrack.identifier;
+          centerCard.dataset.trackIndex = nextIndex;
+          centerCard.dataset.totalTracks = String(sampleTracks.length);
+          const directionData = state.latestExplorerData?.directions?.[directionKey];
+          if (directionData && typeof updateStackSizeIndicator === 'function') {
+              updateStackSizeIndicator(directionData, centerCard, nextIndex);
+          }
+      }
+
+      // Update server
+      sendNextTrack(nextTrack.identifier, directionKey, 'user');
+
+      // Refresh UI
+      refreshCardsWithNewSelection();
+  }
   function createTrackDetailCard(direction, track, positionIndex, totalDimensions, isSelected, trackIndex, totalTracks, swapStackContents) {
+      const swapFn = typeof swapStackContents === 'function' ? swapStackContents : (a, b) => {};
       const card = document.createElement('div');
       let cardClasses = 'dimension-card track-detail-card next-track';
 
@@ -636,7 +700,7 @@
                           };
 
                           // Swap stack contents immediately without animation
-                          swapStackContents(direction.key, oppositeKey);
+                          swapFn(direction.key, oppositeKey);
                       }
                   } else {
                       console.warn(`Opposite direction not available for ${direction.key}`);
@@ -647,6 +711,163 @@
 
       return card;
   }
+
+  function redrawDimensionCardsWithNewNext(newNextDirectionKey) {
+      if (!state.latestExplorerData) return;
+
+      // Update the stored explorer data to track the new next direction
+      const stack = state.latestExplorerData.directions[newNextDirectionKey];
+      state.latestExplorerData.nextTrack = {
+          directionKey: newNextDirectionKey,
+          direction:    stack.direction,
+          track:        stack.sampleTracks[0]
+      };
+
+      // Remove ALL existing track detail cards (both old next track stacks and any other detail cards)
+      document.querySelectorAll('.track-detail-card').forEach(card => card.remove());
+
+      // Recreate the card stack for the new next direction immediately
+      const container = document.getElementById('dimensionCards');
+      const directions = Object.entries(state.latestExplorerData.directions).map(([key, directionInfo]) => ({
+          key: key,
+          name: directionInfo.direction || key,
+          trackCount: directionInfo.trackCount,
+          description: directionInfo.description,
+          diversityScore: directionInfo.diversityScore,
+          sampleTracks: directionInfo.sampleTracks || []
+      }));
+
+      const swapFn = typeof window.swapStackContents === 'function' ? window.swapStackContents : () => {};
+
+      const targetDimension = directions.find(d => d.key === newNextDirectionKey);
+      if (targetDimension) {
+          const dimensionIndex = directions.findIndex(d => d.key === newNextDirectionKey);
+          // Create immediately without animation delay
+          const sampleTracks = (targetDimension.sampleTracks || []).map(entry => entry.track || entry);
+          if (sampleTracks.length === 0) {
+              console.warn(`🔄 redrawDimensionCardsWithNewNext: no sample tracks for ${newNextDirectionKey}`);
+              return;
+          }
+
+          // Use global selection state, default to first track if none selected
+          const selectedTrackIndex = state.selectedIdentifier
+              ? sampleTracks.findIndex(trackObj => trackObj.identifier === state.selectedIdentifier)
+              : 0;
+          const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
+          const selectedTrack = sampleTracks[finalSelectedTrackIndex] || sampleTracks[0];
+
+          // Update global selection bookkeeping for future stack cycles
+          state.stackIndex = finalSelectedTrackIndex;
+          state.selectedIdentifier = selectedTrack?.identifier || state.selectedIdentifier;
+          if (!state.remainingCounts) {
+              state.remainingCounts = {};
+          }
+          state.remainingCounts[newNextDirectionKey] = Math.max(0, sampleTracks.length - finalSelectedTrackIndex - 1);
+
+          // Prefer reusing an existing next-track card if one is already mounted
+          const existingCard = document.querySelector('.dimension-card.next-track');
+          if (existingCard) {
+              // Remove any stray duplicates of the next-track card
+              const duplicates = document.querySelectorAll('.dimension-card.next-track');
+              duplicates.forEach((dup, idx) => {
+                  if (dup !== existingCard) {
+                      dup.remove();
+                  }
+              });
+
+              existingCard.classList.add('next-track');
+              existingCard.classList.remove('animating-to-center');
+              existingCard.dataset.directionKey = newNextDirectionKey;
+              existingCard.dataset.trackMd5 = selectedTrack?.identifier || '';
+              existingCard.dataset.clockPosition = existingCard.dataset.clockPosition || '6';
+              existingCard.style.left = '50%';
+              existingCard.style.top = '45%';
+              existingCard.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
+              existingCard.style.zIndex = '100';
+
+              updateCardWithTrackDetails(existingCard, selectedTrack, {
+                  ...targetDimension,
+                  key: newNextDirectionKey,
+                  sampleTracks
+              }, true, swapFn);
+
+              existingCard.dataset.trackIndex = String(finalSelectedTrackIndex);
+              existingCard.dataset.totalTracks = String(sampleTracks.length);
+
+              const directionData = state.latestExplorerData?.directions?.[newNextDirectionKey];
+              if (directionData && typeof updateStackSizeIndicator === 'function') {
+                  updateStackSizeIndicator(directionData, existingCard, finalSelectedTrackIndex);
+              }
+
+              return;
+          }
+
+          const card = createTrackDetailCard(
+              targetDimension,
+              selectedTrack,
+              dimensionIndex,
+              directions.length,
+              true,
+              finalSelectedTrackIndex,
+              sampleTracks.length,
+              swapFn
+          );
+          card.classList.add('next-track');
+          card.style.left = '50%';
+          card.style.top = '45%';
+          card.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
+          card.style.zIndex = '100';
+
+          container.appendChild(card);
+          card.dataset.trackIndex = String(finalSelectedTrackIndex);
+          card.dataset.totalTracks = String(sampleTracks.length);
+
+          const directionData = state.latestExplorerData?.directions?.[newNextDirectionKey];
+          if (directionData && typeof updateStackSizeIndicator === 'function') {
+              updateStackSizeIndicator(directionData, card, finalSelectedTrackIndex);
+          }
+
+          requestAnimationFrame(() => {
+              card.classList.add('visible');
+          });
+      }
+  }
+
+  function createNextTrackCardStack(direction, index, total, nextTrackData, container) {
+      // Get all sample tracks for this direction
+      direction.sampleTracks = (direction.sampleTracks || []).map(entry => entry.track || entry);
+      const sampleTracks = direction.sampleTracks;
+      // Use global selection state, default to first track if none selected
+      const selectedTrackIndex = state.selectedIdentifier
+          ? sampleTracks.findIndex(trackObj => {
+              const track = trackObj.track || trackObj;
+              return track.identifier === state.selectedIdentifier;
+            })
+          : 0;
+      const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
+
+      const directionKey = direction.key || nextTrackData?.directionKey || direction.directionKey || `direction_${index}`;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - finalSelectedTrackIndex - 1);
+
+      // Create selected card (front, fully visible)
+      const selectedTrack = sampleTracks[finalSelectedTrackIndex];
+      const swapFn = typeof window.swapStackContents === 'function' ? window.swapStackContents : () => {};
+      const selectedCard = createTrackDetailCard(direction, selectedTrack.track || selectedTrack, index, total, true, 0, sampleTracks.length, swapFn);
+      container.appendChild(selectedCard);
+      selectedCard.dataset.trackIndex = String(finalSelectedTrackIndex);
+      selectedCard.dataset.totalTracks = String(sampleTracks.length);
+
+      // Stack depth indication is now handled via CSS pseudo-elements on the main card
+
+      // Stagger animation for selected card
+      setTimeout(() => {
+          selectedCard.classList.add('visible');
+      }, index * 150 + 1000);
+  }
+
 
 
   // Hide the direction key overlay
@@ -700,6 +921,7 @@
 
   // Update card content with track details
   function updateCardWithTrackDetails(card, track, direction, preserveColors = false, swapStackContents) {
+      const swapFn = typeof swapStackContents === 'function' ? swapStackContents : (a, b) => {};
       const duration = (track.duration || track.length) ?
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
@@ -847,7 +1069,7 @@
                   console.log(`🔄 Opposite key found: ${oppositeKey}`);
                   if (oppositeKey) {
                       console.log(`🔄 About to call swapStackContents(${direction.key}, ${oppositeKey})`);
-                      swapStackContents(direction.key, oppositeKey);
+                      swapFn(direction.key, oppositeKey);
                   } else {
                       console.warn(`No opposite direction found for ${direction.key}`);
                   }

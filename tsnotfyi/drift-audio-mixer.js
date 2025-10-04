@@ -20,9 +20,13 @@ class DriftAudioMixer {
     this.currentProcess = null;
     this.driftPlayer = new DirectionalDriftPlayer(radialSearch);
     this.currentTrack = null;
+    this.pendingCurrentTrack = null;
     this.nextTrack = null;
     this.trackStartTime = null;
     this.isTransitioning = false;
+    this._lastBroadcastTrackId = null;
+    this.lastTrackEventPayload = null;
+    this.lastTrackEventTimestamp = 0;
 
     // Session history and exploration data
     this.sessionHistory = []; // Array of previous tracks with timestamps and metadata
@@ -86,58 +90,48 @@ class DriftAudioMixer {
     this.audioMixer.onTrackStart = (reason) => {
       console.log(`🎵 Advanced mixer: Track started (${reason || 'normal'})`);
 
-        if (reason === 'crossfade_complete') {
-          // This means we switched to the next track via crossfade
-          console.log('🔄 Crossfade transition completed - updating currentTrack from + nextTrack');
+      let promoted = false;
 
-          // CRITICAL: Update currentTrack to match what's actually playing
-          if (this.nextTrack) {
-            this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
-            this.nextTrack = null;
-            if (this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
-              this.lockedNextTrackIdentifier = null;
-            }
-            console.log(`✅ Updated currentTrack to: ${this.currentTrack.title}`);
-          } else {
-            console.error('🚨 Crossfade completed but nextTrack is null!');
-          }
+      if (this.pendingCurrentTrack) {
+        this.currentTrack = this.pendingCurrentTrack;
+        this.pendingCurrentTrack = null;
+        promoted = true;
+      } else if (reason === 'crossfade_complete' && this.nextTrack) {
+        this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
+        this.nextTrack = null;
+        promoted = true;
+      }
 
-          this.crossfadeStartedAt = null;
-          const shouldReapplyOverride = this.userSelectionDeferredForCrossfade && this.selectedNextTrackMd5;
-          this.userSelectionDeferredForCrossfade = false;
+      if (promoted && this.currentTrack && this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
+        this.lockedNextTrackIdentifier = null;
+      }
 
-          if (shouldReapplyOverride) {
-            setTimeout(() => {
-              this.applyUserSelectedTrackOverride();
-            }, 0);
-          }
+      if (reason === 'crossfade_complete') {
+        this.crossfadeStartedAt = null;
+        const shouldReapplyOverride = this.userSelectionDeferredForCrossfade && this.selectedNextTrackMd5;
+        this.userSelectionDeferredForCrossfade = false;
+        if (shouldReapplyOverride) {
+          setTimeout(() => {
+            this.applyUserSelectedTrackOverride();
+          }, 0);
         }
-       
+      }
+
+      if (reason !== 'crossfade_complete') {
+        this.crossfadeStartedAt = null;
+        this.userSelectionDeferredForCrossfade = false;
+      }
 
       const engineStartTime = this.audioMixer?.engine?.streamingStartTime;
       this.trackStartTime = engineStartTime || Date.now();
 
-      // Broadcast track event now that audio is actually playing
-      if (this.currentTrack) {
-        console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
-        this.broadcastTrackEvent();
+      if (!this.currentTrack) {
+        console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
+        return;
       }
 
-/*
-      if (reason === 'crossfade_complete') {
-        // This means we switched to the next track via crossfade
-        console.log('🔄 Crossfade transition completed - track already loaded, just broadcast');
-        // DON'T call loadNextTrackIntoMixer() again - it's already loaded
-
-        if (this.selectedNextTrackMd5 || this.isUserSelectionPending) {
-          setTimeout(() => {
-            if (this.selectedNextTrackMd5) {
-              this.applyUserSelectedTrackOverride();
-            }
-          }, 0);
-        }
-      }
-*/
+      console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
+      this.broadcastTrackEvent();
     };
 
     this.audioMixer.onTrackEnd = () => {
@@ -214,8 +208,8 @@ class DriftAudioMixer {
     try {
       // Start the drift
       const seededTrack = await this.driftPlayer.startDrift();
-      this.currentTrack = this.hydrateTrackRecord(seededTrack, { transitionReason: 'drift-start' }) || seededTrack;
-      this.playCurrentTrack();
+      this.pendingCurrentTrack = this.hydrateTrackRecord(seededTrack, { transitionReason: 'drift-start' }) || seededTrack;
+      await this.playCurrentTrack();
 
     } catch (error) {
       console.error('Failed to start drift playback:', error);
@@ -225,7 +219,9 @@ class DriftAudioMixer {
 
   // Play the current track using advanced mixer
   async playCurrentTrack() {
-    if (!this.currentTrack || !this.currentTrack.path) {
+    const trackToPlay = this.pendingCurrentTrack || this.currentTrack;
+
+    if (!trackToPlay || !trackToPlay.path) {
       console.error('No valid track to play');
       this.fallbackToNoise();
       return;
@@ -248,7 +244,7 @@ class DriftAudioMixer {
     });
 
     // Convert Buffer path to string if needed
-    let trackPath = this.currentTrack.path;
+    let trackPath = trackToPlay.path;
     if (trackPath && trackPath.type === 'Buffer' && trackPath.data) {
       trackPath = Buffer.from(trackPath.data).toString('utf8');
       console.log('🔧 Converted Buffer path to string');
@@ -261,7 +257,7 @@ class DriftAudioMixer {
       return;
     }
 
-    console.log(`🎵 ${this.currentTrack.title} by ${this.currentTrack.artist}`);
+    console.log(`🎵 ${trackToPlay.title} by ${trackToPlay.artist}`);
     this.trackStartTime = null;
 
     // DON'T broadcast yet - wait until track actually starts streaming
@@ -301,8 +297,8 @@ class DriftAudioMixer {
         // this.broadcastTrackEvent();
 
         // Schedule next track preparation for crossfading
-        if (this.currentTrack.length && this.currentTrack.length > 10) {
-          const crossfadeStartTime = (this.currentTrack.length - 2.5) * 1000; // Start crossfade 2.5s before end
+        if (trackToPlay.length && trackToPlay.length > 10) {
+          const crossfadeStartTime = (trackToPlay.length - 2.5) * 1000; // Start crossfade 2.5s before end
 
           setTimeout(() => {
             if (this.currentTrack && this.isActive) {
@@ -319,19 +315,21 @@ class DriftAudioMixer {
       } else {
         console.log(`🔧 DEBUG: startStreaming() failed - mixer state may be invalid`);
         console.log(`🔧 DEBUG: audioMixer properties: ${Object.keys(this.audioMixer)}`);
+        this.pendingCurrentTrack = this.pendingCurrentTrack || trackToPlay;
         throw new Error('Failed to start advanced mixer streaming - startStreaming() returned false');
       }
 
     } catch (error) {
       console.error('❌ Advanced mixer playback failed:', error);
       console.error('❌ Stack trace:', error.stack);
-      console.log(`🔧 DEBUG: Error occurred while processing track: ${this.currentTrack?.title} by ${this.currentTrack?.artist}`);
+      console.log(`🔧 DEBUG: Error occurred while processing track: ${trackToPlay?.title} by ${trackToPlay?.artist}`);
       if (rejectLoading) {
         rejectLoading(error);
       }
       this.fallbackToNoise();
       // Clear loading state - track is now seeded (or failed)
       this.currentTrackLoadingPromise = null;
+      this.pendingCurrentTrack = null;
     }
   }
 
@@ -558,12 +556,12 @@ class DriftAudioMixer {
         }
       }
 
-      // Move prepared track to current
-      this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
+      // Commit prepared track as pending until streaming actually starts
+      this.pendingCurrentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
       this.nextTrack = null;
       this.trackStartTime = null;
 
-      if (this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
+      if (this.lockedNextTrackIdentifier && this.pendingCurrentTrack && this.lockedNextTrackIdentifier === this.pendingCurrentTrack.identifier) {
         this.lockedNextTrackIdentifier = null;
       }
 
@@ -573,7 +571,7 @@ class DriftAudioMixer {
 
       // DON'T broadcast here - let the audio mixer broadcast when it actually starts streaming
       // The broadcast will happen in the audioMixer.onTrackStart callback -> broadcastTrackEvent()
-      console.log(`🔧 Track loaded into mixer: ${this.currentTrack.title} - waiting for audio to start before broadcasting`);
+      console.log(`🔧 Track loaded into mixer: ${(this.pendingCurrentTrack || {}).title || 'unknown'} - waiting for audio to start before broadcasting`);
 
       if (!this.audioMixer?.engine?.isStreaming) {
         try {
@@ -743,8 +741,8 @@ class DriftAudioMixer {
       console.log('🔄 Starting track transition...');
 
       const nextTrack = await this.selectNextFromCandidates();
-      this.currentTrack = this.hydrateTrackRecord(nextTrack) || nextTrack;
-      this.playCurrentTrack();
+      this.pendingCurrentTrack = this.hydrateTrackRecord(nextTrack) || nextTrack;
+      await this.playCurrentTrack();
 
       this.isTransitioning = false;
     } catch (error) {
@@ -786,6 +784,8 @@ class DriftAudioMixer {
   fallbackToNoise() {
     // Rate limiting: prevent runaway noise fallback
     const now = Date.now();
+
+    this.pendingCurrentTrack = null;
 
     // Initialize rate limiting variables on first call
     if (!this.lastNoiseTime) {
@@ -873,8 +873,8 @@ class DriftAudioMixer {
       }
 
       console.log('🔄 Attempting to resume drift...');
-      this.currentTrack = await this.selectNextFromCandidates();
-      this.playCurrentTrack();
+      this.pendingCurrentTrack = this.hydrateTrackRecord(await this.selectNextFromCandidates());
+      await this.playCurrentTrack();
     } catch (error) {
       console.error('Failed to resume drift, continuing noise:', error);
       this.fallbackToNoise();
@@ -974,6 +974,15 @@ class DriftAudioMixer {
       this.currentProcess = null;
     }
 
+    // Clear playback state so monitoring endpoints stop reporting this session as active
+    this.trackStartTime = null;
+    this.currentTrack = null;
+    this.nextTrack = null;
+    this.pendingCurrentTrack = null;
+    this._lastBroadcastTrackId = null;
+    this.lastTrackEventPayload = null;
+    this.lastTrackEventTimestamp = 0;
+
     if (!this.pendingClientBootstrap && typeof this.onIdle === 'function' && this.clients.size === 0 && this.eventClients.size === 0) {
       this.onIdle();
     }
@@ -1002,6 +1011,15 @@ class DriftAudioMixer {
       clearTimeout(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+
+    if (this.lastTrackEventPayload) {
+      try {
+        const payloadJson = JSON.stringify(this.lastTrackEventPayload);
+        eventClient.write(`data: ${payloadJson}\n\n`);
+      } catch (replayError) {
+        console.error('📡 Failed to replay cached track event to new SSE client:', replayError);
+      }
+    }
   }
 
   // Remove event client
@@ -1012,6 +1030,76 @@ class DriftAudioMixer {
     if (!this.pendingClientBootstrap && !this.isActive && this.clients.size === 0 && this.eventClients.size === 0 && typeof this.onIdle === 'function') {
       this.onIdle();
     }
+  }
+
+  // Determine whether the audio stream should be considered alive
+  isStreamAlive() {
+    if (this.audioMixer?.engine?.isStreaming) {
+      return true;
+    }
+
+    if (this.clients.size > 0) {
+      if (this.currentTrack && this.trackStartTime) {
+        const now = Date.now();
+        let nominalDurationMs = null;
+
+        try {
+          const adjustedSeconds = this.getAdjustedTrackDuration();
+          if (Number.isFinite(adjustedSeconds) && adjustedSeconds > 0) {
+            nominalDurationMs = adjustedSeconds * 1000;
+          }
+        } catch (durationError) {
+          nominalDurationMs = null;
+        }
+
+        if (!nominalDurationMs && this.currentTrack.length) {
+          nominalDurationMs = this.currentTrack.length * 1000;
+        }
+
+        if (!nominalDurationMs) {
+          return true; // Cannot determine duration; assume alive while clients exist
+        }
+
+        const elapsedMs = now - this.trackStartTime;
+        if (elapsedMs >= 0 && elapsedMs <= nominalDurationMs + 15000) {
+          return true;
+        }
+      } else {
+        return true; // Clients present but no timing metadata - err on side of alive
+      }
+    }
+
+    return false;
+  }
+
+  getStreamSummary() {
+    const cloneTrack = (track) => {
+      if (!track) return null;
+      return {
+        identifier: track.identifier,
+        title: track.title,
+        artist: track.artist,
+        album: track.album || null,
+        direction: track.nextTrackDirection || track.direction || null,
+        length: track.length || null,
+        duration: track.duration || track.length || null
+      };
+    };
+
+    return {
+      sessionId: this.sessionId,
+      isStreaming: Boolean(this.audioMixer?.engine?.isStreaming),
+      audioClientCount: this.clients.size,
+      eventClientCount: this.eventClients.size,
+      trackStartTime: this.trackStartTime,
+      currentTrack: cloneTrack(this.currentTrack),
+      pendingTrack: cloneTrack(this.pendingCurrentTrack),
+      nextTrack: cloneTrack(this.nextTrack),
+      lastBroadcast: this.lastTrackEventPayload ? {
+        timestamp: this.lastTrackEventTimestamp,
+        trackId: this.lastTrackEventPayload.currentTrack?.identifier || null
+      } : null
+    };
   }
 
   // Broadcast event to all SSE clients
@@ -1204,41 +1292,32 @@ class DriftAudioMixer {
   async broadcastTrackEvent(force = false) {
     console.log(`📡 broadcastTrackEvent called, eventClients: ${this.eventClients.size}`);
 
-    if (this.eventClients.size === 0) {
-      console.log(`📡 No event clients, skipping broadcast`);
-      return;
-    }
-
     if (!this.currentTrack) {
       console.log(`📡 No current track, skipping broadcast`);
       return;
     }
 
-    // Continue broadcasting regardless of title - identifier is what matters
-    // Title metadata is cosmetic, not functional
-
-    // THROTTLE: Prevent runaway broadcasting - only broadcast if track actually changed
     const currentTrackId = this.currentTrack.identifier;
+    const alreadyBroadcastSameTrack = this._lastBroadcastTrackId === currentTrackId
+      && this.lastTrackEventPayload
+      && this.lastTrackEventPayload.currentTrack?.identifier === currentTrackId;
 
-    if (!force && this._lastBroadcastTrackId === currentTrackId) {
+    if (!force && alreadyBroadcastSameTrack) {
       console.log(`📡 Skipping duplicate broadcast for same track: ${currentTrackId}`);
       return;
     }
 
-    this._lastBroadcastTrackId = currentTrackId;
-    console.log(`📡 Broadcasting NEW track event: ${this.currentTrack.title}`);
+    let trackEvent = null;
 
     try {
       console.log(`📡 Starting track event broadcast for: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
 
-      // Add current track to history if transitioning from a previous track
       if (this.sessionHistory.length === 0 ||
           this.sessionHistory[this.sessionHistory.length - 1].identifier !== this.currentTrack.identifier) {
         this.addToHistory(this.currentTrack, this.trackStartTime, this.driftPlayer.currentDirection);
         console.log(`📡 Added track to history, total: ${this.sessionHistory.length}`);
       }
 
-      // Get comprehensive exploration data with all the exotic next track data
       let explorerData;
       try {
         console.log(`📊 Loading comprehensive explorer data...`);
@@ -1250,7 +1329,6 @@ class DriftAudioMixer {
         console.error('🚨 This means NO directions will be available for exploration!');
         console.error('🚨 The system will NOT fall back to legacy search - fix the PCA/Core search!');
 
-        // Return empty explorer data - no legacy fallback
         explorerData = {
           directions: {},
           outliers: {},
@@ -1263,7 +1341,6 @@ class DriftAudioMixer {
         };
       }
 
-      // Ensure nextTrack information exists for UI consumption
       if (!explorerData.nextTrack && this.nextTrack) {
         console.log('📊 No explorer nextTrack, falling back to prepared next track');
         explorerData.nextTrack = {
@@ -1279,7 +1356,6 @@ class DriftAudioMixer {
         };
       }
 
-      // If directions came back empty, wait for any pending next-track preparation to complete
       let explorerRetryAttempts = 0;
       while (Object.keys(explorerData.directions || {}).length === 0 && explorerRetryAttempts < 2) {
         explorerRetryAttempts += 1;
@@ -1293,7 +1369,6 @@ class DriftAudioMixer {
           }
         } else if (this.isUserSelectionPending) {
           console.log('⏳ Explorer data empty and user selection pending; deferring broadcast');
-          // Give selection debounce a moment to populate directions
           await new Promise(resolve => setTimeout(resolve, 300));
         } else {
           break;
@@ -1317,11 +1392,9 @@ class DriftAudioMixer {
       const pcaFallback = this.lookupTrackPca(this.currentTrack.identifier);
       const artFallback = this.lookupTrackAlbumCover(this.currentTrack.identifier);
 
-      const trackEvent = {
+      trackEvent = {
         type: 'track_started',
         timestamp: Date.now(),
-
-        // Current track with full metadata
         currentTrack: {
           identifier: this.currentTrack.identifier,
           title: this.currentTrack.title,
@@ -1332,8 +1405,6 @@ class DriftAudioMixer {
           pca: this.currentTrack.pca || pcaFallback || null,
           startTime: this.trackStartTime
         },
-
-        // Session history (last 10 tracks)
         sessionHistory: this.sessionHistory.slice(-10).map(entry => ({
           identifier: entry.identifier,
           title: entry.title,
@@ -1342,18 +1413,12 @@ class DriftAudioMixer {
           direction: entry.direction,
           transitionReason: entry.transitionReason
         })),
-
-        // Current drift state
         driftState: {
           currentDirection: this.driftPlayer.currentDirection,
           stepCount: this.driftPlayer.stepCount,
           sessionDuration: Date.now() - (this.sessionHistory[0]?.startTime || Date.now())
         },
-
-        // Comprehensive explorer section with weighted directions and groups
         explorer: explorerData,
-
-        // Session metadata
         session: {
           id: this.sessionId,
           clients: this.clients.size,
@@ -1370,15 +1435,11 @@ class DriftAudioMixer {
 
       console.log(`📡 Broadcasting comprehensive track event: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
       console.log(`📊 Next track: ${explorerData.nextTrack?.title || 'TBD'} via ${explorerData.nextTrack?.nextTrackDirection || 'unknown'} (${explorerData.nextTrack?.transitionReason || 'unknown'})`);
-
-      this.broadcastEvent(trackEvent);
-
     } catch (error) {
       console.error('📡 SSE track event error:', error);
 
-      // Send minimal fallback event so frontend gets something
       try {
-        const fallbackEvent = {
+        trackEvent = {
           type: 'track_started',
           timestamp: Date.now(),
           currentTrack: {
@@ -1391,12 +1452,26 @@ class DriftAudioMixer {
           error: 'Failed to load full track data',
           errorMessage: error.message
         };
-
-        this.broadcastEvent(fallbackEvent);
       } catch (fallbackError) {
         console.error('📡 Even fallback SSE failed:', fallbackError);
+        trackEvent = null;
       }
     }
+
+    if (!trackEvent) {
+      return;
+    }
+
+    this._lastBroadcastTrackId = currentTrackId;
+    this.lastTrackEventPayload = trackEvent;
+    this.lastTrackEventTimestamp = trackEvent.timestamp;
+
+    if (this.eventClients.size === 0) {
+      console.log('📡 No event clients, caching track event for future subscribers');
+      return;
+    }
+
+    this.broadcastEvent(trackEvent);
   }
 
   // Get directional flow options (expensive - use only when needed)

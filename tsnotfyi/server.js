@@ -219,6 +219,27 @@ app.post('/create-session', async (req, res) => {
 });
 
 async function getSessionForRequest(req, { createIfMissing = true } = {}) {
+  const queryIdRaw = req.query && typeof req.query.session === 'string' ? req.query.session.trim() : null;
+  const queryId = queryIdRaw || null;
+  const cookieId = req.session?.audioSessionId || null;
+
+  if (queryId) {
+    let session = getSessionById(queryId);
+    if (!session && createIfMissing) {
+      console.warn(`🛰️ Session override requested via query but not found: ${queryId} (creating new: ${createIfMissing})`);
+      session = await createSession({ sessionId: queryId });
+    }
+
+    if (session) {
+      console.log(`🛰️ Session resolved via query: ${queryId} (cookie was ${cookieId || 'none'})`);
+      session.lastAccess = new Date();
+      await persistAudioSessionBinding(req, session.sessionId);
+      return session;
+    }
+
+    console.warn(`🛰️ Session override via query failed to resolve: ${queryId}`);
+  }
+
   if (req.params && req.params.sessionId) {
     const requestedId = req.params.sessionId;
     let session = getSessionById(requestedId);
@@ -246,6 +267,9 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
 
     if (session) {
       session.lastAccess = new Date();
+      if (session.sessionId !== cookieId) {
+        console.log(`🛰️ Session resolved via cookie fallback: ${session.sessionId} (cookie=${cookieId || 'none'})`);
+      }
       await persistAudioSessionBinding(req, session.sessionId);
     }
 
@@ -397,19 +421,40 @@ app.post('/refresh-sse', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    if (!session.mixer || !session.mixer.isActive) {
-      console.log(`🔄 Session ${sessionId} is not active, cannot refresh`);
-      return res.status(200).json({ ok: false, reason: 'inactive' });
+    const summary = session.mixer.getStreamSummary ? session.mixer.getStreamSummary() : null;
+    const isStreaming = session.mixer.isStreamAlive ? session.mixer.isStreamAlive() :
+      Boolean(session.mixer.audioMixer?.engine?.isStreaming || (session.mixer.clients && session.mixer.clients.size > 0));
+
+    if (!isStreaming) {
+      console.log(`🔄 Session ${sessionId} reported inactive (no streaming clients)`);
+      return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
     }
 
-    // Trigger SSE broadcast if we have a valid track (just needs path)
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
       console.log(`🔄 Triggering SSE broadcast for session ${sessionId} (${session.mixer.eventClients.size} clients)`);
       session.mixer.broadcastTrackEvent(true);
-      res.status(200).json({ ok: true });
+
+      const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
+      const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
+      const nextTrack = session.mixer.nextTrack || summary?.nextTrack || null;
+      const lastBroadcast = summary?.lastBroadcast || (session.mixer.lastTrackEventPayload ? {
+        timestamp: session.mixer.lastTrackEventTimestamp,
+        trackId: session.mixer.lastTrackEventPayload.currentTrack?.identifier || null
+      } : null);
+
+      res.status(200).json({
+        ok: true,
+        currentTrack,
+        pendingTrack,
+        nextTrack,
+        clientCount: summary?.audioClientCount ?? (session.mixer.clients?.size || 0),
+        eventClientCount: summary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
+        lastBroadcast,
+        streamAlive: true
+      });
     } else {
       console.log(`🔄 Session ${sessionId} has no valid track to broadcast`);
-      res.status(200).json({ ok: false, reason: 'no_track' });
+      res.status(200).json({ ok: false, reason: 'no_track', streamAlive: true });
     }
 
   } catch (error) {
@@ -430,18 +475,40 @@ app.post('/refresh-sse-simple', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    if (!session.mixer || !session.mixer.isActive) {
-      console.log(`🔄 Session ${session.sessionId} is not active, cannot refresh`);
-      return res.status(200).json({ ok: false, reason: 'inactive' });
+    const summary = session.mixer.getStreamSummary ? session.mixer.getStreamSummary() : null;
+    const isStreaming = session.mixer.isStreamAlive ? session.mixer.isStreamAlive() :
+      Boolean(session.mixer.audioMixer?.engine?.isStreaming || (session.mixer.clients && session.mixer.clients.size > 0));
+
+    if (!isStreaming) {
+      console.log(`🔄 Session ${session.sessionId} reported inactive (no streaming clients)`);
+      return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
     }
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
       console.log(`🔄 Triggering SSE broadcast for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       session.mixer.broadcastTrackEvent(true);
-      res.status(200).json({ ok: true });
+
+      const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
+      const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
+      const nextTrack = session.mixer.nextTrack || summary?.nextTrack || null;
+      const lastBroadcast = summary?.lastBroadcast || (session.mixer.lastTrackEventPayload ? {
+        timestamp: session.mixer.lastTrackEventTimestamp,
+        trackId: session.mixer.lastTrackEventPayload.currentTrack?.identifier || null
+      } : null);
+
+      res.status(200).json({
+        ok: true,
+        currentTrack,
+        pendingTrack,
+        nextTrack,
+        clientCount: summary?.audioClientCount ?? (session.mixer.clients?.size || 0),
+        eventClientCount: summary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
+        lastBroadcast,
+        streamAlive: true
+      });
     } else {
       console.log(`🔄 Session ${session.sessionId} has no valid track to broadcast`);
-      res.status(200).json({ ok: false, reason: 'no_track' });
+      res.status(200).json({ ok: false, reason: 'no_track', streamAlive: true });
     }
 
   } catch (error) {
@@ -943,6 +1010,7 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 // Simplified next track endpoint - resolves session from request context
 app.post('/next-track', async (req, res) => {
   const { trackMd5, direction, source = 'user' } = req.body;
+  const normalizedSource = typeof source === 'string' ? source.toLowerCase() : 'user';
   const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!trackMd5) {
@@ -954,7 +1022,7 @@ app.post('/next-track', async (req, res) => {
   }
 
   try {
-    if (source === 'user') {
+    if (normalizedSource === 'user') {
       console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
       if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
@@ -968,7 +1036,19 @@ app.post('/next-track', async (req, res) => {
         }
       }
     } else {
-      console.log(`💓 Heartbeat sync request received for ${trackMd5} (direction: ${direction})`);
+      const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;
+      const advertisedDirection = typeof direction === 'string' ? direction : null;
+      const serverNextTrack = session.mixer.nextTrack?.identifier || null;
+
+      console.log(`💓 Heartbeat sync request received (clientNext=${cleanMd5?.substring(0,8) || 'none'}, direction=${advertisedDirection || 'unknown'})`);
+
+      if (cleanMd5 && serverNextTrack && cleanMd5 !== serverNextTrack) {
+        console.warn('💓 HEARTBEAT next-track mismatch', {
+          clientNext: cleanMd5,
+          serverNext: serverNextTrack,
+          direction: advertisedDirection
+        });
+      }
     }
 
     // Calculate timing info for sync check
@@ -977,11 +1057,15 @@ app.post('/next-track', async (req, res) => {
     const remaining = Math.max(0, duration - elapsed);
 
     const currentTrackId = session.mixer.currentTrack?.identifier || null;
-    console.log(`📤 /next-track response (${source}): currentTrack=${currentTrackId?.substring(0,8)}, nextTrack=${trackMd5.substring(0,8)}, remaining=${Math.round(remaining)}ms`);
+    const preparedNextId = session.mixer.nextTrack?.identifier || null;
+    const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
+
+    console.log(`📤 /next-track response (${normalizedSource}): current=${currentTrackId?.substring(0,8) || 'none'}, pending=${pendingCurrentId?.substring(0,8) || 'none'}, serverNext=${preparedNextId?.substring(0,8) || 'none'}, remaining=${Math.round(remaining)}ms`);
 
     res.json({
       // Acknowledgment
-      nextTrack: trackMd5,
+      nextTrack: preparedNextId,
+      pendingTrack: pendingCurrentId,
 
       // Sync state: current track + timing
       currentTrack: currentTrackId,
