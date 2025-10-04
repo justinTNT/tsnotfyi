@@ -41,6 +41,7 @@ class DriftAudioMixer {
     this.seenTracks = new Set(); // Track IDs that were displayed (top of stack OR selected as next track)
     this.seenTrackArtists = new Set(); // Artists from seen tracks
     this.seenTrackAlbums = new Set(); // Albums from seen tracks
+    this.pendingUserOverrideDirection = null; // Persist direction metadata until override hydrates
 
     // Cleanup callback supplied by session manager
     this.onIdle = null;
@@ -48,6 +49,9 @@ class DriftAudioMixer {
 
     // Explorer configuration
     this.explorerResolution = 'magnifying_glass';
+
+    // Track loading state to prevent concurrent playCurrentTrack calls
+    this.currentTrackLoadingPromise = null; // Seeding vs seeded distinction
 
     // Audio configuration
     this.sampleRate = config.audio.sampleRate;
@@ -60,6 +64,14 @@ class DriftAudioMixer {
       channels: this.channels,
       bitRate: this.bitRate
     });
+
+    const explorerConfig = config.explorer || {};
+    const totalCount = explorerConfig.stackTotalCount;
+    const randomCount = explorerConfig.stackRandomCount;
+    this.stackTotalCount = Number.isFinite(totalCount) && totalCount > 0 ? Math.floor(totalCount) : 15;
+    this.stackRandomCount = Number.isFinite(randomCount) && randomCount >= 0
+      ? Math.min(Math.floor(randomCount), this.stackTotalCount)
+      : Math.min(3, this.stackTotalCount);
 
     // Set up mixer callbacks
     this.audioMixer.onData = (chunk) => {
@@ -80,7 +92,7 @@ class DriftAudioMixer {
 
           // CRITICAL: Update currentTrack to match what's actually playing
           if (this.nextTrack) {
-            this.currentTrack = this.nextTrack;
+            this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
             this.nextTrack = null;
             if (this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
               this.lockedNextTrackIdentifier = null;
@@ -201,7 +213,8 @@ class DriftAudioMixer {
 
     try {
       // Start the drift
-      this.currentTrack = await this.driftPlayer.startDrift();
+      const seededTrack = await this.driftPlayer.startDrift();
+      this.currentTrack = this.hydrateTrackRecord(seededTrack, { transitionReason: 'drift-start' }) || seededTrack;
       this.playCurrentTrack();
 
     } catch (error) {
@@ -217,6 +230,22 @@ class DriftAudioMixer {
       this.fallbackToNoise();
       return;
     }
+
+    // If already loading this track, wait for it instead of starting concurrent load
+    if (this.currentTrackLoadingPromise) {
+      console.log('🔄 Track already loading (seeding), waiting for completion...');
+      await this.currentTrackLoadingPromise;
+      console.log('✅ Concurrent load completed, track now seeded');
+      return;
+    }
+
+    // Create loading promise to prevent concurrent loads
+    let resolveLoading;
+    let rejectLoading;
+    this.currentTrackLoadingPromise = new Promise((resolve, reject) => {
+      resolveLoading = resolve;
+      rejectLoading = reject;
+    });
 
     // Convert Buffer path to string if needed
     let trackPath = this.currentTrack.path;
@@ -282,6 +311,11 @@ class DriftAudioMixer {
           }, Math.max(1000, crossfadeStartTime)); // At least 1s delay
         }
 
+        if (resolveLoading) {
+          resolveLoading();
+        }
+        this.currentTrackLoadingPromise = null;
+
       } else {
         console.log(`🔧 DEBUG: startStreaming() failed - mixer state may be invalid`);
         console.log(`🔧 DEBUG: audioMixer properties: ${Object.keys(this.audioMixer)}`);
@@ -292,7 +326,12 @@ class DriftAudioMixer {
       console.error('❌ Advanced mixer playback failed:', error);
       console.error('❌ Stack trace:', error.stack);
       console.log(`🔧 DEBUG: Error occurred while processing track: ${this.currentTrack?.title} by ${this.currentTrack?.artist}`);
+      if (rejectLoading) {
+        rejectLoading(error);
+      }
       this.fallbackToNoise();
+      // Clear loading state - track is now seeded (or failed)
+      this.currentTrackLoadingPromise = null;
     }
   }
 
@@ -307,11 +346,17 @@ class DriftAudioMixer {
     if (direction) {
       this.driftPlayer.currentDirection = direction;
     }
+    this.pendingUserOverrideDirection = direction || null;
 
     if (this.nextTrack && this.nextTrack.identifier === trackMd5) {
       console.log('🎯 User-selected track already prepared; keeping existing preload');
+      this.nextTrack = this.hydrateTrackRecord(this.nextTrack, {
+        nextTrackDirection: direction || this.nextTrack?.nextTrackDirection,
+        transitionReason: 'user'
+      });
       this.selectedNextTrackMd5 = null;
       this.isUserSelectionPending = false;
+      this.pendingUserOverrideDirection = null;
       return;
     }
 
@@ -382,8 +427,13 @@ class DriftAudioMixer {
 
     if (this.nextTrack && this.nextTrack.identifier === this.selectedNextTrackMd5) {
       console.log('🎯 User-selected track already prepared after debounce; no refresh needed');
+      this.nextTrack = this.hydrateTrackRecord(this.nextTrack, {
+        nextTrackDirection: this.pendingUserOverrideDirection || this.nextTrack?.nextTrackDirection,
+        transitionReason: 'user'
+      });
       this.selectedNextTrackMd5 = null;
       this.isUserSelectionPending = false;
+      this.pendingUserOverrideDirection = null;
       return;
     }
 
@@ -433,25 +483,26 @@ class DriftAudioMixer {
     const preparation = (async () => {
       try {
         const nextTrack = await this.selectNextFromCandidates();
-        if (!nextTrack) {
+        const hydratedNextTrack = this.hydrateTrackRecord(nextTrack);
+        if (!hydratedNextTrack || !hydratedNextTrack.path) {
           console.log('❌ No next track selected for crossfade preparation');
           return;
         }
 
-        console.log(`🎯 Preparing next track for crossfade (${reason}): ${nextTrack.title}`);
-        console.log(`🔧 DEBUG: Next track path: ${nextTrack.path}`);
+        console.log(`🎯 Preparing next track for crossfade (${reason}): ${hydratedNextTrack.title}`);
+        console.log(`🔧 DEBUG: Next track path: ${hydratedNextTrack.path}`);
         console.log(`🔧 DEBUG: Current this.nextTrack: ${this.nextTrack?.title || 'null'}`);
 
-        if (!forceRefresh && this.nextTrack && this.nextTrack.identifier === nextTrack.identifier) {
-          console.log(`⚠️ Same next track already prepared, skipping duplicate processing: ${nextTrack.title}`);
+        if (!forceRefresh && this.nextTrack && this.nextTrack.identifier === hydratedNextTrack.identifier) {
+          console.log(`⚠️ Same next track already prepared, skipping duplicate processing: ${hydratedNextTrack.title}`);
           return;
         }
 
         const previousNext = this.nextTrack;
-        this.nextTrack = nextTrack;
+        this.nextTrack = hydratedNextTrack;
         this.nextTrackLoadPromise = (async () => {
           try {
-            return await this.audioMixer.loadTrack(nextTrack.path, 'next');
+            return await this.audioMixer.loadTrack(hydratedNextTrack.path, 'next');
           } catch (loadErr) {
             this.nextTrack = previousNext || null;
             throw loadErr;
@@ -465,11 +516,11 @@ class DriftAudioMixer {
           this.nextTrackLoadPromise = null;
         }
         console.log(`📊 Next track analysis: BPM=${nextTrackInfo.bpm}, Key=${nextTrackInfo.key}`);
-        if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== nextTrack.identifier) {
+        if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== hydratedNextTrack.identifier) {
           // Lock no longer applies if a different track is queued
           this.lockedNextTrackIdentifier = null;
         }
-        console.log(`✅ Next track prepared successfully: ${nextTrack.title}`);
+        console.log(`✅ Next track prepared successfully: ${hydratedNextTrack.title}`);
       } catch (error) {
         console.error('❌ Failed to prepare next track:', error);
         console.error('❌ Error details:', error.stack);
@@ -508,7 +559,7 @@ class DriftAudioMixer {
       }
 
       // Move prepared track to current
-      this.currentTrack = this.nextTrack;
+      this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
       this.nextTrack = null;
       this.trackStartTime = null;
 
@@ -572,19 +623,25 @@ class DriftAudioMixer {
       // PRIORITY: Check if user has selected a specific track
       if (this.selectedNextTrackMd5) {
         console.log(`🎯 User selected track takes priority: ${this.selectedNextTrackMd5}`);
-        const userSelectedTrack = this.radialSearch.kdTree.getTrack(this.selectedNextTrackMd5);
+        const annotations = { transitionReason: 'user' };
+        if (this.pendingUserOverrideDirection) {
+          annotations.nextTrackDirection = this.pendingUserOverrideDirection;
+        }
+        const userSelectedTrack = this.hydrateTrackRecord(this.selectedNextTrackMd5, annotations);
         if (userSelectedTrack) {
           console.log(`✅ Using user-selected track: ${userSelectedTrack.title} by ${userSelectedTrack.artist}`);
           // Clear the selection after using it
           this.selectedNextTrackMd5 = null;
           this.isUserSelectionPending = false;
           this.lockedNextTrackIdentifier = userSelectedTrack.identifier;
+          this.pendingUserOverrideDirection = null;
           return userSelectedTrack;
         } else {
           console.error(`❌ User-selected track not found: ${this.selectedNextTrackMd5}`);
           this.selectedNextTrackMd5 = null; // Clear invalid selection
           this.isUserSelectionPending = false;
           this.lockedNextTrackIdentifier = null;
+          this.pendingUserOverrideDirection = null;
         }
       }
 
@@ -594,7 +651,29 @@ class DriftAudioMixer {
       const nextTrackFromExplorer = await this.selectNextTrackFromExplorer(explorerData);
 
       if (nextTrackFromExplorer) {
-        const track = this.radialSearch.kdTree.getTrack(nextTrackFromExplorer.identifier);
+        const explorerAnnotations = {
+          transitionReason: nextTrackFromExplorer.transitionReason || 'explorer'
+        };
+        if (nextTrackFromExplorer.nextTrackDirection) {
+          explorerAnnotations.nextTrackDirection = nextTrackFromExplorer.nextTrackDirection;
+        }
+        if (nextTrackFromExplorer.directionKey) {
+          explorerAnnotations.directionKey = nextTrackFromExplorer.directionKey;
+        }
+        if (nextTrackFromExplorer.directionDescription) {
+          explorerAnnotations.directionDescription = nextTrackFromExplorer.directionDescription;
+        }
+        if (nextTrackFromExplorer.diversityScore !== undefined) {
+          explorerAnnotations.diversityScore = nextTrackFromExplorer.diversityScore;
+        }
+        if (nextTrackFromExplorer.weightedDiversityScore !== undefined) {
+          explorerAnnotations.weightedDiversityScore = nextTrackFromExplorer.weightedDiversityScore;
+        }
+        if (nextTrackFromExplorer.domain) {
+          explorerAnnotations.domain = nextTrackFromExplorer.domain;
+        }
+
+        const track = this.hydrateTrackRecord(nextTrackFromExplorer, explorerAnnotations);
         if (track) {
           if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== track.identifier) {
             this.lockedNextTrackIdentifier = null;
@@ -610,7 +689,7 @@ class DriftAudioMixer {
       if (this.lockedNextTrackIdentifier && driftTrack && this.lockedNextTrackIdentifier !== driftTrack.identifier) {
         this.lockedNextTrackIdentifier = null;
       }
-      return driftTrack;
+      return this.hydrateTrackRecord(driftTrack, { transitionReason: 'drift' });
     } catch (error) {
       console.error('Failed to select next track:', error);
       // Ultimate fallback - return null and let system handle it
@@ -663,7 +742,8 @@ class DriftAudioMixer {
       this.isTransitioning = true;
       console.log('🔄 Starting track transition...');
 
-      this.currentTrack = await this.selectNextFromCandidates();
+      const nextTrack = await this.selectNextFromCandidates();
+      this.currentTrack = this.hydrateTrackRecord(nextTrack) || nextTrack;
       this.playCurrentTrack();
 
       this.isTransitioning = false;
@@ -847,7 +927,7 @@ class DriftAudioMixer {
   }
 
   // Start the streaming
-  startStreaming() {
+  async startStreaming() {
     if (this.isActive) return;
 
     console.log(`🎵 Starting drift streaming for session: ${this.sessionId}`);
@@ -859,12 +939,20 @@ class DriftAudioMixer {
       return;
     }
 
+    // If track is seeding, wait for it to become seeded
+    if (this.currentTrackLoadingPromise) {
+      console.log(`🌱 Track is seeding, waiting for it to become seeded...`);
+      await this.currentTrackLoadingPromise;
+      console.log(`🌳 Track seeded and ready`);
+      return;
+    }
+
     // Respect any pre-seeded track (e.g., contrived MD5 journey)
     if (this.currentTrack && this.currentTrack.path) {
       console.log(`🎵 Using pre-seeded track for session start: ${this.currentTrack.title || this.currentTrack.identifier}`);
-      this.playCurrentTrack();
+      await this.playCurrentTrack();
     } else {
-      this.startDriftPlayback();
+      await this.startDriftPlayback();
     }
   }
 
@@ -974,55 +1062,43 @@ class DriftAudioMixer {
     }
   }
 
-  // Strategic sample track selection: use method 3 times to get 24 samples
-  selectStrategicSamples(candidates, currentTrack, maxSamples = 24) {
+  selectStrategicSamples(candidates, currentTrack) {
     if (!candidates || candidates.length === 0) return [];
-    if (candidates.length <= maxSamples) return candidates;
+    if (candidates.length === 1) return candidates;
 
-    const samples = new Set(); // Use Set to avoid duplicates
-    const samplesPerRound = Math.ceil(maxSamples / 3); // 8 samples per round for 24 total
+    const withMetrics = candidates.map(c => ({
+      ...c,
+      track: c.track || c,
+      dirDist: c.distance || c.similarity || 0,
+      priDist: Math.abs((c.track || c).pca?.primary_d || 0)
+    }));
 
-    // Calculate diversity scores if not already present
-    const candidatesWithScores = candidates.map(candidate => {
-      const track = candidate.track || candidate;
-      // Simple diversity based on distance from current track
-      const diversityScore = candidate.distance || candidate.similarity || Math.random();
-      return { ...candidate, track, diversityScore };
-    });
+    // Two sorted arrays: by direction distance and by primary distance
+    const byDir = [...withMetrics].sort((a, b) => a.dirDist - b.dirDist);
+    const byPri = [...withMetrics].sort((a, b) => a.priDist - b.priDist);
 
-    // Round 1: Top-to-bottom sampling (most similar to least similar)
-    const diversitySorted = [...candidatesWithScores].sort((a, b) => a.diversityScore - b.diversityScore);
-    const step1 = Math.max(1, Math.floor(diversitySorted.length / samplesPerRound));
-    for (let i = 0; i < samplesPerRound && i * step1 < diversitySorted.length; i++) {
-      const candidate = diversitySorted[i * step1];
-      if (candidate) samples.add(candidate);
+    const dealt = new Set();
+    const result = [];
+
+    const tryDeal = (arr, idx) => {
+      if (idx < 0 || idx >= arr.length) return false;
+      const c = arr[idx];
+      const id = c.track?.identifier || c.identifier;
+      if (!id || dealt.has(id)) return false;
+      dealt.add(id);
+      result.push(c);
+      return true;
+    };
+
+    // Interleave: front of byDir, back of byDir, front of byPri, back of byPri
+    for (let i = 0; result.length < candidates.length && i < Math.max(byDir.length, byPri.length); i++) {
+      tryDeal(byDir, i);                    // Closest by direction
+      tryDeal(byDir, byDir.length - 1 - i); // Furthest by direction
+      tryDeal(byPri, i);                    // Closest by primary
+      tryDeal(byPri, byPri.length - 1 - i); // Furthest by primary
     }
 
-    // Round 2: Random sampling from remaining candidates
-    const remaining1 = candidatesWithScores.filter(c =>
-      !Array.from(samples).find(s => s.track.identifier === c.track.identifier)
-    );
-    const shuffled = remaining1.sort(() => Math.random() - 0.5);
-    for (let i = 0; i < samplesPerRound && i < shuffled.length; i++) {
-      samples.add(shuffled[i]);
-    }
-
-    // Round 3: Distance-based sampling from still remaining candidates
-    const remaining2 = candidatesWithScores.filter(c =>
-      !Array.from(samples).find(s => s.track.identifier === c.track.identifier)
-    );
-    const distanceSorted = remaining2.sort((a, b) => {
-      const distA = a.distance || a.similarity || 0;
-      const distB = b.distance || b.similarity || 0;
-      return distA - distB;
-    });
-    const step3 = Math.max(1, Math.floor(distanceSorted.length / samplesPerRound));
-    for (let i = 0; i < samplesPerRound && i * step3 < distanceSorted.length; i++) {
-      const candidate = distanceSorted[i * step3];
-      if (candidate) samples.add(candidate);
-    }
-
-    return Array.from(samples).slice(0, maxSamples);
+    return result;
   }
 
   // Smart filtering: exclude played tracks, deprioritize seen tracks and their artists/albums
@@ -1237,6 +1313,10 @@ class DriftAudioMixer {
         return;
       }
 
+      const featuresFallback = this.lookupTrackFeatures(this.currentTrack.identifier);
+      const pcaFallback = this.lookupTrackPca(this.currentTrack.identifier);
+      const artFallback = this.lookupTrackAlbumCover(this.currentTrack.identifier);
+
       const trackEvent = {
         type: 'track_started',
         timestamp: Date.now(),
@@ -1247,9 +1327,9 @@ class DriftAudioMixer {
           title: this.currentTrack.title,
           artist: this.currentTrack.artist,
           duration: this.getAdjustedTrackDuration(),
-          features: this.currentTrack.features || {},
-          albumCover: this.currentTrack.albumCover || null,
-          pca: this.currentTrack.pca || null,
+          features: this.currentTrack.features || featuresFallback || {},
+          albumCover: this.currentTrack.albumCover || artFallback || null,
+          pca: this.currentTrack.pca || pcaFallback || null,
           startTime: this.trackStartTime
         },
 
@@ -1376,8 +1456,6 @@ class DriftAudioMixer {
     console.log(`📊 Track has PCA data:`, !!currentTrackData.pca);
 
     let totalNeighborhood;
-    const resolution = this.explorerResolution || 'magnifying_glass';
-    console.log(`📊 Using explorer resolution: ${resolution}`);
 
     try {
       totalNeighborhood = this.radialSearch.kdTree.pcaRadiusSearch(
@@ -1467,25 +1545,46 @@ class DriftAudioMixer {
     explorerData.directions = this.limitToTopDimensions(explorerData.directions, 12);
 
     // Strategic deduplication: PCA directions take precedence over similar core directions
-    explorerData.directions = this.deduplicateTracksStrategically(explorerData.directions);
+    // TODO explorerData.directions = this.deduplicateTracksStrategically(explorerData.directions);
 
     // 🃏 DEBUG: Verify no duplicate cards across stacks
-    this.debugDuplicateCards(explorerData.directions);
+    // TODO this.debugDuplicateCards(explorerData.directions);
 
     // 🃏 FINAL DEDUPLICATION: Each card appears in exactly one stack (highest position wins)
     explorerData.directions = this.finalDeduplication(explorerData.directions);
 
+    // Recalculate diversity metrics based on post-deduplication reality
+    Object.entries(explorerData.directions).forEach(([directionKey, direction]) => {
+      const actualCount = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.length : 0;
+
+      direction.actualTrackCount = actualCount;
+      direction.isOutlier = actualCount < 3;
+      direction.totalNeighborhoodSize = totalNeighborhoodSize;
+
+      const optionsBonus = Math.min(actualCount / 10, 2.0);
+      const baseScore = totalNeighborhoodSize > 0
+        ? this.calculateDirectionDiversity(actualCount, totalNeighborhoodSize)
+        : this.calculateDirectionDiversity(actualCount, actualCount || 1);
+      direction.diversityScore = baseScore;
+      direction.trackCount = actualCount;
+      direction.adjustedDiversityScore = baseScore * optionsBonus;
+
+      console.log(`🎯 Adjusted diversity for ${directionKey}: base=${baseScore.toFixed(2)}, count=${actualCount}, ` +
+                  `bonus=${optionsBonus.toFixed(2)}, adjusted=${direction.adjustedDiversityScore.toFixed(2)}`);
+    });
+
     // After deduplication, limit each direction back to 24 sample tracks for UI
+    /* TODO
     Object.keys(explorerData.directions).forEach(directionKey => {
       const direction = explorerData.directions[directionKey];
       if (direction.sampleTracks && direction.sampleTracks.length > 24) {
         direction.sampleTracks = this.selectStrategicSamples(
           direction.sampleTracks.map(track => ({ track })),
-          this.currentTrack,
-          24
+          this.currentTrack
         ).map(sample => sample.track);
       }
     });
+    */
 
 
     Object.entries(explorerData.directions).forEach(([key, data]) => {
@@ -1495,6 +1594,12 @@ class DriftAudioMixer {
     // ⚖️ BIDIRECTIONAL PRIORITIZATION: Make larger stack primary, smaller stack opposite
     // Do this AFTER final sampling so we prioritize based on actual final track counts
     explorerData.directions = this.prioritizeBidirectionalDirections(explorerData.directions);
+
+    // 🧼 SAFETY NET: Remove any residual duplicates introduced by prioritization embedding
+    explorerData.directions = this.sanitizeDirectionalStacks(explorerData.directions);
+    explorerData.directions = this.removeEmptyDirections(explorerData.directions);
+    explorerData.directions = this.applyStackBudget(explorerData.directions);
+    explorerData.directions = this.selectTopTrack(explorerData.directions);
 
     Object.entries(explorerData.directions).forEach(([key, data]) => {
       if (data.oppositeDirection) {
@@ -1553,8 +1658,52 @@ class DriftAudioMixer {
 
       const trackCount = candidates.totalAvailable || 0;
       // Smart filtering: exclude played tracks, deprioritize actually seen tracks/artists/albums
-      const smartFiltered = this.filterAndDeprioritizeCandidates(candidates.candidates || []);
-      const sampleTracks = this.selectStrategicSamples(smartFiltered, this.currentTrack, 50);
+      // const smartFiltered = this.filterAndDeprioritizeCandidates(candidates.candidates || []);
+      // TODO: later?
+      const strategicSamples = this.selectStrategicSamples(candidates.candidates || [], this.currentTrack);
+
+      const formattedTracks = strategicSamples.map(sample => {
+        const track = sample.track || sample;
+        const pcaSlices = this.radialSearch.kdTree.calculatePcaContributionFractions(
+          this.currentTrack,
+          track,
+          domain,
+          `${directionKey}:${track.identifier}`,
+          component
+        );
+        const distanceSlices = {
+          kind: 'pca',
+          domain,
+          reference: {
+            key: pcaSlices.referenceKey,
+            distance: pcaSlices.referenceDistance
+          },
+          total: pcaSlices.total,
+          slices: pcaSlices.slices
+        };
+        return {
+          identifier: track.identifier,
+          title: track.title,
+          artist: track.artist,
+          albumCover: track.albumCover,
+          duration: track.length,
+          distance: sample.distance,
+          pca: track.pca,
+          features: track.features,
+          distanceSlices,
+          pcaDistanceSlices: {
+            referenceKey: pcaSlices.referenceKey,
+            referenceDistance: pcaSlices.referenceDistance,
+            total: pcaSlices.total,
+            slices: pcaSlices.slices
+          }
+        };
+      });
+
+      const originalSamples = formattedTracks.map(track => ({
+        ...track,
+        features: track.features ? { ...track.features } : track.features
+      }));
 
       // Skip directions with 0 tracks (completely ignore them)
       if (trackCount === 0) {
@@ -1567,41 +1716,20 @@ class DriftAudioMixer {
         return; // Don't even add to explorerData
       }
 
-      // Corrected diversity calculation based on neighborhood splitting
-      const diversityScore = this.calculateDirectionDiversity(trackCount, totalNeighborhoodSize);
-
-      // Outlier classification: < 3 tracks go to outlier section
-      const isOutlier = trackCount < 3;
-
       explorerData.directions[directionKey] = {
         direction: directionName,
         description: description,
         domain: domain,
         component: component,
         polarity: polarity,
-        trackCount: trackCount,
+        trackCount: formattedTracks.length,
         totalNeighborhoodSize: totalNeighborhoodSize,
-        sampleTracks: sampleTracks.map(track => ({
-          identifier: track.track.identifier,
-          title: track.track.title,
-          artist: track.track.artist,
-          albumCover: track.track.albumCover,
-          duration: track.track.length,
-          distance: track.distance,
-          pca: track.track.pca
-        })),
-        diversityScore: diversityScore,
-        isOutlier: isOutlier,
-        splitRatio: totalNeighborhoodSize > 0 ? (trackCount / totalNeighborhoodSize) : 0
+        diversityScore: this.calculateDirectionDiversity(formattedTracks.length, totalNeighborhoodSize),
+        isOutlier: formattedTracks.length < 3,
+        splitRatio: totalNeighborhoodSize > 0 ? (formattedTracks.length / totalNeighborhoodSize) : 0,
+        sampleTracks: formattedTracks,
+        originalSampleTracks: originalSamples
       };
-
-      // Group outliers separately as requested
-      if (isOutlier) {
-        explorerData.outliers[directionKey] = explorerData.directions[directionKey];
-      }
-
-      console.log(`🎯 Direction ${directionKey}: ${trackCount}/${totalNeighborhoodSize} tracks, diversity: ${diversityScore.toFixed(1)}, ${isOutlier ? 'OUTLIER' : 'VALID'}`);
-
     } catch (error) {
       console.error(`Failed to explore direction ${directionKey}:`, error);
       explorerData.directions[directionKey] = {
@@ -1610,11 +1738,7 @@ class DriftAudioMixer {
         domain: domain,
         component: component,
         polarity: polarity,
-        trackCount: 0,
-        totalNeighborhoodSize: totalNeighborhoodSize,
         sampleTracks: [],
-        diversityScore: 0,
-        isOutlier: true,
         error: error.message
       };
     }
@@ -1659,8 +1783,8 @@ class DriftAudioMixer {
         console.log(`🚨 This suggests too aggressive artist/album filtering or session history is too large`);
       }
 
-      const sampleTracks = this.selectStrategicSamples(filteredCandidates, this.currentTrack, 50);
-      console.log(`🔍 CORE SAMPLING: Selected ${sampleTracks.length} sample tracks from ${filteredCandidates.length} filtered candidates`);
+      const strategicSamples = this.selectStrategicSamples(filteredCandidates, this.currentTrack, 50);
+      console.log(`🔍 CORE SAMPLING: Selected ${strategicSamples.length} sample tracks from ${filteredCandidates.length} filtered candidates`);
 
       // Skip directions with 0 tracks (completely ignore them)
       if (trackCount === 0) {
@@ -1675,11 +1799,50 @@ class DriftAudioMixer {
         return;
       }
 
-      // Corrected diversity calculation based on neighborhood splitting
-      const diversityScore = this.calculateDirectionDiversity(trackCount, totalNeighborhoodSize);
+      const formattedTracks = strategicSamples.map(sample => {
+        const track = sample.track || sample;
+        const directionDim = this.radialSearch.kdTree.getDirectionDimension(direction);
+        const activeDimensions = this.radialSearch.kdTree.dimensions.filter(dim => dim !== directionDim);
+        const featureSlices = this.radialSearch.kdTree.calculateFeatureContributionFractions(
+          this.currentTrack,
+          track,
+          activeDimensions,
+          null,
+          `${directionKey}:${track.identifier || track.track?.identifier}`,
+          directionDim
+        );
+        const distanceSlices = {
+          kind: 'feature',
+          dimensions: activeDimensions,
+          reference: {
+            key: directionDim,
+            distance: featureSlices.referenceDistance
+          },
+          total: featureSlices.total,
+          slices: featureSlices.slices
+        };
+        return {
+          identifier: track.identifier || track.track?.identifier,
+          title: track.title || track.track?.title,
+          artist: track.artist || track.track?.artist,
+          duration: track.length || track.track?.length,
+          distance: sample.distance || sample.similarity,
+          features: track.features || track.track?.features,
+          albumCover: track.albumCover || track.track?.albumCover,
+          distanceSlices,
+          featureDistanceSlices: {
+            referenceKey: directionDim,
+            referenceDistance: featureSlices.referenceDistance,
+            total: featureSlices.total,
+            slices: featureSlices.slices
+          }
+        };
+      });
 
-      // Outlier classification: < 3 tracks go to outlier section
-      const isOutlier = trackCount < 3;
+      const originalSamples = formattedTracks.map(track => ({
+        ...track,
+        features: track.features ? { ...track.features } : track.features
+      }));
 
       explorerData.directions[directionKey] = {
         direction: direction,
@@ -1687,31 +1850,14 @@ class DriftAudioMixer {
         domain: 'original',
         component: feature.name,
         polarity: polarity,
-        trackCount: trackCount,
+        trackCount: formattedTracks.length,
         totalNeighborhoodSize: totalNeighborhoodSize,
-        sampleTracks: sampleTracks.map(track => ({
-          identifier: track.identifier || track.track?.identifier,
-          title: track.title || track.track?.title,
-          artist: track.artist || track.track?.artist,
-          duration: track.length || track.track?.length,
-          distance: track.distance || track.similarity,
-          features: track.features || track.track?.features,
-          albumCover: track.albumCover || track.track?.albumCover
-        })),
-        diversityScore: diversityScore,
-        isOutlier: isOutlier,
-        splitRatio: totalNeighborhoodSize > 0 ? (trackCount / totalNeighborhoodSize) : 0,
+        diversityScore: this.calculateDirectionDiversity(formattedTracks.length, totalNeighborhoodSize),
+        isOutlier: formattedTracks.length < 3,
+        splitRatio: totalNeighborhoodSize > 0 ? (formattedTracks.length / totalNeighborhoodSize) : 0,
+        sampleTracks: formattedTracks,
+        originalSampleTracks: originalSamples
       };
-
-      // Group outliers separately as requested
-      if (isOutlier) {
-        console.log(`🚫 CORE OUTLIER: ${directionKey} has too few tracks (${trackCount} < 5) - marked as OUTLIER - [${feature.name}]`);
-        explorerData.outliers[directionKey] = explorerData.directions[directionKey];
-      } else {
-        console.log(`✅ CORE VALID: ${directionKey} passes all checks - [${feature.name}]`);
-      }
-
-      console.log(`🎯 Original feature ${directionKey}: ${trackCount}/${totalNeighborhoodSize} tracks, diversity: ${diversityScore.toFixed(1)}, ${isOutlier ? 'OUTLIER' : 'VALID'} [${feature.name}]`);
 
     } catch (error) {
       console.error(`🚨 CORE SEARCH ERROR: Failed to explore original feature direction ${directionKey}:`, error);
@@ -2034,6 +2180,542 @@ class DriftAudioMixer {
     return finalDirections;
   }
 
+  // Pick the most suitable top track for each direction (prefer unique album covers and real art)
+  selectTopTrack(directions) {
+    const DEFAULT_ALBUM = '/images/albumcover.png';
+    const DEFAULT_KEY = '__default__';
+    const coverOwners = new Map(); // coverKey -> { directionKey, count }
+
+    const orderedDirections = Object.entries(directions)
+      .sort((a, b) => {
+        const countA = a[1].actualTrackCount ?? (Array.isArray(a[1].sampleTracks) ? a[1].sampleTracks.length : 0);
+        const countB = b[1].actualTrackCount ?? (Array.isArray(b[1].sampleTracks) ? b[1].sampleTracks.length : 0);
+        if (countA !== countB) return countA - countB;
+        return a[0].localeCompare(b[0]);
+      });
+
+    orderedDirections.forEach(([directionKey, direction]) => {
+      const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.slice() : [];
+      if (samples.length === 0) {
+        return;
+      }
+
+      const actualCount = direction.displayTrackCount
+        ?? direction.actualTrackCount
+        ?? samples.length;
+
+      const candidates = samples.map((entry, index) => {
+        const track = entry.track || entry;
+        const cover = track?.albumCover || DEFAULT_ALBUM;
+        const defaultCover = !cover || cover === DEFAULT_ALBUM;
+        const coverKey = defaultCover ? DEFAULT_KEY : cover;
+        const owner = coverOwners.get(coverKey);
+        const penalized = owner && owner.count < actualCount && !defaultCover;
+
+        let score = 0;
+        if (!owner) {
+          score += defaultCover ? 15 : 100;
+        } else if (!defaultCover) {
+          score += penalized ? 5 : 40;
+        } else {
+          score += owner.count < actualCount ? 1 : 5;
+        }
+
+        score -= index;
+
+        return { entry, track, cover, coverKey, defaultCover, score, penalized, index };
+      });
+
+      candidates.sort((a, b) => b.score - a.score);
+
+      const preferred = candidates.find(candidate => {
+        const owner = coverOwners.get(candidate.coverKey);
+        if (!owner) return true;
+        if (candidate.defaultCover) return owner.count >= actualCount;
+        return owner.count >= actualCount;
+      }) || candidates[0];
+
+      if (preferred && preferred.index > 0) {
+        const reordered = samples.slice();
+        reordered.splice(preferred.index, 1);
+        reordered.unshift(preferred.entry);
+        direction.sampleTracks = reordered;
+      } else {
+        direction.sampleTracks = samples;
+      }
+
+      const coverKey = preferred?.defaultCover ? DEFAULT_KEY : preferred?.cover;
+      if (coverKey && !coverOwners.has(coverKey)) {
+        coverOwners.set(coverKey, { directionKey, count: actualCount });
+      }
+
+      console.log(`🎨 Top card for ${directionKey}: ${preferred?.track?.title || 'unknown'} ` +
+                  `(cover=${preferred?.cover || 'default'}, count=${actualCount})`);
+    });
+
+    return directions;
+  }
+
+  applyStackBudget(directions) {
+    if (!directions || typeof directions !== 'object') {
+      return directions;
+    }
+
+    const total = this.stackTotalCount || 0;
+    if (!Number.isFinite(total) || total <= 0) {
+      return directions;
+    }
+
+    const randomCount = Math.min(this.stackRandomCount || 0, total);
+    const deterministicLimit = Math.max(total - randomCount, 0);
+    const usedIds = new Set();
+
+    Object.entries(directions).forEach(([directionKey, direction]) => {
+      const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+      let trimmed;
+
+      if (deterministicLimit === 0) {
+        trimmed = [];
+      } else {
+        trimmed = samples.slice(0, Math.min(samples.length, deterministicLimit));
+      }
+
+      direction.sampleTracks = trimmed;
+      direction.displayTrackCount = trimmed.length;
+      trimmed.forEach(sample => {
+        const track = sample.track || sample;
+        const id = track?.identifier;
+        if (id) {
+          usedIds.add(id);
+        }
+      });
+    });
+
+    Object.entries(directions).forEach(([directionKey, direction]) => {
+      if (!Array.isArray(direction.sampleTracks)) {
+        direction.sampleTracks = [];
+      }
+
+      const currentTracks = direction.sampleTracks;
+      const existingIds = new Set(currentTracks.map(sample => (sample.track || sample)?.identifier).filter(Boolean));
+      const needed = total - currentTracks.length;
+
+      if (needed <= 0) {
+        return;
+      }
+
+      const source = Array.isArray(direction.originalSampleTracks) && direction.originalSampleTracks.length > 0
+        ? direction.originalSampleTracks
+        : currentTracks;
+
+      const available = source.filter(sample => {
+        const track = sample.track || sample;
+        const id = track?.identifier;
+        if (!id) return false;
+        if (existingIds.has(id)) return false;
+        if (usedIds.has(id)) return false;
+        return true;
+      });
+
+      const picks = this.getRandomSubset(available, needed);
+
+      picks.forEach(sample => {
+        const clone = {
+          ...sample,
+          features: sample.features ? { ...sample.features } : sample.features
+        };
+        const track = clone.track || clone;
+        const id = track?.identifier;
+        if (id) {
+          usedIds.add(id);
+          existingIds.add(id);
+        }
+        currentTracks.push(clone);
+      });
+
+      direction.sampleTracks = currentTracks;
+      const finalCount = currentTracks.length;
+      direction.displayTrackCount = finalCount;
+      direction.actualTrackCount = finalCount;
+      direction.trackCount = finalCount;
+    });
+
+    return directions;
+  }
+
+  getRandomSubset(array, size) {
+    if (!Array.isArray(array) || array.length === 0 || size <= 0) {
+      return [];
+    }
+
+    const copy = array.slice();
+    this.shuffleArray(copy);
+    return copy.slice(0, Math.min(size, copy.length));
+  }
+
+  shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+  }
+
+  lookupTrackFeatures(identifier) {
+    if (!identifier) return null;
+    const track = this.radialSearch?.kdTree?.getTrack(identifier);
+    if (!track) return this.findTrackInCurrentExplorer(identifier)?.features || null;
+    return track.features || this.findTrackInCurrentExplorer(identifier)?.features || null;
+  }
+
+  lookupTrackPca(identifier) {
+    if (!identifier) return null;
+    const track = this.radialSearch?.kdTree?.getTrack(identifier);
+    if (!track) return this.findTrackInCurrentExplorer(identifier)?.pca || null;
+    return track.pca || this.findTrackInCurrentExplorer(identifier)?.pca || null;
+  }
+
+  lookupTrackAlbumCover(identifier) {
+    if (!identifier) return null;
+    const track = this.radialSearch?.kdTree?.getTrack(identifier);
+    if (!track) return this.findTrackInCurrentExplorer(identifier)?.albumCover || null;
+    return track.albumCover || this.findTrackInCurrentExplorer(identifier)?.albumCover || null;
+  }
+
+  cloneFeatureMap(features) {
+    if (!features || typeof features !== 'object') return null;
+    const clone = {};
+    for (const [key, value] of Object.entries(features)) {
+      if (value === undefined) continue;
+      clone[key] = value;
+    }
+    return clone;
+  }
+
+  clonePcaMap(pca) {
+    if (!pca || typeof pca !== 'object') return null;
+    const clone = {};
+    if (pca.primary_d !== undefined) {
+      clone.primary_d = pca.primary_d;
+    }
+    ['tonal', 'spectral', 'rhythmic'].forEach(domain => {
+      const domainValue = pca[domain];
+      if (Array.isArray(domainValue)) {
+        clone[domain] = domainValue.slice();
+      } else if (domainValue !== undefined && domainValue !== null) {
+        clone[domain] = domainValue;
+      }
+    });
+    return clone;
+  }
+
+  cloneBaseTrack(track) {
+    if (!track || typeof track !== 'object') return null;
+    const clone = {
+      identifier: track.identifier,
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      albumCover: track.albumCover,
+      path: track.path,
+      length: track.length,
+      duration: track.duration !== undefined ? track.duration : track.length,
+      love: track.love,
+      bpm: track.bpm,
+      key: track.key
+    };
+
+    if (track.features) {
+      clone.features = this.cloneFeatureMap(track.features);
+    }
+    if (track.pca) {
+      clone.pca = this.clonePcaMap(track.pca);
+    }
+    if (track.analysis) {
+      try {
+        clone.analysis = JSON.parse(JSON.stringify(track.analysis));
+      } catch (err) {
+        // Non-serializable analysis structures can be ignored for hydration purposes
+      }
+    }
+
+    return clone;
+  }
+
+  mergeFeatureMaps(...sources) {
+    const merged = {};
+    let hasValue = false;
+
+    sources.forEach(source => {
+      if (!source || typeof source !== 'object') return;
+      for (const [key, value] of Object.entries(source)) {
+        if (value === undefined || value === null) continue;
+        merged[key] = value;
+        hasValue = true;
+      }
+    });
+
+    return hasValue ? merged : null;
+  }
+
+  mergePcaMaps(...sources) {
+    let merged = null;
+
+    sources.forEach(source => {
+      const clone = this.clonePcaMap(source);
+      if (!clone) return;
+
+      if (!merged) {
+        merged = clone;
+        return;
+      }
+
+      if (clone.primary_d !== undefined) {
+        merged.primary_d = clone.primary_d;
+      }
+
+      ['tonal', 'spectral', 'rhythmic'].forEach(domain => {
+        if (clone[domain]) {
+          merged[domain] = clone[domain];
+        }
+      });
+    });
+
+    return merged;
+  }
+
+  hydrateTrackRecord(trackCandidate, annotations = {}) {
+    if (!trackCandidate && !annotations.identifier) {
+      return null;
+    }
+
+    let overlay = {};
+    let nestedCandidate = null;
+
+    if (typeof trackCandidate === 'string') {
+      overlay.identifier = trackCandidate;
+    } else if (trackCandidate && typeof trackCandidate === 'object') {
+      const { track: nested, ...rest } = trackCandidate;
+      overlay = { ...rest };
+
+      if (nested && typeof nested === 'object') {
+        nestedCandidate = nested;
+        for (const [key, value] of Object.entries(nested)) {
+          if (!(key in overlay)) {
+            overlay[key] = value;
+          }
+        }
+      } else {
+        nestedCandidate = trackCandidate;
+      }
+    }
+
+    const identifier = annotations.identifier
+      || overlay.identifier
+      || nestedCandidate?.identifier
+      || null;
+
+    if (!identifier) {
+      return null;
+    }
+
+    const kdTrack = this.radialSearch?.kdTree?.getTrack(identifier);
+    const baseClone = this.cloneBaseTrack(kdTrack) || {};
+
+    const result = {
+      ...baseClone,
+      ...overlay,
+      ...annotations
+    };
+
+    delete result.track;
+
+    result.identifier = identifier;
+    if (!result.length && typeof result.duration === 'number') {
+      result.length = result.duration;
+    }
+    if (!result.duration && typeof result.length === 'number') {
+      result.duration = result.length;
+    }
+    if (!result.path && baseClone.path) {
+      result.path = baseClone.path;
+    }
+    result.albumCover = result.albumCover || baseClone.albumCover || null;
+    result.title = result.title || baseClone.title;
+    result.artist = result.artist || baseClone.artist;
+
+    const mergedFeatures = this.mergeFeatureMaps(
+      baseClone.features,
+      nestedCandidate?.features,
+      overlay.features,
+      annotations.features
+    );
+    if (mergedFeatures) {
+      result.features = mergedFeatures;
+    } else if (result.features) {
+      result.features = this.cloneFeatureMap(result.features) || {};
+    } else {
+      result.features = {};
+    }
+
+    const mergedPca = this.mergePcaMaps(
+      baseClone.pca,
+      nestedCandidate?.pca,
+      overlay.pca,
+      annotations.pca
+    );
+    if (mergedPca) {
+      result.pca = mergedPca;
+    } else if (result.pca) {
+      result.pca = this.clonePcaMap(result.pca);
+    } else {
+      result.pca = null;
+    }
+
+    return result;
+  }
+
+  findTrackInCurrentExplorer(identifier) {
+    if (!identifier || !this.explorerDataCache?.size) return null;
+    for (const [, explorerData] of this.explorerDataCache) {
+      if (!explorerData || !explorerData.directions) continue;
+      for (const direction of Object.values(explorerData.directions)) {
+        const inspect = (dir) => {
+          if (!dir) return null;
+          const primary = dir.sampleTracks || [];
+          for (const sample of primary) {
+            const candidate = sample.track || sample;
+            if (candidate?.identifier === identifier) {
+              return candidate;
+            }
+          }
+          return null;
+        };
+
+        const primaryHit = inspect(direction);
+        if (primaryHit) return primaryHit;
+
+        if (direction.oppositeDirection) {
+          const oppositeHit = inspect(direction.oppositeDirection);
+          if (oppositeHit) return oppositeHit;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Ensure each stack reports unique tracks (within the stack and across all stacks)
+  sanitizeDirectionalStacks(directions) {
+    if (!directions || typeof directions !== 'object') {
+      return directions;
+    }
+
+    const globalAssignments = new Map(); // trackId -> { directionKey, location }
+    let duplicatesRemoved = 0;
+    let missingIdentifiers = 0;
+
+    const normalizeStack = (directionKey, direction, location = 'primary') => {
+      if (!direction || !Array.isArray(direction.sampleTracks)) {
+        return;
+      }
+
+      const localSeen = new Set();
+      const sanitized = [];
+
+      direction.sampleTracks.forEach((entry, index) => {
+        const trackId = entry?.identifier || entry?.track?.identifier;
+
+        if (!trackId) {
+          missingIdentifiers += 1;
+          console.warn(`🧼 STACK SANITIZE: Dropping track without identifier from ${directionKey}/${location} (index ${index})`);
+          return;
+        }
+
+        if (localSeen.has(trackId)) {
+          duplicatesRemoved += 1;
+          console.warn(`🧼 STACK SANITIZE: Removed local duplicate ${trackId} from ${directionKey}/${location} (index ${index})`);
+          return;
+        }
+
+        const existing = globalAssignments.get(trackId);
+        if (existing) {
+          duplicatesRemoved += 1;
+          const title = entry?.title || entry?.track?.title || trackId;
+          console.warn(`🧼 STACK SANITIZE: Removed ${title} (${trackId}) from ${directionKey}/${location}; already assigned to ${existing.directionKey}/${existing.location}`);
+          return;
+        }
+
+        localSeen.add(trackId);
+        globalAssignments.set(trackId, { directionKey, location });
+        sanitized.push(entry);
+      });
+
+      direction.sampleTracks = sanitized;
+
+      if (direction.oppositeDirection) {
+        const oppositeKey = direction.oppositeDirection.key || `${directionKey}_opposite`;
+        normalizeStack(oppositeKey, direction.oppositeDirection, 'opposite');
+      }
+    };
+
+    Object.entries(directions).forEach(([directionKey, direction]) => {
+      normalizeStack(directionKey, direction, 'primary');
+    });
+
+    const summaryParts = [`${globalAssignments.size} unique tracks retained`];
+    if (duplicatesRemoved > 0) {
+      summaryParts.push(`removed ${duplicatesRemoved} duplicates`);
+    }
+    if (missingIdentifiers > 0) {
+      summaryParts.push(`dropped ${missingIdentifiers} missing-id entries`);
+    }
+    console.log(`🧼 STACK SANITIZE: ${summaryParts.join(', ')}`);
+
+    return directions;
+  }
+
+  // Remove directions that lost all candidates after sanitization
+  removeEmptyDirections(directions) {
+    if (!directions || typeof directions !== 'object') {
+      return directions;
+    }
+
+    const cleaned = {};
+
+    Object.entries(directions).forEach(([directionKey, direction]) => {
+      const primaryTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+      const hasPrimaryTracks = primaryTracks.length > 0;
+
+      const opposite = direction.oppositeDirection;
+      const oppositeTracks = Array.isArray(opposite?.sampleTracks) ? opposite.sampleTracks : [];
+      const hasOppositeTracks = oppositeTracks.length > 0;
+
+      if (hasPrimaryTracks) {
+        if (opposite && !hasOppositeTracks) {
+          console.warn(`🧼 STACK SANITIZE: Dropping empty opposite stack for ${directionKey}`);
+          direction.hasOpposite = false;
+          delete direction.oppositeDirection;
+        }
+        cleaned[directionKey] = direction;
+        return;
+      }
+
+      if (hasOppositeTracks) {
+        const promotedKey = opposite.key || `${directionKey}_opposite`;
+        console.warn(`🧼 STACK SANITIZE: Promoting opposite stack ${promotedKey} after ${directionKey} lost all candidates`);
+        cleaned[promotedKey] = {
+          ...opposite,
+          hasOpposite: false
+        };
+        return;
+      }
+
+      console.warn(`🧼 STACK SANITIZE: Removing ${directionKey} entirely (no candidates remain)`);
+    });
+
+    return cleaned;
+  }
+
   // ⚖️ Prioritize bidirectional directions: larger stack becomes primary, smaller becomes opposite
   prioritizeBidirectionalDirections(directions) {
     console.log(`⚖️ PRIORITIZATION START: Processing ${Object.keys(directions).length} directions`);
@@ -2333,24 +3015,15 @@ class DriftAudioMixer {
       });
 
       // Check if we have a good discriminator (both directions score well)
-      const threshold = 10; // Lower threshold - if both directions have tracks, they likely form a discriminator
       const topDirection = sortedDirs[0];
 
       if (sortedDirs.length >= 2) {
-        const secondDirection = sortedDirs[1];
-
-        // If both directions have decent diversity scores, keep both (good discriminator)
-        // The key insight: if both directions exist with tracks, they likely form a meaningful split
-        if (topDirection.diversityScore >= threshold && secondDirection.diversityScore >= threshold) {
-          console.log(`✅   -> Good discriminator for '${dimName}': keeping both directions`);
-          console.log(`✅     Primary: '${topDirection.key}' (${topDirection.trackCount} tracks, diversity: ${topDirection.diversityScore?.toFixed(1)})`);
-          console.log(`✅     Secondary: '${secondDirection.key}' (${secondDirection.trackCount} tracks, diversity: ${secondDirection.diversityScore?.toFixed(1)})`);
-          return [topDirection, secondDirection];
-        }
+        const limited = sortedDirs.slice(0, 2);
+        console.log(`✅   -> Keeping both polarities for '${dimName}' (primary '${limited[0].key}', secondary '${limited[1].key}')`);
+        return limited;
       }
 
-      // Otherwise, just return the best direction
-      console.log(`✅   -> Selected single direction '${topDirection.key}' for '${dimName}': ${topDirection.trackCount} tracks, diversity: ${topDirection.diversityScore?.toFixed(1)}`);
+      console.log(`✅   -> Only one usable direction '${topDirection.key}' for '${dimName}' (${topDirection.trackCount} tracks, diversity: ${topDirection.diversityScore?.toFixed(1)})`);
       return [topDirection];
     };
 
@@ -2467,13 +3140,11 @@ class DriftAudioMixer {
   // Select next track based on weighted diversity score favoring original features
   async selectNextTrackFromExplorer(explorerData) {
     const validDirections = Object.entries(explorerData.directions)
-      .filter(([_, dir]) => dir.trackCount > 0 && !dir.isOutlier)
+      .filter(([_, dir]) => (dir.actualTrackCount ?? dir.trackCount ?? 0) > 0 && !dir.isOutlier)
       .map(([key, dir]) => {
-        // Weight original features higher due to their real data value and user familiarity
+        const baseScore = dir.adjustedDiversityScore ?? dir.diversityScore ?? 0;
         const isOriginalFeature = dir.domain === 'original';
-        const weightedScore = isOriginalFeature ?
-          dir.diversityScore * 1.5 : // 50% bonus for original features
-          dir.diversityScore;
+        const weightedScore = isOriginalFeature ? baseScore * 1.5 : baseScore;
 
         return [key, { ...dir, weightedDiversityScore: weightedScore }];
       })
@@ -2508,6 +3179,43 @@ class DriftAudioMixer {
       ` [${bestDirection.domain}_${bestDirection.component}_${bestDirection.polarity}]` :
       ` [${bestDirection.component}_${bestDirection.polarity}]`;
     console.log(`🎯 Next track selected from direction '${bestDirection.direction}'${componentDetail} (${domainLabel}, weighted diversity: ${weightedScore.toFixed(1)})`);
+
+    const distanceSlices = selectedTrack.distanceSlices
+      || selectedTrack.featureDistanceSlices
+      || selectedTrack.pcaDistanceSlices;
+    if (distanceSlices?.slices?.length) {
+      const referenceLabel = distanceSlices.reference?.key || distanceSlices.referenceKey || 'n/a';
+      const referenceDist = Number(distanceSlices.reference?.distance ?? distanceSlices.referenceDistance ?? 0);
+      const topSlices = [...distanceSlices.slices]
+        .sort((a, b) => {
+          const aRel = a.relative !== null && a.relative !== undefined ? Math.abs(Number(a.relative)) : 0;
+          const bRel = b.relative !== null && b.relative !== undefined ? Math.abs(Number(b.relative)) : 0;
+          if (aRel !== bRel) {
+            return bRel - aRel;
+          }
+          const aFrac = a.fraction !== null && a.fraction !== undefined ? Math.abs(Number(a.fraction)) : 0;
+          const bFrac = b.fraction !== null && b.fraction !== undefined ? Math.abs(Number(b.fraction)) : 0;
+          if (aFrac !== bFrac) {
+            return bFrac - aFrac;
+          }
+          return Math.abs(Number(b.delta || 0)) - Math.abs(Number(a.delta || 0));
+        })
+        .slice(0, 6)
+        .map(slice => {
+          const rel = slice.relative !== null && slice.relative !== undefined
+            ? `${Number(slice.relative).toFixed(3)}×`
+            : 'n/a';
+          const frac = slice.fraction !== null && slice.fraction !== undefined
+            ? Number(slice.fraction).toFixed(3)
+            : 'n/a';
+          const delta = slice.delta !== null && slice.delta !== undefined
+            ? Number(slice.delta).toFixed(3)
+            : 'n/a';
+          const marker = referenceLabel && slice.key === referenceLabel ? '★' : '';
+          return `${slice.key}${marker} Δ=${delta} rel=${rel} frac=${frac}`;
+        });
+      console.log(`🧭 Contribution breakdown (reference=${referenceLabel}, refDist=${referenceDist.toFixed(4)}): ${topSlices.join(' | ')}`);
+    }
 
     return {
       ...selectedTrack,
@@ -2569,7 +3277,7 @@ class DriftAudioMixer {
 
         const trackCount = candidates.totalAvailable || 0;
         const filteredCandidates = this.filterSessionRepeats(candidates.candidates || []);
-        const sampleTracks = this.selectStrategicSamples(filteredCandidates, this.currentTrack, 50);
+        const sampleTracks = this.selectStrategicSamples(filteredCandidates, this.currentTrack);
 
         // Skip directions with 0 tracks (completely ignore them)
         if (trackCount === 0) {

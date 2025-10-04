@@ -15,14 +15,20 @@ const state = {
     camera: null,
     scene: null,
     baseDirectionKey: null,
-    streamUrl: null,
-    eventsEndpoint: null,
+    streamUrl: '/stream',
+    eventsEndpoint: '/events',
+     streamUrlBase: '/stream',
     currentResolution: 'magnifying',
     manualNextTrackOverride: false,
     nextTrackAnimationTimer: null,
     manualNextDirectionKey: null,
     playbackStartTimestamp: null,
-    playbackDurationSeconds: 0
+    playbackDurationSeconds: 0,
+    lastTrackUpdateTs: 0,
+    pendingInitialTrackTimer: null,
+    pendingResyncCheckTimer: null,
+    creatingNewSession: false,
+    remainingCounts: {}
   };
 window.state = state;
 
@@ -213,10 +219,24 @@ function initializeApp() {
 
   function updateNowPlayingCard(trackData, driftState) {
       state.latestCurrentTrack = trackData;
+      window.state = window.state || {};
+      window.state.latestCurrentTrack = trackData;
+      state.lastTrackUpdateTs = Date.now();
+
+      if (state.pendingResyncCheckTimer) {
+        clearTimeout(state.pendingResyncCheckTimer);
+        state.pendingResyncCheckTimer = null;
+      }
+
+      if (state.pendingInitialTrackTimer) {
+        clearTimeout(state.pendingInitialTrackTimer);
+        state.pendingInitialTrackTimer = null;
+      }
 
       // Update direction based on current drift direction
-      const directionText = driftState && driftState.currentDirection ?
-          formatDirectionName(driftState.currentDirection) :
+      const currentDirectionKey = driftState && driftState.currentDirection ? driftState.currentDirection : null;
+      const directionText = currentDirectionKey ?
+          formatDirectionName(currentDirectionKey) :
           'Journey';
       document.getElementById('cardDirection').textContent = directionText;
 
@@ -241,7 +261,7 @@ function initializeApp() {
       photo.style.background = `url('${cover}')`
 
       // Randomly assign panel color variant
-      const panel = document.querySelector('.panel');
+      const panel = document.querySelector('#nowPlayingCard .panel');
       const variants = ['red-variant', 'green-variant', 'yellow-variant', 'blue-variant'];
       // Remove existing variants
       variants.forEach(v => panel.classList.remove(v));
@@ -252,6 +272,15 @@ function initializeApp() {
 		  ? state.previousNextTrack?.variant
 		  : variants[Math.floor(Math.random() * variants.length)]
       );
+
+      const isNegativeDirection = Boolean(currentDirectionKey && currentDirectionKey.includes('_negative'));
+      const nowPlayingRoot = document.getElementById('nowPlayingCard');
+      if (nowPlayingRoot) {
+          nowPlayingRoot.classList.toggle('negative-direction', isNegativeDirection);
+      }
+      if (panel) {
+          panel.classList.toggle('negative-direction', isNegativeDirection);
+      }
 
       // Show card with zoom-in animation
       const card = document.getElementById('nowPlayingCard');
@@ -270,7 +299,8 @@ function preloadImage(url) {
     cache.appendChild(img);
 }
 
-function createDimensionCards(explorerData) {
+function createDimensionCards(explorerData, options = {}) {
+      const skipExitAnimation = options.skipExitAnimation === true;
       const normalizeTracks = (direction) => {
           if (!direction || !Array.isArray(direction.sampleTracks)) return;
           direction.sampleTracks = direction.sampleTracks.map(entry => entry.track || entry);
@@ -293,6 +323,7 @@ function createDimensionCards(explorerData) {
           };
       }
       state.latestExplorerData = explorerData;
+      state.remainingCounts = {};
 
       Object.values(explorerData.directions || {}).forEach(normalizeTracks);
 
@@ -309,6 +340,27 @@ function createDimensionCards(explorerData) {
 
       const nextTrackId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
       const selectionStillPresent = state.selectedIdentifier ? explorerContainsTrack(explorerData, state.selectedIdentifier) : false;
+
+      const overridePinnedButMissing = Boolean(
+          state.manualNextTrackOverride &&
+          state.selectedIdentifier &&
+          !selectionStillPresent
+      );
+
+      if (overridePinnedButMissing) {
+          console.error('🛰️ ACTION pinned-track-missing', {
+              pinnedTrack: state.selectedIdentifier,
+              availableDirections: Object.keys(explorerData.directions || {}),
+              nextTrackFromServer: explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null
+          });
+
+          state.manualNextTrackOverride = false;
+          state.manualNextDirectionKey = null;
+
+          const fallbackIdentifier = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
+          state.selectedIdentifier = fallbackIdentifier;
+      }
+
       const manualOverrideActive = state.manualNextTrackOverride && selectionStillPresent;
 
       if (manualOverrideActive && previousNext && previousNextId) {
@@ -324,6 +376,48 @@ function createDimensionCards(explorerData) {
               state.nextTrackAnimationTimer = null;
           }
           return;
+      }
+
+      if (!skipExitAnimation) {
+          const exitingCards = container.querySelectorAll('.dimension-card');
+          if (exitingCards.length > 0) {
+              let remaining = exitingCards.length;
+              let renderScheduled = false;
+              const scheduleRender = () => {
+                  if (renderScheduled) return;
+                  renderScheduled = true;
+                  createDimensionCards(explorerData, { skipExitAnimation: true });
+              };
+              const fallbackTimer = setTimeout(scheduleRender, 700);
+
+              const tryComplete = () => {
+                  remaining -= 1;
+                  if (remaining <= 0 && !renderScheduled) {
+                      clearTimeout(fallbackTimer);
+                      scheduleRender();
+                  }
+              };
+
+              exitingCards.forEach(card => {
+                  let finished = false;
+                  const handleDone = () => {
+                      if (finished) return;
+                      finished = true;
+                      card.removeEventListener('transitionend', onTransitionEnd);
+                      card.removeEventListener('animationend', onTransitionEnd);
+                      tryComplete();
+                  };
+                  const onTransitionEnd = (event) => {
+                      if (event.target !== card) return;
+                      handleDone();
+                  };
+                  card.addEventListener('transitionend', onTransitionEnd);
+                  card.addEventListener('animationend', onTransitionEnd);
+                  card.classList.add('card-exit');
+                  card.style.pointerEvents = 'none';
+              });
+              return;
+          }
       }
 
       // Clear existing cards
@@ -583,7 +677,7 @@ function createDimensionCards(explorerData) {
           sampleTracks.forEach((trackObj, trackIndex) => {
               const track = trackObj.track || trackObj;
               const isSelectedTrack = trackIndex === finalSelectedTrackIndex;
-              const card = createTrackDetailCard(targetDimension, track, dimensionIndex, directions.length, isSelectedTrack, trackIndex, sampleTracks.length);
+              const card = createTrackDetailCard(targetDimension, track, dimensionIndex, directions.length, isSelectedTrack, trackIndex, sampleTracks.length, swapStackContents);
               container.appendChild(card);
               // Make visible immediately - no delay
               card.classList.add('visible');
@@ -604,10 +698,18 @@ function createDimensionCards(explorerData) {
           : 0;
       const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
 
+      const directionKey = direction.key || nextTrackData?.directionKey || direction.directionKey || `direction_${index}`;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - finalSelectedTrackIndex - 1);
+
       // Create selected card (front, fully visible)
       const selectedTrack = sampleTracks[finalSelectedTrackIndex];
-      const selectedCard = createTrackDetailCard(direction, selectedTrack.track || selectedTrack, index, total, true, 0, sampleTracks.length);
+      const selectedCard = createTrackDetailCard(direction, selectedTrack.track || selectedTrack, index, total, true, 0, sampleTracks.length, swapStackContents);
       container.appendChild(selectedCard);
+      selectedCard.dataset.trackIndex = String(finalSelectedTrackIndex);
+      selectedCard.dataset.totalTracks = String(sampleTracks.length);
 
       // Stack depth indication is now handled via CSS pseudo-elements on the main card
 
@@ -640,6 +742,11 @@ function createDimensionCards(explorerData) {
 
       // Update the global state
       state.selectedIdentifier = firstTrack.identifier;
+      state.stackIndex = 0;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[newNextDirectionKey] = Math.max(0, sampleTracks.length - 1);
 
       // Update latestExplorerData to reflect the new next track
       state.latestExplorerData.nextTrack = {
@@ -687,11 +794,19 @@ function createDimensionCards(explorerData) {
 
   // Refresh cards with new selection state (seamlessly, no blinking)
   function refreshCardsWithNewSelection() {
+      const ICON = '🛰️';
       if (!state.latestExplorerData || !state.selectedIdentifier) return;
       console.log('🔄 Seamlessly updating selection:', state.selectedIdentifier);
 
       // Find the selected card first
       const allTrackCards = document.querySelectorAll('.dimension-card.track-detail-card.next-track');
+      if (allTrackCards.length === 0) {
+          console.warn(`${ICON} ACTION selection-cards-unavailable`, {
+              selection: state.selectedIdentifier,
+              reason: 'no next-track cards rendered'
+          });
+          return;
+      }
       let selectedCard = null;
       let selectedDimensionKey = null;
 
@@ -703,7 +818,16 @@ function createDimensionCards(explorerData) {
           }
       });
 
-      if (!selectedCard) return;
+      if (!selectedCard) {
+          console.error(`${ICON} ACTION selection-card-missing`, {
+              selection: state.selectedIdentifier,
+              availableCards: Array.from(allTrackCards).map(card => ({
+                  direction: card.dataset.directionKey,
+                  track: card.dataset.trackMd5
+              }))
+          });
+          return;
+      }
 
       // Second pass: update all cards based on selection
       allTrackCards.forEach(card => {
@@ -725,6 +849,28 @@ function createDimensionCards(explorerData) {
           if (isSelectedCard) {
               // Update the top card content to show selected track
               card.classList.add('selected');
+
+              const directionData = state.latestExplorerData?.directions?.[directionKey];
+              let selectedIdx = -1;
+              if (directionData && Array.isArray(directionData.sampleTracks)) {
+                  selectedIdx = directionData.sampleTracks.findIndex(sample => {
+                      const sampleTrack = sample.track || sample;
+                      return sampleTrack?.identifier === state.selectedIdentifier;
+                  });
+                  if (selectedIdx >= 0) {
+                      card.dataset.trackIndex = String(selectedIdx);
+                  }
+              }
+              if (!state.remainingCounts) {
+                  state.remainingCounts = {};
+              }
+              const totalTracks = directionData?.sampleTracks?.length || 0;
+              const effectiveIndex = selectedIdx >= 0 ? selectedIdx : 0;
+              card.dataset.totalTracks = String(totalTracks);
+              state.remainingCounts[directionKey] = Math.max(0, totalTracks - effectiveIndex - 1);
+              if (directionData && typeof updateStackSizeIndicator === 'function') {
+                  updateStackSizeIndicator(directionData, card, selectedIdx >= 0 ? selectedIdx : undefined);
+              }
 
               // Show full track details
               const direction = state.latestExplorerData?.directions?.[directionKey];
@@ -757,7 +903,8 @@ function createDimensionCards(explorerData) {
 
       // Immediately hide clickwall and show interface
       elements.clickCatcher.classList.add('fadeOut');
-      elements.volumeControl.style.display = 'block';
+      elements.volumeControl.style.display = 'flex';
+      elements.volumeBar.style.height = (elements.audio.volume * 100) + '%';
       document.body.style.cursor = 'default';
       state.isStarted = true;
 
@@ -768,6 +915,9 @@ function createDimensionCards(explorerData) {
 
       // Set audio source and start playing
       console.log(`🎵 Setting audio source to: ${state.streamUrl}`);
+      if (state.streamUrl) {
+          elements.audio.src = state.streamUrl;
+      }
 
       // Add error event listeners for better diagnostics
       elements.audio.onerror = function(e) {
@@ -858,12 +1008,12 @@ function createDimensionCards(explorerData) {
   elements.volumeControl.addEventListener('click', (e) => {
       e.stopPropagation();
       const rect = elements.volumeControl.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const percent = x / rect.width;
+      const y = e.clientY - rect.top;
+      const percent = 1 - (y / rect.height);
       const volume = Math.max(0, Math.min(1, percent));
 
       elements.audio.volume = volume;
-      elements.volumeBar.style.width = (volume * 100) + '%';
+      elements.volumeBar.style.height = (volume * 100) + '%';
   });
 
   // Keyboard controls
@@ -894,13 +1044,13 @@ function createDimensionCards(explorerData) {
       switch (e.key) {
           case '+':
               elements.audio.volume = Math.min(1, elements.audio.volume + 0.1);
-              elements.volumeBar.style.width = (elements.audio.volume * 100) + '%';
+              elements.volumeBar.style.height = (elements.audio.volume * 100) + '%';
               e.preventDefault();
               break;
 
           case '-':
               elements.audio.volume = Math.max(0, elements.audio.volume - 0.1);
-              elements.volumeBar.style.width = (elements.audio.volume * 100) + '%';
+              elements.volumeBar.style.height = (elements.audio.volume * 100) + '%';
               e.preventDefault();
               break;
 
@@ -1098,6 +1248,22 @@ function createDimensionCards(explorerData) {
 
   animateBeams(sceneInit());
 
+  elements.audio.addEventListener('play', () => {
+      if (state.pendingInitialTrackTimer) return;
+
+      state.pendingInitialTrackTimer = setTimeout(() => {
+          const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
+        if (!hasTrack) {
+            state.manualNextTrackOverride = false;
+            state.manualNextDirectionKey = null;
+            state.selectedIdentifier = null;
+            state.stackIndex = 0;
+            console.warn('🛰️ ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
+            fullResync();
+        }
+      }, 10000);
+  });
+
 
   // ====== Inactivity Management ======
   let inactivityTimer = null;
@@ -1166,17 +1332,26 @@ function createDimensionCards(explorerData) {
 
   function renderProgressBar(progressFraction) {
       const clamped = Math.min(Math.max(progressFraction, 0), 1);
+      const background = document.getElementById('background');
 
       if (clamped <= 0.5) {
           const widthPercent = clamped * 2 * 100; // 0 → 100
           elements.progressWipe.style.left = '0%';
           elements.progressWipe.style.right = 'auto';
           elements.progressWipe.style.width = `${widthPercent}%`;
+
+          if (background) {
+              background.style.background = 'linear-gradient(135deg, #235, #403)';
+          }
       } else {
           const phase2Progress = (clamped - 0.5) * 2; // 0 → 1
           elements.progressWipe.style.left = `${phase2Progress * 100}%`;
           elements.progressWipe.style.right = 'auto';
           elements.progressWipe.style.width = `${(1 - phase2Progress) * 100}%`;
+
+          if (background) {
+              background.style.background = 'linear-gradient(135deg, #235, #453)';
+          }
       }
   }
 
@@ -1406,7 +1581,53 @@ function createDimensionCards(explorerData) {
     const eventSource = new EventSource(eventsUrl);
     connectionHealth.currentEventSource = eventSource;
 
-    eventSource.onopen = () => {
+    const handleSseStuck = async () => {
+      try {
+        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        const sessionInfo = Array.isArray(payload.sessions)
+          ? payload.sessions.find(entry => entry.sessionId === state.sessionId)
+          : null;
+
+        if (sessionInfo && sessionInfo.md5) {
+          console.warn('📡 SSE idle but session active; requesting explorer refresh');
+          await requestSSERefresh();
+          return false;
+        }
+
+        if (sessionInfo && !sessionInfo.md5) {
+          console.warn('📡 SSE idle; session reported but no track yet. Waiting.');
+          return false;
+        }
+      } catch (error) {
+        console.error('📡 SSE stuck check failed:', error);
+      }
+      return true;
+    };
+
+    const resetStuckTimer = () => {
+      if (connectionHealth.sse.stuckTimeout) {
+        clearTimeout(connectionHealth.sse.stuckTimeout);
+      }
+      connectionHealth.sse.stuckTimeout = setTimeout(async () => {
+        const shouldReconnect = await handleSseStuck();
+        if (shouldReconnect) {
+          console.warn('📡 SSE stuck check: forcing reconnect');
+          connectionHealth.sse.status = 'reconnecting';
+          updateConnectionHealthUI();
+          eventSource.close();
+          setTimeout(() => connectSSE(), 1000);
+        } else {
+          resetStuckTimer();
+        }
+      }, 60000);
+    };
+
+          fetch('/refresh-sse-simple', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }).catch(() => {})
+eventSource.onopen = () => {
       console.log('📡 SSE connected');
       connectionHealth.sse.status = 'connected';
       connectionHealth.sse.reconnectAttempts = 0;
@@ -1414,21 +1635,12 @@ function createDimensionCards(explorerData) {
       connectionHealth.sse.lastMessage = Date.now();
       updateConnectionHealthUI();
 
-      // Monitor for stuck connection (no messages for 60s)
-      if (connectionHealth.sse.stuckTimeout) {
-        clearTimeout(connectionHealth.sse.stuckTimeout);
-      }
-      connectionHealth.sse.stuckTimeout = setTimeout(() => {
-        console.warn('📡 SSE stuck - no messages for 60s, forcing reconnect');
-        connectionHealth.sse.status = 'reconnecting';
-        updateConnectionHealthUI();
-        eventSource.close();
-        setTimeout(() => connectSSE(), 1000);
-      }, 60000);
+      resetStuckTimer();
     };
 
     eventSource.onmessage = (event) => {
       connectionHealth.sse.lastMessage = Date.now();
+      resetStuckTimer();
 
       try {
         const raw = JSON.parse(event.data);
@@ -1529,6 +1741,8 @@ function createDimensionCards(explorerData) {
           }
 
           updateNowPlayingCard(data.currentTrack, data.driftState);
+          state.latestExplorerData = data.explorer;
+          state.remainingCounts = {};
           createDimensionCards(data.explorer);
 
           const trackDurationSeconds = data.currentTrack.duration || data.currentTrack.length || 0;
@@ -1703,6 +1917,22 @@ function createDimensionCards(explorerData) {
 
       // Update selection
       state.selectedIdentifier = nextTrack.identifier;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[directionKey] = Math.max(0, sampleTracks.length - nextIndex - 1);
+
+      const centerCard = document.querySelector('.dimension-card.next-track.selected')
+          || document.querySelector('.dimension-card.next-track');
+      if (centerCard) {
+          centerCard.dataset.trackMd5 = nextTrack.identifier;
+          centerCard.dataset.trackIndex = nextIndex;
+          centerCard.dataset.totalTracks = String(sampleTracks.length);
+          const directionData = state.latestExplorerData?.directions?.[directionKey];
+          if (directionData && typeof updateStackSizeIndicator === 'function') {
+              updateStackSizeIndicator(directionData, centerCard, nextIndex);
+          }
+      }
 
       // Update server
       sendNextTrack(nextTrack.identifier, directionKey, 'user');
@@ -1870,7 +2100,7 @@ function createDimensionCards(explorerData) {
       currentCard.dataset.directionType = getDirectionType(displayDimensionKey);
 
       // Update the card with the new track details (this will also handle visual feedback)
-      updateCardWithTrackDetails(currentCard, trackToShow, displayDirection);
+      updateCardWithTrackDetails(currentCard, trackToShow, displayDirection, false, swapStackContents);
   }
 
   // Animate a direction card from its clock position to center (becoming next track stack)
@@ -2137,7 +2367,7 @@ function createDimensionCards(explorerData) {
                          // Cycle the appropriate tracks
                          tracksToUse.push(tracksToUse.shift());
                          const track = tracksToUse[0].track || tracksToUse[0];
-                         updateCardWithTrackDetails(card, track, dimensionToShow, true);
+                         updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           console.log(`🎬 Found existing next track: ${existingNextTrackCard.dataset.directionKey}, rotating to next clock position`);
                           rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
@@ -2164,6 +2394,10 @@ function createDimensionCards(explorerData) {
       if (!card) return;
 
       console.log(`🔄 Rotating center card ${directionKey} to next clock position`);
+
+      if (typeof hideStackSizeIndicator === 'function') {
+          hideStackSizeIndicator();
+      }
 
       // Get all cards on the clock face (not center)
       const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
@@ -2240,6 +2474,15 @@ function createDimensionCards(explorerData) {
 
       // IMPORTANT: Reset reverse state and restore original face
       console.log(`🔄 Restoring original face for ${directionKey} (removing any reversed state)`);
+
+      const lingeringStackVisual = card.querySelector('.stack-line-visual');
+      if (lingeringStackVisual) {
+          lingeringStackVisual.remove();
+      }
+      const lingeringMetrics = card.querySelector('.track-metrics');
+      if (lingeringMetrics) {
+          lingeringMetrics.remove();
+      }
 
       // Remove reversed classes and restore original direction
       card.classList.remove('reversed');
@@ -2370,7 +2613,7 @@ function createDimensionCards(explorerData) {
       const selectedTrack = sampleTracks[0].track || sampleTracks[0];
       console.log(`🔄 Selected track:`, selectedTrack);
       console.log(`🔄 About to call updateCardWithTrackDetails with preserveColors=true...`);
-      updateCardWithTrackDetails(card, selectedTrack, direction, true);
+      updateCardWithTrackDetails(card, selectedTrack, direction, true, swapStackContents);
       console.log(`🔄 Finished calling updateCardWithTrackDetails`);
 
       // Stack depth indication is now handled via CSS pseudo-elements on the main card
@@ -2395,6 +2638,9 @@ function createDimensionCards(explorerData) {
     console.log(`🎵 Audio reconnecting in ${delay}ms (attempt ${connectionHealth.audio.reconnectAttempts}/${connectionHealth.audio.maxAttempts})`);
 
     setTimeout(() => {
+      if (state.streamUrl) {
+        elements.audio.src = state.streamUrl;
+      }
       elements.audio.load();
       if (state.isStarted) {
         elements.audio.play().then(() => {
@@ -2458,20 +2704,37 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     // Use existing data if not provided (heartbeat/refresh case)
     const manualOverrideActive = state.manualNextTrackOverride && state.selectedIdentifier;
 
-    const md5ToSend = trackMd5
-        || (manualOverrideActive ? state.selectedIdentifier : state.latestExplorerData?.nextTrack?.track?.identifier)
-        || state.selectedIdentifier;
+    const allowFallback = source !== 'manual_refresh';
 
-    let dirToSend = direction
-        || (manualOverrideActive ? state.manualNextDirectionKey : state.latestExplorerData?.nextTrack?.directionKey)
-        || null;
+    let md5ToSend = trackMd5;
+    let dirToSend = direction;
+
+    if (!md5ToSend && allowFallback) {
+        if (manualOverrideActive && state.selectedIdentifier) {
+            md5ToSend = state.selectedIdentifier;
+            dirToSend = dirToSend || state.manualNextDirectionKey || null;
+        }
+
+        if (!md5ToSend) {
+            md5ToSend = state.latestExplorerData?.nextTrack?.track?.identifier || null;
+            dirToSend = dirToSend || state.latestExplorerData?.nextTrack?.directionKey || null;
+        }
+
+        if (!md5ToSend) {
+            md5ToSend = state.selectedIdentifier || null;
+        }
+    }
 
     if (manualOverrideActive && !dirToSend) {
         dirToSend = state.manualNextDirectionKey;
     }
 
     if (!md5ToSend) {
-        console.warn('⚠️ sendNextTrack: No track MD5 available, skipping');
+        console.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
+        state.manualNextTrackOverride = false;
+        state.manualNextDirectionKey = null;
+        state.selectedIdentifier = null;
+        state.stackIndex = 0;
         scheduleHeartbeat(10000); // Retry in 10s
         fullResync();
         return;
@@ -2494,13 +2757,26 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 trackMd5: md5ToSend,
-                direction: dirToSend
+                direction: dirToSend,
+                source
             })
         });
 
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data = await response.json();
+        window.state = window.state || {};
+        window.state.lastHeartbeatResponse = data;
+
+        const serverTrack = data.currentTrack;
+        const localTrack = state.latestCurrentTrack?.identifier || null;
+        if (source === 'heartbeat' && serverTrack && localTrack && serverTrack !== localTrack) {
+            console.error('🛰️ ACTION heartbeat-track-mismatch (immediate)', { serverTrack, localTrack });
+            fullResync();
+            return;
+        }
+
+
         // data = { nextTrack, currentTrack, duration, remaining }
 
         console.log(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
@@ -2524,12 +2800,48 @@ function analyzeAndAct(data, source, sentMd5) {
         return;
     }
 
+    const ICON = '🛰️';
+    const serverDurationSeconds = (typeof duration === 'number' && duration > 0) ? (duration / 1000) : null;
+    const serverElapsedSeconds = (typeof duration === 'number' && typeof remaining === 'number' && duration > 0)
+        ? Math.max((duration - remaining) / 1000, 0)
+        : null;
+    const clientDurationSeconds = state.playbackDurationSeconds || null;
+    const clientElapsedSeconds = (state.playbackStartTimestamp && state.playbackDurationSeconds)
+        ? Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0)
+        : null;
+
+    const clientNextTrack = state.latestExplorerData?.nextTrack?.track?.identifier
+        || state.latestExplorerData?.nextTrack?.identifier
+        || state.selectedIdentifier
+        || null;
+
+    console.log(`${ICON} Sync snapshot (${source})`, {
+        server: {
+            currentTrack: currentTrack || null,
+            elapsedSeconds: serverElapsedSeconds,
+            durationSeconds: serverDurationSeconds,
+            nextTrack: nextTrack || null
+        },
+        client: {
+            currentTrack: state.latestCurrentTrack?.identifier || null,
+            elapsedSeconds: clientElapsedSeconds,
+            durationSeconds: clientDurationSeconds,
+            nextTrack: clientNextTrack || null,
+            pendingSelection: state.selectedIdentifier || null
+        },
+        sentOverride: sentMd5 || null
+    });
+
     // Check 1: Current track MD5 mismatch
     const currentMd5 = state.latestCurrentTrack?.identifier;
     const currentTrackMismatch = currentMd5 && currentTrack !== currentMd5;
 
     if (currentTrackMismatch) {
-        console.log(`🔄 CURRENT TRACK MISMATCH! Expected ${currentMd5?.substring(0,8)}, got ${currentTrack?.substring(0,8)}`);
+        console.log(`${ICON} ACTION current-track-mismatch`, {
+            expected: currentMd5,
+            received: currentTrack,
+            source
+        });
         fullResync();
         return;
     }
@@ -2539,11 +2851,19 @@ function analyzeAndAct(data, source, sentMd5) {
     const nextTrackMismatch = expectedNextMd5 && nextTrack !== expectedNextMd5;
 
     if (nextTrackMismatch) {
-        console.log(`🔄 NEXT TRACK MISMATCH! Expected ${expectedNextMd5?.substring(0,8)}, got ${nextTrack?.substring(0,8)}`);
+        console.log(`${ICON} ACTION next-track-mismatch`, {
+            expected: expectedNextMd5,
+            received: nextTrack,
+            source,
+            sentMd5
+        });
 
         // If this is what we just sent, it's a confirmation not a mismatch - just update our state
         if (sentMd5 && nextTrack === sentMd5) {
-            console.log(`✅ Server confirmed our selection - updating local state only`);
+            console.log(`${ICON} ACTION confirmation`, {
+                acknowledged: sentMd5,
+                source
+            });
             selectedNextTrackSha = nextTrack;
             scheduleHeartbeat(60000);
             return;
@@ -2552,11 +2872,18 @@ function analyzeAndAct(data, source, sentMd5) {
         // Otherwise, server picked something different (only happens on heartbeat/auto-transition)
         // Check if the server's next track is in our current neighborhood
         if (isTrackInNeighborhood(nextTrack)) {
-            console.log(`✅ Server's next track found in local neighborhood - promoting to next track stack`);
+            console.log(`${ICON} ACTION promote-neighborhood`, {
+                track: nextTrack,
+                source
+            });
             promoteTrackToNextStack(nextTrack);
             scheduleHeartbeat(60000);
         } else {
-            console.log(`❌ Server's next track NOT in neighborhood - need full resync`);
+            console.log(`${ICON} ACTION full-resync-needed`, {
+                track: nextTrack,
+                reason: 'not_in_neighborhood',
+                source
+            });
             fullResync();
             return;
         }
@@ -2567,12 +2894,16 @@ function analyzeAndAct(data, source, sentMd5) {
         const durationSeconds = Math.max(duration / 1000, 0);
         const elapsedSeconds = Math.max((duration - remaining) / 1000, 0);
         const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-        console.log(`🔄 Timing update from server: duration=${durationSeconds.toFixed(2)}s, elapsed=${clampedElapsed.toFixed(2)}s`);
+        console.log(`${ICON} ACTION timing-update`, {
+            durationSeconds,
+            elapsedSeconds: clampedElapsed,
+            source
+        });
         startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: true });
     }
 
     // All checks passed
-    console.log(`✅ Sync confirmed (${source})`);
+    console.log(`${ICON} ACTION sync-ok`, { source });
     scheduleHeartbeat(60000);
 }
 
@@ -2645,6 +2976,15 @@ function scheduleHeartbeat(delayMs = 60000) {
     state.heartbeatTimeout = setTimeout(() => {
         console.log('💓 Heartbeat triggered');
         sendNextTrack(null, null, 'heartbeat');
+        window.state = window.state || {};
+        const serverTrack = window.state?.lastHeartbeatResponse?.currentTrack;
+        const localTrack = window.state?.latestCurrentTrack?.identifier || null;
+        if (serverTrack && localTrack && serverTrack !== localTrack) {
+            console.error('🛰️ ACTION heartbeat-track-mismatch', { serverTrack, localTrack });
+            fullResync();
+            return;
+        }
+
     }, delayMs);
 
     console.log(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
@@ -2674,6 +3014,21 @@ async function fullResync() {
             console.log('✅ Resync broadcast triggered, waiting for SSE update...');
             // SSE event will update UI
             scheduleHeartbeat(60000);
+
+            if (state.pendingResyncCheckTimer) {
+              clearTimeout(state.pendingResyncCheckTimer);
+            }
+
+            state.pendingResyncCheckTimer = setTimeout(() => {
+              const lastUpdate = state.lastTrackUpdateTs || 0;
+              const age = Date.now() - lastUpdate;
+              const hasCurrent = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
+
+              if (!hasCurrent || age > 5000) {
+                console.warn('🛰️ ACTION resync-followup: no track update after broadcast, requesting SSE refresh');
+                requestSSERefresh();
+              }
+            }, 5000);
         } else {
             console.warn('⚠️ Resync failed:', result.reason);
 
@@ -2693,6 +3048,100 @@ async function fullResync() {
 }
 
 // Request SSE refresh from the backend
+async function createNewJourneySession(reason = 'unknown') {
+    if (state.creatingNewSession) {
+        console.log(`🛰️ ACTION new-session-skip: already creating (${reason})`);
+        return;
+    }
+
+    state.creatingNewSession = true;
+
+    try {
+        console.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
+
+        const streamElement = state.isStarted ? elements.audio : null;
+        if (streamElement) {
+            try {
+                streamElement.pause();
+            } catch (err) {
+                console.warn('🎵 Pause before new session failed:', err);
+            }
+        }
+
+        const response = await fetch('/session/random', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const result = await response.json();
+
+        const streamBase = result.streamUrl || '/stream';
+        const cacheBuster = Date.now();
+        const newStreamUrl = `${streamBase}?session=${encodeURIComponent(result.sessionId || '')}&t=${cacheBuster}`;
+
+        state.sessionId = result.sessionId || null;
+        state.streamUrl = newStreamUrl;
+        state.streamUrlBase = streamBase;
+        state.eventsEndpoint = result.eventsUrl || '/events';
+        window.streamUrl = state.streamUrl;
+        window.eventsUrl = state.eventsEndpoint;
+
+        if (streamElement) {
+            streamElement.src = newStreamUrl;
+        }
+
+        state.manualNextTrackOverride = false;
+        state.manualNextDirectionKey = null;
+        state.selectedIdentifier = null;
+        state.stackIndex = 0;
+        state.latestExplorerData = null;
+        state.remainingCounts = {};
+
+        if (state.pendingInitialTrackTimer) {
+            clearTimeout(state.pendingInitialTrackTimer);
+            state.pendingInitialTrackTimer = null;
+        }
+        if (state.pendingResyncCheckTimer) {
+            clearTimeout(state.pendingResyncCheckTimer);
+            state.pendingResyncCheckTimer = null;
+        }
+
+        if (result.currentTrack) {
+            updateNowPlayingCard(result.currentTrack, null);
+        } else {
+            state.latestCurrentTrack = null;
+            window.state.latestCurrentTrack = null;
+            state.lastTrackUpdateTs = 0;
+        }
+
+        if (connectionHealth.currentEventSource) {
+            connectionHealth.currentEventSource.close();
+            connectionHealth.currentEventSource = null;
+        }
+        connectionHealth.sse.status = 'reconnecting';
+        updateConnectionHealthUI();
+        connectSSE();
+
+        if (streamElement) {
+            streamElement.load();
+            streamElement.play().catch(err => {
+                console.error('🎵 Audio play failed after new session:', err);
+            });
+        }
+
+        scheduleHeartbeat(5000);
+    } catch (error) {
+        console.error('❌ Failed to create new journey session:', error);
+        scheduleHeartbeat(10000);
+    } finally {
+        state.creatingNewSession = false;
+    }
+}
+
 async function requestSSERefresh() {
     try {
         console.log('🔄 Sending SSE refresh request to backend...');
@@ -2707,6 +3156,10 @@ async function requestSSERefresh() {
             requestBody.sessionId = state.sessionId;
         }
 
+        if (!state.latestExplorerData || !state.latestExplorerData.directions) {
+            requestBody.requestExplorerData = true;
+        }
+
         const response = await fetch('/refresh-sse', {
             method: 'POST',
             headers: {
@@ -2719,7 +3172,12 @@ async function requestSSERefresh() {
             const result = await response.json();
             console.log('✅ SSE refresh request successful:', result);
 
-            if (result.active && result.currentTrack) {
+            if (result.ok === false) {
+                console.warn(`🔄 SSE refresh reported issue: ${result.reason || 'unknown'}`);
+                return;
+            }
+
+            if (result.currentTrack) {
                 console.log(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
                 console.log(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
 
@@ -2734,13 +3192,18 @@ async function requestSSERefresh() {
                     console.log(`🔄 No exploration data from backend - keeping existing cards`);
                 }
 
+                if (!result.explorerData && (!state.latestExplorerData || !state.latestExplorerData.directions)) {
+                    console.warn('⚠️ Explorer data still missing after refresh; forcing follow-up request');
+                    fullResync();
+                }
+
                 // Start progress animation if duration is available
                 if (result.currentTrack.duration) {
                     startProgressAnimation(result.currentTrack.duration);
                 }
 
             } else {
-                console.log('🔄 Backend reports inactive session - may need manual intervention');
+                console.warn('🔄 SSE refresh completed but no current track reported');
             }
 
         } else {
@@ -2751,6 +3214,45 @@ async function requestSSERefresh() {
 
     } catch (error) {
         console.error('❌ SSE refresh request error:', error);
+    }
+}
+
+async function manualRefresh() {
+    console.log('🔄 Manual refresh snapshot');
+    try {
+        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const entry = Array.isArray(payload.sessions)
+            ? payload.sessions.find(session => session.sessionId === state.sessionId)
+            : null;
+
+        if (!entry) {
+            console.warn('🛰️ Manual refresh: session missing on server, creating new journey');
+            await createNewJourneySession('manual_refresh_missing');
+            return;
+        }
+
+        if (!entry.md5) {
+            console.warn('🛰️ Manual refresh: no current track reported yet, requesting SSE refresh');
+            await requestSSERefresh();
+            return;
+        }
+
+        const localTrackId = state.latestCurrentTrack?.identifier || null;
+        if (!localTrackId || localTrackId !== entry.md5) {
+            console.warn('🛰️ Manual refresh: local track differs from server snapshot, requesting SSE refresh');
+        } else {
+            console.log('🛰️ Manual refresh: state matches server, refreshing explorer data');
+        }
+
+        await requestSSERefresh();
+    } catch (error) {
+        console.error('❌ Manual refresh snapshot failed:', error);
+        await requestSSERefresh();
     }
 }
 
@@ -2767,8 +3269,7 @@ function setupManualRefreshButton() {
             refreshButton.classList.add('refreshing');
 
             try {
-                // Use heartbeat system for manual refresh
-                await sendNextTrack(null, null, 'manual_refresh');
+                await manualRefresh();
 
                 // Keep spinning animation for a bit longer to show it worked
                 setTimeout(() => {

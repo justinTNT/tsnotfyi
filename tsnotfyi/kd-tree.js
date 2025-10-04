@@ -6,6 +6,30 @@ const fs = require('fs');
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
+function openDatabase(dbPath) {
+    return new Promise((resolve, reject) => {
+        const db = new sqlite3.Database(dbPath, (err) => {
+            if (err) {
+                reject(new Error(`Database connection failed: ${err.message}`));
+            } else {
+                resolve(db);
+            }
+        });
+    });
+}
+
+function runAll(db, query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(query, params, (err, rows) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(rows);
+            }
+        });
+    });
+}
+
 class KDTreeNode {
     constructor(point, dimension, left = null, right = null) {
         this.point = point;
@@ -118,125 +142,104 @@ class MusicalKDTree {
     }
 
     async initialize() {
-        return new Promise((resolve, reject) => {
-            this.db = new sqlite3.Database(this.dbPath, (err) => {
-                if (err) {
-                    reject(`Database connection failed: ${err.message}`);
-                    return;
-                }
+        if (this.db) {
+            return;
+        }
 
-                console.log('Connected to musical database');
-                Promise.all([
-                    this.loadTracks(),
-                    this.loadCalibrationSettings()
-                ]).then(() => {
-                    console.log(`Loaded ${this.tracks.length} tracks`);
-                    console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
-                    this.buildTree();
-                    console.log('KD-tree constructed');
-                    resolve();
-                }).catch(reject);
-            });
-        });
+        this.db = await openDatabase(this.dbPath);
+        console.log('Connected to musical database');
+
+        await Promise.all([
+            this.loadTracks(),
+            this.loadCalibrationSettings()
+        ]);
+
+        console.log(`Loaded ${this.tracks.length} tracks`);
+        console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
+        this.buildTree();
+        console.log('KD-tree constructed');
     }
 
     async loadTracks() {
-        return new Promise((resolve, reject) => {
-            // Load all tracks with their audio features and PCA values
-            const query = `
-                SELECT
-                    identifier,
-                    bt_title as title,
-                    bt_artist as artist,
-                    bt_path as path,
-                    bt_length as length,
-                    ${this.dimensions.join(', ')},
-                    primary_d,
-                    tonal_pc1, tonal_pc2, tonal_pc3,
-                    spectral_pc1, spectral_pc2, spectral_pc3,
-                    rhythmic_pc1, rhythmic_pc2, rhythmic_pc3,
-                    love,hate,beets_meta
-                FROM music_analysis
-                WHERE bpm IS NOT NULL and hate IS 0
-                AND spectral_centroid IS NOT NULL
-                AND primary_d IS NOT NULL
-                ORDER BY identifier
-            `;
+        // Load all tracks with their audio features and PCA values
+        const query = `
+            SELECT
+                identifier,
+                bt_title as title,
+                bt_artist as artist,
+                bt_path as path,
+                bt_length as length,
+                ${this.dimensions.join(', ')},
+                primary_d,
+                tonal_pc1, tonal_pc2, tonal_pc3,
+                spectral_pc1, spectral_pc2, spectral_pc3,
+                rhythmic_pc1, rhythmic_pc2, rhythmic_pc3,
+                love,hate,beets_meta
+            FROM music_analysis
+            WHERE bpm IS NOT NULL and hate IS 0
+            AND spectral_centroid IS NOT NULL
+            AND primary_d IS NOT NULL
+            ORDER BY identifier
+        `;
 
-            this.db.all(query, [], (err, rows) => {
-                if (err) {
-                    reject(err);
-                    return;
+        const rows = await runAll(this.db, query);
+
+        this.tracks = rows.map(row => {
+            const meta = JSON.parse(row.beets_meta);
+            const artPath = (meta.album.artpath?.length > 0) ? meta.album.artpath : '/images/albumcover.png';
+
+            const track = {
+                identifier: row.identifier,
+                title: row.title,
+                artist: row.artist,
+                path: row.path,
+                length: row.length,
+                features: {},
+                albumCover: artPath,
+                love: row.love,
+                pca: {
+                    primary_d: row.primary_d,
+                    tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],
+                    spectral: [row.spectral_pc1, row.spectral_pc2, row.spectral_pc3],
+                    rhythmic: [row.rhythmic_pc1, row.rhythmic_pc2, row.rhythmic_pc3]
                 }
+            };
 
-                this.tracks = rows.map(row => {
-
-                    let meta = JSON.parse(row.beets_meta);
-                    let artPath = (meta.album.artpath?.length > 0) ?  meta.album.artpath : '/images/albumcover.png';
-
-                    const track = {
-                        identifier: row.identifier,
-                        title: row.title,
-                        artist: row.artist,
-                        path: row.path,
-                        length: row.length,
-                        features: {},
-                        albumCover: artPath,
-                        love: row.love,
-                        pca: {
-                            primary_d: row.primary_d,
-                            tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],
-                            spectral: [row.spectral_pc1, row.spectral_pc2, row.spectral_pc3],
-                            rhythmic: [row.rhythmic_pc1, row.rhythmic_pc2, row.rhythmic_pc3]
-                        }
-                    };
-
-                    // Extract feature vector
-                    this.dimensions.forEach(dim => {
-                        track.features[dim] = row[dim] || 0;
-                    });
-
-                    return track;
-                });
-
-                resolve();
+            this.dimensions.forEach(dim => {
+                track.features[dim] = row[dim] || 0;
             });
+
+            return track;
         });
     }
 
     async loadCalibrationSettings() {
-        return new Promise((resolve, reject) => {
-            const query = `
-                SELECT resolution_level as resolution, discriminator, base_x, inner_radius, outer_radius, achieved_percentage, scaling_factor
-                FROM pca_calibration_settings
-                ORDER BY resolution_level, discriminator
-            `;
+        const query = `
+            SELECT resolution_level as resolution, discriminator, base_x, inner_radius, outer_radius, achieved_percentage, scaling_factor
+            FROM pca_calibration_settings
+            ORDER BY resolution_level, discriminator
+        `;
 
-            this.db.all(query, [], (err, rows) => {
-                if (err) {
-                    console.warn('Could not load calibration settings:', err);
-                    this.calibrationSettings = {}; // Use defaults
-                    resolve();
-                    return;
+        try {
+            const rows = await runAll(this.db, query);
+
+            this.calibrationSettings = {};
+            rows.forEach(row => {
+                if (!this.calibrationSettings[row.resolution]) {
+                    this.calibrationSettings[row.resolution] = {};
                 }
-
-                this.calibrationSettings = {};
-                rows.forEach(row => {
-                    if (!this.calibrationSettings[row.resolution]) {
-                        this.calibrationSettings[row.resolution] = {};
-                    }
-                    this.calibrationSettings[row.resolution][row.discriminator] = {
-                        base_x: row.base_x,
-                        inner_radius: row.inner_radius,
-                        outer_radius: row.outer_radius,
-                        achieved_percentage: row.achieved_percentage,
-                        scaling_factor: row.scaling_factor || 1.0
-                    };
-                });
-
-                resolve();
+                this.calibrationSettings[row.resolution][row.discriminator] = {
+                    base_x: row.base_x,
+                    inner_radius: row.inner_radius,
+                    outer_radius: row.outer_radius,
+                    achieved_percentage: row.achieved_percentage,
+                    scaling_factor: row.scaling_factor || 1.0
+                };
             });
-        });
+        } catch (err) {
+            console.warn('Could not load calibration settings:', err);
+            this.calibrationSettings = {}; // Use defaults
+        }
     }
 
     buildTree() {
@@ -444,50 +447,6 @@ class MusicalKDTree {
         }
     }
 
-    // Compute minimum meaningful delta for a specific dimension on this track
-    // Uses binary search to find the delta that crosses the inner radius threshold
-    computeMinimumDeltaForDimension(currentTrack, dimension) {
-        if (!currentTrack.pca || !this.calibrationSettings.magnifying_glass?.primary_d) {
-            return 0; // No threshold if no PCA data
-        }
-
-        const pcaSettings = this.calibrationSettings.magnifying_glass.primary_d;
-        const innerRadius = pcaSettings.inner_radius;
-        const baseValue = currentTrack.features[dimension];
-
-        if (baseValue === undefined) return 0;
-
-        // Binary search for the delta that crosses inner radius
-        let low = 0;
-        let high = Math.abs(baseValue) * 2 + 10; // Generous upper bound
-        let minDelta = 0;
-
-        for (let iter = 0; iter < 15; iter++) { // 15 iterations gives ~0.003% precision
-            const testDelta = (low + high) / 2;
-
-            // Create virtual track with this delta
-            const virtualTrack = {
-                ...currentTrack,
-                features: { ...currentTrack.features, [dimension]: baseValue + testDelta },
-                pca: { ...currentTrack.pca }
-            };
-
-            // Calculate primary_d distance
-            const distance = this.calculatePCADistance(currentTrack, virtualTrack, 'primary_d');
-
-            if (distance >= innerRadius) {
-                // This delta crosses the threshold - try smaller
-                minDelta = testDelta;
-                high = testDelta;
-            } else {
-                // Delta too small - try larger
-                low = testDelta;
-            }
-        }
-
-        return minDelta;
-    }
-
     // Get directional candidates (Stage 1 of radial search algorithm)
     getDirectionalCandidates(currentTrackId, direction, weights = null, ignoreDimensions = []) {
         const currentTrack = this.tracks.find(t => t.identifier === currentTrackId);
@@ -515,22 +474,77 @@ class MusicalKDTree {
         const directionDim = this.getDirectionDimension(direction);
         const currentValue = currentTrack.features[directionDim];
 
-        // Compute minimum meaningful delta for this dimension on this track
-        const minimumDelta = this.computeMinimumDeltaForDimension(currentTrack, directionDim);
+        const pcaSettings = this.calibrationSettings.magnifying_glass?.primary_d;
+        const innerRadius = pcaSettings?.inner_radius || 0;
 
-        const directionalCandidates = neighborhood.filter(result => {
+        const directionalCandidates = [];
+        const ratioSamples = [];
+        const deltaSamples = [];
+
+        neighborhood.forEach(result => {
             const candidateValue = result.track.features[directionDim];
+            if (candidateValue === undefined) {
+                return;
+            }
+
             const delta = Math.abs(candidateValue - currentValue);
+            if (delta === 0) {
+                return;
+            }
 
-            // Must be in the right direction AND exceed minimum delta
             const inDirection = this.isInDirection(currentValue, candidateValue, direction);
-            const exceedsThreshold = delta >= minimumDelta;
+            if (!inDirection) {
+                return;
+            }
 
-            return inDirection && exceedsThreshold;
+            let primaryDistance = null;
+            if (innerRadius > 0 && result.track.pca && currentTrack.pca) {
+                primaryDistance = this.calculatePCADistance(currentTrack, result.track, 'primary_d');
+                if (primaryDistance > 0) {
+                    ratioSamples.push(delta / primaryDistance);
+                }
+            }
+
+            deltaSamples.push(delta);
+            directionalCandidates.push({
+                track: result.track,
+                similarity: result.distance,
+                direction_value: candidateValue,
+                direction_delta: candidateValue - currentValue,
+                featureDelta: delta,
+                primaryDistance
+            });
         });
 
+        let minimumDelta = 0;
+        if (innerRadius > 0) {
+            const meaningfulRatios = ratioSamples.filter(value => Number.isFinite(value) && value > 0);
+            if (meaningfulRatios.length > 0) {
+                meaningfulRatios.sort((a, b) => a - b);
+                const medianRatio = meaningfulRatios[Math.floor(meaningfulRatios.length / 2)];
+                minimumDelta = medianRatio * innerRadius;
+            }
+        }
+
+        if (minimumDelta === 0 && deltaSamples.length > 0) {
+            const sorted = deltaSamples.slice().sort((a, b) => a - b);
+            const percentileIndex = Math.floor(sorted.length * 0.25);
+            minimumDelta = sorted[Math.min(percentileIndex, sorted.length - 1)] || sorted[sorted.length - 1];
+        }
+
+        const filteredCandidates = directionalCandidates.filter(candidate => {
+            const passesDelta = candidate.featureDelta >= minimumDelta * 0.999;
+            const passesPrimary = innerRadius > 0 && candidate.primaryDistance !== null
+                ? candidate.primaryDistance >= innerRadius * 0.95
+                : true;
+            return passesDelta && passesPrimary;
+        });
+
+        const chosenCandidates = filteredCandidates.length > 0 ? filteredCandidates : directionalCandidates;
+
+        const excluded = directionalCandidates.length - chosenCandidates.length;
         if (minimumDelta > 0) {
-            console.log(`🎯 Directional filter: ${directionDim} minimum delta = ${minimumDelta.toFixed(3)} (excluded ${neighborhood.length - directionalCandidates.length} tracks too close)`);
+            console.log(`🎯 Directional filter: ${directionDim} minimum delta ≈ ${minimumDelta.toFixed(3)} (excluded ${excluded} tracks too close or inside inner radius)`);
         }
 
         // Calculate D-minus-i similarity (all dimensions except navigation dimension)
@@ -538,11 +552,11 @@ class MusicalKDTree {
             !ignoreDimensions.includes(dim) && dim !== directionDim
         );
 
-        const candidates = directionalCandidates.map(result => ({
+        const candidates = chosenCandidates.map(result => ({
             track: result.track,
             similarity: this.calculateDimensionSimilarity(currentTrack, result.track, activeDimensions, weights),
-            direction_value: result.track.features[directionDim],
-            direction_delta: result.track.features[directionDim] - currentValue
+            direction_value: result.direction_value,
+            direction_delta: result.direction_delta
         }));
 
         // Sort by similarity in other dimensions
@@ -642,6 +656,265 @@ class MusicalKDTree {
     // Get track by identifier
     getTrack(identifier) {
         return this.tracks.find(t => t.identifier === identifier);
+    }
+
+    cloneFeatureSet(features) {
+        if (!features || typeof features !== 'object') return {};
+        const clone = {};
+        for (const [key, value] of Object.entries(features)) {
+            clone[key] = value;
+        }
+        return clone;
+    }
+
+    clonePcaSet(pca) {
+        if (!pca || typeof pca !== 'object') return {};
+        const clone = {};
+        if (pca.primary_d !== undefined) {
+            clone.primary_d = pca.primary_d;
+        }
+        ['tonal', 'spectral', 'rhythmic'].forEach(domain => {
+            if (Array.isArray(pca[domain])) {
+                clone[domain] = pca[domain].slice();
+            } else if (pca[domain] !== undefined) {
+                clone[domain] = pca[domain];
+            }
+        });
+        return clone;
+    }
+
+    calculateFeatureContributionFractions(currentTrack, candidateTrack, dimensions, weights = null, contextLabel = '', referenceDimension = null) {
+        if (!currentTrack?.features || !candidateTrack?.features) {
+            return { total: 0, referenceDistance: 0, slices: [] };
+        }
+
+        const activeDimensions = Array.isArray(dimensions) && dimensions.length > 0
+            ? dimensions
+            : this.dimensions;
+
+        const appliedWeights = weights || this.defaultWeights;
+        const rawTotalDistance = this.calculateDimensionSimilarity(currentTrack, candidateTrack, activeDimensions, appliedWeights);
+        const totalDistance = Number.isFinite(rawTotalDistance) ? rawTotalDistance : 0;
+        const safeTotal = Math.abs(totalDistance);
+
+        const slices = [];
+        const labelPrefix = contextLabel ? `[${contextLabel}]` : '';
+
+        let referenceDistance = null;
+        if (referenceDimension) {
+            const candidateValue = candidateTrack.features?.[referenceDimension];
+            const currentValue = currentTrack.features?.[referenceDimension];
+            if (candidateValue !== undefined && currentValue !== undefined) {
+                const hybrid = {
+                    features: this.cloneFeatureSet(currentTrack.features),
+                    pca: this.clonePcaSet(currentTrack.pca)
+                };
+                hybrid.features[referenceDimension] = candidateValue;
+
+                referenceDistance = this.calculateDimensionSimilarity(currentTrack, hybrid, [referenceDimension], appliedWeights);
+                const fraction = (safeTotal > this.epsilon && referenceDistance > 0)
+                    ? Math.min(1, referenceDistance / safeTotal)
+                    : 0;
+                const delta = candidateValue - currentValue;
+                const relative = referenceDistance > this.epsilon ? 1 : null;
+
+                console.log(`📐 Feature contribution ${labelPrefix}.${referenceDimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+
+                slices.push({
+                    key: referenceDimension,
+                    value: candidateValue,
+                    delta,
+                    distance: referenceDistance,
+                    fraction,
+                    relative
+                });
+            }
+        }
+
+        activeDimensions.forEach(dimension => {
+            if (referenceDimension && dimension === referenceDimension) {
+                return;
+            }
+
+            const candidateValue = candidateTrack.features?.[dimension];
+            const currentValue = currentTrack.features?.[dimension];
+            if (candidateValue === undefined || currentValue === undefined) {
+                return;
+            }
+
+            const hybrid = {
+                features: this.cloneFeatureSet(currentTrack.features),
+                pca: this.clonePcaSet(currentTrack.pca)
+            };
+            hybrid.features[dimension] = candidateValue;
+
+            const sliceDistance = this.calculateDimensionSimilarity(currentTrack, hybrid, [dimension], appliedWeights);
+            const fraction = (safeTotal > this.epsilon && sliceDistance > 0)
+                ? Math.min(1, sliceDistance / safeTotal)
+                : 0;
+            const delta = candidateValue - currentValue;
+            const relative = (referenceDistance && referenceDistance > this.epsilon)
+                ? sliceDistance / referenceDistance
+                : null;
+
+            console.log(`📐 Feature contribution ${labelPrefix}.${dimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+
+            slices.push({
+                key: dimension,
+                value: candidateValue,
+                delta,
+                distance: sliceDistance,
+                fraction,
+                relative
+            });
+        });
+
+        return { total: totalDistance, referenceDistance, slices };
+    }
+
+    calculatePcaContributionFractions(currentTrack, candidateTrack, domain, contextLabel = '', referenceComponent = null) {
+        if (!currentTrack?.pca || !candidateTrack?.pca) {
+            return { total: 0, referenceDistance: 0, referenceKey: null, slices: [] };
+        }
+
+        const labelPrefix = contextLabel ? `[${contextLabel}]` : '';
+        const rawTotalDistance = this.calculatePCADistance(currentTrack, candidateTrack, domain);
+        const totalDistance = Number.isFinite(rawTotalDistance) ? rawTotalDistance : 0;
+        const safeTotal = Math.abs(totalDistance);
+
+        const slices = [];
+        let referenceDistance = null;
+        let referenceKey = null;
+
+        if (domain === 'primary_d') {
+            const candidateValue = candidateTrack.pca?.primary_d;
+            const currentValue = currentTrack.pca?.primary_d;
+            if (candidateValue === undefined || currentValue === undefined) {
+                return { total: totalDistance, referenceDistance: 0, referenceKey: null, slices: [] };
+            }
+            const hybrid = {
+                features: this.cloneFeatureSet(currentTrack.features),
+                pca: this.clonePcaSet(currentTrack.pca)
+            };
+            hybrid.pca.primary_d = candidateValue;
+
+            referenceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, 'primary_d'));
+            const fraction = (safeTotal > this.epsilon && referenceDistance > 0)
+                ? Math.min(1, referenceDistance / safeTotal)
+                : 0;
+            const delta = candidateValue - currentValue;
+            const relative = referenceDistance > this.epsilon ? 1 : null;
+
+            console.log(`📐 PCA contribution ${labelPrefix}.primary_d: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+
+            slices.push({
+                key: 'primary_d',
+                value: candidateValue,
+                delta,
+                distance: referenceDistance,
+                fraction,
+                relative
+            });
+
+            referenceKey = 'primary_d';
+
+            return { total: totalDistance, referenceDistance, referenceKey, slices };
+        }
+
+        const candidateComponents = candidateTrack.pca?.[domain];
+        const currentComponents = currentTrack.pca?.[domain];
+        if (!Array.isArray(candidateComponents) || !Array.isArray(currentComponents)) {
+            return { total: totalDistance, referenceDistance: 0, referenceKey: null, slices: [] };
+        }
+
+        let referenceIndex = null;
+        if (typeof referenceComponent === 'number' && Number.isFinite(referenceComponent)) {
+            referenceIndex = referenceComponent;
+        } else if (typeof referenceComponent === 'string') {
+            const match = referenceComponent.match(/pc(\d+)/i);
+            if (match) {
+                referenceIndex = parseInt(match[1], 10) - 1;
+            }
+        }
+
+        if (referenceIndex !== null && referenceIndex >= 0 && referenceIndex < candidateComponents.length) {
+            const candidateValue = candidateComponents[referenceIndex];
+            const currentValue = currentComponents[referenceIndex];
+            if (candidateValue !== undefined && currentValue !== undefined) {
+                const hybrid = {
+                    features: this.cloneFeatureSet(currentTrack.features),
+                    pca: this.clonePcaSet(currentTrack.pca)
+                };
+                if (!Array.isArray(hybrid.pca[domain])) {
+                    hybrid.pca[domain] = currentComponents.slice();
+                }
+                hybrid.pca[domain][referenceIndex] = candidateValue;
+
+                referenceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, domain));
+                const fraction = (safeTotal > this.epsilon && referenceDistance > 0)
+                    ? Math.min(1, referenceDistance / safeTotal)
+                    : 0;
+                const delta = candidateValue - currentValue;
+                const relative = referenceDistance > this.epsilon ? 1 : null;
+                const label = `${domain}_pc${referenceIndex + 1}`;
+
+                console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+
+                slices.push({
+                    key: label,
+                    value: candidateValue,
+                    delta,
+                    distance: referenceDistance,
+                    fraction,
+                    relative
+                });
+
+                referenceKey = label;
+            }
+        }
+
+        candidateComponents.forEach((candidateValue, index) => {
+            const currentValue = currentComponents[index];
+            if (candidateValue === undefined || currentValue === undefined) {
+                return;
+            }
+
+            if (referenceIndex !== null && index === referenceIndex) {
+                return;
+            }
+
+            const hybrid = {
+                features: this.cloneFeatureSet(currentTrack.features),
+                pca: this.clonePcaSet(currentTrack.pca)
+            };
+            if (!Array.isArray(hybrid.pca[domain])) {
+                hybrid.pca[domain] = currentComponents.slice();
+            }
+            hybrid.pca[domain][index] = candidateValue;
+
+            const sliceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, domain));
+            const fraction = (safeTotal > this.epsilon && sliceDistance > 0)
+                ? Math.min(1, sliceDistance / safeTotal)
+                : 0;
+            const delta = candidateValue - currentValue;
+            const relative = (referenceDistance && referenceDistance > this.epsilon)
+                ? sliceDistance / referenceDistance
+                : null;
+
+            const label = `${domain}_pc${index + 1}`;
+            console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+
+            slices.push({
+                key: label,
+                value: candidateValue,
+                delta,
+                distance: sliceDistance,
+                fraction,
+                relative
+            });
+        });
+
+        return { total: totalDistance, referenceDistance, referenceKey, slices };
     }
 
     // Get stats about the dataset

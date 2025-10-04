@@ -942,7 +942,7 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 
 // Simplified next track endpoint - resolves session from request context
 app.post('/next-track', async (req, res) => {
-  const { trackMd5, direction } = req.body;
+  const { trackMd5, direction, source = 'user' } = req.body;
   const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!trackMd5) {
@@ -954,19 +954,21 @@ app.post('/next-track', async (req, res) => {
   }
 
   try {
-    console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
+    if (source === 'user') {
+      console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
-    // Set the specific next track by MD5
-    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
-      session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
-    } else if (typeof session.mixer.setNextTrack === 'function') {
-      session.mixer.setNextTrack(trackMd5);
-    } else if (session.mixer.driftPlayer) {
-      // Store the selected track MD5 for next transition
-      session.mixer.selectedNextTrackMd5 = trackMd5;
-      if (direction) {
-        session.mixer.driftPlayer.currentDirection = direction;
+      if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
+        session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
+      } else if (typeof session.mixer.setNextTrack === 'function') {
+        session.mixer.setNextTrack(trackMd5);
+      } else if (session.mixer.driftPlayer) {
+        session.mixer.selectedNextTrackMd5 = trackMd5;
+        if (direction) {
+          session.mixer.driftPlayer.currentDirection = direction;
+        }
       }
+    } else {
+      console.log(`💓 Heartbeat sync request received for ${trackMd5} (direction: ${direction})`);
     }
 
     // Calculate timing info for sync check
@@ -975,7 +977,7 @@ app.post('/next-track', async (req, res) => {
     const remaining = Math.max(0, duration - elapsed);
 
     const currentTrackId = session.mixer.currentTrack?.identifier || null;
-    console.log(`📤 /next-track response: currentTrack=${currentTrackId?.substring(0,8)}, nextTrack=${trackMd5.substring(0,8)}, remaining=${Math.round(remaining)}ms`);
+    console.log(`📤 /next-track response (${source}): currentTrack=${currentTrackId?.substring(0,8)}, nextTrack=${trackMd5.substring(0,8)}, remaining=${Math.round(remaining)}ms`);
 
     res.json({
       // Acknowledgment
@@ -1076,6 +1078,59 @@ app.get('/health', (req, res) => {
     activeSessions: audioSessions.size,
     sessionDetails: sessionDetails,
     radialSearch: radialSearch.getStats()
+  });
+});
+
+app.get('/sessions/now-playing', (req, res) => {
+  const sessions = [];
+
+  const collectSessions = (collection, isEphemeral = false) => {
+    for (const [sessionId, session] of collection) {
+      const mixer = session.mixer;
+      if (!mixer || !mixer.currentTrack) {
+        continue;
+      }
+
+      const track = mixer.currentTrack;
+      let durationSeconds = null;
+      if (typeof mixer.getAdjustedTrackDuration === 'function') {
+        const adjusted = Number(mixer.getAdjustedTrackDuration());
+        if (Number.isFinite(adjusted) && adjusted > 0) {
+          durationSeconds = adjusted;
+        }
+      }
+      if (durationSeconds === null && typeof track.length === 'number') {
+        durationSeconds = track.length;
+      }
+
+      const trackStart = mixer.trackStartTime || session.lastAccess || null;
+      const elapsedMs = trackStart ? Date.now() - trackStart : null;
+
+      sessions.push({
+        sessionId,
+        md5: track.identifier || null,
+        title: track.title || null,
+        artist: track.artist || null,
+        nextTrack: mixer.nextTrack ? {
+          identifier: mixer.nextTrack.identifier || null,
+          title: mixer.nextTrack.title || null,
+          artist: mixer.nextTrack.artist || null
+        } : null,
+        elapsedMs: elapsedMs !== null ? Math.max(elapsedMs, 0) : null,
+        durationMs: durationSeconds !== null ? Math.round(durationSeconds * 1000) : null,
+        clients: mixer.clients ? mixer.clients.size : 0,
+        isEphemeral: isEphemeral || Boolean(session.isEphemeral)
+      });
+    }
+  };
+
+  collectSessions(audioSessions, false);
+  collectSessions(ephemeralSessions, true);
+
+  res.json({
+    status: 'ok',
+    timestamp: Date.now(),
+    sessions
   });
 });
 

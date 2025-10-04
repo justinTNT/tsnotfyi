@@ -23,6 +23,7 @@ body {
     background: linear-gradient(135deg, #235, #453);
     opacity: 0.3;
     z-index: -2;
+    transition: background 1s ease-in-out;
 }
 
 #scene {
@@ -53,37 +54,37 @@ body {
 
 #volumeControl {
     position: fixed;
-    bottom: 20px;
+    bottom: 60px;
     right: 20px;
-    width: 100px;
-    height: 20px;
+    width: 32px;
+    height: 140px;
     background: rgba(17, 17, 17, 0.9);
     border: 1px solid #0a0;
+    border-radius: 18px;
     cursor: grab;
     display: none;
     z-index: 2000;
     backdrop-filter: blur(4px);
+    overflow: hidden;
+    flex-direction: column-reverse;
 }
 
 #volumeBar {
-    height: 100%;
+    width: 100%;
     background: #0a0;
-    width: 85%;
-    transition: width 0.1s;
+    height: 100%;
+    transition: height 0.1s;
+    border-radius: 0 0 18px 18px;
 }
 
 .diagnostic-bar {
     position: fixed;
     bottom: 15px;
-    right: 20px;
+    right: 50px;
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 6px 12px;
-    border: 1px solid #0a0;
-    border-radius: 20px;
-    background: rgba(17, 17, 17, 0.85);
-    backdrop-filter: blur(6px);
+    gap: 6px;
+    padding: 0px 10px;
     z-index: 2000;
 }
 
@@ -99,6 +100,8 @@ body {
     letter-spacing: 0.05em;
     min-width: 52px;
     text-align: right;
+    padding-right: 1em;
+    margin-top: 5px;
 }
 
 .radius-button {
@@ -126,41 +129,72 @@ body {
     box-shadow: 0 0 10px rgba(0, 60, 0, 0.6);
 }
 
-/* Stack size indicator positioned over card top-right corner */
-.stack-size-indicator {
+/* Stack line visualization for remaining tracks */
+.stack-line-visual {
     position: absolute;
-    top: 30px;
-    right: -50px;
-    width: 50px;
-    height: 50px;
-    background: #0a0; /* Volume bar green */
-    border-radius: 25px;
+    top: 50%;
+    left: calc(100% + 8px);
     display: flex;
+    flex-direction: row;
     align-items: center;
-    justify-content: center;
-    z-index: 15; /* Above card content but below reverse button */
-    opacity: 0.8;
-    transition: opacity 0.3s ease, transform 0.2s ease;
-    cursor: pointer;
-    user-select: none;
+    gap: 1px;
+    transform: translateY(-50%);
+    pointer-events: auto;
+    padding-left: 0;
 }
 
-.stack-size-indicator:hover {
-    opacity: 1.0;
-    transform: scale(1.05);
+.stack-line-visual .stack-line {
+    width: 1px;
+    min-width: 1px;
+    border-radius: 999px;
+    background: var(--border-color, rgba(255, 255, 255, 0.9));
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.35);
+    transition: height 140ms ease, opacity 140ms ease;
+    opacity: 0.85;
 }
 
-.stack-size-indicator:active {
-    opacity: 1.0;
-    transform: scale(0.95);
+.stack-line-visual .stack-line:nth-child(4n) {
+    opacity: 0.95;
 }
 
-.stack-size-text {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1em;
-    color: #fff; /* White text */
-    font-weight: bold;
-    user-select: none;
+.track-metrics .metric-chip {
+    background: rgba(16, 16, 16, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 0.65rem;
+    color: #fff;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+.track-metrics .metric-label {
+    opacity: 0.7;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.track-metrics .metric-value {
+    font-weight: 600;
+}
+
+.track-metrics .metric-chip.metric-empty {
+    opacity: 0.6;
+}
+
+.track-metrics {
+    position: absolute;
+    top: -4em;
+    right: -11em;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-end;
+    pointer-events: none;
+    width: 4em;
 }
 
 /* Search icon for fzf activation */
@@ -718,6 +752,14 @@ audio {
                 transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
 }
 
+#nowPlayingCard.negative-direction .rim,
+#nowPlayingCard .panel.negative-direction .rim {
+    -webkit-mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+            mask: radial-gradient(140% 130% at 61% -9%,
+                transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
+}
+
 /* Footer band - simplified to avoid gradient conflicts */
 .bottom {
     position: absolute;
@@ -777,6 +819,12 @@ audio {
 
 .dimension-card.visible {
     opacity: 1;
+}
+
+.dimension-card.card-exit {
+    transform: translate3d(0, 0, -2200px) scale(0.2) rotateX(20deg);
+    opacity: 0;
+    transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.45s ease;
 }
 
 /* Inactive state for direction cards after 20s of inactivity */
