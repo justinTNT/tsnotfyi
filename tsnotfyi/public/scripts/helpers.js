@@ -527,6 +527,102 @@
       });
   }
 
+
+  // Comprehensive duplicate detection system
+
+  function performDuplicateAnalysis(explorerData, context = "unknown") {
+      console.log(`🃏 === DUPLICATE ANALYSIS START (${context}) ===`);
+
+      const allTracks = new Map(); // identifier -> {track, locations: [{direction, index}]}
+      const directionDuplicates = new Map(); // direction -> duplicate info
+      const globalDuplicates = new Map(); // identifier -> locations array
+
+      // Collect all tracks with their locations
+      Object.entries(explorerData.directions).forEach(([directionKey, direction]) => {
+          const sampleTracks = direction.sampleTracks || [];
+          const directionTrackIds = new Set();
+          const directionLocalDups = [];
+
+          sampleTracks.forEach((trackObj, index) => {
+              const track = trackObj.track || trackObj;
+              const id = track.identifier;
+              const location = { direction: directionKey, index };
+
+              // Check for duplicates within this direction (VERY BAD)
+              if (directionTrackIds.has(id)) {
+                  directionLocalDups.push({
+                      id, title: track.title, artist: track.artist,
+                      indices: [directionLocalDups.find(d => d.id === id)?.indices || [], index].flat()
+                  });
+                  console.error(`🃏 VERY BAD: Duplicate in same direction ${directionKey}:`, {
+                      id, title: track.title, artist: track.artist, index
+                  });
+              }
+              directionTrackIds.add(id);
+
+              // Track for global analysis
+              if (!allTracks.has(id)) {
+                  allTracks.set(id, { track, locations: [] });
+              }
+              allTracks.get(id).locations.push(location);
+          });
+
+          // Store direction-level duplicate info
+          if (directionLocalDups.length > 0) {
+              directionDuplicates.set(directionKey, directionLocalDups);
+          }
+      });
+
+      // Analyze for cross-direction and cross-dimension duplicates
+      let crossDirectionCount = 0;
+      let crossDimensionCount = 0;
+
+      allTracks.forEach(({ track, locations }, id) => {
+          if (locations.length > 1) {
+              globalDuplicates.set(id, locations);
+
+              // Check if duplicates span different dimensions
+              const dimensions = new Set(locations.map(loc => {
+                  // Extract base dimension (remove _positive/_negative)
+                  return loc.direction.replace(/_(?:positive|negative)$/, '');
+              }));
+
+              if (dimensions.size > 1) {
+                  crossDimensionCount++;
+                  console.warn(`🃏 WORSE: Cross-dimension duplicate:`, {
+                      id, title: track.title, artist: track.artist,
+                      dimensions: Array.from(dimensions),
+                      locations: locations.map(l => `${l.direction}[${l.index}]`)
+                  });
+              } else {
+                  crossDirectionCount++;
+                  console.log(`🃏 INTERESTING: Cross-direction duplicate:`, {
+                      id, title: track.title, artist: track.artist,
+                      directions: locations.map(l => l.direction),
+                      locations: locations.map(l => `${l.direction}[${l.index}]`)
+                  });
+              }
+          }
+      });
+
+      // Summary report
+      console.log(`🃏 === DUPLICATE ANALYSIS SUMMARY (${context}) ===`);
+      console.log(`🃏 Direction-level duplicates (VERY BAD): ${directionDuplicates.size} directions affected`);
+      console.log(`🃏 Cross-dimension duplicates (WORSE): ${crossDimensionCount} tracks`);
+      console.log(`🃏 Cross-direction duplicates (INTERESTING): ${crossDirectionCount} tracks`);
+      console.log(`🃏 Total duplicate tracks: ${globalDuplicates.size}`);
+      console.log(`🃏 === DUPLICATE ANALYSIS END ===`);
+
+      return {
+          directionDuplicates,
+          crossDimensionCount,
+          crossDirectionCount,
+          globalDuplicates,
+          totalDuplicates: globalDuplicates.size
+      };
+  }
+
+
   // Cycle through stack contents for back card clicks
   function cycleStackContents(directionKey, currentTrackIndex) {
       const stack = state.latestExplorerData.directions[directionKey];

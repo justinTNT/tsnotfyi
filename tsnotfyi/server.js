@@ -1315,7 +1315,7 @@ app.post('/next-track', async (req, res) => {
       console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
       if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
-        session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
+        await session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
       } else if (typeof session.mixer.setNextTrack === 'function') {
         session.mixer.setNextTrack(trackMd5);
       } else if (session.mixer.driftPlayer) {

@@ -32,7 +32,8 @@ const state = {
     pendingResyncCheckTimer: null,
     pendingAudioConfirmTimer: null,
     creatingNewSession: false,
-    remainingCounts: {}
+    remainingCounts: {},
+    pendingManualTrackId: null
   };
 window.state = state;
 
@@ -80,6 +81,43 @@ function explorerContainsTrack(explorerData, identifier) {
   }
 
   return false;
+}
+
+function findTrackInExplorer(explorerData, identifier) {
+  if (!explorerData || !identifier) return null;
+
+  const directions = explorerData.directions || {};
+
+  const considerSamples = (directionKey, direction) => {
+    if (!direction) return null;
+    const samples = direction.sampleTracks || [];
+    for (const sample of samples) {
+      const track = sample?.track || sample;
+      if (track?.identifier === identifier) {
+        return { directionKey, track };
+      }
+    }
+    return null;
+  };
+
+  for (const [key, direction] of Object.entries(directions)) {
+    const match = considerSamples(key, direction);
+    if (match) return match;
+
+    if (direction?.oppositeDirection) {
+      const oppositeKey = direction.oppositeDirection.key || getOppositeDirection(key);
+      const oppositeMatch = considerSamples(oppositeKey || key, direction.oppositeDirection);
+      if (oppositeMatch) return oppositeMatch;
+    }
+  }
+
+  const nextTrack = explorerData.nextTrack?.track || explorerData.nextTrack;
+  if (nextTrack?.identifier === identifier) {
+    const directionKey = explorerData.nextTrack?.directionKey || null;
+    return { directionKey, track: nextTrack };
+  }
+
+  return null;
 }
 
 function normalizeResolution(resolution) {
@@ -295,6 +333,7 @@ function triggerZoomMode(mode) {
     state.currentResolution = returnedResolution;
     state.manualNextTrackOverride = false;
     state.manualNextDirectionKey = null;
+    state.pendingManualTrackId = null;
     updateRadiusControlsUI();
     if (typeof rejig === 'function') {
       rejig();
@@ -598,7 +637,6 @@ function createDimensionCards(explorerData, options = {}) {
               variant: variantFromDirectionType(getDirectionType(previousNext.directionKey))
           };
       }
-      state.latestExplorerData = explorerData;
       state.remainingCounts = {};
 
       Object.values(explorerData.directions || {}).forEach(normalizeTracks);
@@ -615,48 +653,50 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       const nextTrackId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
-      const selectionStillPresent = state.selectedIdentifier ? explorerContainsTrack(explorerData, state.selectedIdentifier) : false;
-      const currentTrackUnchanged = explorerData.currentTrack?.identifier === state.latestCurrentTrack?.identifier;
-      const manualOverrideHydrated = Boolean(state.manualNextTrackOverride && currentTrackUnchanged && selectionStillPresent);
-      const manualOverridePending = Boolean(state.manualNextTrackOverride && currentTrackUnchanged && !selectionStillPresent);
+      const currentTrackId = state.latestCurrentTrack?.identifier;
+      const newCurrentTrackId = explorerData.currentTrack?.identifier || null;
+      const currentTrackUnchanged = Boolean(currentTrackId && newCurrentTrackId && currentTrackId === newCurrentTrackId);
+      const manualOverrideActive = Boolean(state.manualNextTrackOverride && currentTrackUnchanged);
 
-      const overridePinnedButMissing = Boolean(
-          state.manualNextTrackOverride &&
-          state.selectedIdentifier &&
-          !selectionStillPresent &&
-          !currentTrackUnchanged
-      );
-
-      if (overridePinnedButMissing) {
-          console.error('🛰️ ACTION pinned-track-missing', {
-              pinnedTrack: state.selectedIdentifier,
-              availableDirections: Object.keys(explorerData.directions || {}),
-              nextTrackFromServer: explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null
+      if (state.manualNextTrackOverride) {
+          console.log('🛰️ Manual selection state', {
+              manualNextTrackOverride: state.manualNextTrackOverride,
+              selectedIdentifier: state.selectedIdentifier,
+              currentTrackId,
+              newCurrentTrackId,
+              currentTrackUnchanged,
+              manualOverrideActive
           });
-
-          state.manualNextTrackOverride = false;
-          state.manualNextDirectionKey = null;
-
-          const fallbackIdentifier = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
-          state.selectedIdentifier = fallbackIdentifier;
       }
-
-      if (manualOverridePending) {
-          console.log('🎯 Manual override pending hydration; deferring explorer refresh');
-          if (state.nextTrackAnimationTimer) {
-              clearTimeout(state.nextTrackAnimationTimer);
-              state.nextTrackAnimationTimer = null;
-          }
-          state.usingOppositeDirection = false;
-          return;
-      }
-
-      const manualOverrideActive = manualOverrideHydrated;
 
       if (manualOverrideActive && previousNext && previousNextId) {
           console.log('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
-          explorerData.nextTrack = previousNext;
-          state.latestExplorerData = explorerData;
+          const manualSelection = state.selectedIdentifier
+            ? findTrackInExplorer(explorerData, state.selectedIdentifier)
+              || findTrackInExplorer(previousExplorerData, state.selectedIdentifier)
+            : null;
+
+          const manualDirectionKey = state.manualNextDirectionKey
+            || manualSelection?.directionKey
+            || previousNext?.directionKey
+            || explorerData.nextTrack?.directionKey
+            || state.baseDirectionKey
+            || null;
+
+          const manualTrack = manualSelection?.track
+            || previousNext?.track
+            || explorerData.nextTrack?.track
+            || null;
+
+          const mergedNext = manualTrack
+            ? { directionKey: manualDirectionKey, track: manualTrack }
+            : (previousNext || explorerData.nextTrack || null);
+
+          state.latestExplorerData = {
+              ...(previousExplorerData || {}),
+              ...explorerData,
+              nextTrack: mergedNext
+          };
       }
 
       if (manualOverrideActive) {
@@ -668,6 +708,8 @@ function createDimensionCards(explorerData, options = {}) {
           state.usingOppositeDirection = false;
           return;
       }
+
+      state.latestExplorerData = explorerData;
 
       // Reset reverse state when rendering fresh explorer data
       state.usingOppositeDirection = false;
@@ -1023,12 +1065,14 @@ function createDimensionCards(explorerData, options = {}) {
       console.log('🔄 Seamlessly updating selection:', state.selectedIdentifier);
 
       // Find the selected card first
-      const allTrackCards = document.querySelectorAll('.dimension-card.track-detail-card.next-track');
+      const allTrackCards = document.querySelectorAll('.dimension-card.next-track');
       if (allTrackCards.length === 0) {
-          console.warn(`${ICON} ACTION selection-cards-unavailable`, {
-              selection: state.selectedIdentifier,
-              reason: 'no next-track cards rendered'
-          });
+          if (state.manualNextTrackOverride) {
+              console.warn(`${ICON} ACTION selection-cards-unavailable`, {
+                  selection: state.selectedIdentifier,
+                  reason: 'no next-track cards rendered'
+              });
+          }
           return;
       }
       let selectedCard = null;
@@ -1155,7 +1199,7 @@ function createDimensionCards(explorerData, options = {}) {
 
       setTimeout(() => {
           connectSSE();
-      }, 150);
+      }, 5000);
 
       elements.audio.play()
         .then(() => {
@@ -1445,6 +1489,7 @@ function createDimensionCards(explorerData, options = {}) {
         if (!hasTrack) {
             state.manualNextTrackOverride = false;
             state.manualNextDirectionKey = null;
+            state.pendingManualTrackId = null;
             state.selectedIdentifier = null;
             state.stackIndex = 0;
             console.warn('🛰️ ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
@@ -1935,7 +1980,7 @@ function createDimensionCards(explorerData, options = {}) {
           }
 
           const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
-          const manualConflict = state.manualNextTrackOverride && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId;
+          const manualConflict = state.manualNextTrackOverride && manualSelectionId && !isSameTrack && currentTrackId && currentTrackId !== manualSelectionId;
 
           if (manualConflict) {
             console.warn('🛰️ ACTION override-diverged', {
@@ -1945,16 +1990,8 @@ function createDimensionCards(explorerData, options = {}) {
               serverSuggestedNext: inferredTrack || null
             });
 
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            if (inferredTrack) {
-              state.selectedIdentifier = inferredTrack;
-            } else if (currentTrackId) {
-              state.selectedIdentifier = currentTrackId;
-            } else {
-              state.selectedIdentifier = null;
-            }
-            updateRadiusControlsUI();
+            // Keep override active; request a quick heartbeat to reconcile
+            scheduleHeartbeat(10000);
           }
 
           if (!isSameTrack) {
@@ -1978,6 +2015,7 @@ function createDimensionCards(explorerData, options = {}) {
               console.log(`🔍 Resolution changed for same track - surrendering selection, accepting fresh explorer data`);
               state.manualNextTrackOverride = false;
               state.manualNextDirectionKey = null;
+              state.pendingManualTrackId = null;
               state.selectedIdentifier = inferredTrack;
               updateRadiusControlsUI();
             } else if (state.manualNextTrackOverride && state.selectedIdentifier) {
@@ -1989,14 +2027,13 @@ function createDimensionCards(explorerData, options = {}) {
           console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
           console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
 
-          if (state.manualNextTrackOverride && currentTrackId && currentTrackId === state.selectedIdentifier) {
+          if (state.manualNextTrackOverride && currentTrackId && state.pendingManualTrackId && currentTrackId === state.pendingManualTrackId) {
             console.log('🎯 Manual override satisfied by playback; releasing override lock');
             state.manualNextTrackOverride = false;
             state.manualNextDirectionKey = null;
-            if (inferredTrack) {
-              state.selectedIdentifier = inferredTrack;
-              updateRadiusControlsUI();
-            }
+            state.pendingManualTrackId = null;
+            state.selectedIdentifier = currentTrackId;
+            updateRadiusControlsUI();
           }
 
           // New track started - ensure audio is connected
@@ -2067,99 +2104,6 @@ function createDimensionCards(explorerData, options = {}) {
   }
 
   console.log('🚢 Awaiting audio start to establish session.');
-
-    // Comprehensive duplicate detection system
-  function performDuplicateAnalysis(explorerData, context = "unknown") {
-      console.log(`🃏 === DUPLICATE ANALYSIS START (${context}) ===`);
-
-      const allTracks = new Map(); // identifier -> {track, locations: [{direction, index}]}
-      const directionDuplicates = new Map(); // direction -> duplicate info
-      const globalDuplicates = new Map(); // identifier -> locations array
-
-      // Collect all tracks with their locations
-      Object.entries(explorerData.directions).forEach(([directionKey, direction]) => {
-          const sampleTracks = direction.sampleTracks || [];
-          const directionTrackIds = new Set();
-          const directionLocalDups = [];
-
-          sampleTracks.forEach((trackObj, index) => {
-              const track = trackObj.track || trackObj;
-              const id = track.identifier;
-              const location = { direction: directionKey, index };
-
-              // Check for duplicates within this direction (VERY BAD)
-              if (directionTrackIds.has(id)) {
-                  directionLocalDups.push({
-                      id, title: track.title, artist: track.artist,
-                      indices: [directionLocalDups.find(d => d.id === id)?.indices || [], index].flat()
-                  });
-                  console.error(`🃏 VERY BAD: Duplicate in same direction ${directionKey}:`, {
-                      id, title: track.title, artist: track.artist, index
-                  });
-              }
-              directionTrackIds.add(id);
-
-              // Track for global analysis
-              if (!allTracks.has(id)) {
-                  allTracks.set(id, { track, locations: [] });
-              }
-              allTracks.get(id).locations.push(location);
-          });
-
-          // Store direction-level duplicate info
-          if (directionLocalDups.length > 0) {
-              directionDuplicates.set(directionKey, directionLocalDups);
-          }
-      });
-
-      // Analyze for cross-direction and cross-dimension duplicates
-      let crossDirectionCount = 0;
-      let crossDimensionCount = 0;
-
-      allTracks.forEach(({ track, locations }, id) => {
-          if (locations.length > 1) {
-              globalDuplicates.set(id, locations);
-
-              // Check if duplicates span different dimensions
-              const dimensions = new Set(locations.map(loc => {
-                  // Extract base dimension (remove _positive/_negative)
-                  return loc.direction.replace(/_(?:positive|negative)$/, '');
-              }));
-
-              if (dimensions.size > 1) {
-                  crossDimensionCount++;
-                  console.warn(`🃏 WORSE: Cross-dimension duplicate:`, {
-                      id, title: track.title, artist: track.artist,
-                      dimensions: Array.from(dimensions),
-                      locations: locations.map(l => `${l.direction}[${l.index}]`)
-                  });
-              } else {
-                  crossDirectionCount++;
-                  console.log(`🃏 INTERESTING: Cross-direction duplicate:`, {
-                      id, title: track.title, artist: track.artist,
-                      directions: locations.map(l => l.direction),
-                      locations: locations.map(l => `${l.direction}[${l.index}]`)
-                  });
-              }
-          }
-      });
-
-      // Summary report
-      console.log(`🃏 === DUPLICATE ANALYSIS SUMMARY (${context}) ===`);
-      console.log(`🃏 Direction-level duplicates (VERY BAD): ${directionDuplicates.size} directions affected`);
-      console.log(`🃏 Cross-dimension duplicates (WORSE): ${crossDimensionCount} tracks`);
-      console.log(`🃏 Cross-direction duplicates (INTERESTING): ${crossDirectionCount} tracks`);
-      console.log(`🃏 Total duplicate tracks: ${globalDuplicates.size}`);
-      console.log(`🃏 === DUPLICATE ANALYSIS END ===`);
-
-      return {
-          directionDuplicates,
-          crossDimensionCount,
-          crossDirectionCount,
-          globalDuplicates,
-          totalDuplicates: globalDuplicates.size
-      };
-  }
 
 
   // Swap stack contents between current and opposite direction
@@ -2355,7 +2299,7 @@ function createDimensionCards(explorerData, options = {}) {
       console.log(`🎬 Found card element, animating ${directionKey} from clock position to center`);
 
       // Transform this direction card into a next-track stack
-      card.classList.add('next-track', 'animating-to-center');
+      card.classList.add('next-track', 'track-detail-card', 'animating-to-center');
 
       // Animate to center position
       card.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
@@ -2681,7 +2625,7 @@ function createDimensionCards(explorerData, options = {}) {
 
       // After animation, remove next-track styling and reset to normal card
       setTimeout(() => {
-          card.classList.remove('next-track');
+          card.classList.remove('next-track', 'track-detail-card');
           // Stack indication is now handled by CSS pseudo-elements
 
           // Reset card content to simple direction display
@@ -2697,6 +2641,7 @@ function createDimensionCards(explorerData, options = {}) {
 
       // IMPORTANT: Reset reverse state and restore original face
       console.log(`🔄 Restoring original face for ${directionKey} (removing any reversed state)`);
+      card.classList.remove('track-detail-card');
 
       const lingeringStackVisual = card.querySelector('.stack-line-visual');
       if (lingeringStackVisual) {
@@ -2829,6 +2774,7 @@ function createDimensionCards(explorerData, options = {}) {
           console.error(`🔄 Could not find card element for ${directionKey}`);
           return;
       }
+      card.classList.add('track-detail-card');
       console.log(`🔄 Found card for ${directionKey}, updating with track details...`);
       console.log(`🔄 Card element:`, card);
       console.log(`🔄 Sample tracks:`, sampleTracks);
@@ -2909,6 +2855,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
         console.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
         state.manualNextTrackOverride = false;
         state.manualNextDirectionKey = null;
+        state.pendingManualTrackId = null;
         state.selectedIdentifier = null;
         state.stackIndex = 0;
 
@@ -2926,6 +2873,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     if (source === 'user') {
         state.manualNextTrackOverride = true;
         state.manualNextDirectionKey = dirToSend;
+        state.pendingManualTrackId = md5ToSend;
         if (state.nextTrackAnimationTimer) {
             clearTimeout(state.nextTrackAnimationTimer);
             state.nextTrackAnimationTimer = null;
@@ -2956,6 +2904,10 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
                 console.log(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
             }
             applyFingerprint(data.fingerprint);
+        }
+
+        if (source === 'user' && md5ToSend) {
+            state.selectedIdentifier = md5ToSend;
         }
 
         const serverTrack = data.currentTrack;
@@ -3043,9 +2995,34 @@ function analyzeAndAct(data, source, sentMd5) {
 
     // Check 2: Next track MD5 mismatch
     const expectedNextMd5 = state.latestExplorerData?.nextTrack?.track?.identifier || state.selectedIdentifier;
-    const nextTrackMismatch = expectedNextMd5 && nextTrack !== expectedNextMd5;
+    const hasServerNext = Boolean(nextTrack);
+    const nextTrackMismatch = Boolean(expectedNextMd5 && hasServerNext && nextTrack !== expectedNextMd5);
+
+    if (expectedNextMd5 && !hasServerNext) {
+        console.log(`${ICON} ACTION awaiting-server-next`, {
+            expected: expectedNextMd5,
+            source,
+            sentMd5
+        });
+        if (state.manualNextTrackOverride) {
+            scheduleHeartbeat(10000);
+        }
+    }
 
     if (nextTrackMismatch) {
+        if (state.manualNextTrackOverride || state.pendingManualTrackId) {
+            console.log(`${ICON} ACTION server-next-ignored`, {
+                expected: expectedNextMd5,
+                received: nextTrack,
+                source,
+                overrideActive: state.manualNextTrackOverride,
+                pendingManualTrackId: state.pendingManualTrackId,
+                sentMd5
+            });
+            scheduleHeartbeat(20000);
+            return;
+        }
+
         console.log(`${ICON} ACTION next-track-mismatch`, {
             expected: expectedNextMd5,
             received: nextTrack,
@@ -3294,6 +3271,7 @@ async function createNewJourneySession(reason = 'unknown') {
 
         state.manualNextTrackOverride = false;
         state.manualNextDirectionKey = null;
+        state.pendingManualTrackId = null;
         state.selectedIdentifier = null;
         state.stackIndex = 0;
         state.latestExplorerData = null;
