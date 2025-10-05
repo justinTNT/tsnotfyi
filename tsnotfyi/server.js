@@ -615,10 +615,13 @@ app.get('/events', async (req, res) => {
         session.mixer.isActive &&
         session.mixer.currentTrack.title &&
         session.mixer.currentTrack.title.trim() !== '') {
-      console.log('📡 Sending current track info to new SSE client');
-      session.mixer.broadcastTrackEvent(true);
+      console.log('📡 Sending heartbeat and explorer snapshot to new SSE client');
+      await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
+      session.mixer.broadcastExplorerSnapshot(true, 'sse-connected').catch(err => {
+        console.error('📡 Failed to broadcast explorer snapshot on connect:', err);
+      });
     } else {
-      console.log('📡 No valid current track to broadcast, skipping initial track event');
+      console.log('📡 No valid current track to broadcast, skipping initial snapshot');
     }
 
     req.on('close', () => {
@@ -684,8 +687,11 @@ app.post('/refresh-sse', async (req, res) => {
     }
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering SSE broadcast for session ${sessionId} (${session.mixer.eventClients.size} clients)`);
-      session.mixer.broadcastTrackEvent(true);
+      console.log(`🔄 Triggering heartbeat + snapshot for session ${sessionId} (${session.mixer.eventClients.size} clients)`);
+      await session.mixer.broadcastHeartbeat('manual-refresh', { force: true });
+      session.mixer.broadcastExplorerSnapshot(true, 'manual-refresh').catch(err => {
+        console.error('🔄 Failed to broadcast explorer snapshot during refresh:', err);
+      });
 
       const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
       const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
@@ -757,8 +763,11 @@ app.post('/refresh-sse-simple', async (req, res) => {
     }
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering SSE broadcast for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
-      session.mixer.broadcastTrackEvent(true);
+      console.log(`🔄 Triggering heartbeat + snapshot for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
+      await session.mixer.broadcastHeartbeat('manual-refresh-simple', { force: true });
+      session.mixer.broadcastExplorerSnapshot(true, 'manual-refresh-simple').catch(err => {
+        console.error('🔄 Failed to broadcast explorer snapshot during simple refresh:', err);
+      });
 
       const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
       const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
@@ -820,7 +829,12 @@ app.get('/:md5', async (req, res, next) => {
 
     session.mixer.isActive = false;
     session.mixer.nextTrack = null;
-    session.mixer.selectedNextTrackMd5 = null;
+    if (typeof session.mixer.resetManualOverrideLock === 'function') {
+      session.mixer.resetManualOverrideLock();
+    } else {
+      session.mixer.lockedNextTrackIdentifier = null;
+      session.mixer.isUserSelectionPending = false;
+    }
 
     // Get the track from the database
     const track = session.mixer.radialSearch.kdTree.getTrack(md5);
@@ -869,7 +883,12 @@ app.get('/:md51/:md52', async (req, res, next) => {
 
     session.mixer.isActive = false;
     session.mixer.nextTrack = null;
-    session.mixer.selectedNextTrackMd5 = null;
+    if (typeof session.mixer.resetManualOverrideLock === 'function') {
+      session.mixer.resetManualOverrideLock();
+    } else {
+      session.mixer.lockedNextTrackIdentifier = null;
+      session.mixer.isUserSelectionPending = false;
+    }
 
     // Get both tracks from the database
     const track1 = session.mixer.radialSearch.kdTree.getTrack(md51);
@@ -887,8 +906,22 @@ app.get('/:md51/:md52', async (req, res, next) => {
     session.mixer.trackStartTime = Date.now();
     if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
       session.mixer.handleUserSelectedNextTrack(md52, { debounceMs: 0 });
+    } else if (typeof session.mixer.prepareNextTrackForCrossfade === 'function') {
+      try {
+        session.mixer.lockedNextTrackIdentifier = md52;
+        if ('pendingUserOverrideTrackId' in session.mixer) {
+          session.mixer.pendingUserOverrideTrackId = md52;
+        }
+        session.mixer.prepareNextTrackForCrossfade({
+          forceRefresh: true,
+          reason: 'user-selection',
+          overrideTrackId: md52
+        });
+      } catch (legacyError) {
+        console.warn('⚠️ Legacy mixer could not queue user-selected track:', legacyError?.message || legacyError);
+      }
     } else {
-      session.mixer.selectedNextTrackMd5 = md52; // Fallback for legacy mixers
+      console.warn('⚠️ Legacy mixer lacks user override support; manual next-track unavailable.');
     }
 
     console.log(`🎯 Contrived journey seeded: ${track1.title} → ${track2.title}`);
@@ -1248,9 +1281,10 @@ app.post('/session/zoom/:mode', async (req, res) => {
     const normalizedMode = mode === 'magnifying' ? 'magnifying_glass' : mode;
     const changed = session.mixer.setExplorerResolution(normalizedMode);
 
-    if (changed && session.mixer.broadcastTrackEvent) {
-      session.mixer.broadcastTrackEvent(true).catch(err => {
-        console.error('Failed to broadcast after zoom change:', err);
+    if (changed) {
+      await session.mixer.broadcastHeartbeat('zoom-change', { force: false });
+      session.mixer.broadcastExplorerSnapshot(true, 'zoom-change').catch(err => {
+        console.error('Failed to broadcast explorer snapshot after zoom change:', err);
       });
     }
 
@@ -1318,11 +1352,20 @@ app.post('/next-track', async (req, res) => {
         await session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
       } else if (typeof session.mixer.setNextTrack === 'function') {
         session.mixer.setNextTrack(trackMd5);
-      } else if (session.mixer.driftPlayer) {
-        session.mixer.selectedNextTrackMd5 = trackMd5;
-        if (direction) {
+      } else if (typeof session.mixer.prepareNextTrackForCrossfade === 'function') {
+        if (direction && session.mixer.driftPlayer) {
           session.mixer.driftPlayer.currentDirection = direction;
         }
+        if ('pendingUserOverrideTrackId' in session.mixer) {
+          session.mixer.pendingUserOverrideTrackId = trackMd5;
+        }
+        session.mixer.lockedNextTrackIdentifier = trackMd5;
+        await session.mixer.prepareNextTrackForCrossfade({
+          forceRefresh: true,
+          reason: 'user-selection',
+          overrideTrackId: trackMd5,
+          overrideDirection: direction || null
+        });
       }
     } else {
       const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;

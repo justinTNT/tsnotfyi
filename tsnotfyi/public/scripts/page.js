@@ -3,6 +3,8 @@ const state = {
     latestExplorerData: null,
     latestCurrentTrack: null,
     previousNextTrack: null,
+    serverNextTrack: null,
+    serverNextDirection: null,
     usingOppositeDirection: false,
     journeyMode: true,
     selectedIdentifier: null,
@@ -34,6 +36,7 @@ const state = {
     creatingNewSession: false,
     remainingCounts: {},
     pendingManualTrackId: null,
+    pendingSnapshotTrackId: null,
     awaitingSSE: false
   };
 window.state = state;
@@ -1888,6 +1891,213 @@ function createDimensionCards(explorerData, options = {}) {
       ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
       : null;
 
+    const handleHeartbeat = (heartbeat) => {
+      if (!heartbeat || !heartbeat.currentTrack) {
+        console.warn('⚠️ Heartbeat missing currentTrack payload');
+        return;
+      }
+
+      if (heartbeat.fingerprint && state.streamFingerprint !== heartbeat.fingerprint) {
+        applyFingerprint(heartbeat.fingerprint);
+      }
+
+      const currentTrack = heartbeat.currentTrack;
+      const currentTrackId = currentTrack.identifier || null;
+      const previousTrackId = state.latestCurrentTrack?.identifier || null;
+      const trackChanged = Boolean(currentTrackId && previousTrackId && currentTrackId !== previousTrackId);
+
+      if (Number.isFinite(currentTrack.durationMs)) {
+        state.playbackDurationSeconds = Math.max(currentTrack.durationMs / 1000, 0);
+      } else if (Number.isFinite(currentTrack.duration || currentTrack.length)) {
+        state.playbackDurationSeconds = currentTrack.duration || currentTrack.length || 0;
+      }
+
+      if (currentTrack.startTime) {
+        state.playbackStartTimestamp = currentTrack.startTime;
+      } else if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
+        state.playbackStartTimestamp = Date.now() - heartbeat.timing.elapsedMs;
+      }
+
+      state.latestCurrentTrack = {
+        ...state.latestCurrentTrack,
+        ...currentTrack,
+        duration: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null,
+        length: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null
+      };
+      window.state.latestCurrentTrack = state.latestCurrentTrack;
+      state.lastTrackUpdateTs = Date.now();
+
+      if ((trackChanged || (!previousTrackId && currentTrackId)) && currentTrackId) {
+        state.pendingSnapshotTrackId = currentTrackId;
+      }
+
+      const durationSeconds = state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || 0;
+      let elapsedSeconds = null;
+      if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
+        elapsedSeconds = Math.max(heartbeat.timing.elapsedMs / 1000, 0);
+      } else if (state.playbackStartTimestamp) {
+        elapsedSeconds = Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0);
+      }
+
+      if (durationSeconds > 0 && elapsedSeconds != null) {
+        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
+        startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: !trackChanged });
+      }
+
+      const nextTrackId = heartbeat.nextTrack?.track?.identifier || heartbeat.nextTrack?.identifier || null;
+      if (nextTrackId) {
+        state.serverNextTrack = nextTrackId;
+        state.serverNextDirection = heartbeat.nextTrack?.direction || heartbeat.nextTrack?.directionKey || null;
+        if (!state.manualNextTrackOverride) {
+          state.selectedIdentifier = nextTrackId;
+        }
+      }
+
+      const overrideInfo = heartbeat.override || null;
+      if (overrideInfo && overrideInfo.identifier) {
+        const overrideId = overrideInfo.identifier;
+        if (overrideInfo.status === 'pending' || overrideInfo.status === 'prepared' || overrideInfo.status === 'locked') {
+          state.manualNextTrackOverride = true;
+          state.pendingManualTrackId = overrideId;
+          if (!state.selectedIdentifier || state.selectedIdentifier === state.serverNextTrack) {
+            state.selectedIdentifier = overrideId;
+          }
+        }
+      }
+
+      if (trackChanged && currentTrackId && state.manualNextTrackOverride) {
+        if (state.selectedIdentifier && currentTrackId === state.selectedIdentifier) {
+          console.log('🎯 Heartbeat: manual override track is now playing; clearing override after confirmation');
+          state.manualNextTrackOverride = false;
+          state.manualNextDirectionKey = null;
+          state.pendingManualTrackId = null;
+          state.selectedIdentifier = currentTrackId;
+          updateRadiusControlsUI();
+        }
+      }
+    };
+
+    const handleExplorerSnapshot = (snapshot) => {
+      if (!snapshot) {
+        return;
+      }
+
+      if (snapshot.fingerprint && state.streamFingerprint !== snapshot.fingerprint) {
+        applyFingerprint(snapshot.fingerprint);
+      }
+
+      const previousTrackId = state.latestCurrentTrack?.identifier || null;
+      const currentTrackId = snapshot.currentTrack?.identifier || previousTrackId;
+      const trackChanged = Boolean(state.pendingSnapshotTrackId && currentTrackId && state.pendingSnapshotTrackId === currentTrackId);
+
+      if (snapshot.currentTrack) {
+        state.latestCurrentTrack = snapshot.currentTrack;
+        window.state.latestCurrentTrack = snapshot.currentTrack;
+        state.lastTrackUpdateTs = Date.now();
+      }
+
+      if (trackChanged && currentTrackId) {
+        state.pendingSnapshotTrackId = null;
+      }
+
+      const rawResolution = snapshot.explorer?.resolution;
+      const previousResolution = state.currentResolution;
+      const normalizedResolution = normalizeResolution(rawResolution);
+      const resolutionChanged = Boolean(normalizedResolution && normalizedResolution !== previousResolution);
+      if (resolutionChanged) {
+        state.currentResolution = normalizedResolution;
+        console.log(`🔍 Explorer resolution changed to: ${state.currentResolution}`);
+        updateRadiusControlsUI();
+      }
+
+      const inferredTrack = snapshot.explorer?.nextTrack?.track?.identifier
+        || snapshot.explorer?.nextTrack?.identifier
+        || snapshot.nextTrack?.track?.identifier
+        || snapshot.nextTrack?.identifier
+        || null;
+
+      if (inferredTrack) {
+        state.serverNextTrack = inferredTrack;
+        state.serverNextDirection = snapshot.explorer?.nextTrack?.direction || snapshot.nextTrack?.direction || null;
+      }
+
+      const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
+      if (trackChanged && state.manualNextTrackOverride && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId) {
+        console.warn('🛰️ ACTION override-diverged', {
+          manualSelection: manualSelectionId,
+          playing: currentTrackId,
+          manualDirection: state.manualNextDirectionKey,
+          serverSuggestedNext: inferredTrack || null
+        });
+        scheduleHeartbeat(10000);
+      }
+      if (trackChanged) {
+        if (state.manualNextTrackOverride) {
+          const selectionVisible = manualSelectionId && snapshot.explorer && explorerContainsTrack(snapshot.explorer, manualSelectionId);
+          if (!selectionVisible) {
+            console.log('🎯 Manual override maintained across track change (selection not yet in snapshot).');
+          } else {
+            console.log('🎯 Manual override visible in snapshot; keeping selection pinned.');
+          }
+        } else if (inferredTrack) {
+          state.selectedIdentifier = inferredTrack;
+          console.log(`🔄 Snapshot accepted server next track: ${inferredTrack.substring(0, 8)}`);
+          updateRadiusControlsUI();
+        }
+      } else {
+        if (resolutionChanged) {
+          console.log('🔍 Resolution changed while track steady - refreshing explorer selection');
+          state.manualNextTrackOverride = false;
+          state.manualNextDirectionKey = null;
+          state.pendingManualTrackId = null;
+          if (inferredTrack) {
+            state.selectedIdentifier = inferredTrack;
+          }
+          updateRadiusControlsUI();
+        } else if (!state.manualNextTrackOverride && inferredTrack) {
+          state.selectedIdentifier = inferredTrack;
+        }
+      }
+
+      if (state.manualNextTrackOverride && currentTrackId && state.pendingManualTrackId && currentTrackId === state.pendingManualTrackId) {
+        console.log('🎯 Explorer snapshot: manual override satisfied; clearing override state');
+        state.manualNextTrackOverride = false;
+        state.manualNextDirectionKey = null;
+        state.pendingManualTrackId = null;
+        state.selectedIdentifier = currentTrackId;
+        updateRadiusControlsUI();
+      }
+
+      if (snapshot.explorer) {
+        snapshot.explorer.currentTrack = snapshot.currentTrack || snapshot.explorer.currentTrack || null;
+        state.latestExplorerData = snapshot.explorer;
+        state.remainingCounts = {};
+        createDimensionCards(snapshot.explorer);
+      }
+
+      if ((trackChanged || !previousTrackId) && (connectionHealth.audio.status === 'error' || connectionHealth.audio.status === 'failed')) {
+        console.log('🔄 Explorer snapshot received but audio unhealthy; restarting session');
+        handleDeadAudioSession();
+        return;
+      }
+
+      if (snapshot.currentTrack) {
+        console.log(`🎵 ${snapshot.currentTrack.title} by ${snapshot.currentTrack.artist}`);
+        if (snapshot.driftState) {
+          console.log(`🎯 Direction: ${snapshot.driftState.currentDirection}, Step: ${snapshot.driftState.stepCount}`);
+        }
+        updateNowPlayingCard(snapshot.currentTrack, snapshot.driftState);
+      }
+
+      const durationSeconds = snapshot.currentTrack?.duration || snapshot.currentTrack?.length || state.playbackDurationSeconds || 0;
+      const startTimeMs = snapshot.currentTrack?.startTime || state.playbackStartTimestamp || null;
+      if (durationSeconds > 0 && startTimeMs) {
+        const elapsedSeconds = Math.max((Date.now() - startTimeMs) / 1000, 0);
+        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
+        startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: !trackChanged });
+      }
+    };
+
     if (simpleBody) {
       fetch('/refresh-sse-simple', {
         method: 'POST',
@@ -1988,113 +2198,14 @@ function createDimensionCards(explorerData, options = {}) {
           applyFingerprint(data.fingerprint);
         }
 
-        if (data.type === 'track_started') {
-          if (data.fingerprint) {
-            if (state.streamFingerprint !== data.fingerprint) {
-              console.log(`🔄 Track event rotated fingerprint to ${data.fingerprint}`);
-            }
-            applyFingerprint(data.fingerprint);
-          }
+        if (data.type === 'heartbeat') {
+          handleHeartbeat(data);
+          return;
+        }
 
-          const previousTrackId = state.latestCurrentTrack?.identifier || null;
-          const currentTrackId = data.currentTrack?.identifier || null;
-          const isSameTrack = previousTrackId && currentTrackId && previousTrackId === currentTrackId;
-          const inferredTrack = data.explorer?.nextTrack?.track?.identifier || data.explorer?.nextTrack?.identifier || null;
-
-          const rawResolution = data.explorer?.resolution;
-          const normalizedResolution = normalizeResolution(rawResolution);
-          const resolutionChanged = normalizedResolution && normalizedResolution !== state.currentResolution;
-          if (resolutionChanged) {
-            state.currentResolution = normalizedResolution;
-            console.log(`🔍 Explorer resolution changed to: ${state.currentResolution}`);
-            updateRadiusControlsUI();
-          }
-
-          const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
-          const manualConflict = state.manualNextTrackOverride && manualSelectionId && !isSameTrack && currentTrackId && currentTrackId !== manualSelectionId;
-
-          if (manualConflict) {
-            console.warn('🛰️ ACTION override-diverged', {
-              manualSelection: manualSelectionId,
-              playing: currentTrackId,
-              manualDirection: state.manualNextDirectionKey,
-              serverSuggestedNext: inferredTrack || null
-            });
-
-            // Keep override active; request a quick heartbeat to reconcile
-            scheduleHeartbeat(10000);
-          }
-
-          if (!isSameTrack) {
-            if (state.manualNextTrackOverride) {
-              const selectionVisible = state.selectedIdentifier && explorerContainsTrack(data.explorer, state.selectedIdentifier);
-
-              if (selectionVisible) {
-                console.log('🎯 Manual override: selection present in explorer payload; keeping user choice pinned');
-              } else {
-                console.log('🎯 Manual override: selection not yet in payload; waiting before repainting to avoid flicker');
-              }
-            } else {
-              state.selectedIdentifier = inferredTrack;
-              console.log(`🔄 SSE: New track started, accepting server next track: ${inferredTrack?.substring(0,8)}`);
-              updateRadiusControlsUI();
-            }
-          } else {
-            // Same track still playing
-            if (resolutionChanged) {
-              // Resolution changed - surrender previous selection and accept new explorer data
-              console.log(`🔍 Resolution changed for same track - surrendering selection, accepting fresh explorer data`);
-              state.manualNextTrackOverride = false;
-              state.manualNextDirectionKey = null;
-              state.pendingManualTrackId = null;
-              state.selectedIdentifier = inferredTrack;
-              updateRadiusControlsUI();
-            } else if (state.manualNextTrackOverride && state.selectedIdentifier) {
-              // No resolution change - preserve manual selection
-              console.log(`🎯 SSE: Same track playing, preserving manual selection: ${state.selectedIdentifier?.substring(0,8)}`);
-            }
-          }
-
-          console.log(`🎵 ${data.currentTrack.title} by ${data.currentTrack.artist}`);
-          console.log(`🎯 Direction: ${data.driftState?.currentDirection}, Step: ${data.driftState?.stepCount}`);
-
-          if (state.manualNextTrackOverride && currentTrackId && state.pendingManualTrackId && currentTrackId === state.pendingManualTrackId) {
-            console.log('🎯 Manual override satisfied by playback; releasing override lock');
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            state.selectedIdentifier = currentTrackId;
-            updateRadiusControlsUI();
-          }
-
-          // New track started - ensure audio is connected
-          if (connectionHealth.audio.status === 'error' || connectionHealth.audio.status === 'failed') {
-            console.log('🔄 SSE received track but audio errored, restarting session');
-            handleDeadAudioSession();
-            return;
-          }
-
-          updateNowPlayingCard(data.currentTrack, data.driftState);
-          state.latestExplorerData = data.explorer;
-          state.remainingCounts = {};
-          createDimensionCards(data.explorer);
-
-          const trackDurationSeconds = data.currentTrack.duration || data.currentTrack.length || 0;
-          const startTimeMs = data.currentTrack.startTime;
-          let elapsedSeconds = 0;
-          if (startTimeMs) {
-            elapsedSeconds = Math.max(0, (Date.now() - startTimeMs) / 1000);
-          }
-
-          if (trackDurationSeconds > 0) {
-            const clampedElapsed = Math.min(elapsedSeconds, trackDurationSeconds);
-            if (isSameTrack) {
-              console.log(`🔄 SSE progress resync: elapsed=${clampedElapsed.toFixed(2)}s / duration=${trackDurationSeconds.toFixed(2)}s`);
-              startProgressAnimationFromPosition(trackDurationSeconds, clampedElapsed, { resync: true });
-            } else {
-              startProgressAnimationFromPosition(trackDurationSeconds, clampedElapsed);
-            }
-          }
+        if (data.type === 'explorer_snapshot') {
+          handleExplorerSnapshot(data);
+          return;
         }
 
         if (data.type === 'flow_options') {
@@ -2761,6 +2872,21 @@ function createDimensionCards(explorerData, options = {}) {
       }
   }
 
+  function findDirectionKeyContainingTrack(explorerData, trackId) {
+      if (!explorerData || !trackId) return null;
+      for (const [dirKey, direction] of Object.entries(explorerData.directions || {})) {
+          const samples = direction?.sampleTracks || [];
+          const hit = samples.some(sample => {
+              const track = sample?.track || sample;
+              return track?.identifier === trackId;
+          });
+          if (hit) {
+              return dirKey;
+          }
+      }
+      return null;
+  }
+
   // Convert a direction card into a next track stack (add track details and indicators)
   function convertToNextTrackStack(directionKey) {
       console.log(`🔄 Converting ${directionKey} to next track stack...`);
@@ -2771,7 +2897,6 @@ function createDimensionCards(explorerData, options = {}) {
       let actualDirectionKey = directionKey;
 
       if (!directionData) {
-          // FALLBACK: Try the opposite direction if this direction doesn't exist in data
           const oppositeKey = getOppositeDirection(directionKey);
           console.log(`🔄 No data for ${directionKey}, trying opposite: ${oppositeKey}`);
 
@@ -2779,17 +2904,31 @@ function createDimensionCards(explorerData, options = {}) {
               directionData = state.latestExplorerData.directions[oppositeKey];
               actualDirectionKey = oppositeKey;
               console.log(`🔄 Using opposite direction data: ${oppositeKey}`);
-          } else {
-              console.error(`🔄 No direction data found for ${directionKey} or its opposite ${oppositeKey}`);
-              console.error(`🔄 Available directions:`, Object.keys(state.latestExplorerData?.directions || {}));
-              return;
           }
       }
 
-      // Use the resolved direction data and key
+      const explorerNextId = state.latestExplorerData?.nextTrack?.track?.identifier
+        || state.latestExplorerData?.nextTrack?.identifier
+        || null;
+
+      if (!directionData && explorerNextId) {
+          const fallbackKey = findDirectionKeyContainingTrack(state.latestExplorerData, explorerNextId);
+          if (fallbackKey) {
+              console.warn(`🔄 No direction data for ${directionKey}; falling back to ${fallbackKey} for track ${explorerNextId}`);
+              directionData = state.latestExplorerData?.directions?.[fallbackKey] || null;
+              actualDirectionKey = fallbackKey;
+          }
+      }
+
+      if (!directionData) {
+          console.error(`🔄 No direction data found for ${directionKey}`);
+          console.error(`🔄 Available directions:`, Object.keys(state.latestExplorerData?.directions || {}));
+          return;
+      }
+
       const direction = directionData;
-      // Ensure direction has the key property for consistency (use the card's key, not the data key)
-      direction.key = directionKey;
+      direction.key = actualDirectionKey;
+      directionKey = actualDirectionKey;
 
       const sampleTracks = direction.sampleTracks || [];
       if (sampleTracks.length === 0) {
@@ -2797,16 +2936,28 @@ function createDimensionCards(explorerData, options = {}) {
           return;
       }
 
-      state.baseDirectionKey = directionKey;
+      state.baseDirectionKey = actualDirectionKey;
 
-      // Update the main card content with track details
-      const card = document.querySelector(`[data-direction-key="${directionKey}"]`);
+      let card = document.querySelector(`[data-direction-key="${actualDirectionKey}"]`);
       if (!card) {
-          console.error(`🔄 Could not find card element for ${directionKey}`);
+          const fallbackKey = findDirectionKeyContainingTrack(state.latestExplorerData, (sampleTracks[0]?.track || sampleTracks[0])?.identifier);
+          if (fallbackKey) {
+              console.warn(`🔄 Could not find card for ${actualDirectionKey}; attempting fallback card ${fallbackKey}`);
+              card = document.querySelector(`[data-direction-key="${fallbackKey}"]`);
+              if (card) {
+                  state.baseDirectionKey = fallbackKey;
+                  actualDirectionKey = fallbackKey;
+              }
+          }
+      }
+
+      if (!card) {
+          console.error(`🔄 Could not find card element for ${actualDirectionKey}`);
+          console.error('🎬 Available cards: ', Array.from(document.querySelectorAll('.dimension-card')).map(el => el.getAttribute('data-direction-key')));
           return;
       }
       card.classList.add('track-detail-card');
-      console.log(`🔄 Found card for ${directionKey}, updating with track details...`);
+      console.log(`🔄 Found card for ${actualDirectionKey}, updating with track details...`);
       console.log(`🔄 Card element:`, card);
       console.log(`🔄 Sample tracks:`, sampleTracks);
 
@@ -2866,6 +3017,13 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
         if (manualOverrideActive && state.selectedIdentifier) {
             md5ToSend = state.selectedIdentifier;
             dirToSend = dirToSend || state.manualNextDirectionKey || null;
+        }
+
+        if (!md5ToSend) {
+            if (state.serverNextTrack) {
+                md5ToSend = state.serverNextTrack;
+                dirToSend = dirToSend || state.serverNextDirection || null;
+            }
         }
 
         if (!md5ToSend) {

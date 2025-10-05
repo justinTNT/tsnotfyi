@@ -62,6 +62,15 @@ class DriftAudioMixer {
     this.seenTrackArtists = new Set(); // Artists from seen tracks
     this.seenTrackAlbums = new Set(); // Albums from seen tracks
     this.pendingUserOverrideDirection = null; // Persist direction metadata until override hydrates
+    this.pendingUserOverrideTrackId = null; // Track identifier awaiting override preparation
+
+    // Broadcast caching for lean event comms
+    this.lastHeartbeatPayload = null;
+    this.lastHeartbeatSerialized = null;
+    this.lastHeartbeatTimestamp = 0;
+    this.lastExplorerSnapshotPayload = null;
+    this.lastExplorerSnapshotSerialized = null;
+    this.lastExplorerSnapshotTimestamp = 0;
 
     // Cleanup callback supplied by session manager
     this.onIdle = null;
@@ -124,11 +133,11 @@ class DriftAudioMixer {
 
       if (reason === 'crossfade_complete') {
         this.crossfadeStartedAt = null;
-        const shouldReapplyOverride = this.userSelectionDeferredForCrossfade && this.selectedNextTrackMd5;
+        const shouldReapplyOverride = this.userSelectionDeferredForCrossfade && this.pendingUserOverrideTrackId;
         this.userSelectionDeferredForCrossfade = false;
         if (shouldReapplyOverride) {
           setTimeout(() => {
-            this.applyUserSelectedTrackOverride();
+            this.applyUserSelectedTrackOverride(this.pendingUserOverrideTrackId);
           }, 0);
         }
       }
@@ -159,7 +168,14 @@ class DriftAudioMixer {
       }
 
       console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
-      this.broadcastTrackEvent();
+      this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
+        console.error('📡 Failed to broadcast track event:', err);
+      });
+
+      // Kick off next-track preparation immediately so UI has a recommendation
+      this.prepareNextTrackForCrossfade({ reason: 'auto-initial' }).catch(err => {
+        console.warn('⚠️ Initial auto prepare failed:', err?.message || err);
+      });
     };
 
     this.audioMixer.onTrackEnd = () => {
@@ -180,7 +196,6 @@ class DriftAudioMixer {
     };
 
     // User override handling
-    this.selectedNextTrackMd5 = null;
     this.userSelectionDebounceMs = 5000; // milliseconds to coalesce rapid selections
     this.pendingUserSelectionTimer = null;
     this.pendingUserSelectionResolve = null;
@@ -370,26 +385,26 @@ class DriftAudioMixer {
 
     const { direction = null, debounceMs = this.userSelectionDebounceMs } = options;
 
+    console.log(`🎯 [override] handleUserSelectedNextTrack requested ${trackMd5} (direction=${direction || 'none'})`);
+
     if (direction) {
       this.driftPlayer.currentDirection = direction;
     }
     this.pendingUserOverrideDirection = direction || null;
-
-    if (this.nextTrack && this.nextTrack.identifier === trackMd5) {
-      console.log('🎯 User-selected track already prepared; keeping existing preload');
-      this.nextTrack = this.hydrateTrackRecord(this.nextTrack, {
-        nextTrackDirection: direction || this.nextTrack?.nextTrackDirection,
-        transitionReason: 'user'
-      });
-      this.selectedNextTrackMd5 = null;
-      this.isUserSelectionPending = false;
-      this.pendingUserOverrideDirection = null;
-      return;
-    }
-
-    this.selectedNextTrackMd5 = trackMd5;
+    this.pendingUserOverrideTrackId = trackMd5;
     this.isUserSelectionPending = true;
     this.lockedNextTrackIdentifier = trackMd5;
+
+    // Clear any preloaded auto-selection so mixer won't consume it while debounce runs
+    if (typeof this.audioMixer?.clearNextTrackSlot === 'function') {
+      this.audioMixer.clearNextTrackSlot();
+    }
+    if (this.nextTrack) {
+      console.log('🧹 [override] Clearing previously prepared next track to honor manual selection');
+    }
+    this.nextTrack = null;
+
+    this.broadcastHeartbeat('user-selection-pending', { force: true }).catch(() => {});
 
     const effectiveDelay = Number.isFinite(debounceMs) ? Math.max(0, debounceMs) : this.userSelectionDebounceMs;
 
@@ -417,24 +432,38 @@ class DriftAudioMixer {
         this.pendingUserSelectionTimer = timerId;
         this.pendingUserSelectionResolve = resolve;
       });
-      this.pendingUserSelectionTimer = null;
-      this.pendingUserSelectionResolve = null;
-    } else {
-      this.pendingUserSelectionTimer = null;
-      this.pendingUserSelectionResolve = null;
     }
-    if (this.selectedNextTrackMd5 !== trackMd5) {
+
+    this.pendingUserSelectionTimer = null;
+    this.pendingUserSelectionResolve = null;
+
+    if (this.pendingUserOverrideTrackId !== trackMd5) {
       return;
     }
 
-    this.applyUserSelectedTrackOverride();
+    await this.applyUserSelectedTrackOverride(trackMd5);
   }
 
-  applyUserSelectedTrackOverride() {
-    if (!this.selectedNextTrackMd5) {
-      this.isUserSelectionPending = false;
+  clearPendingUserSelection() {
+    this.isUserSelectionPending = false;
+    this.pendingUserOverrideTrackId = null;
+    this.pendingUserOverrideDirection = null;
+  }
+
+  resetManualOverrideLock() {
+    this.clearPendingUserSelection();
+    this.lockedNextTrackIdentifier = null;
+  }
+
+  async applyUserSelectedTrackOverride(trackMd5) {
+    if (!trackMd5 || (this.pendingUserOverrideTrackId && this.pendingUserOverrideTrackId !== trackMd5)) {
+      if (!this.pendingUserOverrideTrackId) {
+        this.clearPendingUserSelection();
+      }
       return;
     }
+
+    console.log(`🎯 [override] applyUserSelectedTrackOverride beginning for ${trackMd5}`);
 
     const mixerStatus = (this.audioMixer && typeof this.audioMixer.getStatus === 'function')
       ? this.audioMixer.getStatus()
@@ -443,7 +472,7 @@ class DriftAudioMixer {
     if (mixerStatus?.isCrossfading) {
       const crossfadeAge = this.crossfadeStartedAt ? Date.now() - this.crossfadeStartedAt : null;
 
-      if (crossfadeAge && crossfadeAge > CROSSFADE_GUARD_MS && this.audioMixer && typeof this.audioMixer.forceTransition === 'function') {
+      if (crossfadeAge && crossfadeAge > CROSSFADE_GUARD_MS && typeof this.audioMixer?.forceTransition === 'function') {
         console.warn(`⚠️ Crossfade still active after ${crossfadeAge}ms; forcing completion to honor user selection`);
         const forced = this.audioMixer.forceTransition('cut');
         this.userSelectionDeferredForCrossfade = false;
@@ -451,7 +480,7 @@ class DriftAudioMixer {
         if (forced) {
           this.crossfadeStartedAt = null;
           setTimeout(() => {
-            this.applyUserSelectedTrackOverride();
+            this.applyUserSelectedTrackOverride(trackMd5);
           }, 0);
           return;
         }
@@ -461,47 +490,54 @@ class DriftAudioMixer {
         console.log('⏳ Crossfade in progress; deferring user-selected override until fade completes');
         this.userSelectionDeferredForCrossfade = true;
       }
-      if (this.pendingUserSelectionTimer) {
-        clearTimeout(this.pendingUserSelectionTimer);
-        this.pendingUserSelectionTimer = null;
+
+      await new Promise(resolve => setTimeout(resolve, 750));
+
+      if (this.pendingUserOverrideTrackId !== trackMd5) {
+        console.log(`🎯 [override] Pending override changed during crossfade defer; aborting apply for ${trackMd5}`);
+        return;
       }
-      if (this.pendingUserSelectionResolve) {
-        this.pendingUserSelectionResolve();
-        this.pendingUserSelectionResolve = null;
-      }
-      this.pendingUserSelectionTimer = setTimeout(() => {
-        this.pendingUserSelectionTimer = null;
-        this.applyUserSelectedTrackOverride();
-      }, 750);
-      return;
+
+      return this.applyUserSelectedTrackOverride(trackMd5);
     }
 
     this.userSelectionDeferredForCrossfade = false;
 
-    if (this.nextTrack && this.nextTrack.identifier === this.selectedNextTrackMd5) {
+    if (this.nextTrack && this.nextTrack.identifier === trackMd5) {
       console.log('🎯 User-selected track already prepared after debounce; no refresh needed');
       this.nextTrack = this.hydrateTrackRecord(this.nextTrack, {
         nextTrackDirection: this.pendingUserOverrideDirection || this.nextTrack?.nextTrackDirection,
         transitionReason: 'user'
       });
-      this.selectedNextTrackMd5 = null;
-      this.isUserSelectionPending = false;
-      this.pendingUserOverrideDirection = null;
+      this.clearPendingUserSelection();
+      this.broadcastHeartbeat('user-selection-already-prepared', { force: true }).catch(() => {});
       return;
     }
 
-    if (this.audioMixer && typeof this.audioMixer.clearNextTrackSlot === 'function') {
+    if (typeof this.audioMixer?.clearNextTrackSlot === 'function') {
       this.audioMixer.clearNextTrackSlot();
     }
 
     this.nextTrack = null;
 
-    this.prepareNextTrackForCrossfade({ forceRefresh: true, reason: 'user-selection' });
+    await this.prepareNextTrackForCrossfade({
+      forceRefresh: true,
+      reason: 'user-selection',
+      overrideTrackId: trackMd5,
+      overrideDirection: this.pendingUserOverrideDirection
+    });
   }
 
   // Prepare next track for crossfading
   async prepareNextTrackForCrossfade(options = {}) {
-    const { forceRefresh = false, reason = 'auto' } = options;
+    const {
+      forceRefresh = false,
+      reason = 'auto',
+      overrideTrackId = null,
+      overrideDirection = null
+    } = options;
+
+    console.log(`🎯 [prepare] begin (reason=${reason}, force=${forceRefresh}, override=${overrideTrackId || 'none'})`);
 
     if (this.pendingPreparationPromise) {
       if (!forceRefresh) {
@@ -517,7 +553,7 @@ class DriftAudioMixer {
       }
     }
 
-    if (forceRefresh && reason === 'user-selection' && !this.selectedNextTrackMd5) {
+    if (forceRefresh && reason === 'user-selection' && !overrideTrackId && !this.pendingUserOverrideTrackId) {
       console.log('🔁 Skipping forced preparation: user selection already resolved');
       return;
     }
@@ -535,14 +571,47 @@ class DriftAudioMixer {
 
     const preparation = (async () => {
       try {
-        const nextTrack = await this.selectNextFromCandidates();
-        const hydratedNextTrack = this.hydrateTrackRecord(nextTrack);
-        if (!hydratedNextTrack || !hydratedNextTrack.path) {
-          console.log('❌ No next track selected for crossfade preparation');
-          return;
+        let hydratedNextTrack = null;
+        let preparationReason = reason;
+
+        if (overrideTrackId) {
+          const annotations = {
+            transitionReason: 'user'
+          };
+          if (overrideDirection || this.pendingUserOverrideDirection) {
+            annotations.nextTrackDirection = overrideDirection || this.pendingUserOverrideDirection;
+          }
+          hydratedNextTrack = this.hydrateTrackRecord(overrideTrackId, annotations);
+
+          if (!hydratedNextTrack) {
+            console.warn(`⚠️ [prepare] hydrateTrackRecord returned null for override ${overrideTrackId}`);
+          }
+
+          if (!hydratedNextTrack || !hydratedNextTrack.path) {
+            console.error(`❌ [prepare] User-selected track not available for crossfade preparation (id=${overrideTrackId}, path=${hydratedNextTrack?.path || 'missing'})`);
+            this.lockedNextTrackIdentifier = null;
+            this.clearPendingUserSelection();
+            return;
+          }
+
+          preparationReason = 'user-selection';
+          console.log(`🎯 [prepare] Hydrated override track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
+        } else {
+          const nextTrack = await this.selectNextFromCandidates();
+          hydratedNextTrack = this.hydrateTrackRecord(nextTrack);
+
+          if (!hydratedNextTrack || !hydratedNextTrack.path) {
+            console.log('❌ No next track selected for crossfade preparation');
+            return;
+          }
+          console.log(`🎯 [prepare] Hydrated auto track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
         }
 
-        console.log(`🎯 Preparing next track for crossfade (${reason}): ${hydratedNextTrack.title}`);
+        if (!hydratedNextTrack.transitionReason) {
+          hydratedNextTrack.transitionReason = preparationReason;
+        }
+
+        console.log(`🎯 Preparing next track for crossfade (${preparationReason}): ${hydratedNextTrack.title}`);
         console.log(`🔧 DEBUG: Next track path: ${hydratedNextTrack.path}`);
         console.log(`🔧 DEBUG: Current this.nextTrack: ${this.nextTrack?.title || 'null'}`);
 
@@ -555,9 +624,15 @@ class DriftAudioMixer {
         this.nextTrack = hydratedNextTrack;
         this.nextTrackLoadPromise = (async () => {
           try {
+            console.log(`🎯 [prepare] Loading track into mixer (${hydratedNextTrack.path})`);
             return await this.audioMixer.loadTrack(hydratedNextTrack.path, 'next');
           } catch (loadErr) {
             this.nextTrack = previousNext || null;
+            if (overrideTrackId) {
+              this.lockedNextTrackIdentifier = null;
+              this.clearPendingUserSelection();
+            }
+            console.error(`❌ [prepare] loadTrack failed for ${hydratedNextTrack.identifier}:`, loadErr?.message || loadErr);
             throw loadErr;
           }
         })();
@@ -569,14 +644,28 @@ class DriftAudioMixer {
           this.nextTrackLoadPromise = null;
         }
         console.log(`📊 Next track analysis: BPM=${nextTrackInfo.bpm}, Key=${nextTrackInfo.key}`);
-        if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== hydratedNextTrack.identifier) {
+        if (overrideTrackId) {
+          this.lockedNextTrackIdentifier = hydratedNextTrack.identifier;
+          this.clearPendingUserSelection();
+          await this.broadcastHeartbeat('user-next-prepared', { force: true });
+        } else if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== hydratedNextTrack.identifier) {
           // Lock no longer applies if a different track is queued
           this.lockedNextTrackIdentifier = null;
+          await this.broadcastHeartbeat('auto-next-prepared', { force: false });
+        } else {
+          await this.broadcastHeartbeat('auto-next-prepared', { force: false });
         }
         console.log(`✅ Next track prepared successfully: ${hydratedNextTrack.title}`);
       } catch (error) {
         console.error('❌ Failed to prepare next track:', error);
         console.error('❌ Error details:', error.stack);
+        if (overrideTrackId) {
+          this.lockedNextTrackIdentifier = null;
+          this.clearPendingUserSelection();
+          await this.broadcastHeartbeat('user-next-failed', { force: true });
+        } else {
+          await this.broadcastHeartbeat('auto-next-failed', { force: true });
+        }
       }
     })();
 
@@ -602,7 +691,7 @@ class DriftAudioMixer {
           console.error('❌ Next-track load failed during transition:', err);
           this.nextTrack = null;
           this.lockedNextTrackIdentifier = null;
-          this.isUserSelectionPending = false;
+          this.clearPendingUserSelection();
           this.nextTrackLoadPromise = null;
           await this.transitionToNext();
           return;
@@ -670,36 +759,10 @@ class DriftAudioMixer {
     }
   }
 
-  // Next track selection - user selection takes priority, then explorer-based selection
+  // Next track selection - explorer-based selection with drift fallback
   async selectNextFromCandidates() {
     try {
-      // PRIORITY: Check if user has selected a specific track
-      if (this.selectedNextTrackMd5) {
-        console.log(`🎯 User selected track takes priority: ${this.selectedNextTrackMd5}`);
-        const annotations = { transitionReason: 'user' };
-        if (this.pendingUserOverrideDirection) {
-          annotations.nextTrackDirection = this.pendingUserOverrideDirection;
-        }
-        const userSelectedTrack = this.hydrateTrackRecord(this.selectedNextTrackMd5, annotations);
-        if (userSelectedTrack) {
-          console.log(`✅ Using user-selected track: ${userSelectedTrack.title} by ${userSelectedTrack.artist}`);
-          // Clear the selection after using it
-          this.selectedNextTrackMd5 = null;
-          this.isUserSelectionPending = false;
-          this.lockedNextTrackIdentifier = userSelectedTrack.identifier;
-          this.pendingUserOverrideDirection = null;
-          return userSelectedTrack;
-        } else {
-          console.error(`❌ User-selected track not found: ${this.selectedNextTrackMd5}`);
-          this.selectedNextTrackMd5 = null; // Clear invalid selection
-          this.isUserSelectionPending = false;
-          this.lockedNextTrackIdentifier = null;
-          this.pendingUserOverrideDirection = null;
-        }
-      }
-
-      // Fallback to explorer-based selection (same logic as SSE event)
-      console.log(`🎯 No user selection, using explorer-based selection`);
+      console.log('🎯 Using explorer-based selection for next track');
       const explorerData = await this.getComprehensiveExplorerData();
       const nextTrackFromExplorer = await this.selectNextTrackFromExplorer(explorerData);
 
@@ -736,8 +799,7 @@ class DriftAudioMixer {
         }
       }
 
-      // Ultimate fallback to drift player
-      console.log(`🎯 Explorer selection failed, using drift player fallback`);
+      console.log('🎯 Explorer selection failed, using drift player fallback');
       const driftTrack = await this.driftPlayer.getNextTrack();
       if (this.lockedNextTrackIdentifier && driftTrack && this.lockedNextTrackIdentifier !== driftTrack.identifier) {
         this.lockedNextTrackIdentifier = null;
@@ -745,7 +807,6 @@ class DriftAudioMixer {
       return this.hydrateTrackRecord(driftTrack, { transitionReason: 'drift' });
     } catch (error) {
       console.error('Failed to select next track:', error);
-      // Ultimate fallback - return null and let system handle it
       return null;
     }
   }
@@ -1141,6 +1202,14 @@ class DriftAudioMixer {
       };
     };
 
+    let summaryNextTrack = cloneTrack(this.nextTrack);
+    if (!summaryNextTrack && this.lockedNextTrackIdentifier) {
+      summaryNextTrack = cloneTrack(this.hydrateTrackRecord({ identifier: this.lockedNextTrackIdentifier }));
+      if (summaryNextTrack) {
+        summaryNextTrack.transitionReason = 'user';
+      }
+    }
+
     return {
       sessionId: this.sessionId,
       isStreaming: Boolean(this.audioMixer?.engine?.isStreaming),
@@ -1149,7 +1218,7 @@ class DriftAudioMixer {
       trackStartTime: this.trackStartTime,
       currentTrack: cloneTrack(this.currentTrack),
       pendingTrack: cloneTrack(this.pendingCurrentTrack),
-      nextTrack: cloneTrack(this.nextTrack),
+      nextTrack: summaryNextTrack,
       lastBroadcast: this.lastTrackEventPayload ? {
         timestamp: this.lastTrackEventTimestamp,
         trackId: this.lastTrackEventPayload.currentTrack?.identifier || null
@@ -1343,12 +1412,156 @@ class DriftAudioMixer {
     return filtered;
   }
 
-  // Enhanced comprehensive track event for SSE with full exploration data
-  async broadcastTrackEvent(force = false) {
-    console.log(`📡 broadcastTrackEvent called, eventClients: ${this.eventClients.size}`);
+  summarizeTrackMinimal(track) {
+    if (!track) {
+      return null;
+    }
 
+    const identifier = track.identifier || null;
+    if (!identifier) {
+      return null;
+    }
+
+    return {
+      identifier,
+      title: track.title || null,
+      artist: track.artist || null,
+      duration: track.length || track.duration || null,
+      albumCover: track.albumCover || null
+    };
+  }
+
+  buildNextTrackSummary() {
+    let candidate = null;
+
+    if (this.nextTrack && this.nextTrack.identifier) {
+      candidate = this.hydrateTrackRecord(this.nextTrack);
+    } else if (this.lockedNextTrackIdentifier) {
+      candidate = this.hydrateTrackRecord({
+        identifier: this.lockedNextTrackIdentifier,
+        nextTrackDirection: this.pendingUserOverrideDirection || null,
+        transitionReason: 'user'
+      });
+    } else if (this.pendingUserOverrideTrackId) {
+      candidate = this.hydrateTrackRecord({
+        identifier: this.pendingUserOverrideTrackId,
+        nextTrackDirection: this.pendingUserOverrideDirection || null,
+        transitionReason: 'user'
+      });
+    }
+
+    if (!candidate) {
+      return null;
+    }
+
+    const summary = this.summarizeTrackMinimal(candidate);
+    if (!summary) {
+      return null;
+    }
+
+    const direction = candidate.nextTrackDirection || candidate.direction || null;
+    const directionKey = candidate.directionKey || null;
+
+    return {
+      directionKey: directionKey || null,
+      direction,
+      transitionReason: candidate.transitionReason || (this.lockedNextTrackIdentifier === summary.identifier ? 'user' : 'auto'),
+      track: summary
+    };
+  }
+
+  buildHeartbeatPayload(reason = 'status') {
     if (!this.currentTrack) {
-      console.log(`📡 No current track, skipping broadcast`);
+      return null;
+    }
+
+    const now = Date.now();
+    const durationSeconds = this.getAdjustedTrackDuration();
+    const durationMs = Number.isFinite(durationSeconds) ? Math.max(Math.round(durationSeconds * 1000), 0) : null;
+    const elapsedMs = this.trackStartTime ? Math.max(now - this.trackStartTime, 0) : null;
+    const remainingMs = durationMs != null && elapsedMs != null
+      ? Math.max(durationMs - elapsedMs, 0)
+      : null;
+
+    const nextSummary = this.buildNextTrackSummary();
+    const overrideId = this.pendingUserOverrideTrackId || this.lockedNextTrackIdentifier || null;
+    let overrideStatus = null;
+    if (overrideId) {
+      if (nextSummary?.track?.identifier === overrideId) {
+        overrideStatus = 'prepared';
+      } else if (this.pendingUserOverrideTrackId === overrideId) {
+        overrideStatus = 'pending';
+      } else {
+        overrideStatus = 'locked';
+      }
+    }
+
+    return {
+      type: 'heartbeat',
+      timestamp: now,
+      reason,
+      fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
+      currentTrack: {
+        identifier: this.currentTrack.identifier,
+        title: this.currentTrack.title,
+        artist: this.currentTrack.artist,
+        startTime: this.trackStartTime,
+        durationMs: durationMs
+      },
+      timing: {
+        elapsedMs,
+        remainingMs
+      },
+      nextTrack: nextSummary,
+      override: overrideId ? {
+        identifier: overrideId,
+        status: overrideStatus,
+        direction: this.pendingUserOverrideDirection || nextSummary?.direction || null
+      } : null,
+      session: {
+        id: this.sessionId,
+        audioClients: this.clients.size,
+        eventClients: this.eventClients.size
+      },
+      drift: {
+        currentDirection: this.driftPlayer.currentDirection
+      }
+    };
+  }
+
+  async broadcastHeartbeat(reason = 'status', { force = false } = {}) {
+    if (!this.currentTrack) {
+      return;
+    }
+
+    if (this.currentFingerprint) {
+      fingerprintRegistry.touch(this.currentFingerprint);
+    }
+
+    const payload = this.buildHeartbeatPayload(reason);
+    if (!payload) {
+      return;
+    }
+
+    const serialized = JSON.stringify(payload);
+    if (!force && serialized === this.lastHeartbeatSerialized) {
+      return;
+    }
+
+    this.lastHeartbeatPayload = payload;
+    this.lastHeartbeatSerialized = serialized;
+    this.lastHeartbeatTimestamp = payload.timestamp;
+
+    if (this.eventClients.size === 0) {
+      return;
+    }
+
+    this.broadcastEvent(payload);
+  }
+
+  async broadcastExplorerSnapshot(force = false, reason = 'snapshot') {
+    if (!this.currentTrack) {
+      console.log('📡 No current track, skipping explorer snapshot');
       return;
     }
 
@@ -1357,19 +1570,22 @@ class DriftAudioMixer {
     }
 
     const currentTrackId = this.currentTrack.identifier;
-    const alreadyBroadcastSameTrack = this._lastBroadcastTrackId === currentTrackId
-      && this.lastTrackEventPayload
-      && this.lastTrackEventPayload.currentTrack?.identifier === currentTrackId;
+    const preparedNextId = this.nextTrack?.identifier || this.lockedNextTrackIdentifier || null;
 
-    if (!force && alreadyBroadcastSameTrack) {
-      console.log(`📡 Skipping duplicate broadcast for same track: ${currentTrackId}`);
+    const lastSnapshotMatches = this._lastBroadcastTrackId === currentTrackId
+      && this.lastExplorerSnapshotPayload
+      && this.lastExplorerSnapshotPayload.currentTrack?.identifier === currentTrackId
+      && (!preparedNextId || this.lastExplorerSnapshotPayload.nextTrack?.track?.identifier === preparedNextId);
+
+    if (!force && lastSnapshotMatches) {
+      console.log(`📡 Skipping duplicate explorer snapshot for ${currentTrackId}`);
       return;
     }
 
-    let trackEvent = null;
+    let snapshotEvent = null;
 
     try {
-      console.log(`📡 Starting track event broadcast for: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
+      console.log(`📡 Building explorer snapshot for: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
 
       if (this.sessionHistory.length === 0 ||
           this.sessionHistory[this.sessionHistory.length - 1].identifier !== this.currentTrack.identifier) {
@@ -1379,38 +1595,18 @@ class DriftAudioMixer {
 
       let explorerData;
       try {
-        console.log(`📊 Loading comprehensive explorer data...`);
         explorerData = await this.getComprehensiveExplorerData();
         console.log(`📊 Explorer data loaded: ${Object.keys(explorerData.directions || {}).length} directions, ${Object.keys(explorerData.outliers || {}).length} outliers`);
       } catch (explorerError) {
-        console.error('🚨🚨🚨 CRITICAL: PCA/Core explorer data FAILED - Legacy fallback has been DISABLED! 🚨🚨🚨');
-        console.error('🚨 Original error:', explorerError);
-        console.error('🚨 This means NO directions will be available for exploration!');
-        console.error('🚨 The system will NOT fall back to legacy search - fix the PCA/Core search!');
-
+        console.error('🚨 Explorer data load failed:', explorerError);
         explorerData = {
           directions: {},
           outliers: {},
           nextTrack: null,
           diversityMetrics: {
             error: true,
-            message: 'PCA/Core search failed - Legacy fallback disabled',
+            message: 'Explorer data unavailable',
             originalError: explorerError.message
-          }
-        };
-      }
-
-      if (!explorerData.nextTrack && this.nextTrack) {
-        console.log('📊 No explorer nextTrack, falling back to prepared next track');
-        explorerData.nextTrack = {
-          directionKey: this.nextTrack.directionKey || this.nextTrack.nextTrackDirection || null,
-          direction: this.nextTrack.nextTrackDirection || null,
-          track: {
-            identifier: this.nextTrack.identifier,
-            title: this.nextTrack.title,
-            artist: this.nextTrack.artist,
-            duration: this.nextTrack.length || this.nextTrack.duration || null,
-            albumCover: this.nextTrack.albumCover || null
           }
         };
       }
@@ -1420,14 +1616,14 @@ class DriftAudioMixer {
         explorerRetryAttempts += 1;
 
         if (this.nextTrackLoadPromise) {
-          console.log('⏳ Explorer data empty while next track is loading; awaiting load before retrying broadcast');
+          console.log('⏳ Explorer data empty while next track is loading; awaiting load before retrying snapshot');
           try {
             await this.nextTrackLoadPromise;
           } catch (loadErr) {
-            console.warn('⚠️ Next-track load failed while waiting for explorer data:', loadErr?.message || loadErr);
+            console.warn('⚠️ Next-track load failed while waiting for explorer snapshot:', loadErr?.message || loadErr);
           }
         } else if (this.isUserSelectionPending) {
-          console.log('⏳ Explorer data empty and user selection pending; deferring broadcast');
+          console.log('⏳ Explorer data empty and user selection pending; deferring snapshot');
           await new Promise(resolve => setTimeout(resolve, 300));
         } else {
           break;
@@ -1443,17 +1639,24 @@ class DriftAudioMixer {
       }
 
       if (Object.keys(explorerData.directions || {}).length === 0) {
-        console.warn('⚠️ Explorer data still empty after retries; skipping broadcast to avoid blank UI');
+        console.warn('⚠️ Explorer data still empty after retries; skipping snapshot to avoid blank UI');
         return;
+      }
+
+      let nextTrackSummary = explorerData.nextTrack;
+      if (!nextTrackSummary || !nextTrackSummary.track) {
+        nextTrackSummary = this.buildNextTrackSummary();
+        explorerData.nextTrack = nextTrackSummary;
       }
 
       const featuresFallback = this.lookupTrackFeatures(this.currentTrack.identifier);
       const pcaFallback = this.lookupTrackPca(this.currentTrack.identifier);
       const artFallback = this.lookupTrackAlbumCover(this.currentTrack.identifier);
 
-      trackEvent = {
-        type: 'track_started',
+      snapshotEvent = {
+        type: 'explorer_snapshot',
         timestamp: Date.now(),
+        reason,
         fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
         currentTrack: {
           identifier: this.currentTrack.identifier,
@@ -1465,6 +1668,7 @@ class DriftAudioMixer {
           pca: this.currentTrack.pca || pcaFallback || null,
           startTime: this.trackStartTime
         },
+        nextTrack: nextTrackSummary || null,
         sessionHistory: this.sessionHistory.slice(-10).map(entry => ({
           identifier: entry.identifier,
           title: entry.title,
@@ -1493,46 +1697,64 @@ class DriftAudioMixer {
         }
       };
 
-      console.log(`📡 Broadcasting comprehensive track event: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
-      console.log(`📊 Next track: ${explorerData.nextTrack?.title || 'TBD'} via ${explorerData.nextTrack?.nextTrackDirection || 'unknown'} (${explorerData.nextTrack?.transitionReason || 'unknown'})`);
+      console.log(`📡 Broadcasting explorer snapshot: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
+      if (snapshotEvent.nextTrack?.track?.identifier) {
+        console.log(`📊 Next track candidate: ${snapshotEvent.nextTrack.track.identifier.substring(0, 8)} (${snapshotEvent.nextTrack.transitionReason || 'unknown'})`);
+      }
     } catch (error) {
-      console.error('📡 SSE track event error:', error);
+      console.error('📡 Explorer snapshot error:', error);
 
       try {
-        trackEvent = {
-          type: 'track_started',
+        snapshotEvent = {
+          type: 'explorer_snapshot',
           timestamp: Date.now(),
+          reason,
           fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
           currentTrack: {
             identifier: this.currentTrack.identifier,
             title: this.currentTrack.title,
             artist: this.currentTrack.artist,
             duration: this.getAdjustedTrackDuration(),
-            albumCover: this.currentTrack.albumCover,
+            albumCover: this.currentTrack.albumCover || null
           },
-          error: 'Failed to load full track data',
-          errorMessage: error.message
+          explorer: { error: true, message: error.message },
+          session: {
+            id: this.sessionId,
+            clients: this.clients.size,
+            totalTracksPlayed: this.sessionHistory.length
+          }
         };
       } catch (fallbackError) {
-        console.error('📡 Even fallback SSE failed:', fallbackError);
-        trackEvent = null;
+        console.error('📡 Even explorer fallback failed:', fallbackError);
+        snapshotEvent = null;
       }
     }
 
-    if (!trackEvent) {
+    if (!snapshotEvent) {
       return;
     }
+
+    const serialized = JSON.stringify(snapshotEvent);
 
     this._lastBroadcastTrackId = currentTrackId;
-    this.lastTrackEventPayload = trackEvent;
-    this.lastTrackEventTimestamp = trackEvent.timestamp;
+    this.lastTrackEventPayload = snapshotEvent;
+    this.lastTrackEventTimestamp = snapshotEvent.timestamp;
+    this.lastExplorerSnapshotPayload = snapshotEvent;
+    this.lastExplorerSnapshotSerialized = serialized;
+    this.lastExplorerSnapshotTimestamp = snapshotEvent.timestamp;
 
     if (this.eventClients.size === 0) {
-      console.log('📡 No event clients, caching track event for future subscribers');
+      console.log('📡 No event clients, caching explorer snapshot for future subscribers');
       return;
     }
 
-    this.broadcastEvent(trackEvent);
+    this.broadcastEvent(snapshotEvent);
+  }
+
+  async broadcastTrackEvent(force = false, options = {}) {
+    const reason = options.reason || 'track-update';
+    await this.broadcastHeartbeat(reason, { force: true });
+    await this.broadcastExplorerSnapshot(force, reason);
   }
 
   // Get directional flow options (expensive - use only when needed)
