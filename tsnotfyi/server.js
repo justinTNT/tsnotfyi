@@ -1043,6 +1043,61 @@ app.get('/search', (req, res) => {
   });
 });
 
+app.get('/track/:identifier/meta', async (req, res) => {
+  const { identifier } = req.params;
+  if (!identifier) {
+    return res.status(400).json({ error: 'missing identifier' });
+  }
+
+  try {
+    let track = radialSearch.kdTree?.getTrack(identifier);
+
+    if (!track) {
+      const searchCollections = [audioSessions, ephemeralSessions];
+
+      for (const collection of searchCollections) {
+        for (const session of collection.values()) {
+          const mixer = session?.mixer;
+          if (!mixer) continue;
+
+          try {
+            if (mixer.currentTrack?.identifier === identifier) {
+              track = mixer.hydrateTrackRecord(mixer.currentTrack);
+              if (track) break;
+            }
+
+            if (mixer.nextTrack?.identifier === identifier) {
+              track = mixer.hydrateTrackRecord(mixer.nextTrack);
+              if (track) break;
+            }
+
+            if (typeof mixer.hydrateTrackRecord === 'function') {
+              const hydrated = mixer.hydrateTrackRecord({ identifier });
+              if (hydrated?.identifier === identifier) {
+                track = hydrated;
+                break;
+              }
+            }
+          } catch (error) {
+            console.warn('⚠️ Mixer hydration failed for track', identifier, error?.message || error);
+          }
+        }
+        if (track) break;
+      }
+    }
+
+    if (!track) {
+      return res.status(404).json({ error: 'track not found' });
+    }
+
+    const payload = JSON.parse(JSON.stringify(track));
+    return res.json({ track: payload });
+  } catch (error) {
+    console.error('Failed to fetch track metadata:', error);
+    res.status(500).json({ error: 'failed to load track metadata' });
+  }
+});
+
 // Main page - serves a UI with 3D visualization
 app.get('/', async (req, res) => {
   try {

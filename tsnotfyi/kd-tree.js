@@ -185,8 +185,15 @@ class MusicalKDTree {
         const rows = await runAll(this.db, query);
 
         this.tracks = rows.map(row => {
-            const meta = JSON.parse(row.beets_meta);
-            const artPath = (meta.album.artpath?.length > 0) ? meta.album.artpath : '/images/albumcover.png';
+            let meta = null;
+            try {
+                meta = row.beets_meta ? JSON.parse(row.beets_meta) : null;
+            } catch (err) {
+                console.warn('⚠️ Failed to parse beets metadata for', row.identifier, err?.message || err);
+                meta = null;
+            }
+
+            const artPath = meta?.album?.artpath?.length > 0 ? meta.album.artpath : '/images/albumcover.png';
 
             const track = {
                 identifier: row.identifier,
@@ -202,7 +209,8 @@ class MusicalKDTree {
                     tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],
                     spectral: [row.spectral_pc1, row.spectral_pc2, row.spectral_pc3],
                     rhythmic: [row.rhythmic_pc1, row.rhythmic_pc2, row.rhythmic_pc3]
-                }
+                },
+                beetsMeta: meta
             };
 
             this.dimensions.forEach(dim => {

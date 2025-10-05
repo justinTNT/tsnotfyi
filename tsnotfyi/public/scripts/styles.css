@@ -204,10 +204,39 @@ body {
     visibility: hidden;
 }
 
+.track-beets {
+    position: absolute;
+    top: 20px;
+    right: -180px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: flex-start;
+    pointer-events: none;
+    min-width: 140px;
+    max-width: 220px;
+    opacity: 1;
+    transition: opacity 160ms ease;
+    transform: translateY(-10%);
+}
+
+.track-beets.hidden {
+    opacity: 0;
+    visibility: hidden;
+}
+
+.track-beets .beets-chip {
+    font-size: 0.65rem;
+    background: rgba(16, 16, 16, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    pointer-events: none;
+    white-space: nowrap;
+}
+
 /* Search icon for fzf activation */
 #searchIcon {
     position: fixed;
-    bottom: 20px;
+    top: 20px;
     left: 20px;
     width: 40px;
     height: 40px;
@@ -256,7 +285,7 @@ body {
     top: 0;
     width: 100%;
     height: 100%;
-    transform: translateX(23%) translateY(-53%) rotateX(23deg) rotateZ(23deg) translateZ(-666px);
+    transform: translateX(13%) translateY(-42%) rotateX(23deg) rotateZ(23deg) translateZ(-666px);
     z-index: 1; /* Behind cards but above background */
     pointer-events: none;
     transition: opacity 0.5s ease, transform 0.5s ease;
@@ -295,7 +324,7 @@ body {
 #dkt1 {
     text-align: left;
     top: 0;
-    left: 0;
+    left: 40%;
     font-size: 0.7rem
 }
 
@@ -724,6 +753,7 @@ audio {
 /* Image div with mask */
 .photo {
     position: absolute;
+    background-size: cover !important;
     inset: 0;
     background: linear-gradient(135deg, #1a0, #051); /* Fallback gradient */
     z-index: 1;
@@ -767,13 +797,6 @@ audio {
                 transparent 59%, #000 59.5%, #000 61%, transparent 61.5%);
 }
 
-/* Footer band - simplified to avoid gradient conflicts */
-.bottom {
-    position: absolute;
-    left: 0; right: 0; bottom: 0;
-    height: 28%;
-    z-index: 3;
-}
 
 /* Text on top */
 .label {
@@ -846,10 +869,120 @@ audio {
     transition: transform 3s ease-out, opacity 3s ease-out;
 }
 
+#dimensionCards.cards-dormant .dimension-card:not(.track-detail-card) {
+    transform: translate(-50%, -50%) translateZ(-2200px) scale(0.3) rotateX(35deg);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.6s ease;
+}
+
+#dimensionCards.cards-dormant .dimension-card.active {
+    opacity: 1;
+}
+
+#dimensionCards.cards-dormant .dimension-card.track-detail-card {
+    opacity: 0;
+    transform: translate(-50%, -50%) translateZ(-1800px) scale(0.5);
+    pointer-events: none;
+}
+
 /* Midpoint tilt state for direction cards when track reaches halfway point */
 .dimension-card:not(.track-detail-card).midpoint-tilt {
     transform: translate(-50%, -50%) translateZ(-1200px) scale(0.5) rotateX(45deg);
     transition: transform 1s ease-out;
+}
+
+#nextTrackPreview {
+    position: fixed;
+    left: 10rem;
+    top: calc(50% + 230px);
+    width: 220px;
+    height: 220px;
+    border-radius: 12px;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(20px) scale(0.85);
+    transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.6s ease;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    z-index: 120;
+}
+
+#nextTrackPreview.visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+#nextTrackPreview.fade-out {
+    opacity: 0;
+    transform: translateY(-20px) scale(0.8);
+}
+
+#nextTrackPreview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+#beetsSegments {
+    position: fixed;
+    right: 50%;
+    justify-content: right;
+    top: 0%;
+    width: 220px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    opacity: 0.2;
+    pointer-events: none;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    transform-origin: center;
+    z-index: 1;
+    scale: 2.34;
+    transform: rotateZ(-13deg);
+}
+
+#beetsSegments.visible {
+    pointer-events: auto;
+    transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)
+}
+
+#beetsSegments.hidden {
+    pointer-events: none;
+}
+
+.beets-chip {
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: #e8f7ff;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+
+.beets-chip .chip-value {
+    color: #8cf4ff;
+}
+
+.beets-chip .chip-key {
+    color: rgba(255, 255, 255, 0.65);
+}
+
+.beets-chip .chip-separator {
+    color: rgba(255, 255, 255, 0.35);
+}
+
+.beets-chip .chip-bracket {
+    color: rgba(255, 255, 255, 0.25);
 }
 
 /* Interaction locked state */
@@ -1013,8 +1146,8 @@ audio {
 
 .dimension-card .dimension-label {
     margin: 0;
-    font-size: 1.2rem;
-    font-weight: 210;
+    font-size: 1.6rem;
+    font-weight: 240;
     text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
     font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
     text-transform: uppercase;

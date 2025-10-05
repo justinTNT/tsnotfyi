@@ -141,6 +141,9 @@
 
   // Get the opposite direction for a given direction key
   function getOppositeDirection(directionKey) {
+      if (!directionKey || typeof directionKey !== 'string') {
+          return null;
+      }
       // Handle PCA directions
       if (directionKey.includes('_positive')) {
           return directionKey.replace('_positive', '_negative');

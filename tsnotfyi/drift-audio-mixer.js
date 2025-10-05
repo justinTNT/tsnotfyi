@@ -601,10 +601,35 @@ class DriftAudioMixer {
           hydratedNextTrack = this.hydrateTrackRecord(nextTrack);
 
           if (!hydratedNextTrack || !hydratedNextTrack.path) {
-            console.log('❌ No next track selected for crossfade preparation');
-            return;
+            console.warn('❌ No next track selected for crossfade preparation; attempting drift fallback');
+
+            let fallbackCandidate = null;
+            try {
+              fallbackCandidate = await this.driftPlayer.getNextTrack();
+            } catch (fallbackErr) {
+              console.error('⚠️ Drift fallback selection failed:', fallbackErr?.message || fallbackErr);
+            }
+
+            const fallbackAnnotations = { transitionReason: 'drift-fallback' };
+            const hydratedFallback = fallbackCandidate
+              ? this.hydrateTrackRecord(fallbackCandidate, fallbackAnnotations)
+              : null;
+
+            if (hydratedFallback && hydratedFallback.path) {
+              hydratedNextTrack = hydratedFallback;
+              preparationReason = 'drift-fallback';
+              console.log(`🎯 [prepare] Hydrated fallback track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
+            } else {
+              console.error('🚫 Fallback track unavailable; scheduling retry in 5s');
+              setTimeout(() => {
+                this.prepareNextTrackForCrossfade('auto-retry', null, { force: true })
+                  .catch(err => console.error('❌ Auto-retry preparation failed:', err));
+              }, 5000);
+              return;
+            }
+          } else {
+            console.log(`🎯 [prepare] Hydrated auto track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
           }
-          console.log(`🎯 [prepare] Hydrated auto track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
         }
 
         if (!hydratedNextTrack.transitionReason) {
@@ -1496,18 +1521,30 @@ class DriftAudioMixer {
       }
     }
 
+    const beetsMeta = this.currentTrack.beetsMeta || this.lookupTrackBeetsMeta(this.currentTrack.identifier) || null;
+
+    const currentTrackPayload = {
+      identifier: this.currentTrack.identifier,
+      title: this.currentTrack.title,
+      artist: this.currentTrack.artist,
+      startTime: this.trackStartTime,
+      durationMs: durationMs
+    };
+
+    if (beetsMeta) {
+      try {
+        currentTrackPayload.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
+      } catch (err) {
+        currentTrackPayload.beetsMeta = beetsMeta;
+      }
+    }
+
     return {
       type: 'heartbeat',
       timestamp: now,
       reason,
       fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
-      currentTrack: {
-        identifier: this.currentTrack.identifier,
-        title: this.currentTrack.title,
-        artist: this.currentTrack.artist,
-        startTime: this.trackStartTime,
-        durationMs: durationMs
-      },
+      currentTrack: currentTrackPayload,
       timing: {
         elapsedMs,
         remainingMs
@@ -1652,22 +1689,34 @@ class DriftAudioMixer {
       const featuresFallback = this.lookupTrackFeatures(this.currentTrack.identifier);
       const pcaFallback = this.lookupTrackPca(this.currentTrack.identifier);
       const artFallback = this.lookupTrackAlbumCover(this.currentTrack.identifier);
+      const beetsFallback = this.lookupTrackBeetsMeta(this.currentTrack.identifier);
+
+      const currentTrackPayload = {
+        identifier: this.currentTrack.identifier,
+        title: this.currentTrack.title,
+        artist: this.currentTrack.artist,
+        duration: this.getAdjustedTrackDuration(),
+        features: this.currentTrack.features || featuresFallback || {},
+        albumCover: this.currentTrack.albumCover || artFallback || null,
+        pca: this.currentTrack.pca || pcaFallback || null,
+        startTime: this.trackStartTime
+      };
+
+      const beetsMeta = this.currentTrack.beetsMeta || beetsFallback || null;
+      if (beetsMeta) {
+        try {
+          currentTrackPayload.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
+        } catch (err) {
+          currentTrackPayload.beetsMeta = beetsMeta;
+        }
+      }
 
       snapshotEvent = {
         type: 'explorer_snapshot',
         timestamp: Date.now(),
         reason,
         fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
-        currentTrack: {
-          identifier: this.currentTrack.identifier,
-          title: this.currentTrack.title,
-          artist: this.currentTrack.artist,
-          duration: this.getAdjustedTrackDuration(),
-          features: this.currentTrack.features || featuresFallback || {},
-          albumCover: this.currentTrack.albumCover || artFallback || null,
-          pca: this.currentTrack.pca || pcaFallback || null,
-          startTime: this.trackStartTime
-        },
+        currentTrack: currentTrackPayload,
         nextTrack: nextTrackSummary || null,
         sessionHistory: this.sessionHistory.slice(-10).map(entry => ({
           identifier: entry.identifier,
@@ -2744,6 +2793,15 @@ class DriftAudioMixer {
     return track.albumCover || this.findTrackInCurrentExplorer(identifier)?.albumCover || null;
   }
 
+  lookupTrackBeetsMeta(identifier) {
+    if (!identifier) return null;
+    const track = this.radialSearch?.kdTree?.getTrack(identifier);
+    if (!track) {
+      return this.findTrackInCurrentExplorer(identifier)?.beetsMeta || null;
+    }
+    return track.beetsMeta || this.findTrackInCurrentExplorer(identifier)?.beetsMeta || null;
+  }
+
   cloneFeatureMap(features) {
     if (!features || typeof features !== 'object') return null;
     const clone = {};
@@ -2792,6 +2850,13 @@ class DriftAudioMixer {
     }
     if (track.pca) {
       clone.pca = this.clonePcaMap(track.pca);
+    }
+    if (track.beetsMeta) {
+      try {
+        clone.beetsMeta = JSON.parse(JSON.stringify(track.beetsMeta));
+      } catch (err) {
+        clone.beetsMeta = track.beetsMeta;
+      }
     }
     if (track.analysis) {
       try {
@@ -2905,6 +2970,18 @@ class DriftAudioMixer {
     result.albumCover = result.albumCover || baseClone.albumCover || null;
     result.title = result.title || baseClone.title;
     result.artist = result.artist || baseClone.artist;
+
+    const beetsSources = [baseClone?.beetsMeta, overlay?.beetsMeta, annotations?.beetsMeta, nestedCandidate?.beetsMeta];
+    const beetsMeta = beetsSources.find(meta => meta && Object.keys(meta).length > 0) || null;
+    if (beetsMeta) {
+      try {
+        result.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
+      } catch (err) {
+        result.beetsMeta = beetsMeta;
+      }
+    } else {
+      delete result.beetsMeta;
+    }
 
     const mergedFeatures = this.mergeFeatureMaps(
       baseClone.features,

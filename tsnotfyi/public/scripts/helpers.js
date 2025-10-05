@@ -83,8 +83,8 @@ function helpersDuplicateLog(...args) {
       'calmer': 'spectral_energy',
       'higher_energy': 'spectral_energy',
       'lower_energy': 'spectral_energy',
-      'more_danceable': 'danceability',
-      'less_danceable': 'danceability',
+      'more_danceable': 'danceable',
+      'less_danceable': 'danceable',
       'busier_onsets': 'onset_rate',
       'denser_onsets': 'onset_rate',
       'sparser_onsets': 'onset_rate',
@@ -506,26 +506,88 @@ function helpersDuplicateLog(...args) {
           }
       });
 
-      if (metricsContainer.children.length > 0) {
-          metricsContainer.classList.add('hidden');
+      const revealTargets = [];
 
-          nextTrackCard.addEventListener('mouseenter', () => {
-              metricsContainer.classList.remove('hidden');
+      metricsContainer.classList.add('hidden');
+      nextTrackCard.appendChild(metricsContainer);
+      revealTargets.push(metricsContainer);
+
+      const collectChips = typeof window.collectBeetsChips === 'function'
+          ? window.collectBeetsChips
+          : null;
+
+      if (collectChips) {
+          const trackData = candidateTrack && (candidateTrack.track || candidateTrack);
+          if (trackData) {
+              const beetsMeta = trackData.beetsMeta || trackData.beets || null;
+              const beetsChips = Array.isArray(beetsMeta)
+                  ? beetsMeta
+                  : (beetsMeta ? collectChips(beetsMeta) : []);
+
+              const chipsArray = Array.isArray(beetsChips) ? beetsChips.slice(0, 12) : [];
+
+              if (chipsArray.length > 0) {
+              const beetsContainer = document.createElement('div');
+              beetsContainer.className = 'track-beets hidden';
+
+                  const escapeHtml = (val) => String(val)
+                      .replace(/&/g, '&amp;')
+                      .replace(/</g, '&lt;')
+                      .replace(/>/g, '&gt;')
+                      .replace(/"/g, '&quot;')
+                      .replace(/'/g, '&#39;');
+
+                  chipsArray.forEach(({ key, value }) => {
+                      if (!key && !value) {
+                          return;
+                      }
+                      const chip = document.createElement('div');
+                      chip.className = 'beets-chip';
+                      const safeKey = escapeHtml(key || 'segment');
+                      const safeValue = escapeHtml(value !== undefined && value !== null ? value : '');
+                      chip.innerHTML = `
+                          <span class="chip-bracket">[</span>
+                          <span class="chip-value">${safeValue}</span>
+                          <span class="chip-separator">:</span>
+                          <span class="chip-key">${safeKey}</span>
+                          <span class="chip-bracket">]</span>
+                      `;
+                      beetsContainer.appendChild(chip);
+                  });
+
+                  if (beetsContainer.children.length > 0) {
+                  nextTrackCard.appendChild(beetsContainer);
+                  revealTargets.push(beetsContainer);
+                  }
+              }
+          }
+      }
+
+      if (revealTargets.length > 0) {
+          const show = () => revealTargets.forEach(el => {
+              el.classList.remove('hidden');
+          });
+          const hide = () => revealTargets.forEach(el => {
+              el.classList.add('hidden');
           });
 
-          nextTrackCard.addEventListener('mouseleave', () => {
-              metricsContainer.classList.add('hidden');
-          });
+          if (nextTrackCard.__chipShowHandler) {
+              nextTrackCard.removeEventListener('mouseenter', nextTrackCard.__chipShowHandler);
+              nextTrackCard.removeEventListener('focus', nextTrackCard.__chipShowHandler);
+          }
 
-          nextTrackCard.addEventListener('focus', () => {
-              metricsContainer.classList.remove('hidden');
-          });
+          if (nextTrackCard.__chipHideHandler) {
+              nextTrackCard.removeEventListener('mouseleave', nextTrackCard.__chipHideHandler);
+              nextTrackCard.removeEventListener('blur', nextTrackCard.__chipHideHandler);
+          }
 
-          nextTrackCard.addEventListener('blur', () => {
-              metricsContainer.classList.add('hidden');
-          });
+          nextTrackCard.__chipShowHandler = show;
+          nextTrackCard.__chipHideHandler = hide;
 
-          nextTrackCard.appendChild(metricsContainer);
+          nextTrackCard.addEventListener('mouseenter', show);
+          nextTrackCard.addEventListener('mouseleave', hide);
+          nextTrackCard.addEventListener('focus', show);
+          nextTrackCard.addEventListener('blur', hide);
       }
   }
 
@@ -685,6 +747,10 @@ function helpersDuplicateLog(...args) {
           }
       }
 
+      if (typeof window.updateNextTrackMetadata === 'function') {
+          window.updateNextTrackMetadata(nextTrack);
+      }
+
       // Update server
       sendNextTrack(nextTrack.identifier, directionKey, 'user');
 
@@ -773,7 +839,6 @@ function helpersDuplicateLog(...args) {
           <div class="panel ${colorVariant}">
               <div class="photo" style="${photoStyle(track.albumCover)}"></div>
               <span class="rim"></span>
-              <div class="bottom"></div>
               ${unoReverseHtml}
               <div class="label">
                   <h2>${directionName}</h2>
@@ -996,7 +1061,7 @@ function helpersDuplicateLog(...args) {
   }
 
   // Update the JSON metadata overlay with full next track data
-  function updateDirectionKeyOverlay(direction) {
+  function updateDirectionKeyOverlay(direction, trackData) {
       helpersColorLog(`🎨 JSON 1`);
       const overlay = document.getElementById('directionKeyOverlay');
       const text1 = document.getElementById('dkt1');
@@ -1005,6 +1070,7 @@ function helpersDuplicateLog(...args) {
       if (!overlay || !text1 || !text2) return;
       helpersColorLog(`🎨 JSON 2`);
 
+      const trackPayload = trackData || state.latestExplorerData?.nextTrack?.track || state.latestExplorerData?.nextTrack || state.latestCurrentTrack;
       const metadata2 = {
           direction: {
               key: direction.key,
@@ -1014,21 +1080,22 @@ function helpersDuplicateLog(...args) {
               diversityScore: direction.diversityScore,
               sampleTracks: direction.sampleTracks?.length || 0
           },
-          nextTrack: direction.sampleTracks?.[0] ? {
-              identifier: direction.sampleTracks[0].identifier,
-              title: getDisplayTitle(direction.sampleTracks[0]),
-              artist: direction.sampleTracks[0].artist || 'Unknown Artist',
-              album: direction.sampleTracks[0].album || null,
-              duration: direction.sampleTracks[0].duration,
-              distance: direction.sampleTracks[0].distance,
-              features: direction.sampleTracks[0].features
+          nextTrack: trackPayload ? {
+              identifier: trackPayload.identifier,
+              title: getDisplayTitle(trackPayload),
+              artist: trackPayload.artist || 'Unknown Artist',
+              album: trackPayload.album || null,
+              duration: trackPayload.duration,
+              distance: trackPayload.distance,
+              features: trackPayload.features,
+              beetsMeta: trackPayload.beetsMeta || trackPayload.beets || null
           } : null,
       };
 
       // Format as readable JSON with proper indentation
       helpersColorLog(`🎨 JSON 3`);
-      text1.textContent = JSON.stringify(state.latestCurrentTrack, null, 2);
-      console.dir({got: text1.textContent, from: state.latestCurrentTrack});
+      text1.textContent = JSON.stringify(trackPayload, null, 2);
+      console.dir({got: text1.textContent, from: trackPayload});
       text2.textContent = JSON.stringify(metadata2, null, 2);
       console.dir({got: text2.textContent, from: metadata2});
 
@@ -1152,7 +1219,6 @@ function helpersDuplicateLog(...args) {
           <div class="${panelClasses}">
               <div class="photo" style="${photoStyle(track.albumCover)}"></div>
               <div class="rim"></div>
-              <div class="bottom"></div>
               <div class="label">
                   <h2>${directionName}</h2>
                   <h3>${getDisplayTitle(track)}</h3>
@@ -1211,7 +1277,7 @@ function helpersDuplicateLog(...args) {
       // Update stack size indicator for next track stacks
       if (card.classList.contains('next-track')) {
           updateStackSizeIndicator(direction, card, stackIndex >= 0 ? stackIndex : undefined);
-          updateDirectionKeyOverlay(direction);
+          updateDirectionKeyOverlay(direction, track);
       } else {
           // Hide indicator if not a next track stack
           hideStackSizeIndicator();
