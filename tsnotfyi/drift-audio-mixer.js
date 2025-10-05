@@ -135,8 +135,10 @@ class DriftAudioMixer {
       if (identifier) {
         const fingerprint = fingerprintRegistry.rotateFingerprint(
           this.sessionId,
-          identifier,
-          this.trackStartTime
+          {
+            trackId: identifier,
+            startTime: this.trackStartTime
+          }
         );
         this.currentFingerprint = fingerprint;
       }

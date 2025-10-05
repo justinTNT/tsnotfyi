@@ -132,6 +132,63 @@ function syncEventsEndpoint(fingerprint) {
   return url;
 }
 
+const fingerprintWaiters = [];
+
+function notifyFingerprintWaiters() {
+  if (!fingerprintWaiters.length) {
+    return;
+  }
+
+  const waiters = fingerprintWaiters.splice(0, fingerprintWaiters.length);
+  for (const entry of waiters) {
+    clearTimeout(entry.timer);
+    entry.resolve(true);
+  }
+}
+
+function applyFingerprint(fingerprint) {
+  if (!fingerprint) {
+    return;
+  }
+
+  state.streamFingerprint = fingerprint;
+  syncEventsEndpoint(fingerprint);
+  notifyFingerprintWaiters();
+}
+
+function clearFingerprint({ reason = 'unknown' } = {}) {
+  if (state.streamFingerprint) {
+    console.log(`🧹 Clearing fingerprint (${reason})`);
+  }
+
+  state.streamFingerprint = null;
+  syncEventsEndpoint(null);
+  syncStreamEndpoint(null, { cacheBust: false });
+}
+
+function waitForFingerprint(timeoutMs = 8000) {
+  if (state.streamFingerprint) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const entry = {
+      resolve,
+      timer: null
+    };
+
+    entry.timer = setTimeout(() => {
+      const index = fingerprintWaiters.indexOf(entry);
+      if (index !== -1) {
+        fingerprintWaiters.splice(index, 1);
+      }
+      resolve(false);
+    }, timeoutMs);
+
+    fingerprintWaiters.push(entry);
+  });
+}
+
   function updateNowPlayingCard(trackData, driftState) {
       state.latestCurrentTrack = trackData;
       window.state = window.state || {};
@@ -202,48 +259,6 @@ function syncEventsEndpoint(fingerprint) {
       card.classList.add('visible');
   }
 
-
-async function bootstrapStream() {
-  console.log('🔧 Bootstrapping stream...');
-
-  const response = await fetch('/stream/bootstrap', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' }
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Failed to bootstrap stream: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-
-  state.sessionId = data.sessionId || null;
-  state.streamFingerprint = data.fingerprint || null;
-  state.streamUrlBase = '/stream';
-  state.eventsEndpointBase = '/events';
-
-  if (state.streamFingerprint) {
-    syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
-    syncEventsEndpoint(state.streamFingerprint);
-  }
-
-  if (typeof data.streamUrl === 'string') {
-    state.streamUrl = data.streamUrl;
-    window.streamUrl = data.streamUrl;
-  }
-
-  window.eventsUrl = state.eventsEndpoint;
-
-  if (data.currentTrack) {
-    updateNowPlayingCard(data.currentTrack, null);
-  } else {
-    state.latestCurrentTrack = null;
-    state.lastTrackUpdateTs = 0;
-  }
-
-  return data;
-}
 
 function updateRadiusControlsUI() {
   const controls = document.querySelectorAll('#radiusControls .radius-button');
@@ -409,9 +424,7 @@ async function initializeApp() {
     }
 
     state.sessionId = null;
-    state.streamFingerprint = null;
-    state.streamUrl = state.streamUrlBase || '/stream';
-    window.streamUrl = state.streamUrl;
+    clearFingerprint({ reason: 'audio_restart' });
 
     if (connectionHealth.currentEventSource) {
       try {
@@ -1124,19 +1137,10 @@ function createDimensionCards(explorerData, options = {}) {
           elements.clickCatcher.style.display = 'none';
       }, 800);
 
-      if (!state.streamFingerprint) {
-          try {
-              await bootstrapStream();
-          } catch (error) {
-              console.error('❌ Unable to start audio without a stream fingerprint:', error);
-              return;
-          }
-      }
-
       const streamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
       state.streamUrl = streamUrl;
       window.streamUrl = streamUrl;
-      console.log(`🎵 Audio connecting with fingerprint: ${state.streamFingerprint}`);
+      console.log(`🎵 Audio connecting to ${streamUrl}`);
 
       startAudioHealthMonitoring();
       audioHealth.isHealthy = false;
@@ -1148,6 +1152,11 @@ function createDimensionCards(explorerData, options = {}) {
 
       elements.audio.src = streamUrl;
       elements.audio.load();
+
+      setTimeout(() => {
+          connectSSE();
+      }, 150);
+
       elements.audio.play()
         .then(() => {
           connectionHealth.audio.status = 'connected';
@@ -1750,13 +1759,15 @@ function createDimensionCards(explorerData, options = {}) {
 
   // Smart SSE connection with health monitoring and reconnection
   function connectSSE() {
-    if (!state.streamFingerprint) {
-      console.error('❌ Cannot connect SSE: no stream fingerprint');
-      return;
-    }
+    const fingerprint = state.streamFingerprint;
+    const eventsUrl = composeEventsEndpoint(fingerprint);
+    syncEventsEndpoint(fingerprint);
 
-    const eventsUrl = syncEventsEndpoint(state.streamFingerprint);
-    console.log(`🔌 Connecting SSE to fingerprint: ${state.streamFingerprint}`);
+    if (fingerprint) {
+      console.log(`🔌 Connecting SSE to fingerprint: ${fingerprint}`);
+    } else {
+      console.log('🔌 Connecting SSE (awaiting fingerprint from audio stream)');
+    }
 
     connectionHealth.sse.status = 'connecting';
     updateConnectionHealthUI();
@@ -1771,7 +1782,7 @@ function createDimensionCards(explorerData, options = {}) {
 
     const handleSseStuck = async () => {
       if (!state.streamFingerprint) {
-        console.warn('📡 SSE stuck but no fingerprint yet; forcing reconnect');
+        console.warn('📡 SSE stuck but fingerprint not yet assigned; waiting for audio session');
         return true;
       }
 
@@ -1798,15 +1809,18 @@ function createDimensionCards(explorerData, options = {}) {
     };
 
     const simpleBody = state.streamFingerprint
-            ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
-            : null;
-          const bodyPayload = simpleBody ? JSON.stringify(simpleBody) : null;
-          fetch('/refresh-sse-simple', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: bodyPayload || '{}'
-          }).catch(() => {})
-eventSource.onopen = () => {
+      ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
+      : null;
+
+    if (simpleBody) {
+      fetch('/refresh-sse-simple', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(simpleBody)
+      }).catch(() => {});
+    }
+
+    eventSource.onopen = () => {
       console.log('📡 SSE connected');
       connectionHealth.sse.status = 'connected';
       connectionHealth.sse.reconnectAttempts = 0;
@@ -1883,9 +1897,7 @@ eventSource.onopen = () => {
           }
 
           if (data.fingerprint) {
-            state.streamFingerprint = data.fingerprint;
-            syncEventsEndpoint(state.streamFingerprint);
-            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+            applyFingerprint(data.fingerprint);
           }
         }
 
@@ -1897,8 +1909,7 @@ eventSource.onopen = () => {
 
         if (state.streamFingerprint && data.fingerprint && data.fingerprint !== state.streamFingerprint) {
           console.log(`🔄 Updating fingerprint from ${state.streamFingerprint} → ${data.fingerprint}`);
-          state.streamFingerprint = data.fingerprint;
-          syncEventsEndpoint(state.streamFingerprint);
+          applyFingerprint(data.fingerprint);
         }
 
         if (data.type === 'track_started') {
@@ -1906,9 +1917,7 @@ eventSource.onopen = () => {
             if (state.streamFingerprint !== data.fingerprint) {
               console.log(`🔄 Track event rotated fingerprint to ${data.fingerprint}`);
             }
-            state.streamFingerprint = data.fingerprint;
-            syncEventsEndpoint(state.streamFingerprint);
-            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+            applyFingerprint(data.fingerprint);
           }
 
           const previousTrackId = state.latestCurrentTrack?.identifier || null;
@@ -2057,13 +2066,7 @@ eventSource.onopen = () => {
     };
   }
 
-  // Initialize stream + SSE connection
-  try {
-    await bootstrapStream();
-    connectSSE();
-  } catch (error) {
-    console.error('❌ Failed to bootstrap stream on init:', error);
-  }
+  console.log('🚢 Awaiting audio start to establish session.');
 
     // Comprehensive duplicate detection system
   function performDuplicateAnalysis(explorerData, context = "unknown") {
@@ -2858,11 +2861,19 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     }
 
     if (!state.streamFingerprint) {
-        console.warn('⚠️ sendNextTrack: No fingerprint available, bootstrapping new stream');
-        await createNewJourneySession('missing_fingerprint');
-        if (!state.streamFingerprint) {
-            console.error('❌ sendNextTrack: Still no fingerprint after bootstrap, aborting');
-            return;
+        console.warn('⚠️ sendNextTrack: No fingerprint yet; waiting for SSE to bind');
+        const ready = await waitForFingerprint(5000);
+
+        if (!ready || !state.streamFingerprint) {
+            console.warn('⚠️ sendNextTrack: Fingerprint still missing after wait; restarting session');
+            await createNewJourneySession('missing_fingerprint');
+
+            const fallbackReady = await waitForFingerprint(5000);
+            if (!fallbackReady || !state.streamFingerprint) {
+                console.error('❌ sendNextTrack: Aborting call - fingerprint unavailable');
+                scheduleHeartbeat(10000);
+                return;
+            }
         }
     }
 
@@ -2944,9 +2955,7 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
             if (state.streamFingerprint !== data.fingerprint) {
                 console.log(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
             }
-            state.streamFingerprint = data.fingerprint;
-            syncEventsEndpoint(state.streamFingerprint);
-            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+            applyFingerprint(data.fingerprint);
         }
 
         const serverTrack = data.currentTrack;
@@ -2977,9 +2986,7 @@ function analyzeAndAct(data, source, sentMd5) {
 
     if (data.fingerprint && state.streamFingerprint !== data.fingerprint) {
         console.log(`🔄 Server response rotated fingerprint to ${data.fingerprint}`);
-        state.streamFingerprint = data.fingerprint;
-        syncEventsEndpoint(state.streamFingerprint);
-        syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+        applyFingerprint(data.fingerprint);
     }
 
     if (!data || !currentTrack) {
@@ -3210,8 +3217,7 @@ async function fullResync() {
             if (state.streamFingerprint !== result.fingerprint) {
                 console.log(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
             }
-            state.streamFingerprint = result.fingerprint;
-            syncEventsEndpoint(state.streamFingerprint);
+            applyFingerprint(result.fingerprint);
         }
 
         if (result.ok) {
@@ -3271,8 +3277,12 @@ async function createNewJourneySession(reason = 'unknown') {
             }
         }
 
-        await bootstrapStream();
-        const newStreamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
+        clearFingerprint({ reason: `new_session_${reason}` });
+        state.sessionId = null;
+
+        const newStreamUrl = composeStreamEndpoint(null, Date.now());
+        state.streamUrl = newStreamUrl;
+        window.streamUrl = newStreamUrl;
 
         if (streamElement) {
             audioHealth.isHealthy = false;
@@ -3280,12 +3290,6 @@ async function createNewJourneySession(reason = 'unknown') {
             audioHealth.bufferingStarted = Date.now();
             streamElement.src = newStreamUrl;
             streamElement.load();
-            if (state.isStarted) {
-                startAudioHealthMonitoring();
-                streamElement.play().catch(err => {
-                    console.error('🎵 Audio play failed after new session:', err);
-                });
-            }
         }
 
         state.manualNextTrackOverride = false;
@@ -3310,7 +3314,15 @@ async function createNewJourneySession(reason = 'unknown') {
         }
         connectionHealth.sse.status = 'reconnecting';
         updateConnectionHealthUI();
-        connectSSE();
+
+        setTimeout(() => connectSSE(), 200);
+
+        if (streamElement && state.isStarted) {
+            startAudioHealthMonitoring();
+            streamElement.play().catch(err => {
+                console.error('🎵 Audio play failed after new session:', err);
+            });
+        }
 
         scheduleHeartbeat(5000);
     } catch (error) {
@@ -3323,8 +3335,11 @@ async function createNewJourneySession(reason = 'unknown') {
 
 async function verifyExistingSessionOrRestart(reason = 'unknown') {
     if (!state.streamFingerprint) {
-        await createNewJourneySession(reason);
-        return;
+        const ready = await waitForFingerprint(3000);
+        if (!ready || !state.streamFingerprint) {
+            await createNewJourneySession(reason);
+            return;
+        }
     }
 
     try {
@@ -3353,8 +3368,12 @@ async function verifyExistingSessionOrRestart(reason = 'unknown') {
 
 async function requestSSERefresh() {
     if (!state.streamFingerprint) {
-        console.warn('⚠️ requestSSERefresh: No fingerprint available');
-        return false;
+        console.warn('⚠️ requestSSERefresh: No fingerprint yet; waiting for SSE handshake');
+        const ready = await waitForFingerprint(4000);
+        if (!ready || !state.streamFingerprint) {
+            console.warn('⚠️ requestSSERefresh: Aborting refresh - fingerprint unavailable');
+            return false;
+        }
     }
 
     try {
@@ -3388,9 +3407,7 @@ async function requestSSERefresh() {
                 if (state.streamFingerprint !== result.fingerprint) {
                     console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
                 }
-                state.streamFingerprint = result.fingerprint;
-                syncEventsEndpoint(state.streamFingerprint);
-                syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+                applyFingerprint(result.fingerprint);
             }
 
             if (result.ok === false) {
@@ -3417,9 +3434,7 @@ async function requestSSERefresh() {
 
                 if (result.fingerprint && state.streamFingerprint !== result.fingerprint) {
                     console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
-                    state.streamFingerprint = result.fingerprint;
-                    syncEventsEndpoint(state.streamFingerprint);
-                    syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+                    applyFingerprint(result.fingerprint);
                 }
 
                 // Update the now playing card with current track data
@@ -3465,9 +3480,13 @@ async function requestSSERefresh() {
 async function manualRefresh() {
     console.log('🔄 Manual refresh snapshot');
     if (!state.streamFingerprint) {
-        console.warn('🛰️ Manual refresh: no fingerprint; creating new journey');
-        await createNewJourneySession('manual_refresh_missing');
-        return;
+        console.warn('🛰️ Manual refresh: no fingerprint yet; waiting before restarting');
+        const ready = await waitForFingerprint(4000);
+        if (!ready || !state.streamFingerprint) {
+            console.warn('🛰️ Manual refresh: fingerprint still missing; creating new journey');
+            await createNewJourneySession('manual_refresh_missing');
+            return;
+        }
     }
 
     const ok = await requestSSERefresh();
