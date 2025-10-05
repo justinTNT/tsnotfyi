@@ -15,11 +15,13 @@ const state = {
     camera: null,
     scene: null,
     baseDirectionKey: null,
-    streamUrl: '/stream',
-    eventsEndpoint: '/events',
-    streamUrlBase: '/stream',
-    eventsEndpointBase: '/events',
-    currentResolution: 'magnifying',
+    sessionId: null,
+    streamFingerprint: null,
+  streamUrl: '/stream',
+  eventsEndpoint: '/events',
+  streamUrlBase: '/stream',
+  eventsEndpointBase: '/events',
+  currentResolution: 'magnifying',
     manualNextTrackOverride: false,
     nextTrackAnimationTimer: null,
     manualNextDirectionKey: null,
@@ -92,11 +94,11 @@ function normalizeResolution(resolution) {
   return value;
 }
 
-function composeStreamEndpoint(sessionId, cacheBust = false) {
+function composeStreamEndpoint(fingerprint, cacheBust = false) {
   const base = state.streamUrlBase || '/stream';
   const params = [];
-  if (sessionId) {
-    params.push(`session=${encodeURIComponent(sessionId)}`);
+  if (fingerprint) {
+    params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
   }
   if (cacheBust !== false) {
     const value = cacheBust === true ? Date.now() : cacheBust;
@@ -108,156 +110,27 @@ function composeStreamEndpoint(sessionId, cacheBust = false) {
   return `${base}?${params.join('&')}`;
 }
 
-function composeEventsEndpoint(sessionId) {
+function composeEventsEndpoint(fingerprint) {
   const base = state.eventsEndpointBase || '/events';
-  if (!sessionId) {
+  if (!fingerprint) {
     return base;
   }
-  return `${base}?session=${encodeURIComponent(sessionId)}`;
+  return `${base}?fingerprint=${encodeURIComponent(fingerprint)}`;
 }
 
-function syncStreamEndpoint(sessionId, { cacheBust = false } = {}) {
-  const url = composeStreamEndpoint(sessionId, cacheBust);
+function syncStreamEndpoint(fingerprint, { cacheBust = false } = {}) {
+  const url = composeStreamEndpoint(fingerprint, cacheBust);
   state.streamUrl = url;
   window.streamUrl = url;
   return url;
 }
 
-function syncEventsEndpoint(sessionId) {
-  const url = composeEventsEndpoint(sessionId);
+function syncEventsEndpoint(fingerprint) {
+  const url = composeEventsEndpoint(fingerprint);
   state.eventsEndpoint = url;
   window.eventsUrl = url;
   return url;
 }
-
-function updateRadiusControlsUI() {
-  const controls = document.querySelectorAll('#radiusControls .radius-button');
-  if (!controls.length) return;
-
-  const active = normalizeResolution(state.currentResolution) || 'magnifying';
-  controls.forEach(btn => {
-    const btnMode = normalizeResolution(btn.dataset.radiusMode);
-    if (btnMode === active) {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
-  });
-}
-
-function triggerZoomMode(mode) {
-  const normalizedMode = normalizeResolution(mode) || 'magnifying';
-
-  state.currentResolution = normalizedMode;
-  updateRadiusControlsUI();
-
-  const endpointMode = normalizedMode === 'magnifying' ? 'magnifying' : normalizedMode;
-
-  fetch(`/session/zoom/${endpointMode}`, {
-    method: 'POST'
-  }).then(response => {
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    return response.json().catch(() => ({}));
-  }).then(result => {
-    const returnedResolution = normalizeResolution(result.resolution) || normalizedMode;
-    state.currentResolution = returnedResolution;
-    state.manualNextTrackOverride = false;
-    state.manualNextDirectionKey = null;
-    updateRadiusControlsUI();
-    if (typeof rejig === 'function') {
-      rejig();
-    }
-  }).catch(error => {
-    console.error('Zoom request failed:', error);
-  });
-}
-
-function setupRadiusControls() {
-  const container = document.getElementById('radiusControls');
-  if (!container) return;
-
-  container.querySelectorAll('.radius-button').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const mode = btn.dataset.radiusMode;
-      triggerZoomMode(mode);
-    });
-  });
-
-  updateRadiusControlsUI();
-}
-
-updateRadiusControlsUI();
-
-initializeApp();
-
-function initializeApp() {
-
-  // ====== Audio Streaming Setup ======
-
-  console.log('🆔 Using cookie-managed audio session');
-
-  // Connection health management
-  const connectionHealth = {
-    sse: {
-      status: 'connecting',
-      lastMessage: Date.now(),
-      reconnectAttempts: 0,
-      reconnectDelay: 2000,
-      maxReconnectDelay: 30000,
-      stuckTimeout: null,
-    },
-    audio: {
-      status: 'connecting',
-      reconnectAttempts: 0,
-      reconnectDelay: 2000,
-      maxReconnectDelay: 30000,
-      maxAttempts: 10,
-    },
-    currentEventSource: null,
-  };
-
-  // Update connection health UI
-  function updateConnectionHealthUI() {
-    const healthIndicator = document.getElementById('connectionHealth');
-    const sseStatus = document.getElementById('sseStatus');
-    const audioStatus = document.getElementById('audioStatus');
-
-    if (!healthIndicator) return;
-
-    // Update status text
-    if (sseStatus) sseStatus.textContent = connectionHealth.sse.status;
-    if (audioStatus) audioStatus.textContent = connectionHealth.audio.status;
-
-    // Determine overall health
-    const sseOk = connectionHealth.sse.status === 'connected';
-    const audioOk = connectionHealth.audio.status === 'connected';
-
-    healthIndicator.classList.remove('healthy', 'degraded', 'error');
-
-    if (sseOk && audioOk) {
-      healthIndicator.classList.add('healthy');
-    } else if (sseOk || audioOk) {
-      healthIndicator.classList.add('degraded');
-    } else {
-      healthIndicator.classList.add('error');
-    }
-  }
-
-  const LOCKOUT_THRESHOLD_SECONDS = 30;
-
-  const elements = {
-	  clickCatcher:        document.getElementById('clickCatcher'),
-          volumeControl:       document.getElementById('volumeControl'),
-          volumeBar:           document.getElementById('volumeBar'),
-          fullscreenProgress:  document.getElementById('fullscreenProgress'),
-	  progressWipe:        document.getElementById('progressWipe'),
-          audio:               document.getElementById('audio'),
-          playbackClock:       document.getElementById('playbackClock')
-  }
-  elements.audio.volume = 0.85;
-
 
   function updateNowPlayingCard(trackData, driftState) {
       state.latestCurrentTrack = trackData;
@@ -328,6 +201,354 @@ function initializeApp() {
       const card = document.getElementById('nowPlayingCard');
       card.classList.add('visible');
   }
+
+
+async function bootstrapStream() {
+  console.log('🔧 Bootstrapping stream...');
+
+  const response = await fetch('/stream/bootstrap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Failed to bootstrap stream: ${response.status} ${text}`);
+  }
+
+  const data = await response.json();
+
+  state.sessionId = data.sessionId || null;
+  state.streamFingerprint = data.fingerprint || null;
+  state.streamUrlBase = '/stream';
+  state.eventsEndpointBase = '/events';
+
+  if (state.streamFingerprint) {
+    syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+    syncEventsEndpoint(state.streamFingerprint);
+  }
+
+  if (typeof data.streamUrl === 'string') {
+    state.streamUrl = data.streamUrl;
+    window.streamUrl = data.streamUrl;
+  }
+
+  window.eventsUrl = state.eventsEndpoint;
+
+  if (data.currentTrack) {
+    updateNowPlayingCard(data.currentTrack, null);
+  } else {
+    state.latestCurrentTrack = null;
+    state.lastTrackUpdateTs = 0;
+  }
+
+  return data;
+}
+
+function updateRadiusControlsUI() {
+  const controls = document.querySelectorAll('#radiusControls .radius-button');
+  if (!controls.length) return;
+
+  const active = normalizeResolution(state.currentResolution) || 'magnifying';
+  controls.forEach(btn => {
+    const btnMode = normalizeResolution(btn.dataset.radiusMode);
+    if (btnMode === active) {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+}
+
+function triggerZoomMode(mode) {
+  const normalizedMode = normalizeResolution(mode) || 'magnifying';
+
+  state.currentResolution = normalizedMode;
+  updateRadiusControlsUI();
+
+  const endpointMode = normalizedMode === 'magnifying' ? 'magnifying' : normalizedMode;
+
+  fetch(`/session/zoom/${endpointMode}`, {
+    method: 'POST'
+  }).then(response => {
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json().catch(() => ({}));
+  }).then(result => {
+    const returnedResolution = normalizeResolution(result.resolution) || normalizedMode;
+    state.currentResolution = returnedResolution;
+    state.manualNextTrackOverride = false;
+    state.manualNextDirectionKey = null;
+    updateRadiusControlsUI();
+    if (typeof rejig === 'function') {
+      rejig();
+    }
+  }).catch(error => {
+    console.error('Zoom request failed:', error);
+  });
+}
+
+function setupRadiusControls() {
+  const container = document.getElementById('radiusControls');
+  if (!container) return;
+
+  container.querySelectorAll('.radius-button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.radiusMode;
+      triggerZoomMode(mode);
+    });
+  });
+
+  updateRadiusControlsUI();
+}
+
+updateRadiusControlsUI();
+
+initializeApp().catch((error) => {
+  console.error('❌ App initialization failed:', error);
+});
+
+async function initializeApp() {
+
+  // ====== Audio Streaming Setup ======
+
+  console.log('🆔 Audio-first session management');
+
+  // Connection health management
+  const connectionHealth = {
+    sse: {
+      status: 'connecting',
+      lastMessage: Date.now(),
+      reconnectAttempts: 0,
+      reconnectDelay: 2000,
+      maxReconnectDelay: 30000,
+      stuckTimeout: null,
+    },
+    audio: {
+      status: 'connecting',
+      reconnectAttempts: 0,
+      reconnectDelay: 2000,
+      maxReconnectDelay: 30000,
+      maxAttempts: 10,
+    },
+    currentEventSource: null,
+  };
+
+  // Update connection health UI
+  function updateConnectionHealthUI() {
+    const healthIndicator = document.getElementById('connectionHealth');
+    const sseStatus = document.getElementById('sseStatus');
+    const audioStatus = document.getElementById('audioStatus');
+
+    if (!healthIndicator) return;
+
+    // Update status text
+    if (sseStatus) sseStatus.textContent = connectionHealth.sse.status;
+    if (audioStatus) audioStatus.textContent = connectionHealth.audio.status;
+
+    // Determine overall health
+    const sseOk = connectionHealth.sse.status === 'connected';
+    const audioOk = connectionHealth.audio.status === 'connected';
+
+    healthIndicator.classList.remove('healthy', 'degraded', 'error');
+
+    if (sseOk && audioOk) {
+      healthIndicator.classList.add('healthy');
+    } else if (sseOk || audioOk) {
+      healthIndicator.classList.add('degraded');
+    } else {
+      healthIndicator.classList.add('error');
+    }
+  }
+
+  const audioHealth = {
+    lastTimeUpdate: null,
+    bufferingStarted: null,
+    isHealthy: false,
+    checkInterval: null,
+    handlingRestart: false,
+    lastObservedTime: 0
+  };
+
+  const LOCKOUT_THRESHOLD_SECONDS = 30;
+
+  const elements = {
+	  clickCatcher:        document.getElementById('clickCatcher'),
+          volumeControl:       document.getElementById('volumeControl'),
+          volumeBar:           document.getElementById('volumeBar'),
+          fullscreenProgress:  document.getElementById('fullscreenProgress'),
+	  progressWipe:        document.getElementById('progressWipe'),
+          audio:               document.getElementById('audio'),
+          playbackClock:       document.getElementById('playbackClock')
+  }
+  elements.audio.volume = 0.85;
+
+  function handleDeadAudioSession() {
+    if (audioHealth.handlingRestart) {
+      return;
+    }
+
+    console.error('💀 Audio session is dead - restarting application');
+    audioHealth.handlingRestart = true;
+    audioHealth.isHealthy = false;
+    if (audioHealth.checkInterval) {
+      clearInterval(audioHealth.checkInterval);
+      audioHealth.checkInterval = null;
+    }
+    audioHealth.lastTimeUpdate = null;
+    audioHealth.bufferingStarted = null;
+
+    connectionHealth.audio.status = 'error';
+    updateConnectionHealthUI();
+
+    try {
+      elements.audio.pause();
+    } catch (err) {
+      console.warn('⚠️ Failed to pause audio during restart:', err);
+    }
+
+    state.sessionId = null;
+    state.streamFingerprint = null;
+    state.streamUrl = state.streamUrlBase || '/stream';
+    window.streamUrl = state.streamUrl;
+
+    if (connectionHealth.currentEventSource) {
+      try {
+        connectionHealth.currentEventSource.close();
+      } catch (err) {
+        console.warn('⚠️ Failed to close SSE during restart:', err);
+      }
+      connectionHealth.currentEventSource = null;
+    }
+
+    setTimeout(() => {
+      window.location.reload();
+    }, 1000);
+  }
+
+  function startAudioHealthMonitoring() {
+    if (audioHealth.checkInterval) {
+      clearInterval(audioHealth.checkInterval);
+    }
+
+    audioHealth.lastTimeUpdate = null;
+    audioHealth.bufferingStarted = null;
+    audioHealth.isHealthy = false;
+    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || 0;
+
+    audioHealth.checkInterval = setInterval(() => {
+      if (audioHealth.handlingRestart) {
+        return;
+      }
+
+      const currentTime = Number(elements.audio.currentTime);
+      if (Number.isFinite(currentTime)) {
+        if (Math.abs(currentTime - audioHealth.lastObservedTime) > 0.05) {
+          audioHealth.lastObservedTime = currentTime;
+          audioHealth.lastTimeUpdate = Date.now();
+          audioHealth.bufferingStarted = null;
+          audioHealth.isHealthy = true;
+          connectionHealth.audio.status = 'connected';
+          updateConnectionHealthUI();
+        }
+      }
+
+      if (!audioHealth.lastTimeUpdate) {
+        return;
+      }
+
+      const now = Date.now();
+      const timeSinceUpdate = now - audioHealth.lastTimeUpdate;
+      const isBuffering = audioHealth.bufferingStarted !== null;
+      const bufferingDuration = isBuffering ? (now - audioHealth.bufferingStarted) : 0;
+
+      if (timeSinceUpdate > 12000) {
+        console.error(`❌ Audio session dead: no timeupdate for ${(timeSinceUpdate / 1000).toFixed(1)}s`);
+        handleDeadAudioSession();
+        return;
+      }
+
+      if (bufferingDuration > 8000) {
+        console.warn(`⚠️ Audio struggling: buffering for ${(bufferingDuration / 1000).toFixed(1)}s`);
+        connectionHealth.audio.status = 'degraded';
+        updateConnectionHealthUI();
+        return;
+      }
+
+      if (audioHealth.isHealthy && connectionHealth.audio.status !== 'connected') {
+        connectionHealth.audio.status = 'connected';
+        updateConnectionHealthUI();
+      }
+    }, 2000);
+  }
+
+  elements.audio.addEventListener('timeupdate', () => {
+    audioHealth.lastTimeUpdate = Date.now();
+    audioHealth.bufferingStarted = null;
+    audioHealth.isHealthy = true;
+    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
+    connectionHealth.audio.status = 'connected';
+    updateConnectionHealthUI();
+  });
+
+  elements.audio.addEventListener('waiting', () => {
+    console.log('⏳ Audio buffering...');
+    audioHealth.bufferingStarted = Date.now();
+    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
+  });
+
+  elements.audio.addEventListener('playing', () => {
+    console.log('▶️ Audio playing');
+    audioHealth.bufferingStarted = null;
+    audioHealth.lastTimeUpdate = Date.now();
+    audioHealth.isHealthy = true;
+    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
+    connectionHealth.audio.status = 'connected';
+    updateConnectionHealthUI();
+  });
+
+  elements.audio.addEventListener('error', (e) => {
+    console.error('❌ Audio error - session is dead', e);
+
+    const mediaError = elements.audio.error;
+    if (mediaError) {
+      console.error('🎵 Audio error details:', {
+        code: mediaError.code,
+        message: mediaError.message,
+        networkState: elements.audio.networkState,
+        readyState: elements.audio.readyState,
+        src: elements.audio.currentSrc,
+        currentTime: elements.audio.currentTime,
+        duration: elements.audio.duration
+      });
+    }
+
+    audioHealth.isHealthy = false;
+    connectionHealth.audio.status = 'error';
+    updateConnectionHealthUI();
+
+    if (typeof checkStreamEndpoint === 'function') {
+      try {
+        checkStreamEndpoint();
+      } catch (err) {
+        console.warn('⚠️ Stream endpoint check failed:', err);
+      }
+    }
+
+    handleDeadAudioSession();
+  });
+
+  elements.audio.addEventListener('stalled', () => {
+    console.error('❌ Audio stalled - network failed');
+    audioHealth.isHealthy = false;
+    connectionHealth.audio.status = 'error';
+    updateConnectionHealthUI();
+  });
+
+  elements.audio.addEventListener('loadstart', () => console.log('🎵 Load started'));
+  elements.audio.addEventListener('canplay', () => console.log('🎵 Can play'));
+  elements.audio.addEventListener('canplaythrough', () => console.log('🎵 Can play through'));
 
 
 
@@ -888,7 +1109,7 @@ function createDimensionCards(explorerData, options = {}) {
   }
 
   // ====== Audio Controls ======
-  function startAudio() {
+  async function startAudio() {
       if (state.isStarted) return;
 
       // Immediately hide clickwall and show interface
@@ -903,62 +1124,30 @@ function createDimensionCards(explorerData, options = {}) {
           elements.clickCatcher.style.display = 'none';
       }, 800);
 
-      // Set audio source and start playing
-      console.log(`🎵 Setting audio source to: ${state.streamUrl}`);
-      if (state.streamUrl) {
-          elements.audio.src = state.streamUrl;
+      if (!state.streamFingerprint) {
+          try {
+              await bootstrapStream();
+          } catch (error) {
+              console.error('❌ Unable to start audio without a stream fingerprint:', error);
+              return;
+          }
       }
 
-      // Add error event listeners for better diagnostics
-      elements.audio.onerror = function(e) {
-          console.error('🎵 Audio error event:', e);
+      const streamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
+      state.streamUrl = streamUrl;
+      window.streamUrl = streamUrl;
+      console.log(`🎵 Audio connecting with fingerprint: ${state.streamFingerprint}`);
 
-          const mediaError = elements.audio.error;
-          let errorType = 'Unknown';
-          let errorMessage = 'Unknown media error';
+      startAudioHealthMonitoring();
+      audioHealth.isHealthy = false;
+      audioHealth.lastTimeUpdate = null;
+      audioHealth.bufferingStarted = Date.now();
 
-          if (mediaError) {
-              switch (mediaError.code) {
-                  case MediaError.MEDIA_ERR_ABORTED:
-                      errorType = 'MEDIA_ERR_ABORTED';
-                      errorMessage = 'Audio loading was aborted by user';
-                      break;
-                  case MediaError.MEDIA_ERR_NETWORK:
-                      errorType = 'MEDIA_ERR_NETWORK';
-                      errorMessage = 'Network error while loading audio';
-                      break;
-                  case MediaError.MEDIA_ERR_DECODE:
-                      errorType = 'MEDIA_ERR_DECODE';
-                      errorMessage = 'Audio decoding error';
-                      break;
-                  case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-                      errorType = 'MEDIA_ERR_SRC_NOT_SUPPORTED';
-                      errorMessage = 'Audio format not supported';
-                      break;
-              }
-          }
+      connectionHealth.audio.status = 'connecting';
+      updateConnectionHealthUI();
 
-          console.error('🎵 Audio error details:', {
-              errorType,
-              errorMessage,
-              errorCode: mediaError?.code,
-              mediaError,
-              networkState: elements.audio.networkState,
-              readyState: elements.audio.readyState,
-              src: elements.audio.src,
-              currentTime: elements.audio.currentTime,
-              duration: elements.audio.duration
-          });
-
-          // Check if server is reachable
-          checkStreamEndpoint();
-      };
-
-      elements.audio.onloadstart = () => console.log('🎵 Load started');
-      elements.audio.oncanplay = () => console.log('🎵 Can play');
-      elements.audio.oncanplaythrough = () => console.log('🎵 Can play through');
-
-      elements.audio.src = state.streamUrl;
+      elements.audio.src = streamUrl;
+      elements.audio.load();
       elements.audio.play()
         .then(() => {
           connectionHealth.audio.status = 'connected';
@@ -974,7 +1163,8 @@ function createDimensionCards(explorerData, options = {}) {
               readyState: elements.audio.readyState,
               src: elements.audio.src
           });
-          // Keep interface visible even if audio fails
+          connectionHealth.audio.status = 'error';
+          updateConnectionHealthUI();
         });
   }
 
@@ -1560,8 +1750,16 @@ function createDimensionCards(explorerData, options = {}) {
 
   // Smart SSE connection with health monitoring and reconnection
   function connectSSE() {
-    const eventsUrl = syncEventsEndpoint(state.sessionId);
-    console.log(`🔌 Connecting to SSE: ${eventsUrl}`);
+    if (!state.streamFingerprint) {
+      console.error('❌ Cannot connect SSE: no stream fingerprint');
+      return;
+    }
+
+    const eventsUrl = syncEventsEndpoint(state.streamFingerprint);
+    console.log(`🔌 Connecting SSE to fingerprint: ${state.streamFingerprint}`);
+
+    connectionHealth.sse.status = 'connecting';
+    updateConnectionHealthUI();
 
     // Close existing connection if any
     if (connectionHealth.currentEventSource) {
@@ -1572,30 +1770,13 @@ function createDimensionCards(explorerData, options = {}) {
     connectionHealth.currentEventSource = eventSource;
 
     const handleSseStuck = async () => {
-      try {
-        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const payload = await response.json();
-        const sessionInfo = Array.isArray(payload.sessions)
-          ? payload.sessions.find(entry => entry.sessionId === state.sessionId)
-          : null;
-
-        if (sessionInfo && sessionInfo.md5) {
-          console.warn('📡 SSE idle but session active; requesting explorer refresh');
-          await requestSSERefresh();
-          return false;
-        }
-
-        if (sessionInfo && !sessionInfo.md5) {
-          console.warn('📡 SSE idle; session reported but no track yet. Waiting.');
-          return false;
-        }
-      } catch (error) {
-        console.error('📡 SSE stuck check failed:', error);
+      if (!state.streamFingerprint) {
+        console.warn('📡 SSE stuck but no fingerprint yet; forcing reconnect');
+        return true;
       }
-      return true;
+
+      const ok = await requestSSERefresh();
+      return !ok;
     };
 
     const resetStuckTimer = () => {
@@ -1616,7 +1797,15 @@ function createDimensionCards(explorerData, options = {}) {
       }, 60000);
     };
 
-          fetch('/refresh-sse-simple', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }).catch(() => {})
+    const simpleBody = state.streamFingerprint
+            ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
+            : null;
+          const bodyPayload = simpleBody ? JSON.stringify(simpleBody) : null;
+          fetch('/refresh-sse-simple', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: bodyPayload || '{}'
+          }).catch(() => {})
 eventSource.onopen = () => {
       console.log('📡 SSE connected');
       connectionHealth.sse.status = 'connected';
@@ -1651,32 +1840,77 @@ eventSource.onopen = () => {
        const data = raw;
        console.log('📡 Event:', data.type, data);
 
-        if (data.type === 'connected' && data.sessionId) {
-          const previousSession = state.sessionId;
-          state.sessionId = data.sessionId;
-          if (previousSession && previousSession !== data.sessionId) {
-            console.warn(`🆔 SSE reported session change ${previousSession} → ${data.sessionId}`);
-          } else if (!previousSession) {
-            console.log(`🆔 SSE assigned session: ${state.sessionId}`);
+        if (data.type === 'error') {
+          console.error('📡 SSE reported error payload:', data.message);
+          if (audioHealth.isHealthy) {
+            eventSource.close();
+            if (data.message === 'fingerprint_not_found') {
+              console.log('🔄 SSE fingerprint missing; requesting refresh');
+              requestSSERefresh()
+                .then((ok) => {
+                  if (ok) {
+                    connectSSE();
+                  } else {
+                    console.warn('⚠️ Fingerprint refresh failed; bootstrapping new stream');
+                    createNewJourneySession('fingerprint_not_found');
+                  }
+                })
+                .catch((err) => {
+                  console.error('❌ Fingerprint refresh request failed:', err);
+                  setTimeout(() => connectSSE(), 2000);
+                });
+            } else {
+              console.log('🔄 SSE error payload received while audio healthy; reconnecting SSE');
+              setTimeout(() => connectSSE(), 2000);
+            }
+          } else {
+            console.log('🔄 SSE error payload and audio unhealthy; restarting session');
+            eventSource.close();
+            handleDeadAudioSession();
           }
-          syncEventsEndpoint(state.sessionId);
-          if (!state.streamUrl || !state.streamUrl.includes('session=')) {
-            syncStreamEndpoint(state.sessionId);
+          return;
+        }
+
+        if (data.type === 'connected') {
+          const previousSession = state.sessionId;
+          if (data.sessionId) {
+            state.sessionId = data.sessionId;
+            if (previousSession && previousSession !== data.sessionId) {
+              console.warn(`🆔 SSE reported session change ${previousSession} → ${data.sessionId}`);
+            } else if (!previousSession) {
+              console.log(`🆔 SSE assigned session: ${state.sessionId}`);
+            }
+          }
+
+          if (data.fingerprint) {
+            state.streamFingerprint = data.fingerprint;
+            syncEventsEndpoint(state.streamFingerprint);
+            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
           }
         }
 
-        // Ignore events from other sessions
+        // Ignore events from other sessions (legacy safety)
         if (state.sessionId && data.session && data.session.sessionId && data.session.sessionId !== state.sessionId) {
           console.log(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${state.sessionId})`);
           return;
         }
 
-        if (!state.sessionId && data.session && data.session.sessionId) {
-          state.sessionId = data.session.sessionId;
-          console.log(`🆔 Session discovered from payload: ${state.sessionId}`);
+        if (state.streamFingerprint && data.fingerprint && data.fingerprint !== state.streamFingerprint) {
+          console.log(`🔄 Updating fingerprint from ${state.streamFingerprint} → ${data.fingerprint}`);
+          state.streamFingerprint = data.fingerprint;
+          syncEventsEndpoint(state.streamFingerprint);
         }
 
         if (data.type === 'track_started') {
+          if (data.fingerprint) {
+            if (state.streamFingerprint !== data.fingerprint) {
+              console.log(`🔄 Track event rotated fingerprint to ${data.fingerprint}`);
+            }
+            state.streamFingerprint = data.fingerprint;
+            syncEventsEndpoint(state.streamFingerprint);
+            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+          }
+
           const previousTrackId = state.latestCurrentTrack?.identifier || null;
           const currentTrackId = data.currentTrack?.identifier || null;
           const isSameTrack = previousTrackId && currentTrackId && previousTrackId === currentTrackId;
@@ -1758,8 +1992,9 @@ eventSource.onopen = () => {
 
           // New track started - ensure audio is connected
           if (connectionHealth.audio.status === 'error' || connectionHealth.audio.status === 'failed') {
-            console.log('🔄 SSE received track but audio errored, reconnecting audio...');
-            reconnectAudio();
+            console.log('🔄 SSE received track but audio errored, restarting session');
+            handleDeadAudioSession();
+            return;
           }
 
           updateNowPlayingCard(data.currentTrack, data.driftState);
@@ -1799,28 +2034,36 @@ eventSource.onopen = () => {
     };
 
     eventSource.onerror = (error) => {
-      console.log('📡 SSE error:', error);
+      console.error('❌ SSE error:', error);
       connectionHealth.sse.status = 'reconnecting';
       updateConnectionHealthUI();
 
-      // EventSource auto-reconnects, but track attempts
-      connectionHealth.sse.reconnectAttempts++;
-      connectionHealth.sse.reconnectDelay = Math.min(
-        connectionHealth.sse.reconnectDelay * 1.5,
-        connectionHealth.sse.maxReconnectDelay
-      );
-
-      // If stuck reconnecting, force recreate
-      if (connectionHealth.sse.reconnectAttempts > 5) {
-        console.log('📡 SSE stuck reconnecting, forcing new connection');
+      if (audioHealth.handlingRestart) {
         eventSource.close();
-        setTimeout(() => connectSSE(), connectionHealth.sse.reconnectDelay);
+        return;
+      }
+
+      if (audioHealth.isHealthy) {
+        console.log('🔄 SSE died but audio healthy - reconnecting SSE to same session');
+        eventSource.close();
+        setTimeout(() => {
+          connectSSE();
+        }, 2000);
+      } else {
+        console.log('🔄 SSE died and audio unhealthy - full restart needed');
+        eventSource.close();
+        handleDeadAudioSession();
       }
     };
   }
 
-  // Initialize SSE connection
-  connectSSE();
+  // Initialize stream + SSE connection
+  try {
+    await bootstrapStream();
+    connectSSE();
+  } catch (error) {
+    console.error('❌ Failed to bootstrap stream on init:', error);
+  }
 
     // Comprehensive duplicate detection system
   function performDuplicateAnalysis(explorerData, context = "unknown") {
@@ -2596,70 +2839,6 @@ eventSource.onopen = () => {
       // Stack depth indication is now handled via CSS pseudo-elements on the main card
   }
 
-
-
-  // Smart audio reconnection with exponential backoff
-  function reconnectAudio() {
-    if (connectionHealth.audio.reconnectAttempts >= connectionHealth.audio.maxAttempts) {
-      console.error('🎵 Max audio reconnect attempts reached');
-      connectionHealth.audio.status = 'failed';
-      updateConnectionHealthUI();
-      return;
-    }
-
-    connectionHealth.audio.reconnectAttempts++;
-    connectionHealth.audio.status = 'reconnecting';
-    updateConnectionHealthUI();
-
-    const delay = connectionHealth.audio.reconnectDelay;
-    console.log(`🎵 Audio reconnecting in ${delay}ms (attempt ${connectionHealth.audio.reconnectAttempts}/${connectionHealth.audio.maxAttempts})`);
-
-    setTimeout(() => {
-      if (state.streamUrl) {
-        elements.audio.src = state.streamUrl;
-      }
-      elements.audio.load();
-      if (state.isStarted) {
-        elements.audio.play().then(() => {
-          connectionHealth.audio.status = 'connected';
-          connectionHealth.audio.reconnectAttempts = 0;
-          connectionHealth.audio.reconnectDelay = 2000;
-          updateConnectionHealthUI();
-        }).catch((err) => {
-          console.error('🎵 Audio play failed:', err);
-          // Exponential backoff
-          connectionHealth.audio.reconnectDelay = Math.min(
-            connectionHealth.audio.reconnectDelay * 2,
-            connectionHealth.audio.maxReconnectDelay
-          );
-          reconnectAudio();
-        });
-      }
-    }, delay);
-  }
-
-  // Audio error handler with smart reconnection
-  elements.audio.addEventListener('error', (e) => {
-    const mediaError = elements.audio.error;
-    console.error('🎵 Audio error:', mediaError?.code, mediaError?.message);
-
-    connectionHealth.audio.status = 'error';
-    updateConnectionHealthUI();
-
-    // Only reconnect for network errors
-    if (mediaError?.code === MediaError.MEDIA_ERR_NETWORK) {
-      reconnectAudio();
-    }
-  });
-
-  // Audio success handler
-  elements.audio.addEventListener('playing', () => {
-    connectionHealth.audio.status = 'connected';
-    connectionHealth.audio.reconnectAttempts = 0;
-    connectionHealth.audio.reconnectDelay = 2000;
-    updateConnectionHealthUI();
-  });
-
   // Periodic status check (optional, for monitoring)
   setInterval(() => {
     fetch('/status').catch(() => {});
@@ -2676,6 +2855,15 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
     if (state.heartbeatTimeout) {
         clearTimeout(state.heartbeatTimeout);
         state.heartbeatTimeout = null;
+    }
+
+    if (!state.streamFingerprint) {
+        console.warn('⚠️ sendNextTrack: No fingerprint available, bootstrapping new stream');
+        await createNewJourneySession('missing_fingerprint');
+        if (!state.streamFingerprint) {
+            console.error('❌ sendNextTrack: Still no fingerprint after bootstrap, aborting');
+            return;
+        }
     }
 
     // Use existing data if not provided (heartbeat/refresh case)
@@ -2712,8 +2900,13 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
         state.manualNextDirectionKey = null;
         state.selectedIdentifier = null;
         state.stackIndex = 0;
-        scheduleHeartbeat(10000); // Retry in 10s
-        fullResync();
+
+        if (source === 'heartbeat') {
+            await requestSSERefresh();
+            scheduleHeartbeat(30000);
+        } else {
+            await requestSSERefresh();
+        }
         return;
     }
 
@@ -2735,7 +2928,9 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
             body: JSON.stringify({
                 trackMd5: md5ToSend,
                 direction: dirToSend,
-                source
+                source,
+                fingerprint: state.streamFingerprint,
+                sessionId: state.sessionId
             })
         });
 
@@ -2744,6 +2939,15 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
         const data = await response.json();
         window.state = window.state || {};
         window.state.lastHeartbeatResponse = data;
+
+        if (data.fingerprint) {
+            if (state.streamFingerprint !== data.fingerprint) {
+                console.log(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
+            }
+            state.streamFingerprint = data.fingerprint;
+            syncEventsEndpoint(state.streamFingerprint);
+            syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+        }
 
         const serverTrack = data.currentTrack;
         const localTrack = state.latestCurrentTrack?.identifier || null;
@@ -2770,6 +2974,13 @@ async function sendNextTrack(trackMd5 = null, direction = null, source = 'user')
 
 function analyzeAndAct(data, source, sentMd5) {
     const { nextTrack, currentTrack, duration, remaining } = data;
+
+    if (data.fingerprint && state.streamFingerprint !== data.fingerprint) {
+        console.log(`🔄 Server response rotated fingerprint to ${data.fingerprint}`);
+        state.streamFingerprint = data.fingerprint;
+        syncEventsEndpoint(state.streamFingerprint);
+        syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+    }
 
     if (!data || !currentTrack) {
         console.warn('⚠️ Invalid server response');
@@ -2971,10 +3182,18 @@ async function fullResync() {
     console.log('🔄 Full resync triggered - calling /refresh-sse');
 
     try {
+        const payload = {};
+        if (state.streamFingerprint) {
+            payload.fingerprint = state.streamFingerprint;
+        }
+        if (state.sessionId) {
+            payload.sessionId = state.sessionId;
+        }
+
         const response = await fetch('/refresh-sse', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: state.sessionId ? JSON.stringify({ sessionId: state.sessionId }) : '{}'
+            body: JSON.stringify(payload)
         });
 
         // Check for 404 - session no longer exists (server restart)
@@ -2986,6 +3205,14 @@ async function fullResync() {
         }
 
         const result = await response.json();
+
+        if (result.fingerprint) {
+            if (state.streamFingerprint !== result.fingerprint) {
+                console.log(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
+            }
+            state.streamFingerprint = result.fingerprint;
+            syncEventsEndpoint(state.streamFingerprint);
+        }
 
         if (result.ok) {
             console.log('✅ Resync broadcast triggered, waiting for SSE update...');
@@ -3032,8 +3259,6 @@ async function createNewJourneySession(reason = 'unknown') {
     }
 
     state.creatingNewSession = true;
-    const previousSessionId = state.sessionId;
-
     try {
         console.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
 
@@ -3046,31 +3271,21 @@ async function createNewJourneySession(reason = 'unknown') {
             }
         }
 
-        const response = await fetch('/session/random', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const result = await response.json();
-
-        const streamBase = result.streamUrl || '/stream';
-        const eventsBase = result.eventsUrl || '/events';
-        const newSessionId = result.sessionId || null;
-        const cacheBuster = Date.now();
-
-        state.streamUrlBase = streamBase;
-        state.eventsEndpointBase = eventsBase;
-        state.sessionId = newSessionId;
-
-        const newStreamUrl = syncStreamEndpoint(newSessionId, { cacheBust: cacheBuster });
-        syncEventsEndpoint(newSessionId);
+        await bootstrapStream();
+        const newStreamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
 
         if (streamElement) {
+            audioHealth.isHealthy = false;
+            audioHealth.lastTimeUpdate = null;
+            audioHealth.bufferingStarted = Date.now();
             streamElement.src = newStreamUrl;
+            streamElement.load();
+            if (state.isStarted) {
+                startAudioHealthMonitoring();
+                streamElement.play().catch(err => {
+                    console.error('🎵 Audio play failed after new session:', err);
+                });
+            }
         }
 
         state.manualNextTrackOverride = false;
@@ -3089,14 +3304,6 @@ async function createNewJourneySession(reason = 'unknown') {
             state.pendingResyncCheckTimer = null;
         }
 
-        if (result.currentTrack) {
-            updateNowPlayingCard(result.currentTrack, null);
-        } else {
-            state.latestCurrentTrack = null;
-            window.state.latestCurrentTrack = null;
-            state.lastTrackUpdateTs = 0;
-        }
-
         if (connectionHealth.currentEventSource) {
             connectionHealth.currentEventSource.close();
             connectionHealth.currentEventSource = null;
@@ -3104,75 +3311,6 @@ async function createNewJourneySession(reason = 'unknown') {
         connectionHealth.sse.status = 'reconnecting';
         updateConnectionHealthUI();
         connectSSE();
-
-        if (streamElement) {
-            streamElement.load();
-            streamElement.play().catch(err => {
-                console.error('🎵 Audio play failed after new session:', err);
-            });
-        }
-
-        if (state.pendingAudioConfirmTimer) {
-            clearTimeout(state.pendingAudioConfirmTimer);
-            state.pendingAudioConfirmTimer = null;
-        }
-
-        if (state.sessionId) {
-            state.pendingAudioConfirmTimer = setTimeout(async () => {
-                state.pendingAudioConfirmTimer = null;
-                try {
-                    const snapshot = await fetch('/sessions/now-playing', { cache: 'no-store' });
-                    if (!snapshot.ok) {
-                        throw new Error(`HTTP ${snapshot.status}`);
-                    }
-
-                    const payload = await snapshot.json();
-                    const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-                    const activeNew = sessions.find(entry => entry.sessionId === state.sessionId);
-                    const activePrev = previousSessionId ? sessions.find(entry => entry.sessionId === previousSessionId) : null;
-
-                    const newHasClient = activeNew && Number(activeNew.clients) > 0;
-                    const prevHasClient = activePrev && Number(activePrev.clients) > 0;
-
-                    if (!newHasClient && prevHasClient) {
-                        console.warn('🛰️ ACTION session-audio-revert: new session missing audio clients, reverting to previous active stream', {
-                            newSession: state.sessionId,
-                            previousSession: previousSessionId,
-                            previousClients: activePrev.clients
-                        });
-
-                        state.sessionId = previousSessionId;
-                        syncEventsEndpoint(previousSessionId);
-                        const restoredStreamUrl = syncStreamEndpoint(previousSessionId, { cacheBust: Date.now() });
-
-                        if (connectionHealth.currentEventSource) {
-                            connectionHealth.currentEventSource.close();
-                            connectionHealth.currentEventSource = null;
-                        }
-                        connectionHealth.sse.status = 'reconnecting';
-                        updateConnectionHealthUI();
-                        connectSSE();
-
-                        if (elements.audio) {
-                            elements.audio.src = restoredStreamUrl;
-                            elements.audio.load();
-                            elements.audio.play().catch(err => {
-                                console.error('🎵 Audio play failed during session revert:', err);
-                            });
-                        }
-
-                        scheduleHeartbeat(5000);
-                    } else if (newHasClient) {
-                        console.log('🛰️ ACTION session-audio-confirmed: audio client attached to new session', {
-                            session: state.sessionId,
-                            clients: activeNew.clients
-                        });
-                    }
-                } catch (error) {
-                    console.error('❌ session audio confirmation failed:', error);
-                }
-            }, 4000);
-        }
 
         scheduleHeartbeat(5000);
     } catch (error) {
@@ -3184,46 +3322,27 @@ async function createNewJourneySession(reason = 'unknown') {
 }
 
 async function verifyExistingSessionOrRestart(reason = 'unknown') {
-    if (!state.sessionId) {
+    if (!state.streamFingerprint) {
         await createNewJourneySession(reason);
         return;
     }
 
     try {
-        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
+        const ok = await requestSSERefresh();
+        if (ok) {
+            console.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting');
 
-        const payload = await response.json();
-        const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
-        const entry = sessions.find(session => session.sessionId === state.sessionId);
-
-        if (entry && entry.md5) {
-            const clientCount = Number(entry.clients) || 0;
-            const elapsedMs = Number.isFinite(entry.elapsedMs) ? entry.elapsedMs : null;
-            const durationMs = Number.isFinite(entry.durationMs) ? entry.durationMs : null;
-            const stillPlaying = clientCount > 0 || (
-                elapsedMs !== null && durationMs !== null && elapsedMs <= durationMs + 15000
-            );
-
-            if (stillPlaying) {
-                console.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting session');
-
-                if (connectionHealth.currentEventSource) {
-                    connectionHealth.currentEventSource.close();
-                    connectionHealth.currentEventSource = null;
-                }
-
-                connectionHealth.sse.status = 'reconnecting';
-                updateConnectionHealthUI();
-                syncStreamEndpoint(state.sessionId);
-                syncEventsEndpoint(state.sessionId);
-                connectSSE();
-
-                scheduleHeartbeat(10000);
-                return;
+            if (connectionHealth.currentEventSource) {
+                connectionHealth.currentEventSource.close();
+                connectionHealth.currentEventSource = null;
             }
+
+            connectionHealth.sse.status = 'reconnecting';
+            updateConnectionHealthUI();
+            connectSSE();
+
+            scheduleHeartbeat(10000);
+            return;
         }
     } catch (error) {
         console.error('❌ verifyExistingSessionOrRestart failed:', error);
@@ -3233,19 +3352,22 @@ async function verifyExistingSessionOrRestart(reason = 'unknown') {
 }
 
 async function requestSSERefresh() {
+    if (!state.streamFingerprint) {
+        console.warn('⚠️ requestSSERefresh: No fingerprint available');
+        return false;
+    }
+
     try {
         console.log('🔄 Sending SSE refresh request to backend...');
         const requestBody = {
             reason: 'zombie_session_recovery',
             clientTime: Date.now(),
-            lastTrackStart: state.latestCurrentTrack?.startTime || null
+            lastTrackStart: state.latestCurrentTrack?.startTime || null,
+            fingerprint: state.streamFingerprint,
+            sessionId: state.sessionId
         };
 
         // Add session ID if we have one
-        if (state.sessionId) {
-            requestBody.sessionId = state.sessionId;
-        }
-
         if (!state.latestExplorerData || !state.latestExplorerData.directions) {
             requestBody.requestExplorerData = true;
         }
@@ -3262,6 +3384,15 @@ async function requestSSERefresh() {
             const result = await response.json();
             console.log('✅ SSE refresh request successful:', result);
 
+            if (result.fingerprint) {
+                if (state.streamFingerprint !== result.fingerprint) {
+                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
+                }
+                state.streamFingerprint = result.fingerprint;
+                syncEventsEndpoint(state.streamFingerprint);
+                syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+            }
+
             if (result.ok === false) {
                 const reason = result.reason || 'unknown';
                 console.warn(`🔄 SSE refresh reported issue: ${reason}`);
@@ -3277,12 +3408,19 @@ async function requestSSERefresh() {
                     console.warn('🔄 SSE refresh returned no track; scheduling quick heartbeat');
                     scheduleHeartbeat(5000);
                 }
-                return;
+                return false;
             }
 
             if (result.currentTrack) {
                 console.log(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
                 console.log(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
+
+                if (result.fingerprint && state.streamFingerprint !== result.fingerprint) {
+                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
+                    state.streamFingerprint = result.fingerprint;
+                    syncEventsEndpoint(state.streamFingerprint);
+                    syncStreamEndpoint(state.streamFingerprint, { cacheBust: false });
+                }
 
                 // Update the now playing card with current track data
                 updateNowPlayingCard(result.currentTrack, null);
@@ -3309,6 +3447,8 @@ async function requestSSERefresh() {
                 console.warn('🔄 SSE refresh completed but no current track reported');
             }
 
+            return true;
+
         } else {
             console.error('❌ SSE refresh request failed:', response.status, response.statusText);
             const errorText = await response.text();
@@ -3318,44 +3458,22 @@ async function requestSSERefresh() {
     } catch (error) {
         console.error('❌ SSE refresh request error:', error);
     }
+
+    return false;
 }
 
 async function manualRefresh() {
     console.log('🔄 Manual refresh snapshot');
-    try {
-        const response = await fetch('/sessions/now-playing', { cache: 'no-store' });
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
+    if (!state.streamFingerprint) {
+        console.warn('🛰️ Manual refresh: no fingerprint; creating new journey');
+        await createNewJourneySession('manual_refresh_missing');
+        return;
+    }
 
-        const payload = await response.json();
-        const entry = Array.isArray(payload.sessions)
-            ? payload.sessions.find(session => session.sessionId === state.sessionId)
-            : null;
-
-        if (!entry) {
-            console.warn('🛰️ Manual refresh: session missing on server, creating new journey');
-            await createNewJourneySession('manual_refresh_missing');
-            return;
-        }
-
-        if (!entry.md5) {
-            console.warn('🛰️ Manual refresh: no current track reported yet, requesting SSE refresh');
-            await requestSSERefresh();
-            return;
-        }
-
-        const localTrackId = state.latestCurrentTrack?.identifier || null;
-        if (!localTrackId || localTrackId !== entry.md5) {
-            console.warn('🛰️ Manual refresh: local track differs from server snapshot, requesting SSE refresh');
-        } else {
-            console.log('🛰️ Manual refresh: state matches server, refreshing explorer data');
-        }
-
-        await requestSSERefresh();
-    } catch (error) {
-        console.error('❌ Manual refresh snapshot failed:', error);
-        await requestSSERefresh();
+    const ok = await requestSSERefresh();
+    if (!ok) {
+        console.warn('🛰️ Manual refresh: refresh failed, creating new journey');
+        await createNewJourneySession('manual_refresh_failure');
     }
 }
 
@@ -3403,7 +3521,11 @@ async function checkStreamEndpoint() {
     try {
         console.log('🔍 Checking stream endpoint connectivity...');
 
-        const response = await fetch(state.streamUrl || '/stream', {
+        const targetUrl = state.streamFingerprint
+            ? composeStreamEndpoint(state.streamFingerprint, Date.now())
+            : (state.streamUrl || '/stream');
+
+        const response = await fetch(targetUrl, {
             method: 'HEAD',
             cache: 'no-cache'
         });

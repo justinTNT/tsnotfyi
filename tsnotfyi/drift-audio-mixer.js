@@ -3,6 +3,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
+const fingerprintRegistry = require('./fingerprint-registry');
 
 // Load configuration
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
@@ -128,6 +129,16 @@ class DriftAudioMixer {
       if (!this.currentTrack) {
         console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
         return;
+      }
+
+      const identifier = this.currentTrack.identifier || null;
+      if (identifier) {
+        const fingerprint = fingerprintRegistry.rotateFingerprint(
+          this.sessionId,
+          identifier,
+          this.trackStartTime
+        );
+        this.currentFingerprint = fingerprint;
       }
 
       console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
@@ -1297,6 +1308,10 @@ class DriftAudioMixer {
       return;
     }
 
+    if (this.currentFingerprint) {
+      fingerprintRegistry.touch(this.currentFingerprint);
+    }
+
     const currentTrackId = this.currentTrack.identifier;
     const alreadyBroadcastSameTrack = this._lastBroadcastTrackId === currentTrackId
       && this.lastTrackEventPayload
@@ -1395,6 +1410,7 @@ class DriftAudioMixer {
       trackEvent = {
         type: 'track_started',
         timestamp: Date.now(),
+        fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
         currentTrack: {
           identifier: this.currentTrack.identifier,
           title: this.currentTrack.title,
@@ -1442,6 +1458,7 @@ class DriftAudioMixer {
         trackEvent = {
           type: 'track_started',
           timestamp: Date.now(),
+          fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
           currentTrack: {
             identifier: this.currentTrack.identifier,
             title: this.currentTrack.title,
@@ -3486,6 +3503,8 @@ class DriftAudioMixer {
   destroy() {
     console.log(`🧹 Destroying drift mixer for session: ${this.sessionId}`);
     this.stopStreaming();
+
+    fingerprintRegistry.removeBySession(this.sessionId);
 
     if (this.pendingUserSelectionTimer) {
       clearTimeout(this.pendingUserSelectionTimer);

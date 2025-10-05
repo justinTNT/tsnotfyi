@@ -6,6 +6,7 @@ const fs = require('fs');
 const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
 const sqlite3 = require('sqlite3').verbose();
+const fingerprintRegistry = require('./fingerprint-registry');
 
 // Load configuration
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
@@ -183,6 +184,15 @@ async function createSession(options = {}) {
 
 initializeServices();
 
+// Prune stale fingerprints every minute (5 minute TTL)
+setInterval(() => {
+  try {
+    fingerprintRegistry.pruneStale(60 * 60 * 1000); // prune entries older than 1 hour
+  } catch (err) {
+    console.warn('⚠️ Fingerprint prune failed:', err?.message || err);
+  }
+}, 10 * 60 * 1000);
+
 // Serve static files and middleware
 app.use(express.json());
 
@@ -215,6 +225,46 @@ app.post('/create-session', async (req, res) => {
   } catch (error) {
     console.error('Failed to create session:', error);
     res.status(500).json({ error: 'Failed to create session' });
+  }
+});
+
+// Bootstrap a stream and return fingerprint and stream URL
+app.post('/stream/bootstrap', async (req, res) => {
+  try {
+    const session = await createSession();
+    const mixer = session.mixer;
+
+    let currentTrack = mixer?.currentTrack || null;
+    let attempts = 0;
+    while (!currentTrack && attempts < 15) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      currentTrack = mixer?.currentTrack || null;
+      attempts += 1;
+    }
+
+    const trackId = currentTrack?.identifier || null;
+    const startTime = mixer?.trackStartTime || Date.now();
+
+    const fingerprint = fingerprintRegistry.rotateFingerprint(session.sessionId, trackId, startTime);
+    fingerprintRegistry.touch(fingerprint, { streamIp: req.ip });
+
+    const response = {
+      sessionId: session.sessionId,
+      streamUrl: `/stream?fingerprint=${encodeURIComponent(fingerprint)}`,
+      fingerprint,
+      currentTrack: currentTrack ? {
+        identifier: currentTrack.identifier,
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: currentTrack.album || null,
+        startTime: startTime
+      } : null
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error('Failed to bootstrap stream:', error);
+    res.status(500).json({ error: 'Failed to bootstrap stream' });
   }
 });
 
@@ -288,19 +338,48 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
 
 // Simplified stream endpoint - resolves session from request context
 app.get('/stream', async (req, res) => {
-  console.log(`🔥 DEBUG: Stream request received (simplified endpoint)`);
+  console.log('🔥 Stream request received');
 
   try {
-    const session = await getSessionForRequest(req);
+    const requestedSessionId = typeof req.query.session === 'string' ? req.query.session.trim() : null;
+    const requestedFingerprint = typeof req.query.fingerprint === 'string' ? req.query.fingerprint.trim() : null;
+    let session;
+    let fingerprintEntry = null;
+
+    if (requestedFingerprint) {
+      fingerprintEntry = fingerprintRegistry.lookup(requestedFingerprint);
+      if (!fingerprintEntry) {
+        console.error(`🎵 Requested fingerprint ${requestedFingerprint} not found`);
+        return res.status(404).json({ error: 'Fingerprint not found' });
+      }
+      session = getSessionById(fingerprintEntry.sessionId);
+      if (!session) {
+        console.error(`🎵 Session ${fingerprintEntry.sessionId} for fingerprint ${requestedFingerprint} not found`);
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      fingerprintRegistry.touch(requestedFingerprint, { streamIp: req.ip });
+      console.log(`🎵 Stream bound via fingerprint ${requestedFingerprint} → session ${session.sessionId}`);
+    } else if (requestedSessionId) {
+      console.log(`🎵 Stream requesting specific session: ${requestedSessionId}`);
+      session = getSessionById(requestedSessionId);
+
+      if (!session) {
+        console.error(`🎵 Requested session ${requestedSessionId} not found`);
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      await persistAudioSessionBinding(req, requestedSessionId);
+    } else {
+      session = await getSessionForRequest(req);
+    }
 
     if (!session) {
       console.log('⚠️ No session available for stream request');
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    console.log(`Client connecting to stream: ${session.sessionId}`);
+    console.log(`🎵 Audio streaming from session: ${session.sessionId}`);
 
-    await persistAudioSessionBinding(req, session.sessionId);
     if (req.method === 'HEAD') {
       return res.end();
     }
@@ -308,7 +387,11 @@ app.get('/stream', async (req, res) => {
     session.mixer.addClient(res);
   } catch (error) {
     console.error('Stream connection error:', error);
-    res.status(500).json({ error: 'Failed to attach to stream' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to attach to stream' });
+    } else {
+      res.end();
+    }
   }
 });
 
@@ -343,10 +426,12 @@ app.get('/session/:sessionId', async (req, res) => {
 
 // Simplified events endpoint - resolves session from request context
 app.get('/events', async (req, res) => {
-  console.log(`📡 SSE connection attempt (simplified endpoint) - headers:`, req.headers.accept);
+  console.log('📡 SSE connection attempt');
+
+  const requestedSessionId = typeof req.query.session === 'string' ? req.query.session.trim() : null;
+  const requestedFingerprint = typeof req.query.fingerprint === 'string' ? req.query.fingerprint.trim() : null;
 
   try {
-    // Set up SSE headers
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -355,7 +440,38 @@ app.get('/events', async (req, res) => {
       'Access-Control-Allow-Headers': 'Cache-Control'
     });
 
-    const session = await getSessionForRequest(req);
+    let session;
+    let fingerprintEntry = null;
+
+    if (requestedFingerprint) {
+      fingerprintEntry = fingerprintRegistry.lookup(requestedFingerprint);
+      if (!fingerprintEntry) {
+        console.error(`📡 Requested fingerprint ${requestedFingerprint} not found`);
+        res.write('data: {"type":"error","message":"fingerprint_not_found"}\n\n');
+        return res.end();
+      }
+      session = getSessionById(fingerprintEntry.sessionId);
+      if (!session) {
+        console.error(`📡 Session ${fingerprintEntry.sessionId} for fingerprint ${requestedFingerprint} not found`);
+        res.write('data: {"type":"error","message":"session_not_found"}\n\n');
+        return res.end();
+      }
+      fingerprintRegistry.touch(requestedFingerprint, { metadataIp: req.ip });
+      console.log(`📡 SSE bound via fingerprint ${requestedFingerprint} → session ${session.sessionId}`);
+    } else if (requestedSessionId) {
+      console.log(`📡 SSE requesting specific session: ${requestedSessionId}`);
+      session = getSessionById(requestedSessionId);
+
+      if (!session) {
+        console.error(`📡 Requested session ${requestedSessionId} not found`);
+        res.write('data: {"type":"error","message":"session_not_found"}\n\n');
+        return res.end();
+      }
+
+      await persistAudioSessionBinding(req, requestedSessionId);
+    } else {
+      session = await getSessionForRequest(req);
+    }
 
     if (!session) {
       console.log('⚠️ Unable to create or locate session for SSE request');
@@ -363,17 +479,19 @@ app.get('/events', async (req, res) => {
       return res.end();
     }
 
-    await persistAudioSessionBinding(req, session.sessionId);
+    console.log(`📡 SSE connected to session: ${session.sessionId}`);
+    const activeFingerprint = fingerprintEntry
+      ? requestedFingerprint
+      : fingerprintRegistry.getFingerprintForSession(session.sessionId);
+    const connectedPayload = {
+      type: 'connected',
+      sessionId: session.sessionId,
+      fingerprint: activeFingerprint || null
+    };
+    res.write(`data: ${JSON.stringify(connectedPayload)}\n\n`);
 
-    // Send initial connection event
-    res.write('data: {"type":"connected","sessionId":"' + session.sessionId + '"}\n\n');
-
-    console.log(`📡 Found session ${session.sessionId}, adding SSE client`);
-    console.log(`📡 Session currently has ${session.mixer.eventClients.size} SSE clients before adding`);
     session.mixer.addEventClient(res);
-    console.log(`📡 Session now has ${session.mixer.eventClients.size} SSE clients after adding`);
 
-    // Send current track info ONLY if session is actively streaming a valid track
     if (session.mixer.currentTrack &&
         session.mixer.isActive &&
         session.mixer.currentTrack.title &&
@@ -384,7 +502,6 @@ app.get('/events', async (req, res) => {
       console.log('📡 No valid current track to broadcast, skipping initial track event');
     }
 
-    // Handle client disconnect
     req.on('close', () => {
       if (session && session.mixer.removeEventClient) {
         session.mixer.removeEventClient(res);
@@ -393,7 +510,12 @@ app.get('/events', async (req, res) => {
 
   } catch (error) {
     console.error('📡 SSE connection error:', error);
-    res.status(500).json({ error: 'SSE connection failed' });
+    try {
+      res.write('data: {"type":"error","message":"connection_failed"}\n\n');
+      res.end();
+    } catch (err) {
+      // Ignore secondary failure
+    }
   }
 });
 
@@ -405,22 +527,34 @@ app.get('/events/:sessionId', (req, res) => {
 
 // SSE refresh endpoint - triggers server to rebroadcast current state via SSE (pull/monadic)
 app.post('/refresh-sse', async (req, res) => {
-  const sessionId = req.body.sessionId || req.session?.audioSessionId;
+  const requestFingerprint = typeof req.body.fingerprint === 'string' ? req.body.fingerprint.trim() : null;
+  const sessionIdFromBody = req.body.sessionId || req.session?.audioSessionId || null;
 
-  console.log(`🔄 SSE refresh request from client for session: ${sessionId}`);
-
-  try {
-    if (!sessionId) {
-      return res.status(400).json({ error: 'Session ID is required' });
+  let session = null;
+  if (requestFingerprint) {
+    const entry = fingerprintRegistry.lookup(requestFingerprint);
+    if (entry) {
+      session = getSessionById(entry.sessionId) || null;
+      if (session) {
+        fingerprintRegistry.touch(requestFingerprint, { metadataIp: req.ip });
+      }
     }
-
-    const session = getSessionById(sessionId);
-
     if (!session) {
-      console.log(`🔄 No session found for refresh request: ${sessionId}`);
+      return res.status(404).json({ error: 'Fingerprint not found' });
+    }
+  } else if (sessionIdFromBody) {
+    session = getSessionById(sessionIdFromBody);
+    if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
+  } else {
+    return res.status(400).json({ error: 'Fingerprint or session ID is required' });
+  }
 
+  const sessionId = session.sessionId;
+  console.log(`🔄 SSE refresh request for session ${sessionId}${requestFingerprint ? ` (fingerprint=${requestFingerprint})` : ''}`);
+
+  try {
     const summary = session.mixer.getStreamSummary ? session.mixer.getStreamSummary() : null;
     const isStreaming = session.mixer.isStreamAlive ? session.mixer.isStreamAlive() :
       Boolean(session.mixer.audioMixer?.engine?.isStreaming || (session.mixer.clients && session.mixer.clients.size > 0));
@@ -450,7 +584,9 @@ app.post('/refresh-sse', async (req, res) => {
         clientCount: summary?.audioClientCount ?? (session.mixer.clients?.size || 0),
         eventClientCount: summary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
         lastBroadcast,
-        streamAlive: true
+        streamAlive: true,
+        sessionId,
+        fingerprint: fingerprintRegistry.getFingerprintForSession(sessionId)
       });
     } else {
       console.log(`🔄 Session ${sessionId} has no valid track to broadcast`);
@@ -468,7 +604,24 @@ app.post('/refresh-sse-simple', async (req, res) => {
   console.log('🔄 Simple SSE refresh request from client');
 
   try {
-    const session = await getSessionForRequest(req, { createIfMissing: false });
+    const requestFingerprint = typeof req.body?.fingerprint === 'string'
+      ? req.body.fingerprint.trim()
+      : (typeof req.query?.fingerprint === 'string' ? req.query.fingerprint.trim() : null);
+
+    let session = null;
+    if (requestFingerprint) {
+      const entry = fingerprintRegistry.lookup(requestFingerprint);
+      if (entry) {
+        session = getSessionById(entry.sessionId) || null;
+        if (session) {
+          fingerprintRegistry.touch(requestFingerprint, { metadataIp: req.ip });
+        }
+      }
+    }
+
+    if (!session) {
+      session = await getSessionForRequest(req, { createIfMissing: false });
+    }
 
     if (!session) {
       console.log('🔄 No session associated with request');
@@ -504,7 +657,9 @@ app.post('/refresh-sse-simple', async (req, res) => {
         clientCount: summary?.audioClientCount ?? (session.mixer.clients?.size || 0),
         eventClientCount: summary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
         lastBroadcast,
-        streamAlive: true
+        streamAlive: true,
+        sessionId: session.sessionId,
+        fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId)
       });
     } else {
       console.log(`🔄 Session ${session.sessionId} has no valid track to broadcast`);
@@ -1009,12 +1164,27 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 
 // Simplified next track endpoint - resolves session from request context
 app.post('/next-track', async (req, res) => {
-  const { trackMd5, direction, source = 'user' } = req.body;
+  const { trackMd5, direction, source = 'user', fingerprint: requestFingerprint } = req.body;
   const normalizedSource = typeof source === 'string' ? source.toLowerCase() : 'user';
-  const session = await getSessionForRequest(req, { createIfMissing: false });
 
   if (!trackMd5) {
     return res.status(400).json({ error: 'Track MD5 is required' });
+  }
+
+  let session = null;
+
+  if (typeof requestFingerprint === 'string' && requestFingerprint.trim()) {
+    const entry = fingerprintRegistry.lookup(requestFingerprint.trim());
+    if (!entry) {
+      return res.status(404).json({ error: 'Fingerprint not found' });
+    }
+    session = getSessionById(entry.sessionId) || null;
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found for fingerprint' });
+    }
+    fingerprintRegistry.touch(requestFingerprint.trim(), { metadataIp: req.ip });
+  } else {
+    session = await getSessionForRequest(req, { createIfMissing: false });
   }
 
   if (!session) {
@@ -1070,7 +1240,10 @@ app.post('/next-track', async (req, res) => {
       // Sync state: current track + timing
       currentTrack: currentTrackId,
       duration: Math.round(duration),
-      remaining: Math.round(remaining)
+      remaining: Math.round(remaining),
+
+      sessionId: session.sessionId,
+      fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId)
     });
   } catch (error) {
     console.error('Next track selection error:', error);
