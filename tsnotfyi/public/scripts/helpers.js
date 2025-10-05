@@ -5,6 +5,23 @@
 //  *) updateCardWithTrackDetails
 //  *) createDirectionCard
 
+const HELPERS_DEBUG = {
+  colors: false,
+  duplicates: false
+};
+
+function helpersColorLog(...args) {
+  if (HELPERS_DEBUG.colors) {
+    console.log(...args);
+  }
+}
+
+function helpersDuplicateLog(...args) {
+  if (HELPERS_DEBUG.duplicates) {
+    console.log(...args);
+  }
+}
+
   // create all the styling for album covers
   const albumCoverBackground = (albumCover) =>
     `url('${albumCover}')`
@@ -531,7 +548,11 @@
   // Comprehensive duplicate detection system
 
   function performDuplicateAnalysis(explorerData, context = "unknown") {
-      console.log(`🃏 === DUPLICATE ANALYSIS START (${context}) ===`);
+      if (!HELPERS_DEBUG.duplicates) {
+          return;
+      }
+
+      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS START (${context}) ===`);
 
       const allTracks = new Map(); // identifier -> {track, locations: [{direction, index}]}
       const directionDuplicates = new Map(); // direction -> duplicate info
@@ -596,7 +617,7 @@
                   });
               } else {
                   crossDirectionCount++;
-                  console.log(`🃏 INTERESTING: Cross-direction duplicate:`, {
+                  helpersDuplicateLog(`🃏 INTERESTING: Cross-direction duplicate:`, {
                       id, title: track.title, artist: track.artist,
                       directions: locations.map(l => l.direction),
                       locations: locations.map(l => `${l.direction}[${l.index}]`)
@@ -606,12 +627,12 @@
       });
 
       // Summary report
-      console.log(`🃏 === DUPLICATE ANALYSIS SUMMARY (${context}) ===`);
-      console.log(`🃏 Direction-level duplicates (VERY BAD): ${directionDuplicates.size} directions affected`);
-      console.log(`🃏 Cross-dimension duplicates (WORSE): ${crossDimensionCount} tracks`);
-      console.log(`🃏 Cross-direction duplicates (INTERESTING): ${crossDirectionCount} tracks`);
-      console.log(`🃏 Total duplicate tracks: ${globalDuplicates.size}`);
-      console.log(`🃏 === DUPLICATE ANALYSIS END ===`);
+      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS SUMMARY (${context}) ===`);
+      helpersDuplicateLog(`🃏 Direction-level duplicates (VERY BAD): ${directionDuplicates.size} directions affected`);
+      helpersDuplicateLog(`🃏 Cross-dimension duplicates (WORSE): ${crossDimensionCount} tracks`);
+      helpersDuplicateLog(`🃏 Cross-direction duplicates (INTERESTING): ${crossDirectionCount} tracks`);
+      helpersDuplicateLog(`🃏 Total duplicate tracks: ${globalDuplicates.size}`);
+      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS END ===`);
 
       return {
           directionDuplicates,
@@ -976,13 +997,13 @@
 
   // Update the JSON metadata overlay with full next track data
   function updateDirectionKeyOverlay(direction) {
-      console.log(`🎨 JSON 1`);
+      helpersColorLog(`🎨 JSON 1`);
       const overlay = document.getElementById('directionKeyOverlay');
       const text1 = document.getElementById('dkt1');
       const text2 = document.getElementById('dkt2');
 
       if (!overlay || !text1 || !text2) return;
-      console.log(`🎨 JSON 2`);
+      helpersColorLog(`🎨 JSON 2`);
 
       const metadata2 = {
           direction: {
@@ -1005,13 +1026,13 @@
       };
 
       // Format as readable JSON with proper indentation
-      console.log(`🎨 JSON 3`);
+      helpersColorLog(`🎨 JSON 3`);
       text1.textContent = JSON.stringify(state.latestCurrentTrack, null, 2);
       console.dir({got: text1.textContent, from: state.latestCurrentTrack});
       text2.textContent = JSON.stringify(metadata2, null, 2);
       console.dir({got: text2.textContent, from: metadata2});
 
-      console.log(`🎨 JSON metadata overlay updated for: ${direction.key}`);
+      helpersColorLog(`🎨 JSON metadata overlay updated for: ${direction.key}`);
   }
 
 
@@ -1061,7 +1082,7 @@
 
       if (preserveColors) {
           // When preserving colors (e.g., card promotion to center), use existing CSS custom properties
-          console.log(`🎨 PRESERVE: Keeping existing colors for ${direction.key}`);
+          helpersColorLog(`🎨 PRESERVE: Keeping existing colors for ${direction.key}`);
           const computedStyle = getComputedStyle(card);
           borderColor = computedStyle.getPropertyValue('--border-color').trim() ||
                        card.style.getPropertyValue('--border-color').trim();
@@ -1070,7 +1091,7 @@
 
           // Fallback: if no existing colors, calculate fresh ones
           if (!borderColor || !glowColor) {
-              console.log(`🎨 PRESERVE FALLBACK: No existing colors found, calculating fresh ones`);
+              helpersColorLog(`🎨 PRESERVE FALLBACK: No existing colors found, calculating fresh ones`);
               const freshColors = getDirectionColor(directionType, direction.key);
               borderColor = borderColor || freshColors.border;
               glowColor = glowColor || freshColors.glow;
@@ -1080,13 +1101,13 @@
 
           if (state.usingOppositeDirection) {
               // In reverse mode, get analogous complementary colors for the current dimension
-              console.log(`🎨 REVERSE: Calculating reverse colors for ${direction.key} (${directionType})`);
+              helpersColorLog(`🎨 REVERSE: Calculating reverse colors for ${direction.key} (${directionType})`);
               const reverseColors = getDirectionColor(directionType, direction.key + '_force_negative');
               borderColor = reverseColors.border;
               glowColor = reverseColors.glow;
           } else {
               // Normal mode: get primary colors for the current dimension
-              console.log(`🎨 NORMAL: Calculating primary colors for ${direction.key} (${directionType})`);
+              helpersColorLog(`🎨 NORMAL: Calculating primary colors for ${direction.key} (${directionType})`);
               const primaryColors = getDirectionColor(directionType, direction.key + '_force_primary');
               borderColor = primaryColors.border;
               glowColor = primaryColors.glow;

@@ -5,6 +5,21 @@ const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
 const fingerprintRegistry = require('./fingerprint-registry');
 
+const VERBOSE_EXPLORER = process.env.LOG_EXPLORER === '1';
+const VERBOSE_CACHE = process.env.LOG_CACHE === '1';
+
+function explorerLog(...args) {
+  if (VERBOSE_EXPLORER) {
+    console.log(...args);
+  }
+}
+
+function cacheLog(...args) {
+  if (VERBOSE_CACHE) {
+    console.log(...args);
+  }
+}
+
 // Load configuration
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -166,8 +181,9 @@ class DriftAudioMixer {
 
     // User override handling
     this.selectedNextTrackMd5 = null;
-    this.userSelectionDebounceMs = 400; // milliseconds to coalesce rapid selections
+    this.userSelectionDebounceMs = 5000; // milliseconds to coalesce rapid selections
     this.pendingUserSelectionTimer = null;
+    this.pendingUserSelectionResolve = null;
     this.isUserSelectionPending = false;
 
     // Keep user's chosen track locked until it becomes current
@@ -346,7 +362,7 @@ class DriftAudioMixer {
     }
   }
 
-  handleUserSelectedNextTrack(trackMd5, options = {}) {
+  async handleUserSelectedNextTrack(trackMd5, options = {}) {
     if (!trackMd5) {
       console.warn('⚠️ Ignoring user track override without a trackMd5');
       return;
@@ -379,18 +395,39 @@ class DriftAudioMixer {
 
     if (this.pendingUserSelectionTimer) {
       clearTimeout(this.pendingUserSelectionTimer);
+      this.pendingUserSelectionTimer = null;
+    }
+    if (this.pendingUserSelectionResolve) {
+      this.pendingUserSelectionResolve();
+      this.pendingUserSelectionResolve = null;
     }
 
     if (effectiveDelay > 0) {
       console.log(`🕓 Debouncing user-selected track override for ${effectiveDelay}ms`);
-      this.pendingUserSelectionTimer = setTimeout(() => {
-        this.pendingUserSelectionTimer = null;
-        this.applyUserSelectedTrackOverride();
-      }, effectiveDelay);
+      await new Promise(resolve => {
+        const timerId = setTimeout(() => {
+          if (this.pendingUserSelectionTimer === timerId) {
+            this.pendingUserSelectionTimer = null;
+          }
+          if (this.pendingUserSelectionResolve === resolve) {
+            this.pendingUserSelectionResolve = null;
+          }
+          resolve();
+        }, effectiveDelay);
+        this.pendingUserSelectionTimer = timerId;
+        this.pendingUserSelectionResolve = resolve;
+      });
+      this.pendingUserSelectionTimer = null;
+      this.pendingUserSelectionResolve = null;
     } else {
       this.pendingUserSelectionTimer = null;
-      this.applyUserSelectedTrackOverride();
+      this.pendingUserSelectionResolve = null;
     }
+    if (this.selectedNextTrackMd5 !== trackMd5) {
+      return;
+    }
+
+    this.applyUserSelectedTrackOverride();
   }
 
   applyUserSelectedTrackOverride() {
@@ -426,6 +463,11 @@ class DriftAudioMixer {
       }
       if (this.pendingUserSelectionTimer) {
         clearTimeout(this.pendingUserSelectionTimer);
+        this.pendingUserSelectionTimer = null;
+      }
+      if (this.pendingUserSelectionResolve) {
+        this.pendingUserSelectionResolve();
+        this.pendingUserSelectionResolve = null;
       }
       this.pendingUserSelectionTimer = setTimeout(() => {
         this.pendingUserSelectionTimer = null;
@@ -738,7 +780,7 @@ class DriftAudioMixer {
     const topDirections = directionsByQuality.slice(0, 3);
     const chosenDirection = topDirections[Math.floor(Math.random() * topDirections.length)];
 
-    console.log(`🎯 New direction: ${chosenDirection} (${flowOptions[chosenDirection].candidates.length} candidates)`);
+    explorerLog(`🎯 New direction: ${chosenDirection} (${flowOptions[chosenDirection].candidates.length} candidates)`);
     return chosenDirection;
   }
 
@@ -1663,7 +1705,7 @@ class DriftAudioMixer {
       direction.trackCount = actualCount;
       direction.adjustedDiversityScore = baseScore * optionsBonus;
 
-      console.log(`🎯 Adjusted diversity for ${directionKey}: base=${baseScore.toFixed(2)}, count=${actualCount}, ` +
+      explorerLog(`🎯 Adjusted diversity for ${directionKey}: base=${baseScore.toFixed(2)}, count=${actualCount}, ` +
                   `bonus=${optionsBonus.toFixed(2)}, adjusted=${direction.adjustedDiversityScore.toFixed(2)}`);
     });
 
@@ -1681,9 +1723,11 @@ class DriftAudioMixer {
     */
 
 
-    Object.entries(explorerData.directions).forEach(([key, data]) => {
-        console.log(`🚫🚫BEFORE🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`)
-    });
+    if (VERBOSE_EXPLORER) {
+      Object.entries(explorerData.directions).forEach(([key, data]) => {
+          explorerLog(`🚫🚫BEFORE🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`);
+      });
+    }
 
     // ⚖️ BIDIRECTIONAL PRIORITIZATION: Make larger stack primary, smaller stack opposite
     // Do this AFTER final sampling so we prioritize based on actual final track counts
@@ -1695,14 +1739,16 @@ class DriftAudioMixer {
     explorerData.directions = this.applyStackBudget(explorerData.directions);
     explorerData.directions = this.selectTopTrack(explorerData.directions);
 
-    Object.entries(explorerData.directions).forEach(([key, data]) => {
-      if (data.oppositeDirection) {
-        const opKey = data.oppositeDirection.key;
-        console.log(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length}, ${data.oppositeDirection.sampleTracks.length} ${opKey}`);
-      } else {
-        console.log(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`);
-      }
-    });
+    if (VERBOSE_EXPLORER) {
+      Object.entries(explorerData.directions).forEach(([key, data]) => {
+        if (data.oppositeDirection) {
+          const opKey = data.oppositeDirection.key;
+          explorerLog(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length}, ${data.oppositeDirection.sampleTracks.length} ${opKey}`);
+        } else {
+          explorerLog(`🚫🚫AFTER🚫🚫 ${key} ${data.sampleTracks.length} ${data.hasOpposite}`);
+        }
+      });
+    }
 
     // Calculate diversity scores and select next track
     explorerData.diversityMetrics = this.calculateExplorerDiversityMetrics(explorerData.directions, totalNeighborhoodSize);
@@ -2343,7 +2389,7 @@ class DriftAudioMixer {
         coverOwners.set(coverKey, { directionKey, count: actualCount });
       }
 
-      console.log(`🎨 Top card for ${directionKey}: ${preferred?.track?.title || 'unknown'} ` +
+      explorerLog(`🎨 Top card for ${directionKey}: ${preferred?.track?.title || 'unknown'} ` +
                   `(cover=${preferred?.cover || 'default'}, count=${actualCount})`);
     });
 
@@ -2812,8 +2858,8 @@ class DriftAudioMixer {
 
   // ⚖️ Prioritize bidirectional directions: larger stack becomes primary, smaller becomes opposite
   prioritizeBidirectionalDirections(directions) {
-    console.log(`⚖️ PRIORITIZATION START: Processing ${Object.keys(directions).length} directions`);
-    console.log(`⚖️ Direction keys:`, Object.keys(directions));
+    explorerLog(`⚖️ PRIORITIZATION START: Processing ${Object.keys(directions).length} directions`);
+    explorerLog(`⚖️ Direction keys:`, Object.keys(directions));
 
     const pairs = new Map(); // baseKey -> {positive: dirData, negative: dirData}
     const processedKeys = new Set();
@@ -2828,7 +2874,7 @@ class DriftAudioMixer {
       const positiveMatch = directionKey.match(/^(.+)_positive$/);
       const negativeMatch = directionKey.match(/^(.+)_negative$/);
 
-      console.log(`⚖️ CHECKING: ${directionKey} -> positive: ${!!positiveMatch}, negative: ${!!negativeMatch}`);
+      explorerLog(`⚖️ CHECKING: ${directionKey} -> positive: ${!!positiveMatch}, negative: ${!!negativeMatch}`);
 
       if (positiveMatch) {
         const baseKey = positiveMatch[1];
@@ -2852,7 +2898,7 @@ class DriftAudioMixer {
           const positiveCount = parseCount(positiveData);
           const negativeCount = parseCount(negativeData);
 
-          console.log(`⚖️ BIDIRECTIONAL PAIR: ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
+          explorerLog(`⚖️ BIDIRECTIONAL PAIR: ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
 
           let primaryDirection, oppositeDirection, primaryKey, oppositeKey;
 
@@ -2867,7 +2913,7 @@ class DriftAudioMixer {
             primaryKey = negativeKey;
             oppositeKey = directionKey;
           } else {
-            console.log(`⚖️ Equal sizes (${positiveSamples} samples), preferring positive for ${baseKey}`);
+            explorerLog(`⚖️ Equal sizes (${positiveSamples} samples), preferring positive for ${baseKey}`);
             primaryDirection = positiveData;
             oppositeDirection = negativeData;
             primaryKey = directionKey;
@@ -2884,12 +2930,12 @@ class DriftAudioMixer {
             }
           };
 
-          console.log(`⚖️ PRIMARY: ${primaryKey} (${primaryDirection.sampleTracks?.length || 0} tracks) with embedded opposite ${oppositeKey} (${oppositeDirection.sampleTracks?.length || 0} tracks)`);
+          explorerLog(`⚖️ PRIMARY: ${primaryKey} (${primaryDirection.sampleTracks?.length || 0} tracks) with embedded opposite ${oppositeKey} (${oppositeDirection.sampleTracks?.length || 0} tracks)`);
 
           processedKeys.add(directionKey);
           processedKeys.add(negativeKey);
         } else {
-          console.log(`⚖️ BIDIRECTIONAL PAIR: nothing found for negative ${negativeKey}`);
+          explorerLog(`⚖️ BIDIRECTIONAL PAIR: nothing found for negative ${negativeKey}`);
           finalDirections[directionKey] = {
             ...directionData,
             hasOpposite: directionData.oppositeDirection ? true : directionData.hasOpposite
@@ -2906,7 +2952,7 @@ class DriftAudioMixer {
 
         const positiveData = directionData.oppositeDirection || directions[positiveKey];
         if (positiveData) {
-          console.log(`⚖️ NEGATIVE MATCH using embedded positive for ${baseKey}`);
+          explorerLog(`⚖️ NEGATIVE MATCH using embedded positive for ${baseKey}`);
 
           const parseCount = (direction) => {
             const raw = direction?.trackCount;
@@ -2922,7 +2968,7 @@ class DriftAudioMixer {
           const positiveCount = parseCount(positiveData);
           const negativeCount = parseCount(directionData);
 
-          console.log(`⚖️ BIDIRECTIONAL PAIR (negative first): ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
+          explorerLog(`⚖️ BIDIRECTIONAL PAIR (negative first): ${baseKey} - positive samples:${positiveSamples}, tracks:${positiveCount} vs negative samples:${negativeSamples}, tracks:${negativeCount}`);
 
           let primaryDirection, oppositeDirection, primaryKey, oppositeKey;
           if (negativeSamples > positiveSamples || (negativeSamples === positiveSamples && negativeCount >= positiveCount)) {
@@ -2950,7 +2996,7 @@ class DriftAudioMixer {
           processedKeys.add(directionKey);
           processedKeys.add(positiveKey);
         } else {
-          console.log(`⚖️ BIDIRECTIONAL PAIR: nothing found for positive ${positiveKey}`);
+          explorerLog(`⚖️ BIDIRECTIONAL PAIR: nothing found for positive ${positiveKey}`);
           finalDirections[directionKey] = {
             ...directionData,
             hasOpposite: directionData.oppositeDirection ? true : directionData.hasOpposite
@@ -2963,7 +3009,7 @@ class DriftAudioMixer {
       }
     });
 
-    console.log(`⚖️ BIDIRECTIONAL PRIORITIZATION: Processed ${Object.keys(directions).length} dimensions -> ${Object.keys(finalDirections).length} final dimensions`);
+    explorerLog(`⚖️ BIDIRECTIONAL PRIORITIZATION: Processed ${Object.keys(directions).length} dimensions -> ${Object.keys(finalDirections).length} final dimensions`);
     return finalDirections;
   }
 

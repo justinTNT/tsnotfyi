@@ -33,9 +33,34 @@ const state = {
     pendingAudioConfirmTimer: null,
     creatingNewSession: false,
     remainingCounts: {},
-    pendingManualTrackId: null
+    pendingManualTrackId: null,
+    awaitingSSE: false
   };
 window.state = state;
+
+const DEBUG_FLAGS = {
+  deck: false,
+  duplicates: false,
+  colors: false
+};
+
+function deckLog(...args) {
+  if (DEBUG_FLAGS.deck) {
+    console.log(...args);
+  }
+}
+
+function duplicateLog(...args) {
+  if (DEBUG_FLAGS.duplicates) {
+    console.log(...args);
+  }
+}
+
+function colorLog(...args) {
+  if (DEBUG_FLAGS.colors) {
+    console.log(...args);
+  }
+}
 
 (function hydrateStateFromLocation() {
   state.streamUrlBase = '/stream';
@@ -464,6 +489,7 @@ async function initializeApp() {
 
     state.sessionId = null;
     clearFingerprint({ reason: 'audio_restart' });
+    state.awaitingSSE = false;
 
     if (connectionHealth.currentEventSource) {
       try {
@@ -558,6 +584,10 @@ async function initializeApp() {
     audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
     connectionHealth.audio.status = 'connected';
     updateConnectionHealthUI();
+    if (state.awaitingSSE && !connectionHealth.currentEventSource) {
+      state.awaitingSSE = false;
+      connectSSE();
+    }
   });
 
   elements.audio.addEventListener('error', (e) => {
@@ -641,11 +671,12 @@ function createDimensionCards(explorerData, options = {}) {
 
       Object.values(explorerData.directions || {}).forEach(normalizeTracks);
 
-      // Run comprehensive duplicate analysis on new data
-      performDuplicateAnalysis(explorerData, "createDimensionCards");
+      if (DEBUG_FLAGS.duplicates) {
+          performDuplicateAnalysis(explorerData, "createDimensionCards");
+      }
 
       const container = document.getElementById('dimensionCards');
-      console.log('🎯 Container element:', container);
+      deckLog('🎯 Container element:', container);
 
       if (!container) {
           console.error('❌ NO CONTAINER ELEMENT FOUND!');
@@ -659,7 +690,7 @@ function createDimensionCards(explorerData, options = {}) {
       const manualOverrideActive = Boolean(state.manualNextTrackOverride && currentTrackUnchanged);
 
       if (state.manualNextTrackOverride) {
-          console.log('🛰️ Manual selection state', {
+          deckLog('🛰️ Manual selection state', {
               manualNextTrackOverride: state.manualNextTrackOverride,
               selectedIdentifier: state.selectedIdentifier,
               currentTrackId,
@@ -670,7 +701,7 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       if (manualOverrideActive && previousNext && previousNextId) {
-          console.log('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
+          deckLog('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
           const manualSelection = state.selectedIdentifier
             ? findTrackInExplorer(explorerData, state.selectedIdentifier)
               || findTrackInExplorer(previousExplorerData, state.selectedIdentifier)
@@ -700,7 +731,7 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       if (manualOverrideActive) {
-          console.log('🎯 Manual next track override active; preserving existing cards (selection still present)');
+          deckLog('🎯 Manual next track override active; preserving existing cards (selection still present)');
           if (state.nextTrackAnimationTimer) {
               clearTimeout(state.nextTrackAnimationTimer);
               state.nextTrackAnimationTimer = null;
@@ -797,19 +828,17 @@ function createDimensionCards(explorerData, options = {}) {
           return;
       }
 
-      console.log(`🎯 RECEIVED ${directionCount} directions from server:`, Object.keys(explorerData.directions));
+      deckLog(`🎯 RECEIVED ${directionCount} directions from server:`, Object.keys(explorerData.directions));
 
-      console.log('🎯 CREATING CARDS from explorer data:', explorerData);
+      deckLog('🎯 CREATING CARDS from explorer data:', explorerData);
 
       // Don't auto-select globally - let each direction use its own first track by default
-      // This prevents the bug where all cards try to use the same track from the first direction
-      console.log(`🎯 Not setting global selectedIdentifier - each direction will use its own first track`);
+      deckLog(`🎯 Not setting global selectedIdentifier - each direction will use its own first track`);
 
-      // Smart filtering: max 11 regular directions + outliers, or 12 if no outliers
-      console.log(`🔍 Raw explorerData.directions:`, explorerData.directions);
+      deckLog(`🔍 Raw explorerData.directions:`, explorerData.directions);
 
       let allDirections = Object.entries(explorerData.directions).map(([key, directionInfo]) => {
-          console.log(`🔍 Processing direction: ${key}`, directionInfo);
+      deckLog(`🔍 Processing direction: ${key}`, directionInfo);
           return {
               key: key,
               name: directionInfo.direction || key,
@@ -824,7 +853,7 @@ function createDimensionCards(explorerData, options = {}) {
           };
       });
 
-      console.log(`🔍 All directions mapped:`, allDirections);
+      deckLog(`🔍 All directions mapped:`, allDirections);
 
       // ✅ Server now prioritizes larger stacks as primary, smaller as oppositeDirection
 
@@ -836,7 +865,7 @@ function createDimensionCards(explorerData, options = {}) {
       );
       const regularDirections = allDirections.filter(d => !outlierDirections.includes(d));
 
-      console.log(`🎯 Found ${regularDirections.length} regular directions, ${outlierDirections.length} outliers`);
+      deckLog(`🎯 Found ${regularDirections.length} regular directions, ${outlierDirections.length} outliers`);
 
       // Apply smart limits
       let directions;
@@ -849,7 +878,7 @@ function createDimensionCards(explorerData, options = {}) {
           directions = regularDirections.slice(0, 12);
       }
 
-      console.log(`🎯 Using ${directions.length} total directions: ${directions.length - outlierDirections.length} regular + ${outlierDirections.length} outliers`);
+      deckLog(`🎯 Using ${directions.length} total directions: ${directions.length - outlierDirections.length} regular + ${outlierDirections.length} outliers`);
 
       if (directions.length === 0) {
           console.error(`❌ NO DIRECTIONS TO DISPLAY!`);
@@ -876,19 +905,19 @@ function createDimensionCards(explorerData, options = {}) {
           if (outlierSpaceAvailable > 0) {
               const outliersToAdd = legacyOutliers.slice(0, outlierSpaceAvailable);
               directions.push(...outliersToAdd);
-              console.log(`🌟 Added ${outliersToAdd.length} legacy outlier directions (${outlierSpaceAvailable} slots available)`);
+              deckLog(`🌟 Added ${outliersToAdd.length} legacy outlier directions (${outlierSpaceAvailable} slots available)`);
           }
       }
 
       // Server now handles bidirectional prioritization - just trust the hasOpposite flag
       const bidirectionalDirections = directions.filter(direction => direction.hasOpposite);
-      console.log(`🔄 Server provided ${bidirectionalDirections.length} directions with reverse capability`);
-      console.log(`🔄 Directions with opposites:`, bidirectionalDirections.map(d => `${d.key} (${d.sampleTracks?.length || 0} tracks)`));
+      deckLog(`🔄 Server provided ${bidirectionalDirections.length} directions with reverse capability`);
+      deckLog(`🔄 Directions with opposites:`, bidirectionalDirections.map(d => `${d.key} (${d.sampleTracks?.length || 0} tracks)`));
 
       // Find the next track direction from explorer data
       const nextTrackDirection = explorerData.nextTrack ? explorerData.nextTrack.directionKey : null;
 
-      console.log(`🎯 About to create ${directions.length} cards - drawing order: bottom first, next track last`);
+      deckLog(`🎯 About to create ${directions.length} cards - drawing order: bottom first, next track last`);
       let cardsCreated = 0;
 
       // Separate next track cards from regular cards for proper drawing order
@@ -914,23 +943,23 @@ function createDimensionCards(explorerData, options = {}) {
           const trackCount = tracks.length;
           for (t in tracks) preloadImage(t.albumCover);
 
-          console.log(`🎯 Creating direction card ${index}: ${direction.key} (${trackCount} tracks)${hasReverse ? ' with reverse' : ''}`);
+          deckLog(`🎯 Creating direction card ${index}: ${direction.key} (${trackCount} tracks)${hasReverse ? ' with reverse' : ''}`);
           if (hasReverse) {
               const oppositeTracks = direction.oppositeDirection?.sampleTracks || [];
               const oppositeCount = oppositeTracks.length;
               for (t in oppositeTracks) preloadImage(t.albumCover);
-              console.log(`🔄 Reverse available: ${oppositeCount} tracks in opposite direction`);
+              deckLog(`🔄 Reverse available: ${oppositeCount} tracks in opposite direction`);
           }
 
           // All start as direction cards in clock positions (no special next-track handling yet)
-          console.log(`Create direction card ${index}`);
+          deckLog(`Create direction card ${index}`);
           let card;
           try {
               card = createDirectionCard(direction, index, directions.length, false, null, hasReverse, null, directions);
-              console.log(`✅ Created card for ${direction.key}, appending to container`);
+              deckLog(`✅ Created card for ${direction.key}, appending to container`);
               container.appendChild(card);
               cardsCreated++;
-              console.log(`✅ Successfully added card ${index} (${direction.key}) to DOM, total cards: ${cardsCreated}`);
+              deckLog(`✅ Successfully added card ${index} (${direction.key}) to DOM, total cards: ${cardsCreated}`);
 
               // Stagger the animation
               // TODO setTimeout(() => {
@@ -951,34 +980,35 @@ function createDimensionCards(explorerData, options = {}) {
 
       state.nextTrackAnimationTimer = setTimeout(() => {
           if (explorerData.nextTrack) {
-              console.log(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
+              deckLog(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
               animateDirectionToCenter(explorerData.nextTrack.directionKey);
           }
           state.nextTrackAnimationTimer = null;
       }, directions.length * 150 + 1500); // Wait for all cards to appear
 
-      console.log(`🎯 FINISHED creating ${cardsCreated} cards in container`);
+      deckLog(`🎯 FINISHED creating ${cardsCreated} cards in container`);
 
-      // 🐞 DEBUG: Count cards by type in the DOM
-      const allCards = container.querySelectorAll('.dimension-card');
-      const nextTrackCards = container.querySelectorAll('.dimension-card.next-track');
-      const regularCards = container.querySelectorAll('.dimension-card:not(.next-track)');
-      const trackDetailCards = container.querySelectorAll('.track-detail-card');
+      if (DEBUG_FLAGS.deck) {
+        // Diagnostic counts
+        const allCards = container.querySelectorAll('.dimension-card');
+        const nextTrackCards = container.querySelectorAll('.dimension-card.next-track');
+        const regularCards = container.querySelectorAll('.dimension-card:not(.next-track)');
+        const trackDetailCards = container.querySelectorAll('.track-detail-card');
 
-      console.log(`🐞 DOM CARDS SUMMARY:`);
-      console.log(`🐞   Total cards in DOM: ${allCards.length}`);
-      console.log(`🐞   Next track cards: ${nextTrackCards.length}`);
-      console.log(`🐞   Regular direction cards: ${regularCards.length}`);
-      console.log(`🐞   Track detail cards: ${trackDetailCards.length}`);
+        deckLog(`🐞 DOM CARDS SUMMARY:`);
+        deckLog(`🐞   Total cards in DOM: ${allCards.length}`);
+        deckLog(`🐞   Next track cards: ${nextTrackCards.length}`);
+        deckLog(`🐞   Regular direction cards: ${regularCards.length}`);
+        deckLog(`🐞   Track detail cards: ${trackDetailCards.length}`);
 
-      // 🐞 DEBUG: Show what text content is actually visible
-      allCards.forEach((card, index) => {
-          const labelDiv = card.querySelector('.label');
-          const text = labelDiv ? labelDiv.textContent.trim() : 'NO LABEL';
-          const isNextTrack = card.classList.contains('next-track');
-          const isTrackDetail = card.classList.contains('track-detail-card');
-          console.log(`🐞   Card ${index}: ${isNextTrack ? '[NEXT]' : '[REG]'} ${isTrackDetail ? '[TRACK]' : '[DIR]'} "${text.substring(0, 50)}..."`);
-      });
+        allCards.forEach((card, index) => {
+            const labelDiv = card.querySelector('.label');
+            const text = labelDiv ? labelDiv.textContent.trim() : 'NO LABEL';
+            const isNextTrack = card.classList.contains('next-track');
+            const isTrackDetail = card.classList.contains('track-detail-card');
+            deckLog(`🐞   Card ${index}: ${isNextTrack ? '[NEXT]' : '[REG]'} ${isTrackDetail ? '[TRACK]' : '[DIR]'} "${text.substring(0, 50)}..."`);
+        });
+      }
 
       // Apply initial selection state to show stacked cards immediately
       setTimeout(() => {
@@ -994,7 +1024,7 @@ function createDimensionCards(explorerData, options = {}) {
           return;
       }
 
-      console.log(`🔄 Swapping next track direction from ${state.latestExplorerData.nextTrack?.directionKey} to ${newNextDirectionKey}`);
+      deckLog(`🔄 Swapping next track direction from ${state.latestExplorerData.nextTrack?.directionKey} to ${newNextDirectionKey}`);
 
       // Get the first track from the new direction
       const newDirection = state.latestExplorerData.directions[newNextDirectionKey];
@@ -1196,10 +1226,7 @@ function createDimensionCards(explorerData, options = {}) {
 
       elements.audio.src = streamUrl;
       elements.audio.load();
-
-      setTimeout(() => {
-          connectSSE();
-      }, 5000);
+      state.awaitingSSE = true;
 
       elements.audio.play()
         .then(() => {
@@ -1218,6 +1245,9 @@ function createDimensionCards(explorerData, options = {}) {
           });
           connectionHealth.audio.status = 'error';
           updateConnectionHealthUI();
+          if (!connectionHealth.currentEventSource) {
+              connectSSE();
+          }
         });
   }
 
@@ -1807,6 +1837,7 @@ function createDimensionCards(explorerData, options = {}) {
     const fingerprint = state.streamFingerprint;
     const eventsUrl = composeEventsEndpoint(fingerprint);
     syncEventsEndpoint(fingerprint);
+    state.awaitingSSE = false;
 
     if (fingerprint) {
       console.log(`🔌 Connecting SSE to fingerprint: ${fingerprint}`);
@@ -3267,6 +3298,7 @@ async function createNewJourneySession(reason = 'unknown') {
             audioHealth.bufferingStarted = Date.now();
             streamElement.src = newStreamUrl;
             streamElement.load();
+            state.awaitingSSE = true;
         }
 
         state.manualNextTrackOverride = false;
