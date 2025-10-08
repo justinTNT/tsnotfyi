@@ -32,6 +32,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import traceback
 
+# PCA computation dependencies
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +91,35 @@ class ProcessingConfig:
     # Debug options
     verbose: bool = False
     dry_run: bool = False
+
+def compute_path_keywords(path_str: str) -> str:
+    if not path_str:
+        return ""
+    segments = [seg for seg in path_str.split('/') if seg]
+    if len(segments) <= 5:
+        trimmed = path_str
+    else:
+        trimmed = ' '.join(segments[5:])
+    trimmed = trimmed.rsplit('.', 1)[0] if segments and '.' in segments[-1] else trimmed
+    return (
+        trimmed
+        .replace('_', ' ')
+        .replace('-', ' ')
+        .replace('.', ' ')
+        .replace('/', ' ')
+        .strip()
+        .lower()
+    )
+
+
+def decode_value(value):
+    if isinstance(value, (bytes, memoryview)):
+        try:
+            return bytes(value).decode('utf-8')
+        except UnicodeDecodeError:
+            return bytes(value).hex()
+    return value
+
 
 class BeetsMetadataExtractor:
     """Extracts comprehensive metadata from beets database"""
@@ -172,6 +208,45 @@ class BeetsMetadataExtractor:
             # Add computed fields
             track_data['identifier'] = identifier
             track_data['path_str'] = path
+            track_data['path_keywords'] = compute_path_keywords(path)
+
+            item_dict = {k: decode_value(v) for k, v in dict(row).items()}
+
+            album_row = None
+            if row['album_id'] is not None:
+                album_row = self.beets_db.execute(
+                    "SELECT * FROM albums WHERE id = ?",
+                    (row['album_id'],)
+                ).fetchone()
+            album_dict = {k: decode_value(v) for k, v in dict(album_row).items()} if album_row else None
+
+            item_attrs = {
+                decode_value(attr_row[0]): decode_value(attr_row[1])
+                for attr_row in self.beets_db.execute(
+                    "SELECT key, value FROM item_attributes WHERE entity_id = ?",
+                    (row['id'],)
+                )
+                if attr_row[0]
+            }
+
+            album_attrs = {}
+            if album_row is not None:
+                album_attrs = {
+                    decode_value(attr_row[0]): decode_value(attr_row[1])
+                    for attr_row in self.beets_db.execute(
+                        "SELECT key, value FROM album_attributes WHERE entity_id = ?",
+                        (album_row['id'],)
+                    )
+                    if attr_row[0]
+                }
+
+            meta_payload = {
+                'item': item_dict,
+                'album': album_dict,
+                'item_attributes': item_attrs,
+                'album_attributes': album_attrs
+            }
+            track_data['beets_meta'] = json.dumps(meta_payload, ensure_ascii=True, sort_keys=True)
 
             tracks.append(track_data)
 
@@ -380,6 +455,423 @@ class FeatureProcessor:
 
         return derived
 
+
+class PCAComputer:
+    """Computes PCA transformations and values for music indices.
+
+    This class handles:
+    - Loading all track indices from database
+    - Fitting PCA models on 4 discriminator spaces:
+      * primary_d: 1D PCA on all 18 core features
+      * tonal: 3D PCA on 7 tonal features
+      * spectral: 3D PCA on 7 spectral features
+      * rhythmic: 3D PCA on 4 rhythmic features
+    - Extracting transformation weights (components, means, scales)
+    - Dynamic calibration for 3 resolution levels
+    - Validation of computed values
+    """
+
+    def __init__(self):
+        """Initialize PCA computer with feature groupings."""
+        # Core feature groups (18 features total)
+        self.core_indices = [
+            'bpm', 'danceability', 'onset_rate', 'beat_punch',
+            'tonal_clarity', 'tuning_purity', 'fifths_strength',
+            'chord_strength', 'chord_change_rate', 'crest', 'entropy',
+            'spectral_centroid', 'spectral_rolloff', 'spectral_kurtosis',
+            'spectral_energy', 'spectral_flatness', 'sub_drive', 'air_sizzle'
+        ]
+
+        # Domain groupings
+        self.domain_indices = {
+            'tonal': ['tonal_clarity', 'tuning_purity', 'fifths_strength',
+                     'chord_strength', 'chord_change_rate', 'crest', 'entropy'],
+            'spectral': ['spectral_centroid', 'spectral_rolloff', 'spectral_kurtosis',
+                        'spectral_energy', 'spectral_flatness', 'sub_drive', 'air_sizzle'],
+            'rhythmic': ['bpm', 'danceability', 'onset_rate', 'beat_punch']
+        }
+
+        # Storage for fitted models
+        self.scaler = None  # Global scaler for all 18 features
+        self.discriminators = {}  # Will store PCA models and scalers
+        self.data = None  # DataFrame of all tracks
+
+    def fit_pca_on_library(self, db_path: str) -> Dict[str, np.ndarray]:
+        """Fit PCA models on entire library.
+
+        Args:
+            db_path: Path to database with music_analysis table
+
+        Returns:
+            Dict mapping discriminator names to value arrays
+        """
+        logger.info("🧮 FITTING PCA ON LIBRARY")
+        logger.info("="*60)
+
+        # Load all track indices
+        conn = sqlite3.connect(db_path)
+
+        # Build query
+        columns = ['identifier'] + self.core_indices
+        query = f"SELECT {', '.join(columns)} FROM music_analysis WHERE identifier IS NOT NULL"
+
+        self.data = pd.read_sql_query(query, conn)
+        conn.close()
+
+        n_tracks = len(self.data)
+        logger.info(f"Loaded {n_tracks:,} tracks with {len(self.core_indices)} features")
+
+        if n_tracks < 1000:
+            logger.warning(f"⚠️  Only {n_tracks} tracks - PCA may be unstable (recommend 1000+)")
+
+        # Extract feature matrix
+        core_data = self.data[self.core_indices].fillna(0).values
+
+        # Fit global scaler
+        self.scaler = StandardScaler()
+        core_scaled = self.scaler.fit_transform(core_data)
+
+        logger.info(f"Standardized features (mean≈0, std≈1)")
+
+        # Fit primary discriminator (1D PCA on all 18 features)
+        logger.info("\nFitting primary_d (1D PCA on 18 features)...")
+        pca_primary = PCA(n_components=1, random_state=42)
+        pca_primary.fit(core_scaled)
+
+        d_values = pca_primary.transform(core_scaled)[:, 0]
+        variance_explained = pca_primary.explained_variance_ratio_[0]
+
+        self.discriminators['primary_d'] = {
+            'values': d_values,
+            'pca_model': pca_primary,
+            'scaler': self.scaler,
+            'variance_explained': variance_explained,
+            'n_components': 1,
+            'feature_indices': self.core_indices
+        }
+
+        logger.info(f"  ✅ primary_d: {variance_explained:.1%} variance explained")
+
+        # Fit domain discriminators (3D PCA each)
+        for domain_name, indices in self.domain_indices.items():
+            logger.info(f"\nFitting {domain_name} (3D PCA on {len(indices)} features)...")
+
+            # Extract domain data
+            domain_data = self.data[indices].fillna(0).values
+
+            # Fit domain scaler
+            domain_scaler = StandardScaler()
+            domain_scaled = domain_scaler.fit_transform(domain_data)
+
+            # Fit domain PCA (3 components)
+            pca_domain = PCA(n_components=3, random_state=42)
+            pca_domain.fit(domain_scaled)
+
+            domain_values = pca_domain.transform(domain_scaled)
+            total_variance = np.sum(pca_domain.explained_variance_ratio_)
+
+            self.discriminators[domain_name] = {
+                'values': domain_values,
+                'pca_model': pca_domain,
+                'scaler': domain_scaler,
+                'total_variance': total_variance,
+                'n_components': 3,
+                'feature_indices': indices
+            }
+
+            logger.info(f"  ✅ {domain_name}: {total_variance:.1%} variance explained")
+
+        logger.info(f"\n✅ All PCA models fitted successfully")
+
+        return self.discriminators
+
+    def extract_transformation_weights(self) -> List[Tuple]:
+        """Extract PCA transformation weights from fitted models.
+
+        Returns:
+            List of (component, feature_index, feature_name, weight, mean, scale) tuples
+            Expected: 72 rows (18 + 21 + 21 + 12)
+        """
+        logger.info("\n🔬 EXTRACTING PCA TRANSFORMATION WEIGHTS")
+        logger.info("="*60)
+
+        weights = []
+
+        # 1. Primary discriminator (18 features, 1 component)
+        logger.info("Extracting primary_d weights (18 features)...")
+        pca_primary = self.discriminators['primary_d']['pca_model']
+
+        for feature_idx, feature_name in enumerate(self.core_indices):
+            weight = float(pca_primary.components_[0][feature_idx])
+            mean = float(self.scaler.mean_[feature_idx])
+            scale = float(self.scaler.scale_[feature_idx])
+
+            weights.append((
+                'primary_d',
+                feature_idx,
+                feature_name,
+                weight,
+                mean,
+                scale
+            ))
+
+        logger.info(f"  ✅ Extracted {len(self.core_indices)} primary_d weights")
+
+        # 2. Domain discriminators (tonal, spectral, rhythmic)
+        for domain_name in ['tonal', 'spectral', 'rhythmic']:
+            domain_info = self.discriminators[domain_name]
+            pca_model = domain_info['pca_model']
+            scaler = domain_info['scaler']
+            feature_indices = domain_info['feature_indices']
+            n_components = domain_info['n_components']
+
+            logger.info(f"Extracting {domain_name} weights ({len(feature_indices)} features × {n_components} components)...")
+
+            for component_idx in range(n_components):
+                component_name = f"{domain_name}_pc{component_idx + 1}"
+
+                for feature_idx, feature_name in enumerate(feature_indices):
+                    weight = float(pca_model.components_[component_idx][feature_idx])
+                    mean = float(scaler.mean_[feature_idx])
+                    scale = float(scaler.scale_[feature_idx])
+
+                    weights.append((
+                        component_name,
+                        feature_idx,
+                        feature_name,
+                        weight,
+                        mean,
+                        scale
+                    ))
+
+            logger.info(f"  ✅ Extracted {len(feature_indices) * n_components} {domain_name} weights")
+
+        logger.info(f"\n✅ Total transformation weights extracted: {len(weights)}")
+        logger.info(f"   Expected: 72 (18 primary_d + 21 tonal + 21 spectral + 12 rhythmic)")
+
+        if len(weights) != 72:
+            logger.warning(f"   ⚠️  WARNING: Expected 72 weights, got {len(weights)}")
+
+        return weights
+
+    def calibrate_resolution_controls(self) -> Dict[str, Any]:
+        """Calibrate intuitive resolution controls using dynamic binary search.
+
+        Finds optimal 2x→3x base scales for target percentages:
+        - 🔬 Microscope (1%): Ultra-precise similarity
+        - 🔍 Magnifying Glass (5%): Focused exploration
+        - 🔭 Binoculars (10%): Broader discovery
+
+        Returns:
+            Dict with calibration results for all resolutions and discriminators
+        """
+        logger.info("\n🎯 CALIBRATING RESOLUTION CONTROLS (DYNAMIC)")
+        logger.info("="*70)
+
+        # Build NN models for each discriminator
+        logger.info("Building nearest neighbor models...")
+        discriminator_data = {
+            'primary_d': self.discriminators['primary_d']['values'].reshape(-1, 1),
+            'tonal': self.discriminators['tonal']['values'],
+            'spectral': self.discriminators['spectral']['values'],
+            'rhythmic': self.discriminators['rhythmic']['values']
+        }
+
+        nn_models = {}
+        n_tracks = len(self.data)
+        search_k = min(2000, n_tracks)
+
+        for name, values in discriminator_data.items():
+            nn_models[name] = NearestNeighbors(n_neighbors=search_k, metric='euclidean')
+            nn_models[name].fit(values)
+            logger.info(f"  ✅ {name}: {values.shape[1]}D space, k={search_k}")
+
+        # Target resolutions
+        target_resolutions = {
+            'microscope': {'emoji': '🔬', 'target_pct': 1.0, 'description': 'Ultra-precise similarity'},
+            'magnifying_glass': {'emoji': '🔍', 'target_pct': 5.0, 'description': 'Focused exploration'},
+            'binoculars': {'emoji': '🔭', 'target_pct': 10.0, 'description': 'Broader discovery'}
+        }
+
+        # Test query indices (sample different parts of library)
+        n_test_queries = min(15, n_tracks)
+        test_indices = np.linspace(0, n_tracks-1, n_test_queries, dtype=int)
+
+        calibration_results = {}
+
+        logger.info(f"\nFinding optimal 2x→3x base scales (testing on {n_test_queries} query points)...")
+
+        for resolution_name, resolution_config in target_resolutions.items():
+            emoji = resolution_config['emoji']
+            target_pct = resolution_config['target_pct']
+            description = resolution_config['description']
+
+            logger.info(f"\n{emoji} {resolution_name.replace('_', ' ').title()} ({target_pct}%): {description}")
+
+            calibration_results[resolution_name] = {
+                'config': resolution_config,
+                'discriminator_calibrations': {}
+            }
+
+            # Calibrate each discriminator
+            for disc_name in ['primary_d', 'tonal', 'spectral', 'rhythmic']:
+                # Binary search for optimal base_x
+                x_candidates = np.logspace(-2, 0.5, 50)  # 0.01 to ~3.16
+                best_x = None
+                best_error = float('inf')
+                best_avg_pct = None
+
+                for x in x_candidates:
+                    inner_radius = 2 * x
+                    outer_radius = 3 * x
+
+                    percentages = []
+
+                    for query_idx in test_indices:
+                        query_point = discriminator_data[disc_name][query_idx:query_idx+1]
+                        distances, _ = nn_models[disc_name].kneighbors(query_point)
+                        distances = distances[0]
+
+                        in_zone = np.sum((distances >= inner_radius) & (distances <= outer_radius))
+                        percentage = (in_zone / len(distances)) * 100
+                        percentages.append(percentage)
+
+                    avg_percentage = np.mean(percentages)
+                    error = abs(avg_percentage - target_pct)
+
+                    if error < best_error:
+                        best_error = error
+                        best_x = x
+                        best_avg_pct = avg_percentage
+
+                result = {
+                    'best_x': best_x,
+                    'best_inner': 2 * best_x,
+                    'best_outer': 3 * best_x,
+                    'achieved_percentage': best_avg_pct,
+                    'error': best_error
+                }
+
+                calibration_results[resolution_name]['discriminator_calibrations'][disc_name] = result
+
+                logger.info(f"   {disc_name:<12}: x={best_x:.3f} → {best_avg_pct:.1f}% (error: {best_error:.1f}%)")
+
+        logger.info(f"\n✅ Dynamic calibration complete for all resolution levels")
+
+        return calibration_results
+
+    def validate_pca_integrity(self, db_path: str) -> bool:
+        """Validate PCA values in database match computed values.
+
+        Cross-references database PCA values against freshly computed values.
+        Raises ValueError if validation fails.
+
+        Args:
+            db_path: Path to database with music_analysis table
+
+        Returns:
+            True if validation passes
+
+        Raises:
+            ValueError: If validation fails
+        """
+        logger.info("\n✅ VALIDATING PCA INTEGRITY")
+        logger.info("="*70)
+
+        try:
+            conn = sqlite3.connect(db_path)
+
+            # Load database PCA values
+            db_df = pd.read_sql_query("""
+                SELECT rowid, primary_d, tonal_pc1, tonal_pc2, tonal_pc3,
+                       spectral_pc1, spectral_pc2, spectral_pc3,
+                       rhythmic_pc1, rhythmic_pc2, rhythmic_pc3
+                FROM music_analysis
+                WHERE primary_d IS NOT NULL
+                ORDER BY rowid
+            """, conn)
+
+            conn.close()
+
+            logger.info(f"Loaded {len(db_df):,} database records")
+
+            # Compare with computed values
+            tolerance = 1e-10
+            validation_results = {}
+            all_passed = True
+
+            # Validate primary_d
+            computed_primary_d = self.discriminators['primary_d']['values']
+            db_primary_d = db_df['primary_d'].values
+            diff = np.abs(db_primary_d - computed_primary_d[:len(db_primary_d)])
+            max_diff = np.max(diff)
+            matches = np.sum(diff < tolerance)
+            match_pct = (matches / len(db_primary_d)) * 100
+
+            validation_results['primary_d'] = {
+                'matches': int(matches),
+                'total': len(db_primary_d),
+                'match_pct': match_pct,
+                'max_diff': float(max_diff),
+                'passed': match_pct > 99.9
+            }
+
+            logger.info(f"primary_d: {matches:,}/{len(db_primary_d):,} exact matches ({match_pct:.2f}%), max diff: {max_diff:.2e}")
+
+            if not validation_results['primary_d']['passed']:
+                all_passed = False
+                logger.error(f"  ❌ FAILED: Match percentage below threshold")
+
+            # Validate domain components
+            for domain in ['tonal', 'spectral', 'rhythmic']:
+                n_components = self.discriminators[domain]['n_components']
+                computed_values = self.discriminators[domain]['values']
+
+                for component_idx in range(n_components):
+                    column_name = f"{domain}_pc{component_idx + 1}"
+                    db_values = db_df[column_name].values
+                    computed_col = computed_values[:len(db_values), component_idx]
+
+                    diff = np.abs(db_values - computed_col)
+                    max_diff = np.max(diff)
+                    matches = np.sum(diff < tolerance)
+                    match_pct = (matches / len(db_values)) * 100
+
+                    validation_results[column_name] = {
+                        'matches': int(matches),
+                        'total': len(db_values),
+                        'match_pct': match_pct,
+                        'max_diff': float(max_diff),
+                        'passed': match_pct > 99.9
+                    }
+
+                    logger.info(f"{column_name}: {matches:,}/{len(db_values):,} exact matches ({match_pct:.2f}%), max diff: {max_diff:.2e}")
+
+                    if not validation_results[column_name]['passed']:
+                        all_passed = False
+                        logger.error(f"  ❌ FAILED: Match percentage below threshold")
+
+            # Overall summary
+            total_values = sum(r['total'] for r in validation_results.values())
+            total_matches = sum(r['matches'] for r in validation_results.values())
+            overall_match_pct = (total_matches / total_values) * 100
+
+            logger.info(f"\n📊 OVERALL VALIDATION:")
+            logger.info(f"   Total values checked: {total_values:,}")
+            logger.info(f"   Total exact matches: {total_matches:,}")
+            logger.info(f"   Overall match rate: {overall_match_pct:.2f}%")
+            logger.info(f"   Status: {'✅ PASSED' if all_passed else '❌ FAILED'}")
+
+            if not all_passed:
+                raise ValueError("PCA integrity validation failed: computed values do not match database values")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ PCA integrity validation error: {e}")
+            raise
+
+
 class DatabaseManager:
     """Manages the output database with comprehensive beets metadata integration"""
 
@@ -464,6 +956,9 @@ class DatabaseManager:
             else:
                 beets_cols.append(f"bt_{col} TEXT")
 
+        beets_cols.append("path_keywords TEXT")
+        beets_cols.append("beets_meta TEXT")
+
         # Music indices columns
         indices_cols = [
             # Rhythmic
@@ -498,6 +993,7 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_danceability ON music_analysis(danceability)",
             "CREATE INDEX IF NOT EXISTS idx_tonal_clarity ON music_analysis(tonal_clarity)",
             "CREATE INDEX IF NOT EXISTS idx_processed_at ON music_analysis(processed_at)",
+            "CREATE INDEX IF NOT EXISTS idx_path_keywords ON music_analysis(path_keywords)",
         ]
 
         for index_sql in indexes:
@@ -520,6 +1016,9 @@ class DatabaseManager:
         for col in self.beets_columns:
             bt_key = f"bt_{col}"
             all_data[bt_key] = track_data.get(col)
+
+        all_data['path_keywords'] = track_data.get('path_keywords')
+        all_data['beets_meta'] = track_data.get('beets_meta')
 
         # Add indices
         all_data.update(indices)
@@ -553,6 +1052,200 @@ class DatabaseManager:
     def commit(self):
         """Commit database changes"""
         self.db.commit()
+
+    def add_pca_columns(self):
+        """Add PCA columns to music_analysis table if they don't exist."""
+        logger.info("Adding PCA columns to music_analysis table...")
+
+        pca_columns = [
+            'primary_d REAL',
+            'tonal_pc1 REAL', 'tonal_pc2 REAL', 'tonal_pc3 REAL',
+            'spectral_pc1 REAL', 'spectral_pc2 REAL', 'spectral_pc3 REAL',
+            'rhythmic_pc1 REAL', 'rhythmic_pc2 REAL', 'rhythmic_pc3 REAL'
+        ]
+
+        for column_def in pca_columns:
+            column_name = column_def.split()[0]
+            try:
+                self.db.execute(f"ALTER TABLE music_analysis ADD COLUMN {column_def}")
+                logger.info(f"  ✅ Added column: {column_name}")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+        # Create indexes
+        index_columns = ['primary_d', 'tonal_pc1', 'spectral_pc1', 'rhythmic_pc1']
+        for col in index_columns:
+            try:
+                self.db.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON music_analysis({col})")
+            except:
+                pass
+
+        self.db.commit()
+        logger.info("✅ PCA columns ready")
+
+    def create_pca_tables(self):
+        """Create pca_transformations and pca_calibration_settings tables."""
+        logger.info("Creating PCA metadata tables...")
+
+        # pca_transformations table
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS pca_transformations (
+            component TEXT NOT NULL,
+            feature_index INTEGER NOT NULL,
+            feature_name TEXT NOT NULL,
+            weight REAL NOT NULL,
+            mean REAL NOT NULL,
+            scale REAL NOT NULL,
+            PRIMARY KEY (component, feature_index)
+        )
+        """)
+
+        self.db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pca_component
+        ON pca_transformations(component)
+        """)
+
+        # pca_calibration_settings table
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS pca_calibration_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            resolution_level TEXT NOT NULL,
+            discriminator TEXT NOT NULL,
+            base_x REAL NOT NULL,
+            inner_radius REAL NOT NULL,
+            outer_radius REAL NOT NULL,
+            target_percentage REAL NOT NULL,
+            achieved_percentage REAL NOT NULL,
+            library_size INTEGER NOT NULL,
+            calibration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(resolution_level, discriminator)
+        )
+        """)
+
+        self.db.commit()
+        logger.info("✅ PCA metadata tables ready")
+
+    def insert_pca_transformations(self, weights: List[Tuple]):
+        """Bulk insert PCA transformation weights."""
+        logger.info(f"Inserting {len(weights)} transformation weights...")
+
+        # Clear existing weights
+        self.db.execute("DELETE FROM pca_transformations")
+
+        # Insert new weights
+        insert_sql = """
+        INSERT INTO pca_transformations
+        (component, feature_index, feature_name, weight, mean, scale)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+
+        self.db.executemany(insert_sql, weights)
+        self.db.commit()
+
+        # Verify
+        cursor = self.db.execute("SELECT COUNT(*) FROM pca_transformations")
+        count = cursor.fetchone()[0]
+
+        logger.info(f"✅ Inserted {count} transformation weights")
+
+        # Breakdown by component
+        cursor = self.db.execute("""
+        SELECT component, COUNT(*)
+        FROM pca_transformations
+        GROUP BY component
+        ORDER BY component
+        """)
+
+        for component, cnt in cursor.fetchall():
+            logger.info(f"   {component}: {cnt} weights")
+
+        if count != len(weights):
+            raise ValueError(f"Insertion mismatch: expected {len(weights)}, inserted {count}")
+
+    def batch_update_pca_values(self, pca_computer):
+        """Batch update PCA values for all tracks."""
+        logger.info("Updating PCA values for all tracks...")
+
+        n_tracks = len(pca_computer.data)
+        batch_size = 1000
+
+        for i in range(0, n_tracks, batch_size):
+            batch_end = min(i + batch_size, n_tracks)
+            batch_updates = []
+
+            for j in range(i, batch_end):
+                row = pca_computer.data.iloc[j]
+                identifier = row['identifier']
+
+                # Extract PCA values from fitted models
+                primary_d_val = float(pca_computer.discriminators['primary_d']['values'][j])
+                tonal_vals = pca_computer.discriminators['tonal']['values'][j]
+                spectral_vals = pca_computer.discriminators['spectral']['values'][j]
+                rhythmic_vals = pca_computer.discriminators['rhythmic']['values'][j]
+
+                update_values = (
+                    primary_d_val,
+                    float(tonal_vals[0]), float(tonal_vals[1]), float(tonal_vals[2]),
+                    float(spectral_vals[0]), float(spectral_vals[1]), float(spectral_vals[2]),
+                    float(rhythmic_vals[0]), float(rhythmic_vals[1]), float(rhythmic_vals[2]),
+                    identifier
+                )
+                batch_updates.append(update_values)
+
+            update_sql = """
+            UPDATE music_analysis SET
+                primary_d = ?, tonal_pc1 = ?, tonal_pc2 = ?, tonal_pc3 = ?,
+                spectral_pc1 = ?, spectral_pc2 = ?, spectral_pc3 = ?,
+                rhythmic_pc1 = ?, rhythmic_pc2 = ?, rhythmic_pc3 = ?
+            WHERE identifier = ?
+            """
+
+            self.db.executemany(update_sql, batch_updates)
+
+            if (i + batch_size) % 10000 == 0:
+                logger.info(f"  Updated {i + batch_size:,}/{n_tracks:,} tracks...")
+
+        self.db.commit()
+        logger.info(f"✅ Updated {n_tracks:,} tracks with PCA values")
+
+    def insert_calibration_settings(self, calibration_results: Dict):
+        """Insert calibration settings into database."""
+        logger.info("Inserting calibration settings...")
+
+        # Clear existing settings
+        self.db.execute("DELETE FROM pca_calibration_settings")
+
+        insert_sql = """
+        INSERT INTO pca_calibration_settings
+        (resolution_level, discriminator, base_x, inner_radius, outer_radius,
+         target_percentage, achieved_percentage, library_size)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        # Get library size
+        cursor = self.db.execute("SELECT COUNT(*) FROM music_analysis")
+        library_size = cursor.fetchone()[0]
+
+        settings = []
+        for resolution_name, resolution_data in calibration_results.items():
+            target_pct = resolution_data['config']['target_pct']
+
+            for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
+                settings.append((
+                    resolution_name,
+                    disc_name,
+                    disc_results['best_x'],
+                    disc_results['best_inner'],
+                    disc_results['best_outer'],
+                    target_pct,
+                    disc_results['achieved_percentage'],
+                    library_size
+                ))
+
+        self.db.executemany(insert_sql, settings)
+        self.db.commit()
+
+        logger.info(f"✅ Inserted {len(settings)} calibration settings")
 
     def close(self):
         """Close database connection"""
@@ -891,6 +1584,48 @@ Examples:
     try:
         processor.initialize()
         processor.process_all()
+
+        # STAGE 3: PCA COMPUTATION AND CALIBRATION
+        logger.info("=" * 80)
+        logger.info("STAGE 3: PCA COMPUTATION AND CALIBRATION")
+        logger.info("=" * 80)
+
+        try:
+            # 1. Create PCA tables
+            processor.db_manager.create_pca_tables()
+            processor.db_manager.add_pca_columns()
+
+            # 2. Initialize PCA computer and fit models
+            pca_computer = PCAComputer()
+            pca_computer.fit_pca_on_library(config.output_db_path)
+
+            # 3. Extract and store transformation weights
+            weights = pca_computer.extract_transformation_weights()
+            processor.db_manager.insert_pca_transformations(weights)
+
+            # 4. Update all tracks with PCA values
+            processor.db_manager.batch_update_pca_values(pca_computer)
+
+            # 5. Calibrate resolution controls
+            calibration_results = pca_computer.calibrate_resolution_controls()
+            processor.db_manager.insert_calibration_settings(calibration_results)
+
+            # 6. Validate integrity
+            pca_computer.validate_pca_integrity(config.output_db_path)
+
+            logger.info("\n" + "=" * 80)
+            logger.info("✅ PCA COMPUTATION COMPLETE")
+            logger.info("=" * 80)
+            logger.info("   - 72 transformation weights stored")
+            logger.info("   - 12 calibration settings computed")
+            logger.info("   - All values validated")
+            logger.info(f"   - Database ready: {config.output_db_path}")
+
+        except Exception as e:
+            logger.error(f"❌ PCA computation failed: {e}")
+            if config.verbose:
+                logger.error(traceback.format_exc())
+            raise RuntimeError("PCA computation failed - import incomplete")
 
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")
