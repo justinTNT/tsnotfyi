@@ -408,6 +408,13 @@ class DriftAudioMixer {
 
     const effectiveDelay = Number.isFinite(debounceMs) ? Math.max(0, debounceMs) : this.userSelectionDebounceMs;
 
+    this.broadcastSelectionEvent('selection_ack', {
+      status: 'pending',
+      trackId: trackMd5,
+      direction: this.pendingUserOverrideDirection,
+      debounceMs: effectiveDelay
+    });
+
     if (this.pendingUserSelectionTimer) {
       clearTimeout(this.pendingUserSelectionTimer);
       this.pendingUserSelectionTimer = null;
@@ -511,6 +518,12 @@ class DriftAudioMixer {
       });
       this.clearPendingUserSelection();
       this.broadcastHeartbeat('user-selection-already-prepared', { force: true }).catch(() => {});
+      this.broadcastSelectionEvent('selection_ready', {
+        status: 'prepared',
+        trackId: trackMd5,
+        direction: this.pendingUserOverrideDirection || this.driftPlayer.currentDirection || null,
+        note: 'already_prepared'
+      });
       return;
     }
 
@@ -680,6 +693,14 @@ class DriftAudioMixer {
         } else {
           await this.broadcastHeartbeat('auto-next-prepared', { force: false });
         }
+        if (this.pendingUserOverrideTrackId === hydratedNextTrack.identifier || this.lockedNextTrackIdentifier === hydratedNextTrack.identifier) {
+          this.broadcastSelectionEvent('selection_ready', {
+            status: 'prepared',
+            trackId: hydratedNextTrack.identifier,
+            direction: this.pendingUserOverrideDirection || hydratedNextTrack.nextTrackDirection || this.driftPlayer.currentDirection || null
+          });
+          this.clearPendingUserSelection();
+        }
         console.log(`✅ Next track prepared successfully: ${hydratedNextTrack.title}`);
       } catch (error) {
         console.error('❌ Failed to prepare next track:', error);
@@ -688,6 +709,11 @@ class DriftAudioMixer {
           this.lockedNextTrackIdentifier = null;
           this.clearPendingUserSelection();
           await this.broadcastHeartbeat('user-next-failed', { force: true });
+          this.broadcastSelectionEvent('selection_failed', {
+            trackId: overrideTrackId,
+            status: 'failed',
+            reason: error?.message || 'load_failed'
+          });
         } else {
           await this.broadcastHeartbeat('auto-next-failed', { force: true });
         }
@@ -1143,6 +1169,28 @@ class DriftAudioMixer {
     }
   }
 
+  async restartStream(reason = 'manual-restart') {
+    console.log(`🔄 Restarting stream for session ${this.sessionId} (${reason})`);
+
+    try {
+      this.stopStreaming();
+    } catch (error) {
+      console.warn('⚠️ restartStream stopStreaming error:', error?.message || error);
+    }
+
+    this.clearPendingUserSelection();
+    this.lockedNextTrackIdentifier = null;
+
+    try {
+      await this.startDriftPlayback();
+      await this.broadcastTrackEvent(true, { reason: reason || 'manual-restart' });
+      console.log(`✅ Stream restarted for session ${this.sessionId}`);
+    } catch (error) {
+      console.error('❌ restartStream failed:', error);
+      throw error;
+    }
+  }
+
   // Add event client for SSE
   addEventClient(eventClient) {
     console.log(`📡 Event client connected to session: ${this.sessionId}`);
@@ -1268,6 +1316,20 @@ class DriftAudioMixer {
     }
   }
 
+  broadcastSelectionEvent(type, payload = {}) {
+    if (!type) {
+      return;
+    }
+    const event = {
+      type,
+      sessionId: this.sessionId,
+      timestamp: Date.now(),
+      ...payload
+    };
+    console.log(`📡 Session ${this.sessionId} selection event`, event);
+    this.broadcastEvent(event);
+  }
+
   // Add track to session history
   addToHistory(track, startTimestamp, direction = null, transitionReason = 'natural') {
     const historyEntry = {
@@ -1317,11 +1379,15 @@ class DriftAudioMixer {
     const dealt = new Set();
     const result = [];
 
+    const currentIdentifier = currentTrack?.identifier || null;
+
     const tryDeal = (arr, idx) => {
       if (idx < 0 || idx >= arr.length) return false;
       const c = arr[idx];
       const id = c.track?.identifier || c.identifier;
-      if (!id || dealt.has(id)) return false;
+      if (!id) return false;
+      if (currentIdentifier && id === currentIdentifier) return false; // Never surface the current track in suggestion stacks
+      if (dealt.has(id)) return false;
       dealt.add(id);
       result.push(c);
       return true;
@@ -1803,7 +1869,9 @@ class DriftAudioMixer {
   async broadcastTrackEvent(force = false, options = {}) {
     const reason = options.reason || 'track-update';
     await this.broadcastHeartbeat(reason, { force: true });
-    await this.broadcastExplorerSnapshot(force, reason);
+    if (force || reason === 'track-update' || reason === 'track-started') {
+      await this.broadcastExplorerSnapshot(force, reason);
+    }
   }
 
   // Get directional flow options (expensive - use only when needed)

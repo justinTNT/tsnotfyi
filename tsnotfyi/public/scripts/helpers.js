@@ -29,9 +29,87 @@ function helpersDuplicateLog(...args) {
   const photoStyle = (albumCover) =>
     `background: ${albumCoverBackground(albumCover)}; background-size: 120%; background-position-x: 45%`
 
+  function extractFileStem(candidate) {
+      if (!candidate || typeof candidate !== 'string') return null;
+
+      const trimmed = candidate.trim();
+      if (!trimmed) return null;
+
+      const segments = trimmed.split(/[/\\]/);
+      const filename = segments[segments.length - 1];
+      if (!filename) return null;
+
+      const dotIndex = filename.lastIndexOf('.');
+      const stem = dotIndex > 0 ? filename.slice(0, dotIndex) : filename;
+      const cleaned = stem.trim();
+      return cleaned || null;
+  }
+
   function getDisplayTitle(track) {
-      return track.title ||
-          (track.identifier ? `Track ${track.identifier.substring(0, 8)}...` : 'Unknown Track');
+      if (!track) return 'Unknown Track';
+
+      const directTitle = typeof track.title === 'string' ? track.title.trim() : '';
+      if (directTitle) return directTitle;
+
+      const beetsTitle = typeof track.beetsMeta?.title === 'string'
+          ? track.beetsMeta.title.trim()
+          : typeof track.beets?.title === 'string'
+              ? track.beets.title.trim()
+              : '';
+      if (beetsTitle) return beetsTitle;
+
+      const metadataTitle = typeof track.metadata?.title === 'string' ? track.metadata.title.trim() : '';
+      if (metadataTitle) return metadataTitle;
+
+      const fallbackPaths = [
+          track.fileName,
+          track.filename,
+          track.file,
+          track.filepath,
+          track.filePath,
+          track.path,
+          track.relativePath,
+          track.sourceFile,
+          track.source_path,
+          track.sourcePath,
+          track.beetsMeta?.path,
+          track.beets?.path,
+          track.beetsMeta?.item?.path,
+          track.beets?.item?.path,
+          track.item?.path,
+          track.item?.file,
+          track.libraryItem?.path,
+          track.libraryItem?.file
+      ];
+
+      if (typeof window !== 'undefined' && track.identifier) {
+          const cachedMeta = window.state?.trackMetadataCache?.[track.identifier]?.meta;
+          if (cachedMeta) {
+              const cachedTitle = typeof cachedMeta.title === 'string' ? cachedMeta.title.trim() : '';
+              if (cachedTitle) {
+                  return cachedTitle;
+              }
+
+              fallbackPaths.push(
+                  cachedMeta.path,
+                  cachedMeta.file,
+                  cachedMeta.filename,
+                  cachedMeta.item?.path,
+                  cachedMeta.item?.file
+              );
+          }
+      }
+
+      for (const candidate of fallbackPaths) {
+          const stem = extractFileStem(candidate);
+          if (stem) return stem;
+      }
+
+      if (track.identifier) {
+          return `Track ${track.identifier.substring(0, 8)}...`;
+      }
+
+      return 'Unknown Track';
   }
 
   function findTrackInExplorer(directionKey, explorerData, identifier) {
@@ -64,6 +142,200 @@ function helpersDuplicateLog(...args) {
           if (hit) return hit;
       }
       return null;
+  }
+
+
+  function resolveOppositeDirectionKey(direction) {
+      if (!direction) return null;
+
+      const stateRef = window.state || {};
+      const directions = stateRef.latestExplorerData?.directions || {};
+
+      const directOpposite = direction.oppositeDirection;
+      if (directOpposite) {
+          if (directOpposite.key) return directOpposite.key;
+          if (directOpposite.direction) return directOpposite.direction;
+      }
+
+      const directionKey = direction.key || direction.direction || null;
+      if (!directionKey) {
+          return null;
+      }
+
+      const derived = getOppositeDirection(directionKey);
+      if (derived) {
+          return derived;
+      }
+
+      if (directions[directionKey]?.oppositeDirection) {
+          const alt = directions[directionKey].oppositeDirection;
+          if (alt.key) return alt.key;
+          if (alt.direction) return alt.direction;
+      }
+
+      for (const [key, dirData] of Object.entries(directions)) {
+          const opposite = dirData.oppositeDirection;
+          if (!opposite) continue;
+          if (opposite.key === directionKey || opposite.direction === directionKey) {
+              return dirData.key || key;
+          }
+      }
+
+      return null;
+  }
+
+  function resolveOppositeBorderColor(direction, fallbackColor = '#ffffff') {
+      if (!direction) return fallbackColor;
+
+      const tryColorForKey = (key) => {
+          if (!key) return null;
+          const directionType = getDirectionType(key);
+          const colors = getDirectionColor(directionType, key);
+          return colors && colors.border ? colors.border : null;
+      };
+
+      const oppositeKey = resolveOppositeDirectionKey(direction);
+      const directColor = tryColorForKey(oppositeKey);
+      if (directColor) {
+          return directColor;
+      }
+
+      const derivedKey = getOppositeDirection(direction.key || direction.direction || null);
+      const derivedColor = tryColorForKey(derivedKey);
+      if (derivedColor) {
+          return derivedColor;
+      }
+
+      return direction.borderColor || fallbackColor;
+  }
+
+  const UNO_REVERSE_SVG = `
+      <svg version="1.1" xmlns="http://www.w3.org/2000/svg" x="0" y="0" viewBox="0 0 512 512" aria-hidden="true">
+          <g>
+              <path class="reverse-arrow-top" d="M270.129,28.332c57.441-0.156,114.883-1.758,172.32-2.156c-9.199,57.117-18.961,114.238-27.598,171.516c-15.203-16.238-29.922-32.879-44.883-49.277c-51.52,44.879-104.32,88.32-156.238,132.801c-20-25.84-36.879-60.082-21.922-92.641c22.402-51.359,76.48-76.32,116.402-112.082C295.012,60.813,282.449,44.652,270.129,28.332z"/>
+              <path class="reverse-arrow-bottom" d="M310.129,226.254c6.32-4.563,12.082-11.281,20.32-12.16c20.719,25.441,34.801,61.52,18.48,92.965c-23.039,49.438-76,73.117-114.48,108.719c12.801,16.156,25.68,32.234,38.641,48.313c-57.84,0.406-115.68,1.359-173.52,1.523c9.84-57.039,18.961-114.164,28-171.281c14.961,15.922,29.199,32.563,43.281,49.359C217.969,305.371,263.891,265.613,310.129,226.254z"/>
+              <path class="reverse-backdrop" d="M244.727,24.222c15.869-8.79,11.562-11.329,34.203-12.368c39.84-3.68,79.922-0.563,119.922-2.164c17.277,0.801,36.477-2.797,52.078,6.641c11.199,11.523,2.961,27.441,1.922,41.121c-9.441,47.602-12.801,96.559-26,143.281c-2.914,15.937-9.946,20.593-33.136,41.035c-11.166,9.842-10.221-4.209-45.027-36.017c30.663,48.91,28.48,79.306,13.761,109.142c-21.52,45.758-67.281,71.914-103.359,104.961c9.602,14.797,42.711,46.116,34.746,56.864c-21.165,28.561-28.042,23.108-92.495,26.652c-47.346,2.603-72.412,2.805-131.533,0.242c-17.117-8.805-5.65-36.809-1.304-78.852c0,0,9.955-68.556,22.178-120.067c3.063-12.906,28.478-27.794,28.478-27.794c17.697-9.408,18.502-1.391,51.679,34.782c-10.879-29.602-44.298-50.308-26.208-99.235c18.961-49.52,71.099-85.636,109.658-118.757c-26.891-43.033-42.011-51.323-19.386-63.112M270.129,28.332c12.32,16.32,24.883,32.48,38.082,48.16c-39.922,35.762-94,60.723-116.402,112.082c-14.957,32.559,1.922,66.801,21.922,92.641c51.918-44.48,104.719-87.922,156.238-132.801c14.961,16.398,29.68,33.039,44.883,49.277c8.637-57.277,18.398-114.398,27.598-171.516C385.012,26.574,327.57,28.176,270.129,28.332M310.129,226.254c-46.238,39.359-92.16,79.117-139.277,117.438c-14.082-16.797-28.32-33.438-43.281-49.359c-9.039,57.117-18.16,114.242-28,171.281c57.84-0.164,115.68-1.117,173.52-1.523c-12.961-16.078-25.84-32.156-38.641-48.313c38.344-35.818,93.298-59.394,112.282-111.595c16.32-31.445,2.238-67.523-18.48-92.965c-8.239,0.879-14.001,7.597-20.32,12.16Z"/>
+          </g>
+      </svg>
+  `.trim();
+
+  function renderReverseIcon({ interactive = false, topColor = null, bottomColor = null, highlight = null, extraClasses = '' } = {}) {
+      const classes = ['uno-reverse'];
+      if (interactive) {
+          classes.push('next-track-reverse');
+      } else {
+          classes.push('direction-reverse');
+      }
+      if (highlight === 'top') {
+          classes.push('highlight-top');
+      } else if (highlight === 'bottom') {
+          classes.push('highlight-bottom');
+      }
+      if (extraClasses) {
+          classes.push(extraClasses);
+      }
+
+      const tag = interactive ? 'button' : 'div';
+      const attr = interactive
+          ? 'type="button" aria-label="Swap opposite direction"'
+          : 'aria-hidden="true"';
+      const styleParts = [];
+      if (topColor) {
+          styleParts.push(`--reverse-top-color: ${topColor}`);
+      }
+      if (bottomColor) {
+          styleParts.push(`--reverse-bottom-color: ${bottomColor}`);
+      }
+      const styleAttr = styleParts.length ? ` style="${styleParts.join('; ')}"` : '';
+
+      return `<${tag} class="${classes.join(' ')}" ${attr}${styleAttr}><div class="symbol">${UNO_REVERSE_SVG}</div></${tag}>`;
+  }
+
+  window.resolveOppositeDirectionKey = resolveOppositeDirectionKey;
+  window.resolveOppositeBorderColor = resolveOppositeBorderColor;
+  window.renderReverseIcon = renderReverseIcon;
+
+
+  function resolveDirectionKeyForCard(direction, card, track = null, fallbackKey = null) {
+      const candidates = [];
+      if (direction?.key) candidates.push(direction.key);
+      if (card?.dataset?.directionKey) candidates.push(card.dataset.directionKey);
+      if (direction?.direction) candidates.push(direction.direction);
+      if (track?.directionKey) candidates.push(track.directionKey);
+      if (track?.direction) candidates.push(track.direction);
+      if (fallbackKey) candidates.push(fallbackKey);
+
+      for (const key of candidates) {
+          if (key) {
+              if (direction) {
+                  direction.key = key;
+              }
+              return key;
+          }
+      }
+      return null;
+  }
+
+  function getDirectionVisualContext({ direction, card, track = null, fallbackKey = null }) {
+      const resolvedKey = resolveDirectionKeyForCard(direction, card, track, fallbackKey);
+      if (!resolvedKey) {
+          return null;
+      }
+
+      const directionType = getDirectionType(resolvedKey);
+      const directionColors = getDirectionColor(directionType, resolvedKey);
+      const isNegative = isNegativeDirection(resolvedKey);
+
+      return { resolvedKey, directionType, directionColors, isNegative };
+  }
+
+  function hasOppositeForDirection(direction, resolvedKey) {
+      const explorerDirections = state.latestExplorerData?.directions || {};
+      const oppositeKey = getOppositeDirection(resolvedKey);
+      return (
+          direction?.hasOpposite === true ||
+          !!direction?.oppositeDirection ||
+          (oppositeKey ? !!explorerDirections[oppositeKey] : false) ||
+          Object.values(explorerDirections).some(dir => dir?.oppositeDirection?.key === resolvedKey)
+      );
+  }
+
+  function applyReverseBadge(card, direction, context, { interactive = false, extraClasses = '', highlightOverride = null } = {}) {
+      const panel = card.querySelector('.panel');
+      const existing = card.querySelector('.uno-reverse');
+      if (existing) {
+          existing.remove();
+      }
+
+      const hasOpposite = hasOppositeForDirection(direction, context.resolvedKey);
+      if (!hasOpposite || !panel) {
+          delete card.dataset.oppositeBorderColor;
+          return;
+      }
+
+      const reverseColor = resolveOppositeBorderColor(direction, context.directionColors.border);
+      if (reverseColor) {
+          card.dataset.oppositeBorderColor = reverseColor;
+      } else {
+          delete card.dataset.oppositeBorderColor;
+      }
+
+      const topColor = context.isNegative ? (reverseColor || context.directionColors.border) : context.directionColors.border;
+      const bottomColor = context.isNegative ? context.directionColors.border : (reverseColor || context.directionColors.border);
+      const highlight = interactive ? (highlightOverride || (context.isNegative ? 'top' : 'bottom')) : null;
+
+      const baseClass = interactive ? 'enabled' : 'has-opposite';
+      const combinedExtra = extraClasses ? `${baseClass} ${extraClasses}` : baseClass;
+
+      const badgeHtml = renderReverseIcon({
+          interactive,
+          topColor,
+          bottomColor,
+          highlight,
+          extraClasses: combinedExtra
+      });
+
+      panel.insertAdjacentHTML('beforeend', badgeHtml);
   }
 
 
@@ -164,12 +436,243 @@ function helpersDuplicateLog(...args) {
       return undefined;
   }
 
+  const CONSISTENCY_CHECK_TOLERANCE = 1e-3;
+  const CONSISTENCY_DYNAMIC_MIN_TOLERANCE = 0.02;
+  const CONSISTENCY_DYNAMIC_RELATIVE = 0.12;
+  const CONSISTENCY_MIN_SPREAD = 0.05;
+  const CONSISTENCY_MAX_INCONSISTENT_RATIO = 0.34;
+
+  function resolveMetricValueForConsistency(descriptor, rawTrack, direction) {
+      if (!descriptor || !rawTrack) {
+          return undefined;
+      }
+
+      const track = rawTrack.track || rawTrack;
+      if (!track) {
+          return undefined;
+      }
+
+      let value = extractMetricValue(descriptor, track);
+
+      if (value === undefined && track.identifier && window.state?.latestExplorerData) {
+          const explorerData = window.state.latestExplorerData;
+          let fallback = null;
+          if (direction?.key) {
+              fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
+          }
+          if (!fallback) {
+              fallback = findTrackInExplorer(null, explorerData, track.identifier);
+          }
+          if (fallback) {
+              value = extractMetricValue(descriptor, fallback);
+          }
+      }
+
+      if (value === undefined) {
+          return undefined;
+      }
+
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : undefined;
+  }
+
+  function resolvePrimaryDForConsistency(rawTrack, direction) {
+      const track = rawTrack?.track || rawTrack;
+      if (!track) {
+          return undefined;
+      }
+
+      let value = track?.pca?.primary_d;
+
+      if (!Number.isFinite(Number(value)) && track?.identifier && window.state?.latestExplorerData) {
+          const explorerData = window.state.latestExplorerData;
+          let fallback = null;
+          if (direction?.key) {
+              fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
+          }
+          if (!fallback) {
+              fallback = findTrackInExplorer(null, explorerData, track.identifier);
+          }
+
+          if (fallback?.pca?.primary_d !== undefined) {
+              value = fallback.pca.primary_d;
+          }
+      }
+
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : undefined;
+  }
+
+  function evaluateDirectionConsistency(direction, { card = null, sampleTracks = [], currentTrack = null } = {}) {
+      if (!direction) {
+          return;
+      }
+
+      const stateRef = window.state || {};
+      const activeCurrentTrack = currentTrack || stateRef.latestCurrentTrack;
+      const descriptor = getDirectionMetricDescriptor(direction.key, direction);
+
+      const samples = Array.isArray(sampleTracks) && sampleTracks.length
+          ? sampleTracks
+          : (Array.isArray(direction.sampleTracks) ? direction.sampleTracks : []);
+
+      const polarity = isNegativeDirection(direction.key) ? -1 : 1;
+      const descriptorKey = descriptor
+          ? (descriptor.type === 'feature'
+              ? descriptor.key
+              : `${descriptor.domain}_pc${descriptor.index + 1}`)
+          : null;
+
+      const issues = [];
+      const diffEntries = [];
+
+      const currentMetric = descriptor
+          ? resolveMetricValueForConsistency(descriptor, activeCurrentTrack, direction)
+          : undefined;
+
+      if (descriptor && Number.isFinite(currentMetric)) {
+          samples.forEach(sample => {
+              const metric = resolveMetricValueForConsistency(descriptor, sample, direction);
+              if (Number.isFinite(metric)) {
+                  const track = sample?.track || sample;
+                  const trackId = track?.identifier || track?.trackMd5 || null;
+                  diffEntries.push({
+                      id: trackId,
+                      title: getDisplayTitle(track),
+                      diff: metric - currentMetric
+                  });
+              }
+          });
+
+          if (diffEntries.length > 0) {
+              const metricSpread = diffEntries.reduce((max, entry) => Math.max(max, Math.abs(entry.diff)), 0);
+              const tolerance = resolveConsistencyTolerance(currentMetric, metricSpread);
+
+              if (metricSpread >= Math.max(tolerance, CONSISTENCY_MIN_SPREAD)) {
+                  const inconsistent = diffEntries.filter(entry => (entry.diff * polarity) < -tolerance);
+                  const supporting = diffEntries.filter(entry => (entry.diff * polarity) > tolerance);
+                  if (supporting.length === 0 && inconsistent.length > 0) {
+                      issues.push(`${descriptorKey} diffs oppose implied polarity (${inconsistent.length}/${diffEntries.length})`);
+                  } else if (inconsistent.length > 0 && inconsistent.length / diffEntries.length > CONSISTENCY_MAX_INCONSISTENT_RATIO) {
+                      issues.push(`${descriptorKey} diffs contradict implied polarity for ${inconsistent.length}/${diffEntries.length} samples`);
+                  }
+              } else {
+                  helpersColorLog(`🧮 Skipping ${descriptorKey} metric diff check due to low spread: ${metricSpread.toFixed(3)} < tolerance ${tolerance.toFixed(3)}`);
+              }
+          }
+      }
+
+      const skipPrimaryDeltaCheck = /_pc\d+/i.test(direction.key || '');
+      const primaryDeltas = [];
+      const currentPrimaryD = skipPrimaryDeltaCheck ? undefined : resolvePrimaryDForConsistency(activeCurrentTrack, direction);
+
+      let baselinePrimaryValue = Number.isFinite(currentPrimaryD) ? currentPrimaryD : undefined;
+      let baselinePrimaryId = Number.isFinite(currentPrimaryD)
+          ? (activeCurrentTrack?.identifier || activeCurrentTrack?.trackMd5 || null)
+          : null;
+
+      if (!Number.isFinite(baselinePrimaryValue)) {
+          for (const sample of samples) {
+              const candidatePrimary = resolvePrimaryDForConsistency(sample, direction);
+              if (Number.isFinite(candidatePrimary)) {
+                  const track = sample?.track || sample;
+                  baselinePrimaryValue = candidatePrimary;
+                  baselinePrimaryId = track?.identifier || track?.trackMd5 || null;
+                  break;
+              }
+          }
+      }
+
+      if (!skipPrimaryDeltaCheck && Number.isFinite(baselinePrimaryValue)) {
+          samples.forEach(sample => {
+              const candidatePrimary = resolvePrimaryDForConsistency(sample, direction);
+              if (!Number.isFinite(candidatePrimary)) {
+                  return;
+              }
+              const track = sample?.track || sample;
+              const trackId = track?.identifier || track?.trackMd5 || null;
+              if (trackId && baselinePrimaryId && trackId === baselinePrimaryId) {
+                  return;
+              }
+              primaryDeltas.push({
+                  id: trackId,
+                  title: getDisplayTitle(track),
+                  value: candidatePrimary,
+                  delta: candidatePrimary - baselinePrimaryValue
+              });
+          });
+
+          if (primaryDeltas.length >= 2) {
+              const primarySpread = primaryDeltas.reduce((max, entry) => Math.max(max, Math.abs(entry.delta)), 0);
+              const primaryTolerance = resolveConsistencyTolerance(baselinePrimaryValue, primarySpread);
+
+              if (primarySpread >= Math.max(primaryTolerance, CONSISTENCY_MIN_SPREAD)) {
+                  const supporting = primaryDeltas.filter(entry => (entry.delta * polarity) > primaryTolerance).length;
+                  const contradicting = primaryDeltas.filter(entry => (entry.delta * polarity) < -primaryTolerance).length;
+
+                  const netDelta = primaryDeltas.reduce((sum, entry) => sum + entry.delta * polarity, 0);
+                  const averageSigned = netDelta / primaryDeltas.length;
+
+                  if (Math.abs(averageSigned) <= primaryTolerance) {
+                      helpersColorLog(`🧮 Skipping primary_d polarity check (mean delta ${averageSigned.toFixed(3)} within tolerance ${primaryTolerance.toFixed(3)})`);
+                  } else if (supporting === 0 && contradicting > 0) {
+                      issues.push(`primary_d deltas oppose implied polarity (contradicting=${contradicting})`);
+                  } else if (contradicting > 0 && contradicting / primaryDeltas.length > CONSISTENCY_MAX_INCONSISTENT_RATIO) {
+                      issues.push(`primary_d deltas mixed beyond tolerance (contra=${contradicting}/${primaryDeltas.length})`);
+                  }
+              } else {
+                  helpersColorLog(`🧮 Skipping primary_d check due to low spread: ${primarySpread.toFixed(3)} < tolerance ${primaryTolerance.toFixed(3)}`);
+              }
+          }
+      }
+
+      const status = issues.length ? 'warn' : 'ok';
+
+      const cardElement = card instanceof Element ? card : null;
+      const signature = issues.join(' | ') || 'ok';
+      const previousSignature = cardElement ? cardElement.dataset.consistencySignature || null : null;
+
+      if (cardElement) {
+          cardElement.dataset.consistencyStatus = status;
+          cardElement.dataset.consistencySignature = signature;
+          if (issues.length) {
+              cardElement.dataset.consistencyIssues = signature;
+              cardElement.classList.add('consistency-issue');
+          } else {
+              delete cardElement.dataset.consistencyIssues;
+              cardElement.classList.remove('consistency-issue');
+          }
+      }
+
+      if (signature !== previousSignature) {
+          if (issues.length) {
+              console.warn(`⚠️ Consistency check failed for ${direction.key}`, {
+                  issues,
+                  descriptor: descriptorKey,
+                  metricDiffs: diffEntries,
+                  primaryDeltas
+              });
+          } else if (window.DEBUG_FLAGS?.consistency && (diffEntries.length || primaryDeltas.length)) {
+              console.debug(`✅ Consistency check passed for ${direction.key}`, {
+                  descriptor: descriptorKey,
+                  sampleCount: samples.length,
+                  metricDiffs: diffEntries,
+                  primaryDeltas
+              });
+          }
+      }
+  }
+
+  window.evaluateDirectionConsistency = evaluateDirectionConsistency;
+
   // Update the stack visualization with remaining track count
   function updateStackSizeIndicator(direction, cardForContext, overrideIndex) {
       const nextTrackCard = cardForContext
           || document.querySelector('.dimension-card.next-track.selected')
           || document.querySelector('.dimension-card.next-track');
       if (!nextTrackCard) return;
+
+      const isNextTrackCard = nextTrackCard.classList.contains('next-track');
 
       // Remove any existing stack indicator
       const existingIndicator = nextTrackCard.querySelector('.stack-line-visual');
@@ -272,7 +775,7 @@ function helpersDuplicateLog(...args) {
           existingMetrics.remove();
       }
 
-      if (remainingCount > 0) {
+      if (!isNextTrackCard && remainingCount > 0) {
           const stackLineContainer = document.createElement('div');
           stackLineContainer.className = 'stack-line-visual';
 
@@ -290,7 +793,7 @@ function helpersDuplicateLog(...args) {
               line.style.height = `${Math.max(2, Math.round(currentHeight))}px`;
               line.style.backgroundColor = lineColor;
               stackLineContainer.appendChild(line);
-              currentHeight = currentHeight * 0.75;
+              currentHeight = currentHeight * 0.85;
           }
 
           stackLineContainer.addEventListener('click', (e) => {
@@ -305,10 +808,40 @@ function helpersDuplicateLog(...args) {
       const metricsContainer = document.createElement('div');
       metricsContainer.className = 'track-metrics';
 
+      const hasHttpWord = (text) => {
+          if (!text) return false;
+          const parts = text.split(/\s+/);
+          return parts.some(part => /^https?:/i.test(part));
+      };
+
+      const shouldDisplayMetric = (label, value) => {
+          if (label === null || label === undefined) {
+              return false;
+          }
+          const text = String(label).trim();
+          if (!text) {
+              return false;
+          }
+          if (hasHttpWord(text)) {
+              return false;
+          }
+          if (value !== undefined && value !== null) {
+              const valueText = String(value).trim();
+              if (hasHttpWord(valueText)) {
+                  return false;
+              }
+          }
+          return true;
+      };
+
       const createMetric = (label, value) => {
+          if (!shouldDisplayMetric(label, value)) {
+              return null;
+          }
           const container = document.createElement('div');
           container.className = 'metric-chip';
-          container.innerHTML = `<span class="metric-label">${label}</span><span class="metric-value">${value}</span>`;
+          const labelText = String(label).trim();
+          container.innerHTML = `<span class="metric-label">${labelText}</span><span class="metric-value">${value}</span>`;
           return container;
       };
 
@@ -400,18 +933,27 @@ function helpersDuplicateLog(...args) {
       };
 
       if (window.debugNextTrackMetrics.candidate) {
-          metricsContainer.appendChild(createMetric('next', formatMetric(candidateValue)));
+          const metric = createMetric('next', formatMetric(candidateValue));
+          if (metric) {
+              metricsContainer.appendChild(metric);
+          }
       }
 
       if (window.debugNextTrackMetrics.current) {
-          metricsContainer.appendChild(createMetric('curr', formatMetric(currentValue)));
+          const metric = createMetric('curr', formatMetric(currentValue));
+          if (metric) {
+              metricsContainer.appendChild(metric);
+          }
       }
 
       if (window.debugNextTrackMetrics.delta) {
           const diff = (candidateValue !== undefined && currentValue !== undefined)
               ? Number(candidateValue) - Number(currentValue)
               : undefined;
-          metricsContainer.appendChild(createMetric(' Δ ', formatDelta(diff)));
+          const metric = createMetric(' Δ ', formatDelta(diff));
+          if (metric) {
+              metricsContainer.appendChild(metric);
+          }
       }
 
       if (window.debugNextTrackMetrics.others) {
@@ -454,7 +996,10 @@ function helpersDuplicateLog(...args) {
                   const relativeText = relativeTextRaw !== '--' ? `${relativeTextRaw}×` : relativeTextRaw;
                   const fractionText = formatRatio(slice.fraction);
                   const valueText = `${deltaText} ${relativeText} ${fractionText}`;
-                  metricsContainer.appendChild(createMetric(label, valueText));
+                  const metric = createMetric(label, valueText);
+                  if (metric) {
+                      metricsContainer.appendChild(metric);
+                  }
               });
           } else {
               const otherDiffs = [];
@@ -495,7 +1040,10 @@ function helpersDuplicateLog(...args) {
                   .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
                   .slice(0, 10)
                   .forEach(({ key, delta }) => {
-                      metricsContainer.appendChild(createMetric(key, formatDelta(delta)));
+                      const metric = createMetric(key, formatDelta(delta));
+                      if (metric) {
+                          metricsContainer.appendChild(metric);
+                      }
                   });
           }
       }
@@ -591,10 +1139,23 @@ function helpersDuplicateLog(...args) {
       }
   }
 
-  // Hide the stack size indicator
-  function hideStackSizeIndicator() {
-      const allCards = document.querySelectorAll('.dimension-card');
-      allCards.forEach(card => {
+  // Hide stack size indicators - defaults to next-track cards unless a target is provided
+  function hideStackSizeIndicator(target) {
+      let cards;
+      if (!target) {
+          cards = Array.from(document.querySelectorAll('.dimension-card.next-track, .dimension-card.track-detail-card'));
+      } else if (target instanceof Element) {
+          cards = [target];
+      } else if (typeof NodeList !== 'undefined' && target instanceof NodeList) {
+          cards = Array.from(target).filter(Boolean);
+      } else if (Array.isArray(target)) {
+          cards = target.filter(Boolean);
+      } else {
+          cards = target ? [target] : [];
+      }
+
+      cards.forEach(card => {
+          if (!card) return;
           const indicator = card.querySelector('.stack-line-visual');
           if (indicator) {
               indicator.remove();
@@ -605,6 +1166,62 @@ function helpersDuplicateLog(...args) {
           }
       });
   }
+
+  // Apply stack size visuals to direction cards so we can see stack depth at a glance
+  function applyDirectionStackIndicator(direction, card, options = {}) {
+      if (!direction || !card) return;
+      if (card.classList.contains('next-track')) return;
+
+      const existingIndicator = card.querySelector('.stack-line-visual');
+      if (existingIndicator) {
+          existingIndicator.remove();
+      }
+
+      const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+      const reportedCount = Number(direction.trackCount);
+      const totalTracks = Number.isFinite(reportedCount) && reportedCount > 0
+          ? Math.max(reportedCount, sampleTracks.length)
+          : sampleTracks.length;
+      const includeActive = options.includeActive === true;
+      const lineCount = includeActive ? totalTracks : Math.max(0, totalTracks - 1);
+
+      if (lineCount <= 0) {
+          return;
+      }
+
+      const stackLineContainer = document.createElement('div');
+      stackLineContainer.className = 'stack-line-visual';
+
+      const computedStyle = window.getComputedStyle(card);
+      const fallbackColor = direction.borderColor || '#ffffff';
+      const lineColor = (computedStyle.getPropertyValue('--border-color') || computedStyle.borderColor || fallbackColor).trim() || fallbackColor;
+
+      let cardHeight = card.offsetHeight || 0;
+      if (!cardHeight) {
+          const rect = card.getBoundingClientRect();
+          cardHeight = rect?.height || 0;
+      }
+      const baseHeight = cardHeight ? Math.max(2, Math.round(cardHeight * 0.66)) : 40;
+
+      let currentHeight = baseHeight;
+      for (let i = 0; i < lineCount; i += 1) {
+          const line = document.createElement('div');
+          line.className = 'stack-line';
+          line.style.height = `${Math.max(2, Math.round(currentHeight))}px`;
+          line.style.backgroundColor = lineColor;
+          stackLineContainer.appendChild(line);
+          currentHeight *= 0.75;
+      }
+
+      stackLineContainer.addEventListener('click', (e) => {
+          e.stopPropagation();
+          card.click();
+      });
+
+      card.appendChild(stackLineContainer);
+  }
+
+  window.applyDirectionStackIndicator = applyDirectionStackIndicator;
 
 
   // Comprehensive duplicate detection system
@@ -741,9 +1358,20 @@ function helpersDuplicateLog(...args) {
           centerCard.dataset.trackMd5 = nextTrack.identifier;
           centerCard.dataset.trackIndex = nextIndex;
           centerCard.dataset.totalTracks = String(sampleTracks.length);
+
           const directionData = state.latestExplorerData?.directions?.[directionKey];
-          if (directionData && typeof updateStackSizeIndicator === 'function') {
-              updateStackSizeIndicator(directionData, centerCard, nextIndex);
+          if (directionData) {
+              const directionForUpdate = {
+                  ...directionData,
+                  key: directionKey,
+                  sampleTracks: directionData.sampleTracks || sampleTracks
+              };
+
+              updateCardWithTrackDetails(centerCard, nextTrack, directionForUpdate, true, window.swapStackContents);
+
+              if (typeof updateStackSizeIndicator === 'function') {
+                  updateStackSizeIndicator(directionData, centerCard, nextIndex);
+              }
           }
       }
 
@@ -760,86 +1388,84 @@ function helpersDuplicateLog(...args) {
   function createTrackDetailCard(direction, track, positionIndex, totalDimensions, isSelected, trackIndex, totalTracks, swapStackContents) {
       const swapFn = typeof swapStackContents === 'function' ? swapStackContents : (a, b) => {};
       const card = document.createElement('div');
-      let cardClasses = 'dimension-card track-detail-card next-track';
 
-      // Add stacking classes based on total track count in this direction
+      let cardClasses = 'dimension-card track-detail-card next-track';
       if (totalTracks > 1) {
           cardClasses += ' stacked';
       }
       if (totalTracks >= 3) {
           cardClasses += ' heavily-stacked';
       }
-
-      // Add negative-direction class for inverted rim
-      if (isNegativeDirection(direction.key)) {
-          cardClasses += ' negative-direction';
-      }
-
-      // Add outlier class for special styling
       if (direction.isOutlier) {
           cardClasses += ' outlier';
       }
-
       card.className = cardClasses;
-      card.dataset.directionKey = direction.key;
+
       card.dataset.trackMd5 = track.identifier;
       card.dataset.trackIndex = trackIndex;
       card.dataset.totalTracks = totalTracks;
+      card.dataset.trackTitle = getDisplayTitle(track) || '';
+      card.dataset.trackArtist = track.artist || '';
+      card.dataset.trackAlbum = track.album || '';
+      if (track.albumCover) {
+          card.dataset.trackAlbumCover = track.albumCover;
+      } else {
+          delete card.dataset.trackAlbumCover;
+      }
+      card.dataset.trackAlbumCover = track.albumCover || '';
+
+      const context = getDirectionVisualContext({ direction, card, track });
+      if (!context) {
+          console.warn(`⚠️ Unable to resolve direction context for track detail card (${direction?.key || 'unknown'})`);
+          return card;
+      }
+
+      const { resolvedKey, directionType, directionColors, isNegative } = context;
+      const colorVariant = variantFromDirectionType(directionType);
+
+      card.dataset.directionKey = resolvedKey;
+      if (!card.dataset.originalDirectionKey) {
+          card.dataset.originalDirectionKey = resolvedKey;
+      }
 
       // Position next track cards at CENTER of screen
-      const centerX = 50; // Dead center horizontally
-      const centerY = 45; // Slightly above center to balance with UI
-
-      // For multiple tracks in stack, use small offset for stacking
+      const centerX = 50;
+      const centerY = 45;
       const angle = (positionIndex / totalDimensions) * Math.PI * 2 - Math.PI / 2;
-      const radiusX = 8; // Small offset for stacked cards
-      const radiusY = 5; // Minimal vertical offset
+      const radiusX = 8;
+      const radiusY = 5;
       const baseX = centerX + radiusX * Math.cos(angle);
       const baseY = centerY + radiusY * Math.sin(angle);
 
-      // Stack cards: selected track in front, others behind and to the right
-      const offsetX = isSelected ? 0 : (trackIndex - 0) * 2; // 2% offset per card behind
-      const offsetY = isSelected ? 0 : -10; // Move back cards up by 10% to be halfway closer to top edge
-      const offsetZ = isSelected ? -1000 : -2500 - (trackIndex * 250); // Even further back for less crowding
-      const scale = isSelected ? 0.85 : 0.3; // Smaller cards overall to reduce crowding
-      const zIndex = isSelected ? 100 : (200 - trackIndex); // Higher z-index for back cards to ensure clickability
+      const offsetX = isSelected ? 0 : trackIndex * 2;
+      const offsetY = isSelected ? 0 : -10;
+      const offsetZ = isSelected ? -1000 : -2500 - (trackIndex * 250);
+      const scale = isSelected ? 0.85 : 0.3;
+      const zIndex = isSelected ? 100 : (200 - trackIndex);
 
       card.style.left = `${baseX + offsetX}%`;
       card.style.top = `${baseY + offsetY}%`;
-      // Use 2D transforms instead of 3D for better performance
       card.style.transform = `translate(-50%, -50%) scale(${scale})`;
       card.style.zIndex = zIndex;
       card.style.position = 'absolute';
       card.style.willChange = 'transform, opacity';
 
-      // Use same color as parent dimension for consistency
-      const directionType = getDirectionType(direction.key);
-      const colorVariant = variantFromDirectionType(directionType);
-
-
-      // Track details
       const duration = (track.duration || track.length) ?
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
 
-      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
+      const numericDuration = Number(track.duration ?? track.length);
+      if (Number.isFinite(numericDuration)) {
+          card.dataset.trackDurationSeconds = String(numericDuration);
+      }
+      card.dataset.trackDurationDisplay = duration;
 
-      const explorerDirections = state.latestExplorerData?.directions || {};
-      const oppositeKey = getOppositeDirection(direction.key);
-      const hasOpposite =
-          direction.hasOpposite === true ||
-          !!direction.oppositeDirection ||
-          (oppositeKey ? !!explorerDirections[oppositeKey] : false) ||
-          Object.values(explorerDirections).some(dir => dir.oppositeDirection?.key === direction.key);
-      const unoReverseHtml = hasOpposite && isSelected ? `
-          <div class="uno-reverse enabled">^</div>
-      ` : '';
+      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
 
       card.innerHTML = `
           <div class="panel ${colorVariant}">
               <div class="photo" style="${photoStyle(track.albumCover)}"></div>
               <span class="rim"></span>
-              ${unoReverseHtml}
               <div class="label">
                   <h2>${directionName}</h2>
                   <h3>${getDisplayTitle(track)}</h3>
@@ -850,168 +1476,243 @@ function helpersDuplicateLog(...args) {
           </div>
       `;
 
-      // Click handler - cycle through tracks in this direction
-      card.addEventListener('click', (e) => {
-          // Check if clicking on the reverse icon - if so, don't cycle
-          if (e.target.closest('.uno-reverse')) {
-              console.log(`🔄 Clicked on reverse icon, ignoring card click`);
-              return; // Let the reverse icon handle its own behavior
-          }
+      card.style.setProperty('--border-color', directionColors.border);
+      card.style.setProperty('--glow-color', directionColors.glow);
+      card.classList.toggle('negative-direction', isNegative);
 
-          console.log(`🔄 Cycling stack for dimension: ${direction.key} from track index ${state.stackIndex}`);
-          cycleStackContents(direction.key, state.stackIndex);
+      const rimEl = card.querySelector('.rim');
+      if (rimEl) {
+          const rimStyle = isNegative
+              ? `conic-gradient(from 180deg, ${directionColors.glow}, ${directionColors.border}, ${directionColors.glow})`
+              : `conic-gradient(${directionColors.border}, ${directionColors.glow}, ${directionColors.border})`;
+          rimEl.style.background = rimStyle;
+      }
+
+      applyReverseBadge(card, direction, context, {
+          interactive: isSelected,
+          extraClasses: isSelected ? 'enabled' : 'has-opposite'
       });
 
-      // Add click handler for Uno Reverse symbol if present
-      if (hasOpposite && isSelected) {
-          const unoReverse = card.querySelector('.uno-reverse');
-          if (unoReverse) {
-              unoReverse.addEventListener('click', (e) => {
-                  e.stopPropagation(); // Prevent card click
-                  console.log(`🔄 Swapping stack contents from ${direction.key} to opposite`);
-
-                  const currentDirection = state.latestExplorerData.directions[direction.key];
-                  if (currentDirection && currentDirection.oppositeDirection) {
-                      // Temporarily add the opposite direction to SSE data for swapping
-                      const oppositeKey = getOppositeDirection(direction.key);
-                      if (oppositeKey) {
-                          state.latestExplorerData.directions[oppositeKey] = {
-                              ...currentDirection.oppositeDirection,
-                              hasOpposite: true,
-                              key: oppositeKey
-                          };
-
-                          // Swap stack contents immediately without animation
-                          swapFn(direction.key, oppositeKey);
-                      }
-                  } else {
-                      console.warn(`Opposite direction not available for ${direction.key}`);
-                  }
-              });
+      card.addEventListener('click', (e) => {
+          if (e.target.closest('.uno-reverse')) {
+              console.log(`🔄 Clicked on reverse icon, ignoring card click`);
+              return;
           }
+
+          console.log(`🔄 Cycling stack for dimension: ${resolvedKey} from track index ${state.stackIndex}`);
+          cycleStackContents(resolvedKey, state.stackIndex);
+      });
+
+      const reverseButton = card.querySelector('.uno-reverse.next-track-reverse');
+      if (reverseButton) {
+          reverseButton.addEventListener('click', (e) => {
+              e.stopPropagation();
+              console.log(`🔄 Swapping stack contents from ${resolvedKey} to opposite`);
+
+              const currentDirection = state.latestExplorerData.directions[resolvedKey];
+              if (currentDirection && currentDirection.oppositeDirection) {
+                  const oppositeKey = getOppositeDirection(resolvedKey);
+                  if (oppositeKey) {
+                      state.latestExplorerData.directions[oppositeKey] = {
+                          ...currentDirection.oppositeDirection,
+                          hasOpposite: true,
+                          key: oppositeKey
+                      };
+
+                      swapFn(resolvedKey, oppositeKey);
+                  }
+              } else {
+                  console.warn(`Opposite direction not available for ${resolvedKey}`);
+              }
+          });
       }
 
       return card;
   }
 
+  function ensureStackedPreviewLayer() {
+      const container = document.getElementById('dimensionCards');
+      if (!container) return null;
+      let layer = container.querySelector('.stacked-preview-layer');
+      if (!layer) {
+          layer = document.createElement('div');
+          layer.className = 'stacked-preview-layer';
+          container.appendChild(layer);
+      }
+      return layer;
+  }
+
+  function clearStackedPreviewLayer() {
+      const container = document.getElementById('dimensionCards');
+      if (!container) return;
+      const layer = container.querySelector('.stacked-preview-layer');
+      if (layer) {
+          layer.innerHTML = '';
+      }
+  }
+
+  function renderStackedPreviews(card, direction, selectedIndex) {
+      const container = document.getElementById('dimensionCards');
+      if (!container) return;
+
+      const layer = ensureStackedPreviewLayer();
+      if (!layer) return;
+
+      if (!card || !card.classList.contains('next-track')) {
+          clearStackedPreviewLayer();
+          return;
+      }
+
+      const samples = Array.isArray(direction?.sampleTracks)
+          ? direction.sampleTracks.map(entry => entry?.track || entry).filter(Boolean)
+          : [];
+
+      const currentId = card.dataset.trackMd5 || null;
+      let activeIndex = samples.findIndex(sample => sample?.identifier === currentId);
+      if (activeIndex < 0 && Number.isFinite(selectedIndex)) {
+          activeIndex = selectedIndex;
+      }
+
+      const remaining = activeIndex >= 0 ? samples.slice(activeIndex + 1) : samples.slice(1);
+
+      if (!remaining.length) {
+          clearStackedPreviewLayer();
+          return;
+      }
+
+      const containerRect = container.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      const baseWidth = cardRect.width || 200;
+      const baseHeight = cardRect.height || baseWidth * (5 / 3);
+      const originX = cardRect.left - containerRect.left;
+      const originY = cardRect.top - containerRect.top;
+
+      layer.innerHTML = '';
+
+      const maxItems = 4;
+      const previews = remaining.slice(0, maxItems);
+      previews.forEach((sample, index) => {
+          const scale = Math.pow(0.9, index + 1);
+          let offsetX = originX + baseWidth * 0.1 + 30 * (index - 1);
+          const offsetY = originY + 16 * index;
+
+          const preview = document.createElement('div');
+          preview.className = 'stacked-preview-layer-card';
+          preview.style.width = `${baseWidth}px`;
+          preview.style.height = `${baseHeight}px`;
+          preview.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+          const zIndex = previews.length - index;
+          preview.style.zIndex = `${zIndex}`;
+
+          const panel = document.createElement('div');
+          panel.className = 'preview-panel';
+
+          const photo = document.createElement('div');
+          photo.className = 'preview-photo';
+          if (sample.albumCover) {
+              photo.style.backgroundImage = `url("${sample.albumCover}")`;
+          }
+
+          const rim = document.createElement('span');
+          rim.className = 'preview-rim';
+
+          const label = document.createElement('div');
+          label.className = 'preview-label';
+          label.innerHTML = `
+              <h4>${formatDirectionName(direction.key || direction.direction || '')}</h4>
+              <h5>${getDisplayTitle(sample)}</h5>
+          `;
+
+          panel.appendChild(photo);
+          panel.appendChild(rim);
+          panel.appendChild(label);
+          preview.appendChild(panel);
+          layer.appendChild(preview);
+      });
+  }
+
   function redrawDimensionCardsWithNewNext(newNextDirectionKey) {
       if (!state.latestExplorerData) return;
 
-      // Update the stored explorer data to track the new next direction
-      const stack = state.latestExplorerData.directions[newNextDirectionKey];
-      state.latestExplorerData.nextTrack = {
-          directionKey: newNextDirectionKey,
-          direction:    stack.direction,
-          track:        stack.sampleTracks[0]
+      const targetDimension = state.latestExplorerData.directions?.[newNextDirectionKey];
+      if (!targetDimension) {
+          console.warn(`🔄 redrawDimensionCardsWithNewNext: direction ${newNextDirectionKey} not found`);
+          return;
+      }
+
+      const normalizeSample = (sample) => {
+          if (!sample) return null;
+          if (sample.track) return sample.track;
+          return sample;
       };
 
-      // Remove ALL existing track detail cards (both old next track stacks and any other detail cards)
-      document.querySelectorAll('.track-detail-card').forEach(card => card.remove());
+      const sampleTracks = (targetDimension.sampleTracks || [])
+          .map(normalizeSample)
+          .filter(track => track && track.identifier);
 
-      // Recreate the card stack for the new next direction immediately
-      const container = document.getElementById('dimensionCards');
-      const directions = Object.entries(state.latestExplorerData.directions).map(([key, directionInfo]) => ({
-          key: key,
-          name: directionInfo.direction || key,
-          trackCount: directionInfo.trackCount,
-          description: directionInfo.description,
-          diversityScore: directionInfo.diversityScore,
-          sampleTracks: directionInfo.sampleTracks || []
-      }));
+      if (!sampleTracks.length) {
+          console.warn(`🔄 redrawDimensionCardsWithNewNext: no sample tracks for ${newNextDirectionKey}`);
+          return;
+      }
 
-      const swapFn = typeof window.swapStackContents === 'function' ? window.swapStackContents : () => {};
+      const selectedTrackIndex = state.selectedIdentifier
+          ? sampleTracks.findIndex(track => track.identifier === state.selectedIdentifier)
+          : 0;
+      const finalSelectedIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
+      const selectedTrack = sampleTracks[finalSelectedIndex] || sampleTracks[0];
 
-      const targetDimension = directions.find(d => d.key === newNextDirectionKey);
-      if (targetDimension) {
-          const dimensionIndex = directions.findIndex(d => d.key === newNextDirectionKey);
-          // Create immediately without animation delay
-          const sampleTracks = (targetDimension.sampleTracks || []).map(entry => entry.track || entry);
-          if (sampleTracks.length === 0) {
-              console.warn(`🔄 redrawDimensionCardsWithNewNext: no sample tracks for ${newNextDirectionKey}`);
-              return;
+      state.stackIndex = finalSelectedIndex;
+      state.selectedIdentifier = selectedTrack?.identifier || state.selectedIdentifier;
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
+      }
+      state.remainingCounts[newNextDirectionKey] = Math.max(0, sampleTracks.length - finalSelectedIndex - 1);
+
+      state.latestExplorerData.nextTrack = {
+          directionKey: newNextDirectionKey,
+          direction: targetDimension.direction,
+          track: selectedTrack
+      };
+
+      const currentNextCard = document.querySelector('.dimension-card.next-track');
+      let demoteDelay = 0;
+      if (currentNextCard) {
+          const currentKey = currentNextCard.dataset.baseDirectionKey
+              || currentNextCard.dataset.originalDirectionKey
+              || currentNextCard.dataset.directionKey
+              || null;
+          if (currentKey && currentKey !== newNextDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
+              const demoted = rotateCenterCardToNextPosition(currentKey)
+                  || rotateCenterCardToNextPosition(currentNextCard.dataset.directionKey || currentKey);
+              if (demoted) {
+                  demoteDelay = 820; // match animation duration in rotateCenterCardToNextPosition
+              }
           }
+      }
 
-          // Use global selection state, default to first track if none selected
-          const selectedTrackIndex = state.selectedIdentifier
-              ? sampleTracks.findIndex(trackObj => trackObj.identifier === state.selectedIdentifier)
-              : 0;
-          const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
-          const selectedTrack = sampleTracks[finalSelectedTrackIndex] || sampleTracks[0];
-
-          // Update global selection bookkeeping for future stack cycles
-          state.stackIndex = finalSelectedTrackIndex;
-          state.selectedIdentifier = selectedTrack?.identifier || state.selectedIdentifier;
-          if (!state.remainingCounts) {
-              state.remainingCounts = {};
-          }
-          state.remainingCounts[newNextDirectionKey] = Math.max(0, sampleTracks.length - finalSelectedTrackIndex - 1);
-
-          // Prefer reusing an existing next-track card if one is already mounted
-          const existingCard = document.querySelector('.dimension-card.next-track');
-          if (existingCard) {
-              // Remove any stray duplicates of the next-track card
-              const duplicates = document.querySelectorAll('.dimension-card.next-track');
-              duplicates.forEach((dup, idx) => {
-                  if (dup !== existingCard) {
-                      dup.remove();
-                  }
-              });
-
-              existingCard.classList.add('next-track');
-              existingCard.classList.remove('animating-to-center');
-              existingCard.dataset.directionKey = newNextDirectionKey;
-              existingCard.dataset.trackMd5 = selectedTrack?.identifier || '';
-              existingCard.dataset.clockPosition = existingCard.dataset.clockPosition || '6';
-              existingCard.style.left = '50%';
-              existingCard.style.top = '45%';
-              existingCard.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
-              existingCard.style.zIndex = '100';
-
-              updateCardWithTrackDetails(existingCard, selectedTrack, {
+      const promote = () => {
+          if (typeof animateDirectionToCenter === 'function') {
+              animateDirectionToCenter(newNextDirectionKey);
+          } else {
+              // Fallback: directly convert card without animation
+              const targetCard = document.querySelector(`[data-direction-key="${newNextDirectionKey}"]`);
+              if (!targetCard) {
+                  console.warn(`🔄 redrawDimensionCardsWithNewNext: no card found for ${newNextDirectionKey}`);
+                  return;
+              }
+              updateCardWithTrackDetails(targetCard, selectedTrack, {
                   ...targetDimension,
                   key: newNextDirectionKey,
-                  sampleTracks
-              }, true, swapFn);
-
-              existingCard.dataset.trackIndex = String(finalSelectedTrackIndex);
-              existingCard.dataset.totalTracks = String(sampleTracks.length);
-
-              const directionData = state.latestExplorerData?.directions?.[newNextDirectionKey];
-              if (directionData && typeof updateStackSizeIndicator === 'function') {
-                  updateStackSizeIndicator(directionData, existingCard, finalSelectedTrackIndex);
-              }
-
-              return;
+                  sampleTracks: sampleTracks.map(track => ({ track }))
+              }, true, window.swapStackContents);
+              targetCard.classList.add('next-track', 'track-detail-card');
           }
+      };
 
-          const card = createTrackDetailCard(
-              targetDimension,
-              selectedTrack,
-              dimensionIndex,
-              directions.length,
-              true,
-              finalSelectedTrackIndex,
-              sampleTracks.length,
-              swapFn
-          );
-          card.classList.add('next-track');
-          card.style.left = '50%';
-          card.style.top = '45%';
-          card.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
-          card.style.zIndex = '100';
-
-          container.appendChild(card);
-          card.dataset.trackIndex = String(finalSelectedTrackIndex);
-          card.dataset.totalTracks = String(sampleTracks.length);
-
-          const directionData = state.latestExplorerData?.directions?.[newNextDirectionKey];
-          if (directionData && typeof updateStackSizeIndicator === 'function') {
-              updateStackSizeIndicator(directionData, card, finalSelectedTrackIndex);
-          }
-
-          requestAnimationFrame(() => {
-              card.classList.add('visible');
-          });
+      if (demoteDelay > 0) {
+          setTimeout(promote, demoteDelay);
+      } else {
+          promote();
       }
   }
 
@@ -1110,29 +1811,53 @@ function helpersDuplicateLog(...args) {
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
 
-      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
+      const context = getDirectionVisualContext({
+          direction,
+          card,
+          track,
+          fallbackKey: card.dataset.originalDirectionKey
+      });
 
-      const explorerDirections = state.latestExplorerData?.directions || {};
-      const oppositeKey = getOppositeDirection(direction.key);
-      const hasOpposite =
-          direction.hasOpposite === true ||
-          !!direction.oppositeDirection ||
-          (oppositeKey ? !!explorerDirections[oppositeKey] : false) ||
-          Object.values(explorerDirections).some(dir => dir.oppositeDirection?.key === direction.key);
+      if (!context) {
+          console.warn(`⚠️ Unable to resolve direction context when updating card (${direction?.key || 'unknown'})`);
+          return;
+      }
 
-      // 🎯 DEBUG: Detailed reverse icon availability check
-      const directionData = state.latestExplorerData.directions[direction.key];
-      const oppositeExists = oppositeKey && state.latestExplorerData.directions[oppositeKey];
+      const { resolvedKey, directionType, directionColors, isNegative } = context;
+      direction.key = resolvedKey;
 
-      const unoReverseHtml = hasOpposite ? `
-          <div class="uno-reverse next-track-reverse enabled"></div>
-      ` : '';
-      console.log(`🔄 Generated unoReverseHtml:`, unoReverseHtml.trim());
+      if (!card.dataset.originalDirectionKey) {
+          card.dataset.originalDirectionKey = resolvedKey;
+      }
 
-      // Always define directionType for later use
-      const directionType = getDirectionType(direction.key);
+      const variantClass = variantFromDirectionType(directionType);
+
+      if (typeof window !== 'undefined' && typeof window.setCardVariant === 'function') {
+          window.setCardVariant(card, variantFromDirectionType(directionType));
+      }
+
+      if (state.usingOppositeDirection) {
+          if (!card.dataset.baseDirectionKey) {
+              card.dataset.baseDirectionKey = state.baseDirectionKey || resolvedKey;
+          }
+          card.dataset.oppositeDirectionKey = resolvedKey;
+      } else {
+          if (!card.dataset.baseDirectionKey || card.dataset.baseDirectionKey !== resolvedKey) {
+              card.dataset.baseDirectionKey = resolvedKey;
+          }
+          if (state.currentOppositeDirectionKey) {
+              card.dataset.oppositeDirectionKey = state.currentOppositeDirectionKey;
+          } else {
+              delete card.dataset.oppositeDirectionKey;
+          }
+      }
+
+      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
+      const hasOpposite = hasOppositeForDirection(direction, resolvedKey);
+      const wantsInteractiveReverse = hasOpposite && (card.classList.contains('next-track') || card.classList.contains('track-detail-card'));
+      const highlight = wantsInteractiveReverse ? (isNegative ? 'top' : 'bottom') : null;
       card.dataset.directionType = directionType;
-      const intrinsicNegative = isNegativeDirection(direction.key);
+      const intrinsicNegative = isNegative;
 
       const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
       const currentIndex = sampleTracks.findIndex(sample => {
@@ -1144,12 +1869,26 @@ function helpersDuplicateLog(...args) {
           card.dataset.trackMd5 = track.identifier;
       }
       card.dataset.trackIndex = currentIndex >= 0 ? currentIndex : 0;
+      card.dataset.directionKey = resolvedKey;
+
+      // Persist core track metadata so later refreshes can fall back to the latest details
+      card.dataset.trackTitle = getDisplayTitle(track) || '';
+      card.dataset.trackArtist = track.artist || '';
+      card.dataset.trackAlbum = track.album || '';
+
+      const numericDuration = Number(track.duration ?? track.length);
+      if (Number.isFinite(numericDuration)) {
+          card.dataset.trackDurationSeconds = String(numericDuration);
+      } else {
+          delete card.dataset.trackDurationSeconds;
+      }
+      card.dataset.trackDurationDisplay = duration;
 
       let borderColor, glowColor;
 
       if (preserveColors) {
           // When preserving colors (e.g., card promotion to center), use existing CSS custom properties
-          helpersColorLog(`🎨 PRESERVE: Keeping existing colors for ${direction.key}`);
+          helpersColorLog(`🎨 PRESERVE: Keeping existing colors for ${resolvedKey}`);
           const computedStyle = getComputedStyle(card);
           borderColor = computedStyle.getPropertyValue('--border-color').trim() ||
                        card.style.getPropertyValue('--border-color').trim();
@@ -1159,31 +1898,31 @@ function helpersDuplicateLog(...args) {
           // Fallback: if no existing colors, calculate fresh ones
           if (!borderColor || !glowColor) {
               helpersColorLog(`🎨 PRESERVE FALLBACK: No existing colors found, calculating fresh ones`);
-              const freshColors = getDirectionColor(directionType, direction.key);
+              const freshColors = getDirectionColor(directionType, resolvedKey);
               borderColor = borderColor || freshColors.border;
               glowColor = glowColor || freshColors.glow;
           }
       } else {
-          // SIMPLIFIED COLOR CALCULATION: Always calculate fresh colors from dimension
-
+          // Always respect the intrinsic palette of the resolved direction
           if (state.usingOppositeDirection) {
-              // In reverse mode, get analogous complementary colors for the current dimension
-              helpersColorLog(`🎨 REVERSE: Calculating reverse colors for ${direction.key} (${directionType})`);
-              const reverseColors = getDirectionColor(directionType, direction.key + '_force_negative');
-              borderColor = reverseColors.border;
-              glowColor = reverseColors.glow;
+              helpersColorLog(`🎨 OPPOSITE: Using intrinsic colors for ${resolvedKey} (${directionType})`);
           } else {
-              // Normal mode: get primary colors for the current dimension
-              helpersColorLog(`🎨 NORMAL: Calculating primary colors for ${direction.key} (${directionType})`);
-              const primaryColors = getDirectionColor(directionType, direction.key + '_force_primary');
-              borderColor = primaryColors.border;
-              glowColor = primaryColors.glow;
+              helpersColorLog(`🎨 NORMAL: Using intrinsic colors for ${resolvedKey} (${directionType})`);
           }
+          borderColor = directionColors.border;
+          glowColor = directionColors.glow;
       }
+
+      borderColor = borderColor || directionColors.border;
+      glowColor = glowColor || directionColors.glow;
 
       // Apply the final colors
       card.style.setProperty('--border-color', borderColor);
       card.style.setProperty('--glow-color', glowColor);
+      card.style.setProperty('--card-border-color', borderColor);
+      if (typeof window !== 'undefined' && typeof window.getCardBackgroundColor === 'function') {
+          card.style.setProperty('--card-background-color', window.getCardBackgroundColor(directionType));
+      }
 
       // ALSO update the data attributes to match
       card.dataset.borderColor = borderColor;
@@ -1202,16 +1941,12 @@ function helpersDuplicateLog(...args) {
           rimEl.style.background = rimStyle;
       };
 
-      applyRimBackground(card.querySelector('.rim'));
-
       // Preserve existing panel classes (color variants)
       const existingPanel = card.querySelector('.panel');
       let panelClasses = 'panel';
       if (existingPanel) {
           panelClasses = existingPanel.className;
       } else {
-          // Generate panel class from direction type if no existing panel
-          const variantClass = variantFromDirectionType(directionType);
           panelClasses = `panel ${variantClass}`;
       }
 
@@ -1226,7 +1961,6 @@ function helpersDuplicateLog(...args) {
                   <h5>${track.album || ''}</h5>
                   <p>${duration} · FLAC</p>
               </div>
-              ${unoReverseHtml}
           </div>
       `;
 
@@ -1237,33 +1971,31 @@ function helpersDuplicateLog(...args) {
 
       applyRimBackground(card.querySelector('.rim'));
 
-      // Add click handler for Uno Reverse if present
-      if (hasOpposite) {
-          const unoReverse = card.querySelector('.uno-reverse.next-track-reverse');
+      applyReverseBadge(card, direction, context, {
+          interactive: wantsInteractiveReverse,
+          highlightOverride: highlight,
+          extraClasses: wantsInteractiveReverse ? 'enabled' : 'has-opposite'
+      });
 
-          // Set reversed icon state and rim direction
-          if (unoReverse) {
-              unoReverse.classList.toggle('reversed', state.usingOppositeDirection);
-              unoReverse.addEventListener('click', (e) => {
-                  e.stopPropagation();
-                  console.log(`🔄 Reverse icon clicked for ${direction.key}`);
+      const reverseButton = card.querySelector('.uno-reverse.next-track-reverse');
+      if (reverseButton) {
+          reverseButton.classList.toggle('reversed', state.usingOppositeDirection);
+          reverseButton.addEventListener('click', (e) => {
+              e.stopPropagation();
+              console.log(`🔄 Reverse icon clicked for ${resolvedKey}`);
 
-                  const oppositeKey = getOppositeDirection(direction.key);
-                  console.log(`🔄 Opposite key found: ${oppositeKey}`);
-                  if (oppositeKey) {
-                      console.log(`🔄 About to call swapStackContents(${direction.key}, ${oppositeKey})`);
-                      swapFn(direction.key, oppositeKey);
-                  } else {
-                      console.warn(`No opposite direction found for ${direction.key}`);
-                  }
-              });
-          }
-
-
+              const oppositeKey = getOppositeDirection(resolvedKey);
+              console.log(`🔄 Opposite key found: ${oppositeKey}`);
+              if (oppositeKey) {
+                  console.log(`🔄 About to call swapStackContents(${resolvedKey}, ${oppositeKey})`);
+                  swapFn(resolvedKey, oppositeKey);
+              } else {
+                  console.warn(`No opposite direction found for ${resolvedKey}`);
+              }
+          });
       }
 
-      // Ensure card's data-direction-key matches the actual direction being displayed
-      card.dataset.directionKey = direction.key;
+      card.dataset.directionKey = resolvedKey;
       const stackIndex = Array.isArray(direction.sampleTracks)
           ? direction.sampleTracks.findIndex(sample => {
               const candidate = sample?.track || sample;
@@ -1276,11 +2008,35 @@ function helpersDuplicateLog(...args) {
 
       // Update stack size indicator for next track stacks
       if (card.classList.contains('next-track')) {
+          const sampleCount = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.length : 0;
+          card.style.marginLeft = sampleCount > 1 ? '-40px' : '0px';
+
           updateStackSizeIndicator(direction, card, stackIndex >= 0 ? stackIndex : undefined);
           updateDirectionKeyOverlay(direction, track);
+          const numericIndex = Number(card.dataset.trackIndex ?? stackIndex ?? 0);
+          renderStackedPreviews(card, direction, Number.isFinite(numericIndex) ? numericIndex : 0);
       } else {
-          // Hide indicator if not a next track stack
-          hideStackSizeIndicator();
+          card.style.marginLeft = '0px';
+          if (typeof applyDirectionStackIndicator === 'function') {
+              applyDirectionStackIndicator(direction, card);
+          } else {
+              hideStackSizeIndicator(card);
+          }
           hideDirectionKeyOverlay();
+          clearStackedPreviewLayer();
       }
+
+      if (typeof evaluateDirectionConsistency === 'function') {
+          const samplesForCheck = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+          evaluateDirectionConsistency(direction, {
+              card,
+              sampleTracks: samplesForCheck,
+              currentTrack: window.state?.latestCurrentTrack
+          });
+      }
+  }
+  function resolveConsistencyTolerance(referenceValue = 0, spreadValue = 0) {
+      const magnitude = Math.max(Math.abs(referenceValue || 0), Math.abs(spreadValue || 0));
+      const relativeComponent = magnitude * CONSISTENCY_DYNAMIC_RELATIVE;
+      return Math.max(CONSISTENCY_CHECK_TOLERANCE, CONSISTENCY_DYNAMIC_MIN_TOLERANCE, relativeComponent);
   }

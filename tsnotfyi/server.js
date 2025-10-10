@@ -82,8 +82,7 @@ function checkSingleton() {
   });
 }
 
-// Check singleton before starting
-checkSingleton();
+// Server startup handled in startServer() to support test harness
 
 const audioSessions = new Map(); // Keep for backward compatibility
 const ephemeralSessions = new Map(); // One-off MD5 journey sessions
@@ -381,7 +380,7 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
 // Simplified stream endpoint - resolves session from request context
 app.get('/stream', async (req, res) => {
   try {
-    const session = await getSessionForRequest(req);
+    const session = await getSessionForRequest(req, { createIfMissing: true });
 
     if (!session) {
       logSessionEvent('audio_stream_request_failed', {
@@ -520,8 +519,15 @@ app.get('/events', async (req, res) => {
       return null;
     };
 
-    let session = findOrphanSession(clientIp);
-    let resolution = session ? 'orphan' : null;
+    let session = await getSessionForRequest(req, { createIfMissing: false });
+    let resolution = session ? 'context' : null;
+
+    if (!session) {
+      session = findOrphanSession(clientIp);
+      if (session) {
+        resolution = 'orphan';
+      }
+    }
 
     if (!session && clientIp) {
       for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -553,7 +559,7 @@ app.get('/events', async (req, res) => {
 
     let createdViaFallback = false;
     if (!session) {
-      session = await getSessionForRequest(req);
+      session = await getSessionForRequest(req, { createIfMissing: true });
       resolution = resolution || 'fallback_create';
       createdViaFallback = true;
     }
@@ -651,6 +657,8 @@ app.get('/events/:sessionId', (req, res) => {
 app.post('/refresh-sse', async (req, res) => {
   const requestFingerprint = typeof req.body.fingerprint === 'string' ? req.body.fingerprint.trim() : null;
   const sessionIdFromBody = req.body.sessionId || req.session?.audioSessionId || null;
+  const stageParam = typeof req.body.stage === 'string' ? req.body.stage.trim().toLowerCase() : null;
+  const stage = ['session', 'restart', 'rebroadcast'].includes(stageParam) ? stageParam : 'rebroadcast';
 
   let session = null;
   if (requestFingerprint) {
@@ -661,33 +669,91 @@ app.post('/refresh-sse', async (req, res) => {
         fingerprintRegistry.touch(requestFingerprint, { metadataIp: req.ip });
       }
     }
-    if (!session) {
-      return res.status(404).json({ error: 'Fingerprint not found' });
-    }
   } else if (sessionIdFromBody) {
     session = getSessionById(sessionIdFromBody);
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-  } else {
-    return res.status(400).json({ error: 'Fingerprint or session ID is required' });
   }
 
-  const sessionId = session.sessionId;
-  console.log(`🔄 SSE refresh request for session ${sessionId}${requestFingerprint ? ` (fingerprint=${requestFingerprint})` : ''}`);
+  if (!session && stage !== 'session') {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  const resolvedSessionId = session?.sessionId || null;
+  logSessionEvent('refresh_request', {
+    stage,
+    sessionId: resolvedSessionId,
+    fingerprintProvided: Boolean(requestFingerprint),
+    sessionIdProvided: Boolean(sessionIdFromBody),
+    ip: extractRequestIp(req)
+  });
 
   try {
+    if (stage === 'session') {
+      const newSession = await createSession({ autoStart: true });
+      const currentTrack = newSession.mixer.currentTrack || null;
+      const fingerprint = fingerprintRegistry.ensureFingerprint(newSession.sessionId, {
+        trackId: currentTrack?.identifier || null,
+        startTime: newSession.mixer.trackStartTime || Date.now(),
+        streamIp: extractRequestIp(req)
+      });
+
+      logSessionEvent('refresh_response', {
+        stage: 'session',
+        sessionId: newSession.sessionId,
+        trackId: currentTrack?.identifier || null
+      });
+
+      return res.status(200).json({
+        ok: true,
+        stage: 'session',
+        sessionId: newSession.sessionId,
+        fingerprint,
+        currentTrack,
+        streamAlive: Boolean(currentTrack),
+        streamUrl: '/stream',
+        eventsUrl: '/events'
+      });
+    }
+
     const summary = session.mixer.getStreamSummary ? session.mixer.getStreamSummary() : null;
     const isStreaming = session.mixer.isStreamAlive ? session.mixer.isStreamAlive() :
       Boolean(session.mixer.audioMixer?.engine?.isStreaming || (session.mixer.clients && session.mixer.clients.size > 0));
 
+    if (stage === 'restart') {
+      await session.mixer.restartStream('manual-refresh');
+      const restartSummary = session.mixer.getStreamSummary ? session.mixer.getStreamSummary() : summary;
+
+      logSessionEvent('refresh_response', {
+        stage: 'restart',
+        sessionId: session.sessionId,
+        trackId: restartSummary?.currentTrack?.identifier || null
+      });
+
+      return res.status(200).json({
+        ok: true,
+        stage: 'restart',
+        sessionId: session.sessionId,
+        fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
+        currentTrack: restartSummary?.currentTrack || null,
+        pendingTrack: restartSummary?.pendingTrack || null,
+        nextTrack: restartSummary?.nextTrack || null,
+        clientCount: restartSummary?.audioClientCount ?? (session.mixer.clients?.size || 0),
+        eventClientCount: restartSummary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
+        streamAlive: true
+      });
+    }
+
     if (!isStreaming) {
-      console.log(`🔄 Session ${sessionId} reported inactive (no streaming clients)`);
+      logSessionEvent('refresh_response', {
+        stage: 'rebroadcast',
+        sessionId: session.sessionId,
+        streamAlive: false,
+        note: 'inactive'
+      }, { level: 'warn' });
       return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
     }
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering heartbeat + snapshot for session ${sessionId} (${session.mixer.eventClients.size} clients)`);
+      console.log(`🔄 Triggering heartbeat + snapshot for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       await session.mixer.broadcastHeartbeat('manual-refresh', { force: true });
       session.mixer.broadcastExplorerSnapshot(true, 'manual-refresh').catch(err => {
         console.error('🔄 Failed to broadcast explorer snapshot during refresh:', err);
@@ -701,8 +767,15 @@ app.post('/refresh-sse', async (req, res) => {
         trackId: session.mixer.lastTrackEventPayload.currentTrack?.identifier || null
       } : null);
 
-      res.status(200).json({
+      logSessionEvent('refresh_response', {
+        stage: 'rebroadcast',
+        sessionId: session.sessionId,
+        trackId: currentTrack?.identifier || null
+      });
+
+      return res.status(200).json({
         ok: true,
+        stage: 'rebroadcast',
         currentTrack,
         pendingTrack,
         nextTrack,
@@ -710,16 +783,25 @@ app.post('/refresh-sse', async (req, res) => {
         eventClientCount: summary?.eventClientCount ?? (session.mixer.eventClients?.size || 0),
         lastBroadcast,
         streamAlive: true,
-        sessionId,
-        fingerprint: fingerprintRegistry.getFingerprintForSession(sessionId)
+        sessionId: session.sessionId,
+        fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId)
       });
-    } else {
-      console.log(`🔄 Session ${sessionId} has no valid track to broadcast`);
-      res.status(200).json({ ok: false, reason: 'no_track', streamAlive: true });
     }
+
+    logSessionEvent('refresh_response', {
+      stage: 'rebroadcast',
+      sessionId: session.sessionId,
+      note: 'no_track'
+    });
+    res.status(200).json({ ok: false, reason: 'no_track', streamAlive: true });
 
   } catch (error) {
     console.error('🔄 SSE refresh error:', error);
+    logSessionEvent('refresh_response', {
+      stage,
+      sessionId: session?.sessionId || null,
+      error: error?.message || String(error)
+    }, { level: 'error' });
     res.status(500).json({ error: error.message });
   }
 });
@@ -955,28 +1037,15 @@ app.get('/search', (req, res) => {
       CAST(beets_json_b64 AS TEXT) as beets_json_b64
     FROM tracks
     WHERE
-      LOWER(CAST(path_b64 AS TEXT)) LIKE LOWER(?)
-      OR identifier LIKE ?
-    ORDER BY
-      CASE
-        -- Exact matches in artist/title get priority
-        WHEN LOWER(CAST(beets_json_b64 AS TEXT)) LIKE LOWER(?) THEN 1
-        -- Path segment matches get second priority
-        WHEN LOWER(CAST(path_b64 AS TEXT)) LIKE LOWER(?) THEN 2
-        -- SHA matches get third priority
-        WHEN identifier LIKE ? THEN 3
-        ELSE 4
-      END,
-      LENGTH(CAST(path_b64 AS TEXT))
+      LOWER(path_keywords) LIKE LOWER(?)
+      OR identifier = ?
     LIMIT ?
   `;
 
   const searchPattern    = `%${query}%`;
-  const metadataPattern  = `%${query}%`;
-  const pathPattern      = `%${query}%`;
   const md5Pattern       = `%${query}%`;
 
-  db.all(searchQuery, [searchPattern, searchPattern, metadataPattern, pathPattern, md5Pattern, limit], (err, rows) => {
+  db.all(searchQuery, [searchPattern, md5Pattern, limit], (err, rows) => {
     if (err) {
       console.error('Search error:', err);
       return res.status(500).json({ error: 'Search failed' });
@@ -1111,7 +1180,7 @@ app.get('/', async (req, res) => {
 
 // Simplified status endpoint - resolves session from request context
 app.get('/status', async (req, res) => {
-  const session = await getSessionForRequest(req);
+    const session = await getSessionForRequest(req, { createIfMissing: true });
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
@@ -1400,6 +1469,9 @@ app.post('/next-track', async (req, res) => {
   }
 
   try {
+    const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;
+    const advertisedDirection = typeof direction === 'string' ? direction : null;
+
     if (normalizedSource === 'user') {
       console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
 
@@ -1423,8 +1495,6 @@ app.post('/next-track', async (req, res) => {
         });
       }
     } else {
-      const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;
-      const advertisedDirection = typeof direction === 'string' ? direction : null;
       const serverNextTrack = session.mixer.nextTrack?.identifier || null;
 
       console.log(`💓 Heartbeat sync request received (clientNext=${cleanMd5?.substring(0,8) || 'none'}, direction=${advertisedDirection || 'unknown'})`);
@@ -1449,21 +1519,32 @@ app.post('/next-track', async (req, res) => {
 
     console.log(`📤 /next-track response (${normalizedSource}): current=${currentTrackId?.substring(0,8) || 'none'}, pending=${pendingCurrentId?.substring(0,8) || 'none'}, serverNext=${preparedNextId?.substring(0,8) || 'none'}, remaining=${Math.round(remaining)}ms`);
 
-    res.json({
-      // Acknowledgment
+    const responsePayload = {
+      status: normalizedSource === 'user' ? 'locked' : 'ok',
+      sessionId: session.sessionId,
+      fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
+      currentTrack: currentTrackId,
       nextTrack: preparedNextId,
       pendingTrack: pendingCurrentId,
-
-      // Sync state: current track + timing
-      currentTrack: currentTrackId,
       duration: Math.round(duration),
-      remaining: Math.round(remaining),
+      remaining: Math.round(remaining)
+    };
 
-      sessionId: session.sessionId,
-      fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId)
-    });
+    if (normalizedSource === 'user') {
+      responsePayload.trackId = cleanMd5 || null;
+      responsePayload.direction = advertisedDirection || session.mixer.pendingUserOverrideDirection || null;
+    }
+
+    res.json(responsePayload);
   } catch (error) {
     console.error('Next track selection error:', error);
+    if (normalizedSource === 'user' && session?.mixer) {
+      session.mixer.broadcastSelectionEvent('selection_failed', {
+        status: 'failed',
+        trackId: trackMd5,
+        reason: error?.message || 'request_failed'
+      });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -1608,75 +1689,7 @@ app.get('/sessions/now-playing', (req, res) => {
   });
 });
 
-// Clean up inactive sessions
-setInterval(() => {
-  const now = new Date();
-  const timeout = 60 * 60 * 1000; // 60 minutes (longer for smart reconnection)
-
-  for (const [sessionId, session] of audioSessions) {
-    // Don't clean up sessions with active connections or recent activity
-    const hasActiveAudioClients = session.mixer.clients && session.mixer.clients.size > 0;
-    const hasActiveEventClients = session.mixer.eventClients && session.mixer.eventClients.size > 0;
-    const isActiveStreaming = session.mixer.isActive;
-    const hasRecentActivity = (now - session.lastAccess) < timeout;
-
-    // Keep session alive if:
-    // 1. Has active audio clients, OR
-    // 2. Has active SSE clients (frontend monitoring), OR
-    // 3. Is actively streaming, OR
-    // 4. Had recent activity (within timeout)
-    if (hasActiveAudioClients || hasActiveEventClients || isActiveStreaming || hasRecentActivity) {
-      continue; // Keep session alive
-    }
-
-    console.log(`🧹 Cleaning up inactive session: ${sessionId} (idle: ${Math.round((now - session.lastAccess) / 60000)}m)`);
-    session.mixer.destroy();
-    audioSessions.delete(sessionId);
-  }
-}, 60 * 1000); // Check every minute
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
-
-  for (const [sessionId, session] of audioSessions) {
-    console.log(`Destroying session: ${sessionId}`);
-    session.mixer.destroy();
-  }
-
-  radialSearch.close();
-  process.exit(0);
-});
-
-const server = app.listen(port, () => {
-  console.log(`🎵 Audio streaming server listening at http://localhost:${port}`);
-  console.log('🎯 No Icecast needed - direct Node.js streaming!');
-  console.log(`🔒 Server protected by PID ${process.pid}`);
-});
-
-// Handle port conflicts gracefully
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`❌ PORT CONFLICT: Port ${port} is already in use!`);
-    console.error(`❌ Another server instance may be running`);
-    console.error(`❌ Check: lsof -i :${port} or kill existing processes`);
-
-    // Clean up our PID file since we failed to start
-    try {
-      if (fs.existsSync(pidFile)) {
-        fs.unlinkSync(pidFile);
-        console.log(`🧹 Cleaned up PID file after port conflict`);
-      }
-    } catch (cleanupErr) {
-      console.error('Error cleaning up PID file:', cleanupErr);
-    }
-
-    process.exit(1);
-  } else {
-    console.error('Server error:', err);
-    process.exit(1);
-  }
-});
+// Session control endpoints (legacy compatibility)
 app.post('/session/seek', async (req, res) => {
   const session = await getSessionForRequest(req, { createIfMissing: false });
 
@@ -1691,3 +1704,114 @@ app.post('/session/:sessionId/seek', (req, res) => {
   console.log(`⚠️ Deprecated seek URL requested: /session/${req.params.sessionId}/seek`);
   res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/seek instead.' });
 });
+
+let serverInstance = null;
+let cleanupTimer = null;
+let hasRegisteredSigintHandler = false;
+
+function startServer() {
+  if (serverInstance) {
+    return serverInstance;
+  }
+
+  checkSingleton();
+
+  cleanupTimer = setInterval(() => {
+    const now = new Date();
+    const timeout = 60 * 60 * 1000; // 60 minutes (longer for smart reconnection)
+
+    for (const [sessionId, session] of audioSessions) {
+      // Don't clean up sessions with active connections or recent activity
+      const hasActiveAudioClients = session.mixer.clients && session.mixer.clients.size > 0;
+      const hasActiveEventClients = session.mixer.eventClients && session.mixer.eventClients.size > 0;
+      const isActiveStreaming = session.mixer.isActive;
+      const hasRecentActivity = (now - session.lastAccess) < timeout;
+
+      // Keep session alive if it still looks healthy to clients
+      if (hasActiveAudioClients || hasActiveEventClients || isActiveStreaming || hasRecentActivity) {
+        continue;
+      }
+
+      console.log(`🧹 Cleaning up inactive session: ${sessionId} (idle: ${Math.round((now - session.lastAccess) / 60000)}m)`);
+      session.mixer.destroy();
+      audioSessions.delete(sessionId);
+    }
+  }, 60 * 1000); // Check every minute
+
+  if (!hasRegisteredSigintHandler) {
+    process.on('SIGINT', () => {
+      console.log('Shutting down gracefully...');
+
+      for (const [sessionId, session] of audioSessions) {
+        console.log(`Destroying session: ${sessionId}`);
+        session.mixer.destroy();
+      }
+
+      radialSearch.close();
+
+      if (cleanupTimer) {
+        clearInterval(cleanupTimer);
+        cleanupTimer = null;
+      }
+
+      if (serverInstance) {
+        serverInstance.close(() => process.exit(0));
+      } else {
+        process.exit(0);
+      }
+    });
+    hasRegisteredSigintHandler = true;
+  }
+
+  serverInstance = app.listen(port, () => {
+    console.log(`🎵 Audio streaming server listening at http://localhost:${port}`);
+    console.log('🎯 No Icecast needed - direct Node.js streaming!');
+    console.log(`🔒 Server protected by PID ${process.pid}`);
+  });
+
+  serverInstance.on('close', () => {
+    if (cleanupTimer) {
+      clearInterval(cleanupTimer);
+      cleanupTimer = null;
+    }
+  });
+
+  // Handle port conflicts gracefully
+  serverInstance.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ PORT CONFLICT: Port ${port} is already in use!`);
+      console.error('❌ Another server instance may be running');
+      console.error(`❌ Check: lsof -i :${port} or kill existing processes`);
+
+      // Clean up our PID file since we failed to start
+      try {
+        if (fs.existsSync(pidFile)) {
+          fs.unlinkSync(pidFile);
+          console.log('🧹 Cleaned up PID file after port conflict');
+        }
+      } catch (cleanupErr) {
+        console.error('Error cleaning up PID file:', cleanupErr);
+      }
+
+      process.exit(1);
+    } else {
+      console.error('Server error:', err);
+      process.exit(1);
+    }
+  });
+
+  return serverInstance;
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  persistAudioSessionBinding,
+  registerSession,
+  unregisterSession,
+  getSessionById
+};

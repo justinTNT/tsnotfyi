@@ -104,6 +104,10 @@ body {
     margin-top: 5px;
 }
 
+.playback-clock.is-hidden {
+    visibility: hidden;
+}
+
 .radius-button {
     width: 32px;
     height: 32px;
@@ -137,7 +141,7 @@ body {
     display: flex;
     flex-direction: row;
     align-items: center;
-    gap: 1px;
+    gap: 2px;
     transform: translateY(-50%);
     pointer-events: auto;
     padding-left: 0;
@@ -196,7 +200,7 @@ body {
     pointer-events: none;
     width: 4em;
     opacity: 1;
-    transition: opacity 160ms ease;
+    transition: opacity 1666ms ease;
 }
 
 .track-metrics.hidden {
@@ -207,7 +211,7 @@ body {
 .track-beets {
     position: absolute;
     top: 20px;
-    right: -180px;
+    left: -123%;
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -216,7 +220,7 @@ body {
     min-width: 140px;
     max-width: 220px;
     opacity: 1;
-    transition: opacity 160ms ease;
+    transition: opacity 1666ms ease;
     transform: translateY(-10%);
 }
 
@@ -723,6 +727,10 @@ audio {
     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
 }
 
+#nowPlayingCard .card {
+    background: var(--card-background, #fff);
+}
+
 /* Inner panel with color variations */
 .panel {
     position: relative;
@@ -831,10 +839,11 @@ audio {
     position: absolute;
     width: 200px;
     aspect-ratio: 3/5;
-    border: none;
+    border: 1px solid var(--card-border-color, rgba(255, 255, 255, 0.35));
     border-radius: 1.8rem;
     padding: 10px;
     box-sizing: border-box;
+    background: var(--card-background-color, rgba(20, 20, 20, 0.65));
     /* Clean shadow without glow */
     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
     transition: box-shadow 0.3s ease;
@@ -844,6 +853,24 @@ audio {
     transform: translateZ(-1500px) scale(0.3);
     cursor: pointer;
     pointer-events: auto;
+}
+
+.dimension-card[data-consistency-status="warn"] {
+    box-shadow: 0 0 18px rgba(255, 189, 57, 0.45), 0 0 6px rgba(0, 0, 0, 0.35);
+}
+
+.dimension-card[data-consistency-status="warn"]::after {
+    content: '⚠ consistency';
+    position: absolute;
+    top: 0.6rem;
+    right: 0.8rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #ffd66b;
+    text-shadow: 0 0 6px rgba(0, 0, 0, 0.7);
+    pointer-events: none;
 }
 
 
@@ -892,65 +919,202 @@ audio {
     transition: transform 1s ease-out;
 }
 
-#nextTrackPreview {
+#nextTrackTray {
     position: fixed;
-    left: 10rem;
+    left: 0%;
+    width: 80%;
     top: calc(50% + 230px);
-    width: 220px;
-    height: 220px;
-    border-radius: 12px;
-    overflow: hidden;
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(20px) scale(0.85);
-    transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.6s ease;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
-    z-index: 120;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    z-index: 1;
+    pointer-events: auto;
 }
 
-#nextTrackPreview.visible {
+.next-track-tray-preview {
+    width: 180px;
+    height: 180px;
+    border-radius: 14px;
+    background-size: cover;
+    background-position: center;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    opacity: 0;
+    transform: translateY(24px) scale(0.85);
+    transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.6s ease;
+}
+
+.next-track-tray-preview.visible {
     opacity: 1;
     transform: translateY(0) scale(1);
 }
 
-#nextTrackPreview.fade-out {
+.next-track-tray-preview.fade-out {
     opacity: 0;
-    transform: translateY(-20px) scale(0.8);
+    transform: translateY(-20px) scale(0.75);
 }
 
-#nextTrackPreview img {
+.next-track-tray-items {
+    display: flex;
+    gap: 12px;
+    pointer-events: auto;
+}
+
+.next-track-tray-item {
+    width: 96px;
+    height: 96px;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    background: rgba(20, 20, 20, 0.65);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    position: relative;
+    opacity: 0;
+    transform: scale(0.82);
+    transition: transform 0.4s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.4s ease;
+}
+
+.next-track-tray-item.visible {
+    opacity: 1;
+    transform: scale(1);
+}
+
+.next-track-tray-item.pending {
+    opacity: 0;
+    transform: scale(0.75);
+}
+
+.next-track-tray-item.exit-left {
+    opacity: 1;
+    animation: trayItemExitLeft 0.6s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+
+@keyframes trayItemExitLeft {
+    0% {
+        opacity: 1;
+        transform: translateX(0) scale(1);
+    }
+    60% {
+        opacity: 0.6;
+        transform: translateX(-72px) scale(0.9);
+    }
+    100% {
+        opacity: 0;
+        transform: translateX(-180px) scale(0.85);
+    }
+}
+
+@keyframes dimensionCardExitCurve {
+    0% {
+        opacity: 1;
+        transform: translate(-50%, -50%) translateZ(-800px) scale(0.5);
+    }
+    45% {
+        opacity: 0.65;
+        transform: translate(-95%, -20%) translateZ(-600px) scale(0.6);
+    }
+    100% {
+        opacity: 0;
+        transform: translate(-180%, -160%) translateZ(-1900px) scale(0.35);
+    }
+}
+
+.dimension-card.dormant-exit {
+    pointer-events: none;
+    animation: dimensionCardExitCurve 0.85s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.stacked-preview-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    left:6%;
+}
+
+.stacked-preview-layer-card {
+    position: absolute;
+    width: 220px;
+    height: 340px;
+    border-radius: 1.8rem;
+    overflow: hidden;
+    background: rgba(20, 20, 20, 0.65);
+    box-shadow: 0 16px 32px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+}
+
+.stacked-preview-layer-card .preview-panel {
+    position: absolute;
+    inset: 0;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.stacked-preview-layer-card .preview-photo {
+    flex: 1;
+    border-radius: 1.2rem;
+    background-size: cover;
+    background-position: center;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.stacked-preview-layer-card .preview-rim {
+    position: absolute;
+    inset: 10px;
+    border-radius: 1.2rem;
+    pointer-events: none;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.stacked-preview-layer-card .preview-label {
+    margin-top: 8px;
+    padding: 10px 12px;
+    border-radius: 1rem;
+    background: rgba(0, 0, 0, 0.5);
+    color: rgba(255, 255, 255, 0.92);
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+}
+
+.stacked-preview-layer-card .preview-label h4,
+.stacked-preview-layer-card .preview-label h5 {
+    margin: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.stacked-preview-layer-card .preview-label h5 {
+    margin-top: 4px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    opacity: 0.85;
+}
+
+.next-track-tray-item .next-track-tray-cover {
     width: 100%;
     height: 100%;
-    object-fit: cover;
-    display: block;
+    background-size: cover;
+    background-position: center;
 }
 
-#beetsSegments {
-    position: fixed;
-    right: 50%;
-    justify-content: right;
-    top: 0%;
-    width: 220px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    opacity: 0.2;
-    pointer-events: none;
-    transition: opacity 0.3s ease, transform 0.3s ease;
-    transform-origin: center;
-    z-index: 1;
-    scale: 2.34;
-    transform: rotateZ(-13deg);
+.next-track-tray-item::after {
+    content: attr(data-direction-label);
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    right: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgba(255, 255, 255, 0.82);
+    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
 }
 
-#beetsSegments.visible {
-    pointer-events: auto;
-    transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)
-}
-
-#beetsSegments.hidden {
-    pointer-events: none;
-}
 
 .beets-chip {
     background: rgba(0, 0, 0, 0.55);
@@ -1040,7 +1204,7 @@ audio {
     left: 1px;
     right: -1px;
     bottom: -1px;
-    background: var(--border-color, #ccc);
+    background: inherit;
     border-radius: 1.8rem;
     box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4);
     z-index: -1;
@@ -1054,7 +1218,7 @@ audio {
     left: 1px;
     right: -1px;
     bottom: -1px;
-    background: var(--border-color, #ccc);
+    background: inherit;
     border-radius: 1.8rem;
     box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
     z-index: -2;
@@ -1158,38 +1322,54 @@ audio {
     position: absolute;
     top: 10px;
     right: 10px;
-    width: 32px;
-    height: 32px;
+    width: 36px;
+    height: 36px;
     z-index: 15;
-    opacity: 0.8;
+    opacity: 1;
     transition: all 0.3s ease;
     cursor: pointer;
     user-select: none;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 3em;
-    rotate: 45deg;
-    color: #fff;
-    text-shadow:
-        1px 1px 0 #000,
-        -1px -1px 0 #000,
-        1px -1px 0 #000,
-        -1px 1px 0 #000;
     pointer-events: auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: inherit;
 }
 
-.uno-reverse::after {
-    content: "⇄";
+.uno-reverse .symbol {
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
 }
 
-.uno-reverse.reversed {
-    transform: rotate(90deg);
+.uno-reverse .symbol svg {
+    width: 100%;
+    height: 100%;
 }
 
-/* Next track Uno Reverse styling */
+.uno-reverse .symbol svg .reverse-arrow-top {
+    fill: var(--reverse-top-color, currentColor);
+    transition: fill 0.2s ease;
+}
+
+.uno-reverse .symbol svg .reverse-arrow-bottom {
+    fill: var(--reverse-bottom-color, var(--reverse-top-color, currentColor));
+    transition: fill 0.2s ease;
+}
+
+.uno-reverse .symbol svg .reverse-backdrop {
+    fill: rgba(0, 0, 0, 0.35);
+}
+
+.uno-reverse.direction-reverse {
+    pointer-events: none;
+    cursor: default;
+}
+
 .uno-reverse.next-track-reverse {
-    opacity: 0.7;
     cursor: pointer;
     transition:
         transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
@@ -1202,7 +1382,22 @@ audio {
 }
 
 .uno-reverse.next-track-reverse:active {
-    opacity: 0.8;
+}
+
+.uno-reverse.next-track-reverse:focus-visible {
+    outline: none;
+}
+
+.uno-reverse.next-track-reverse.highlight-top:hover .reverse-arrow-top,
+.uno-reverse.next-track-reverse.highlight-top:focus-visible .reverse-arrow-top,
+.uno-reverse.next-track-reverse.highlight-top:active .reverse-arrow-top {
+    fill: #ffffff !important;
+}
+
+.uno-reverse.next-track-reverse.highlight-bottom:hover .reverse-arrow-bottom,
+.uno-reverse.next-track-reverse.highlight-bottom:focus-visible .reverse-arrow-bottom,
+.uno-reverse.next-track-reverse.highlight-bottom:active .reverse-arrow-bottom {
+    fill: #ffffff !important;
 }
 
 .uno-reverse.disabled {
@@ -1221,7 +1416,6 @@ audio {
 }
 
 .uno-reverse.enabled:active {
-    opacity: 0.8;
 }
 
 /* Bidirectional card flip animation */
@@ -1231,29 +1425,29 @@ audio {
 
 /* Outlier card styling - Orange (default) */
 .dimension-card.outlier {
-    border: 1px solid #ff6b35;
-    background: linear-gradient(135deg, #2a1810 0%, #3d2418 50%, #2a1810 100%);
+    border: 1px solid var(--card-border-color, #ff6b35);
+    background: var(--card-background-color, #2a1810);
     box-shadow: 0 8px 32px rgba(255, 107, 53, 0.3), inset 0 1px 0 rgba(255, 107, 53, 0.2);
 }
 
 /* Red variation - Rhythmic directions */
 .dimension-card.red-variant {
-    border: 1px solid #e74c3c;
-    background: linear-gradient(135deg, #2a1818 0%, #3d1f1f 50%, #2a1818 100%);
+    border: 1px solid var(--card-border-color, #e74c3c);
+    background: var(--card-background-color, #2a1818);
     box-shadow: 0 8px 32px rgba(231, 76, 60, 0.3), inset 0 1px 0 rgba(231, 76, 60, 0.2);
 }
 
 /* Green variation - Tonal directions */
 .dimension-card.green-variant {
-    border: 1px solid #27ae60;
-    background: linear-gradient(135deg, #182a1a 0%, #1f3d22 50%, #182a1a 100%);
+    border: 1px solid var(--card-border-color, #27ae60);
+    background: var(--card-background-color, #182a1a);
     box-shadow: 0 8px 32px rgba(39, 174, 96, 0.3), inset 0 1px 0 rgba(39, 174, 96, 0.2);
 }
 
 /* Blue variation - Spectral directions */
 .dimension-card.blue-variant {
-    border: 1px solid #3498db;
-    background: linear-gradient(135deg, #18222a 0%, #1f2f3d 50%, #18222a 100%);
+    border: 1px solid var(--card-border-color, #3498db);
+    background: var(--card-background-color, #18222a);
     box-shadow: 0 8px 32px rgba(52, 152, 219, 0.3), inset 0 1px 0 rgba(52, 152, 219, 0.2);
 }
 
@@ -1387,4 +1581,22 @@ audio {
     0% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
     50% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(90deg); }
     100% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
+}
+
+
+#beetsSegments {
+    position: fixed;
+    right: 50%;
+    justify-content: right;
+    top: 0%;
+    width: 220px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    opacity: 0.2;
+    pointer-events: none;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    transform-origin: center;
+    z-index: 1;
+    transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)
 }

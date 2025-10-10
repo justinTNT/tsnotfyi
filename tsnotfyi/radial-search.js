@@ -365,8 +365,16 @@ class RadialSearchService {
             // Get neighborhood using specified PCA discriminator
             const neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, resolution, pcaDomain, 500);
 
-            // Filter by PCA direction
+            // Filter by PCA direction and make sure we never include the center track itself
             const candidates = neighborhood.filter(result => {
+                if (!result?.track?.identifier) {
+                    return false;
+                }
+
+                if (result.track.identifier === currentTrack.identifier) {
+                    return false;
+                }
+
                 return this.isInPCADirection(currentTrack, result.track, pcaDomain, pcaComponent, direction);
             });
 

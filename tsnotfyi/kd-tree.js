@@ -101,7 +101,7 @@ class MusicalKDTree {
                 pc3: {
                     positive: 'full_spectrum',      // spectral_energy, spectral_rolloff, spectral_centroid
                     negative: 'narrow_spectrum',
-                    description: 'Spectral fullness'
+                    description: 'Spectral texture balance'
                 }
             },
             rhythmic: {
@@ -389,13 +389,18 @@ class MusicalKDTree {
 
         const distance = this.calculatePCADistance(centerTrack, node.point, discriminator);
 
-        // Use inner/outer radius for annular search
-        if (distance >= settings.inner_radius && distance <= settings.outer_radius &&
-            node.point.identifier !== centerTrack.identifier) {
-            results.push({
-                track: node.point,
-                distance: distance
-            });
+        if (node.point.identifier === centerTrack.identifier) {
+            if (distance > this.epsilon) {
+                console.warn(`⚠️ PCA radius search computed non-zero distance (${distance}) for center track ${centerTrack.identifier}`);
+            }
+        } else {
+            // Use inner/outer radius for annular search
+            if (distance >= settings.inner_radius && distance <= settings.outer_radius) {
+                results.push({
+                    track: node.point,
+                    distance: distance
+                });
+            }
         }
 
         // Continue tree traversal based on PCA distance bounds
@@ -504,6 +509,30 @@ class MusicalKDTree {
             if (!inDirection) {
                 return;
             }
+
+  // TODO: Locality filter - currently uses raw feature distance
+  // Once PCA weights are stored, recalculate PCA for proper distance check
+  const otherDimensions = this.dimensions.filter(d =>
+      d !== directionDim && !ignoreDimensions.includes(d)
+  );
+
+  let violatesLocality = false;
+  for (const dim of otherDimensions) {
+      const dimDelta = Math.abs(result.track.features[dim] - currentTrack.features[dim]);
+
+      // TODO: This should use PCA distance after recalculating hybrid.pca
+      // For now: raw feature delta check (approximate)
+      const maxAllowedChange = searchRadius * 0.15; // Conservative threshold
+
+      if (dimDelta > maxAllowedChange) {
+          violatesLocality = true;
+          break;
+      }
+  }
+
+  if (violatesLocality) {
+      return; // Skip this candidate
+  }
 
             let primaryDistance = null;
             if (innerRadius > 0 && result.track.pca && currentTrack.pca) {

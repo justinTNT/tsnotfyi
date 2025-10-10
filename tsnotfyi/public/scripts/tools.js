@@ -123,6 +123,10 @@
 
   // Detect if a direction is negative (should have inverted rim)
   function isNegativeDirection(directionKey) {
+      if (!directionKey || typeof directionKey !== 'string') {
+          return false;
+      }
+
       // Check for PCA negative directions
       if (directionKey.includes('_negative')) {
           return true;
@@ -144,32 +148,76 @@
       if (!directionKey || typeof directionKey !== 'string') {
           return null;
       }
-      // Handle PCA directions
-      if (directionKey.includes('_positive')) {
-          return directionKey.replace('_positive', '_negative');
-      }
-      if (directionKey.includes('_negative')) {
-          return directionKey.replace('_negative', '_positive');
+
+      const trimmedKey = directionKey.trim();
+      const suffixMatch = trimmedKey.match(/^(.*?)(\s+\d+)$/);
+      const baseKey = suffixMatch ? suffixMatch[1] : trimmedKey;
+      const numericSuffix = suffixMatch ? suffixMatch[2] : '';
+
+      const resolveOppositeBase = (key) => {
+          if (!key) return null;
+
+          if (key.includes('_positive')) {
+              return key.replace('_positive', '_negative');
+          }
+          if (key.includes('_negative')) {
+              return key.replace('_negative', '_positive');
+          }
+
+          const oppositeDirections = {
+              'faster': 'slower',
+              'slower': 'faster',
+              'brighter': 'darker',
+              'darker': 'brighter',
+              'more_energetic': 'calmer',
+              'calmer': 'more_energetic',
+              'more_danceable': 'less_danceable',
+              'less_danceable': 'more_danceable',
+              'more_tonal': 'more_atonal',
+              'more_atonal': 'more_tonal',
+              'more_complex': 'simpler',
+              'simpler': 'more_complex',
+              'more_punchy': 'smoother',
+              'smoother': 'more_punchy'
+          };
+          return oppositeDirections[key] || null;
+      };
+
+      const oppositeBase = resolveOppositeBase(baseKey);
+      if (!oppositeBase) {
+          return null;
       }
 
-      // Handle traditional directions
-      const oppositeDirections = {
-          'faster': 'slower',
-          'slower': 'faster',
-          'brighter': 'darker',
-          'darker': 'brighter',
-          'more_energetic': 'calmer',
-          'calmer': 'more_energetic',
-          'more_danceable': 'less_danceable',
-          'less_danceable': 'more_danceable',
-          'more_tonal': 'more_atonal',
-          'more_atonal': 'more_tonal',
-          'more_complex': 'simpler',
-          'simpler': 'more_complex',
-          'more_punchy': 'smoother',
-          'smoother': 'more_punchy'
-      };
-      return oppositeDirections[directionKey];
+      if (!numericSuffix) {
+          return oppositeBase;
+      }
+
+      const candidateWithSuffix = `${oppositeBase}${numericSuffix}`;
+      const stateRef = (typeof window !== 'undefined' && window.state) ? window.state : null;
+      const directionMap = stateRef?.latestExplorerData?.directions || null;
+
+      if (directionMap && directionMap[candidateWithSuffix]) {
+          return candidateWithSuffix;
+      }
+
+      if (directionMap && directionMap[oppositeBase]) {
+          return oppositeBase;
+      }
+
+      if (directionMap) {
+          const suffixNumber = numericSuffix.trim();
+          const alternate = Object.keys(directionMap).find(key => {
+              if (!key.startsWith(oppositeBase)) return false;
+              const altMatch = key.match(/^(.*?)(\s+\d+)$/);
+              if (!altMatch) return false;
+              return altMatch[1] === oppositeBase && altMatch[2] && altMatch[2].trim() === suffixNumber;
+          });
+          if (alternate) {
+              return alternate;
+          }
+      }
+
+      return oppositeBase;
   }
 
 
@@ -228,6 +276,28 @@
           g = Math.round((g + m) * 255).toString(16).padStart(2, '0');
           b = Math.round((b + m) * 255).toString(16).padStart(2, '0');
           return `#${r}${g}${b}`;
+      };
+
+      const clamp01 = (value) => Math.max(0, Math.min(1, value));
+      const wrapHue = (hue) => ((hue % 360) + 360) % 360;
+
+      const NEGATIVE_OVERRIDES = {
+          rhythmic_core: {
+              borderHueShift: 25,
+              glowHueShift: 20,
+              borderSaturationScale: 0.9,
+              glowSaturationScale: 0.85,
+              borderLightnessDelta: 0.08,
+              glowLightnessDelta: 0.05
+          },
+          tonal_core: {
+              borderHueShift: 52,
+              glowHueShift: 55,
+              borderSaturationScale: 0.82,
+              glowSaturationScale: 0.8,
+              borderLightnessDelta: 0.06,
+              glowLightnessDelta: 0.05
+          }
       };
 
       // ANALOGOUS COMPLEMENTARY PAIRS COLOR SYSTEM
@@ -311,15 +381,20 @@
           }
 
           // Apply analogous complementary formula
-          const analogousHue = (baseHue + 60) % 360;                    // +60° hue shift for more visible difference
-          const reducedSaturation = Math.max(0, Math.min(1, baseSaturation * 0.7));              // Reduce border saturation
-          const increasedLightness = Math.max(0, Math.min(1, baseLightness + 0.1)); // Increase border lightness
-          const reducedGlowSaturation = Math.max(0, Math.min(1, glowSaturation * 0.7));          // Reduce glow saturation
-          const increasedGlowLightness = Math.max(0, Math.min(1, glowLightness + 0.1)); // Increase glow lightness
+          const override = NEGATIVE_OVERRIDES[directionType];
+
+          const borderHue = wrapHue(baseHue + (override?.borderHueShift ?? 60));
+          const glowHue = wrapHue(baseHue + (override?.glowHueShift ?? 60));
+
+          const reducedSaturation = clamp01(baseSaturation * (override?.borderSaturationScale ?? 0.7));
+          const increasedLightness = clamp01(baseLightness + (override?.borderLightnessDelta ?? 0.1));
+
+          const reducedGlowSaturation = clamp01(glowSaturation * (override?.glowSaturationScale ?? 0.7));
+          const increasedGlowLightness = clamp01(glowLightness + (override?.glowLightnessDelta ?? 0.1));
 
           return {
-              border: hslToHex(analogousHue, reducedSaturation, increasedLightness),
-              glow: hslToHex(analogousHue, reducedGlowSaturation, increasedGlowLightness)
+              border: hslToHex(borderHue, reducedSaturation, increasedLightness),
+              glow: hslToHex(glowHue, reducedGlowSaturation, increasedGlowLightness)
           };
       }
 
