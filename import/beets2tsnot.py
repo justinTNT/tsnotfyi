@@ -32,6 +32,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import traceback
 
+# PostgreSQL support
+try:
+    import psycopg2
+    import psycopg2.extras
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+
 # PCA computation dependencies
 import pandas as pd
 import numpy as np
@@ -66,6 +74,14 @@ class ProcessingConfig:
     beets_db_path: str
     output_db_path: str = "tsnot_analysis.db"
     checkpoint_db_path: Optional[str] = None
+
+    # PostgreSQL settings (if using PostgreSQL instead of SQLite)
+    use_postgres: bool = False
+    pg_host: str = "localhost"
+    pg_port: int = 5432
+    pg_database: str = "tsnotfyi"
+    pg_user: str = "postgres"
+    pg_password: Optional[str] = None  # From env var if not provided
 
     # Processing strategy
     tranche: str = "proof_tools"
@@ -496,11 +512,11 @@ class PCAComputer:
         self.discriminators = {}  # Will store PCA models and scalers
         self.data = None  # DataFrame of all tracks
 
-    def fit_pca_on_library(self, db_path: str) -> Dict[str, np.ndarray]:
+    def fit_pca_on_library(self, db_config) -> Dict[str, np.ndarray]:
         """Fit PCA models on entire library.
 
         Args:
-            db_path: Path to database with music_analysis table
+            db_config: Either a database path (str) for SQLite, or ProcessingConfig for PostgreSQL
 
         Returns:
             Dict mapping discriminator names to value arrays
@@ -509,7 +525,21 @@ class PCAComputer:
         logger.info("="*60)
 
         # Load all track indices
-        conn = sqlite3.connect(db_path)
+        if isinstance(db_config, str):
+            # SQLite path (legacy)
+            conn = sqlite3.connect(db_config)
+        elif hasattr(db_config, 'use_postgres') and db_config.use_postgres:
+            # PostgreSQL config
+            conn = psycopg2.connect(
+                host=db_config.pg_host,
+                port=db_config.pg_port,
+                database=db_config.pg_database,
+                user=db_config.pg_user,
+                password=db_config.pg_password or os.getenv('PGPASSWORD')
+            )
+        else:
+            # ProcessingConfig with SQLite
+            conn = sqlite3.connect(db_config.output_db_path)
 
         # Build query
         columns = ['identifier'] + self.core_indices
@@ -884,11 +914,38 @@ class DatabaseManager:
 
     def _connect(self):
         """Connect to output database"""
-        self.db = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.execute("PRAGMA cache_size=10000")
-        logger.info(f"Connected to output database: {self.db_path}")
+        if self.config.use_postgres:
+            if not POSTGRES_AVAILABLE:
+                raise ImportError("PostgreSQL requested but psycopg2 not installed. Run: pip install psycopg2-binary")
+
+            try:
+                self.db = psycopg2.connect(
+                    host=self.config.pg_host,
+                    port=self.config.pg_port,
+                    database=self.config.pg_database,
+                    user=self.config.pg_user,
+                    password=self.config.pg_password or os.getenv('PGPASSWORD')
+                )
+                self.db.autocommit = False  # Explicit transaction control
+
+                # Set session parameters (equivalent to SQLite PRAGMA)
+                with self.db.cursor() as cur:
+                    cur.execute("SET work_mem = '50MB'")
+                    cur.execute("SET maintenance_work_mem = '256MB'")
+                    cur.execute("SET synchronous_commit = OFF")  # Faster bulk inserts
+
+                logger.info(f"Connected to PostgreSQL database: {self.config.pg_database}")
+
+            except Exception as e:
+                logger.error(f"Failed to connect to PostgreSQL: {e}")
+                raise
+        else:
+            # SQLite connection (original behavior)
+            self.db = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            self.db.execute("PRAGMA cache_size=10000")
+            logger.info(f"Connected to SQLite database: {self.db_path}")
 
     def initialize_schema(self, beets_columns: List[str]):
         """Initialize database schema with beets metadata integration"""
@@ -897,9 +954,13 @@ class DatabaseManager:
         # Create main analysis table
         columns_sql = self._build_columns_sql()
 
+        # Adjust types based on database
+        identifier_type = "VARCHAR(32)" if self.config.use_postgres else "TEXT"
+        autoincrement = "SERIAL" if self.config.use_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
         create_sql = f"""
         CREATE TABLE IF NOT EXISTS music_analysis (
-            identifier TEXT PRIMARY KEY,
+            identifier {identifier_type} PRIMARY KEY,
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
             -- Beets metadata (bt_ prefix)
@@ -910,28 +971,37 @@ class DatabaseManager:
         )
         """
 
-        self.db.execute(create_sql)
-
-        # Create metadata table
-        self.db.execute("""
+        metadata_table_sql = f"""
         CREATE TABLE IF NOT EXISTS processing_metadata (
             key TEXT PRIMARY KEY,
             value TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """
 
-        # Create processing log table
-        self.db.execute("""
+        log_table_sql = f"""
         CREATE TABLE IF NOT EXISTS processing_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {autoincrement},
             identifier TEXT,
             status TEXT,
             error_type TEXT,
             error_message TEXT,
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            {"" if self.config.use_postgres else ""}
         )
-        """)
+        """
+
+        if self.config.use_postgres:
+            # PostgreSQL uses cursor pattern
+            with self.db.cursor() as cur:
+                cur.execute(create_sql)
+                cur.execute(metadata_table_sql)
+                cur.execute(log_table_sql)
+        else:
+            # SQLite uses direct execute
+            self.db.execute(create_sql)
+            self.db.execute(metadata_table_sql)
+            self.db.execute(log_table_sql)
 
         # Create indexes
         self._create_indexes()
@@ -942,6 +1012,9 @@ class DatabaseManager:
     def _build_columns_sql(self) -> Dict[str, str]:
         """Build SQL column definitions"""
 
+        # Type mappings based on database
+        float_type = "DOUBLE PRECISION" if self.config.use_postgres else "REAL"
+
         # Beets metadata columns with bt_ prefix
         beets_cols = []
         for col in self.beets_columns:
@@ -950,7 +1023,7 @@ class DatabaseManager:
             elif col in ['path']:
                 beets_cols.append(f"bt_{col} TEXT")
             elif col in ['length', 'mtime', 'added', 'rg_track_gain', 'rg_track_peak', 'rg_album_gain', 'rg_album_peak', 'r128_track_gain', 'r128_album_gain']:
-                beets_cols.append(f"bt_{col} REAL")
+                beets_cols.append(f"bt_{col} {float_type}")
             elif col in ['year', 'month', 'day', 'track', 'tracktotal', 'disc', 'disctotal', 'comp', 'bitrate', 'samplerate', 'bitdepth', 'channels', 'original_year', 'original_month', 'original_day', 'bpm']:
                 beets_cols.append(f"bt_{col} INTEGER")
             else:
@@ -962,19 +1035,19 @@ class DatabaseManager:
         # Music indices columns
         indices_cols = [
             # Rhythmic
-            "bpm REAL", "danceability REAL", "onset_rate REAL", "beat_punch REAL",
+            f"bpm {float_type}", f"danceability {float_type}", f"onset_rate {float_type}", f"beat_punch {float_type}",
             # Tonal
-            "tonal_clarity REAL", "tuning_purity REAL", "fifths_strength REAL",
-            "chord_strength REAL", "chord_change_rate REAL",
+            f"tonal_clarity {float_type}", f"tuning_purity {float_type}", f"fifths_strength {float_type}",
+            f"chord_strength {float_type}", f"chord_change_rate {float_type}",
             # Harmonic
-            "crest REAL", "entropy REAL",
+            f"crest {float_type}", f"entropy {float_type}",
             # Spectral
-            "spectral_centroid REAL", "spectral_rolloff REAL", "spectral_kurtosis REAL",
-            "spectral_energy REAL", "spectral_flatness REAL",
+            f"spectral_centroid {float_type}", f"spectral_rolloff {float_type}", f"spectral_kurtosis {float_type}",
+            f"spectral_energy {float_type}", f"spectral_flatness {float_type}",
             # Production
-            "sub_drive REAL", "air_sizzle REAL",
+            f"sub_drive {float_type}", f"air_sizzle {float_type}",
             # Calculated
-            "opb REAL", "pulse_cohesion REAL", "spectral_slope REAL"
+            f"opb {float_type}", f"pulse_cohesion {float_type}", f"spectral_slope {float_type}"
         ]
 
         return {
@@ -996,16 +1069,57 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_path_keywords ON music_analysis(path_keywords)",
         ]
 
-        for index_sql in indexes:
-            self.db.execute(index_sql)
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                # Enable trigram extension for fuzzy search
+                cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                logger.info("Enabled pg_trgm extension for fuzzy search")
+
+                # Create standard indexes
+                for index_sql in indexes:
+                    cur.execute(index_sql)
+
+                # Add fuzzy search GIN index on path_keywords
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_path_keywords_fuzzy
+                    ON music_analysis USING GIN (path_keywords gin_trgm_ops)
+                """)
+                logger.info("Created fuzzy search index on path_keywords")
+        else:
+            # SQLite - standard indexes only
+            for index_sql in indexes:
+                self.db.execute(index_sql)
+
+    def _get_placeholder(self, count: int = 1) -> str:
+        """Get database-specific parameter placeholder"""
+        if self.config.use_postgres:
+            return ', '.join([f'%s' for _ in range(count)])
+        else:
+            return ', '.join(['?' for _ in range(count)])
+
+    def _execute(self, sql: str, params: tuple = ()):
+        """Execute SQL with cursor handling based on database type"""
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                cur.execute(sql, params)
+                return cur
+        else:
+            return self.db.execute(sql, params)
 
     def track_exists(self, identifier: str) -> bool:
         """Check if track already processed"""
-        cursor = self.db.execute(
-            "SELECT 1 FROM music_analysis WHERE identifier = ?",
-            (identifier,)
-        )
-        return cursor.fetchone() is not None
+        ph = '%s' if self.config.use_postgres else '?'
+
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                cur.execute(f"SELECT 1 FROM music_analysis WHERE identifier = {ph}", (identifier,))
+                return cur.fetchone() is not None
+        else:
+            cursor = self.db.execute(
+                f"SELECT 1 FROM music_analysis WHERE identifier = {ph}",
+                (identifier,)
+            )
+            return cursor.fetchone() is not None
 
     def insert_track(self, track_data: Dict, indices: Dict):
         """Insert complete track analysis"""
@@ -1025,29 +1139,61 @@ class DatabaseManager:
 
         # Build insert SQL
         columns = list(all_data.keys())
-        placeholders = ', '.join(['?' for _ in columns])
+        ph = '%s' if self.config.use_postgres else '?'
+        placeholders = ', '.join([ph for _ in columns])
         values = [all_data[col] for col in columns]
 
-        insert_sql = f"""
-        INSERT OR REPLACE INTO music_analysis ({', '.join(columns)})
-        VALUES ({placeholders})
-        """
-
-        self.db.execute(insert_sql, values)
+        if self.config.use_postgres:
+            # PostgreSQL UPSERT
+            update_cols = [col for col in columns if col != 'identifier']
+            update_clause = ', '.join([f'{col} = EXCLUDED.{col}' for col in update_cols])
+            insert_sql = f"""
+            INSERT INTO music_analysis ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT (identifier) DO UPDATE SET {update_clause}
+            """
+            with self.db.cursor() as cur:
+                cur.execute(insert_sql, values)
+        else:
+            # SQLite INSERT OR REPLACE
+            insert_sql = f"""
+            INSERT OR REPLACE INTO music_analysis ({', '.join(columns)})
+            VALUES ({placeholders})
+            """
+            self.db.execute(insert_sql, values)
 
     def log_error(self, identifier: str, error_type: str, error_message: str):
         """Log processing error"""
-        self.db.execute("""
+        ph = '%s' if self.config.use_postgres else '?'
+        sql = f"""
         INSERT INTO processing_log (identifier, status, error_type, error_message)
-        VALUES (?, 'failed', ?, ?)
-        """, (identifier, error_type, error_message))
+        VALUES ({ph}, 'failed', {ph}, {ph})
+        """
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                cur.execute(sql, (identifier, error_type, error_message))
+        else:
+            self.db.execute(sql, (identifier, error_type, error_message))
 
     def update_metadata(self, key: str, value: str):
         """Update processing metadata"""
-        self.db.execute("""
-        INSERT OR REPLACE INTO processing_metadata (key, value)
-        VALUES (?, ?)
-        """, (key, value))
+        ph = '%s' if self.config.use_postgres else '?'
+        if self.config.use_postgres:
+            # PostgreSQL UPSERT
+            sql = f"""
+            INSERT INTO processing_metadata (key, value)
+            VALUES ({ph}, {ph})
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """
+            with self.db.cursor() as cur:
+                cur.execute(sql, (key, value))
+        else:
+            # SQLite INSERT OR REPLACE
+            sql = f"""
+            INSERT OR REPLACE INTO processing_metadata (key, value)
+            VALUES ({ph}, {ph})
+            """
+            self.db.execute(sql, (key, value))
 
     def commit(self):
         """Commit database changes"""
@@ -1129,22 +1275,41 @@ class DatabaseManager:
         """Bulk insert PCA transformation weights."""
         logger.info(f"Inserting {len(weights)} transformation weights...")
 
-        # Clear existing weights
-        self.db.execute("DELETE FROM pca_transformations")
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                # Clear existing weights
+                cur.execute("DELETE FROM pca_transformations")
 
-        # Insert new weights
-        insert_sql = """
-        INSERT INTO pca_transformations
-        (component, feature_index, feature_name, weight, mean, scale)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """
+                # Insert new weights using execute_values (fastest for PostgreSQL)
+                insert_sql = """
+                INSERT INTO pca_transformations
+                (component, feature_index, feature_name, weight, mean, scale)
+                VALUES %s
+                """
+                psycopg2.extras.execute_values(cur, insert_sql, weights, page_size=1000)
 
-        self.db.executemany(insert_sql, weights)
-        self.db.commit()
+            self.db.commit()
 
-        # Verify
-        cursor = self.db.execute("SELECT COUNT(*) FROM pca_transformations")
-        count = cursor.fetchone()[0]
+            # Verify
+            with self.db.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM pca_transformations")
+                count = cur.fetchone()[0]
+        else:
+            # SQLite
+            self.db.execute("DELETE FROM pca_transformations")
+
+            insert_sql = """
+            INSERT INTO pca_transformations
+            (component, feature_index, feature_name, weight, mean, scale)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """
+
+            self.db.executemany(insert_sql, weights)
+            self.db.commit()
+
+            # Verify
+            cursor = self.db.execute("SELECT COUNT(*) FROM pca_transformations")
+            count = cursor.fetchone()[0]
 
         logger.info(f"✅ Inserted {count} transformation weights")
 
@@ -1192,15 +1357,20 @@ class DatabaseManager:
                 )
                 batch_updates.append(update_values)
 
-            update_sql = """
+            ph = '%s' if self.config.use_postgres else '?'
+            update_sql = f"""
             UPDATE music_analysis SET
-                primary_d = ?, tonal_pc1 = ?, tonal_pc2 = ?, tonal_pc3 = ?,
-                spectral_pc1 = ?, spectral_pc2 = ?, spectral_pc3 = ?,
-                rhythmic_pc1 = ?, rhythmic_pc2 = ?, rhythmic_pc3 = ?
-            WHERE identifier = ?
+                primary_d = {ph}, tonal_pc1 = {ph}, tonal_pc2 = {ph}, tonal_pc3 = {ph},
+                spectral_pc1 = {ph}, spectral_pc2 = {ph}, spectral_pc3 = {ph},
+                rhythmic_pc1 = {ph}, rhythmic_pc2 = {ph}, rhythmic_pc3 = {ph}
+            WHERE identifier = {ph}
             """
 
-            self.db.executemany(update_sql, batch_updates)
+            if self.config.use_postgres:
+                with self.db.cursor() as cur:
+                    psycopg2.extras.execute_batch(cur, update_sql, batch_updates, page_size=1000)
+            else:
+                self.db.executemany(update_sql, batch_updates)
 
             if (i + batch_size) % 10000 == 0:
                 logger.info(f"  Updated {i + batch_size:,}/{n_tracks:,} tracks...")
@@ -1212,37 +1382,73 @@ class DatabaseManager:
         """Insert calibration settings into database."""
         logger.info("Inserting calibration settings...")
 
-        # Clear existing settings
-        self.db.execute("DELETE FROM pca_calibration_settings")
+        ph = '%s' if self.config.use_postgres else '?'
 
-        insert_sql = """
-        INSERT INTO pca_calibration_settings
-        (resolution_level, discriminator, base_x, inner_radius, outer_radius,
-         target_percentage, achieved_percentage, library_size)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                # Clear existing settings
+                cur.execute("DELETE FROM pca_calibration_settings")
 
-        # Get library size
-        cursor = self.db.execute("SELECT COUNT(*) FROM music_analysis")
-        library_size = cursor.fetchone()[0]
+                # Get library size
+                cur.execute("SELECT COUNT(*) FROM music_analysis")
+                library_size = cur.fetchone()[0]
 
-        settings = []
-        for resolution_name, resolution_data in calibration_results.items():
-            target_pct = resolution_data['config']['target_pct']
+                settings = []
+                for resolution_name, resolution_data in calibration_results.items():
+                    target_pct = resolution_data['config']['target_pct']
 
-            for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
-                settings.append((
-                    resolution_name,
-                    disc_name,
-                    disc_results['best_x'],
-                    disc_results['best_inner'],
-                    disc_results['best_outer'],
-                    target_pct,
-                    disc_results['achieved_percentage'],
-                    library_size
-                ))
+                    for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
+                        settings.append((
+                            resolution_name,
+                            disc_name,
+                            disc_results['best_x'],
+                            disc_results['best_inner'],
+                            disc_results['best_outer'],
+                            target_pct,
+                            disc_results['achieved_percentage'],
+                            library_size
+                        ))
 
-        self.db.executemany(insert_sql, settings)
+                # Use execute_values for bulk insert
+                insert_sql = """
+                INSERT INTO pca_calibration_settings
+                (resolution_level, discriminator, base_x, inner_radius, outer_radius,
+                 target_percentage, achieved_percentage, library_size)
+                VALUES %s
+                """
+                psycopg2.extras.execute_values(cur, insert_sql, settings, page_size=1000)
+        else:
+            # SQLite
+            self.db.execute("DELETE FROM pca_calibration_settings")
+
+            insert_sql = f"""
+            INSERT INTO pca_calibration_settings
+            (resolution_level, discriminator, base_x, inner_radius, outer_radius,
+             target_percentage, achieved_percentage, library_size)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """
+
+            # Get library size
+            cursor = self.db.execute("SELECT COUNT(*) FROM music_analysis")
+            library_size = cursor.fetchone()[0]
+
+            settings = []
+            for resolution_name, resolution_data in calibration_results.items():
+                target_pct = resolution_data['config']['target_pct']
+
+                for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
+                    settings.append((
+                        resolution_name,
+                        disc_name,
+                        disc_results['best_x'],
+                        disc_results['best_inner'],
+                        disc_results['best_outer'],
+                        target_pct,
+                        disc_results['achieved_percentage'],
+                        library_size
+                    ))
+
+            self.db.executemany(insert_sql, settings)
         self.db.commit()
 
         logger.info(f"✅ Inserted {len(settings)} calibration settings")
@@ -1493,6 +1699,20 @@ Examples:
     parser.add_argument('--checkpoint-db',
                        help='Checkpoint database for resumable processing')
 
+    # PostgreSQL options
+    parser.add_argument('--postgres', action='store_true',
+                       help='Use PostgreSQL instead of SQLite')
+    parser.add_argument('--pg-host', default='localhost',
+                       help='PostgreSQL host (default: localhost)')
+    parser.add_argument('--pg-port', type=int, default=5432,
+                       help='PostgreSQL port (default: 5432)')
+    parser.add_argument('--pg-database', default='tsnotfyi',
+                       help='PostgreSQL database name (default: tsnotfyi)')
+    parser.add_argument('--pg-user', default='postgres',
+                       help='PostgreSQL user (default: postgres)')
+    parser.add_argument('--pg-password',
+                       help='PostgreSQL password (or use PGPASSWORD env var)')
+
     # Performance tuning
     parser.add_argument('--parallel', type=int, default=4,
                        help='Number of parallel jobs')
@@ -1557,7 +1777,14 @@ Examples:
         validate_files=not args.no_validate_files,
         include_failed=args.include_failed,
         verbose=args.verbose,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        # PostgreSQL options
+        use_postgres=args.postgres,
+        pg_host=args.pg_host,
+        pg_port=args.pg_port,
+        pg_database=args.pg_database,
+        pg_user=args.pg_user,
+        pg_password=args.pg_password
     )
 
     # Validate beets database exists
@@ -1597,7 +1824,7 @@ Examples:
 
             # 2. Initialize PCA computer and fit models
             pca_computer = PCAComputer()
-            pca_computer.fit_pca_on_library(config.output_db_path)
+            pca_computer.fit_pca_on_library(config)
 
             # 3. Extract and store transformation weights
             weights = pca_computer.extract_transformation_weights()
