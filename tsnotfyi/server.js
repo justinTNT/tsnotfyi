@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
 
 // Load configuration
@@ -157,13 +157,19 @@ function attachEphemeralCleanup(sessionId, session) {
 const radialSearch = new RadialSearchService();
 
 // Initialize database connection
-const dbPath = config.database.path.replace('~', process.env.HOME);
-const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
-  if (err) {
-    console.error('Database connection failed:', err.message);
-  } else {
-    console.log('📊 Connected to music database');
-  }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || config.database.postgresql.connectionString,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+pool.on('connect', () => {
+  console.log('📊 Connected to PostgreSQL music database');
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected database error:', err);
 });
 
 async function initializeServices() {
@@ -1019,7 +1025,7 @@ app.get('/:md51/:md52', async (req, res, next) => {
 
 
 // Fuzzy search endpoint
-app.get('/search', (req, res) => {
+app.get('/search', async (req, res) => {
   const query = req.query.q;
   const limit = parseInt(req.query.limit) || 50;
 
@@ -1029,45 +1035,29 @@ app.get('/search', (req, res) => {
 
   console.log(`🔍 Fuzzy search: "${query}" (limit: ${limit})`);
 
-  // Enhanced fuzzy search SQL - searches decoded paths, metadata, and path segments
+  // PostgreSQL trigram fuzzy search on music_analysis table
   const searchQuery = `
     SELECT
       identifier,
-      CAST(path_b64 AS TEXT) as path_b64,
-      CAST(beets_json_b64 AS TEXT) as beets_json_b64
-    FROM tracks
-    WHERE
-      LOWER(path_keywords) LIKE LOWER(?)
-      OR identifier = ?
-    LIMIT ?
+      bt_path,
+      bt_title,
+      bt_artist,
+      bt_album,
+      bt_year,
+      similarity(path_keywords, $1) AS score
+    FROM music_analysis
+    WHERE path_keywords % $1
+    ORDER BY score DESC
+    LIMIT $2
   `;
 
-  const searchPattern    = `%${query}%`;
-  const md5Pattern       = `%${query}%`;
-
-  db.all(searchQuery, [searchPattern, md5Pattern, limit], (err, rows) => {
-    if (err) {
-      console.error('Search error:', err);
-      return res.status(500).json({ error: 'Search failed' });
-    }
+  try {
+    const result = await pool.query(searchQuery, [query, limit]);
+    const rows = result.rows;
 
     const results = rows.map(row => {
       try {
-        // Decode base64 path
-        const decodedPath = Buffer.from(row.path_b64, 'base64').toString('utf8');
-
-        // Try to decode beets metadata
-        let metadata = {};
-        if (row.beets_json_b64) {
-          try {
-            const beetsJson = Buffer.from(row.beets_json_b64, 'base64').toString('utf8');
-            metadata = JSON.parse(beetsJson);
-          } catch (e) {
-            // Skip metadata decode errors
-          }
-        }
-
-        // Extract filename and path segments for fzf-style navigation
+        const decodedPath = row.bt_path;
         const filename = path.basename(decodedPath);
         const directory = path.dirname(decodedPath).replace('/Volumes/', '');
 
@@ -1087,15 +1077,14 @@ app.get('/search', (req, res) => {
           filename: filename,
           directory: directory,
           segments: pathParts.slice(3),  // ignore tranche, year, month
-          albumCover: metadata.album.artpath || '/images/albumcover.png',
-          title: metadata.title || filename,
-          artist: metadata.artist || segments.pathArtist || '',
-          album: metadata.album || segments.pathAlbum || '',
-          year: metadata.year || segments.year || '',
-          // fzf-style matched text highlighting could be added here
-          displayText: `${metadata.artist || segments.pathArtist || 'Unknown'} - ${metadata.title || filename}`,
-          // Include searchable path info
-          searchableText: `${decodedPath} ${metadata.artist || ''} ${metadata.title || ''} ${metadata.album || ''} ${segments.tranche} ${segments.year} ${segments.month}`
+          albumCover: '/images/albumcover.png',
+          title: row.bt_title || filename,
+          artist: row.bt_artist || segments.pathArtist || '',
+          album: row.bt_album || segments.pathAlbum || '',
+          year: row.bt_year || segments.year || '',
+          score: row.score,  // Similarity score 0.0-1.0
+          displayText: `${row.bt_artist || segments.pathArtist || 'Unknown'} - ${row.bt_title || filename}`,
+          searchableText: `${decodedPath} ${row.bt_artist || ''} ${row.bt_title || ''} ${row.bt_album || ''} ${segments.tranche} ${segments.year} ${segments.month}`
         };
       } catch (e) {
         console.error('Error processing row:', e);
@@ -1109,7 +1098,10 @@ app.get('/search', (req, res) => {
       total: results.length,
       hasMore: results.length === limit
     });
-  });
+  } catch (err) {
+    console.error('Search error:', err);
+    return res.status(500).json({ error: 'Search failed' });
+  }
 });
 
 app.get('/track/:identifier/meta', async (req, res) => {

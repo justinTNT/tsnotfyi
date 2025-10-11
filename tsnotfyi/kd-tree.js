@@ -1,4 +1,4 @@
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
 
@@ -6,28 +6,38 @@ const fs = require('fs');
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-function openDatabase(dbPath) {
+// Module-level pool (shared across instances)
+let globalPool = null;
+
+function openDatabase(connectionString) {
     return new Promise((resolve, reject) => {
-        const db = new sqlite3.Database(dbPath, (err) => {
-            if (err) {
-                reject(new Error(`Database connection failed: ${err.message}`));
-            } else {
-                resolve(db);
+        try {
+            if (globalPool) {
+                resolve(globalPool);
+                return;
             }
-        });
+
+            globalPool = new Pool({
+                connectionString: connectionString,
+                max: 20,
+                idleTimeoutMillis: 30000,
+                connectionTimeoutMillis: 2000,
+            });
+
+            globalPool.on('error', (err) => {
+                console.error('Unexpected database error:', err);
+            });
+
+            resolve(globalPool);
+        } catch (err) {
+            reject(new Error(`Database connection failed: ${err.message}`));
+        }
     });
 }
 
-function runAll(db, query, params = []) {
-    return new Promise((resolve, reject) => {
-        db.all(query, params, (err, rows) => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve(rows);
-            }
-        });
-    });
+async function runAll(pool, query, params = []) {
+    const result = await pool.query(query, params);
+    return result.rows;
 }
 
 class KDTreeNode {
@@ -40,8 +50,10 @@ class KDTreeNode {
 }
 
 class MusicalKDTree {
-    constructor(dbPath = config.database.path.replace('~', process.env.HOME)) {
-        this.dbPath = dbPath;
+    constructor(connectionString = null) {
+        this.connectionString = connectionString ||
+                               process.env.DATABASE_URL ||
+                               config.database.postgresql.connectionString;
         this.db = null;
         this.root = null;
         this.tracks = [];
@@ -146,8 +158,8 @@ class MusicalKDTree {
             return;
         }
 
-        this.db = await openDatabase(this.dbPath);
-        console.log('Connected to musical database');
+        this.db = await openDatabase(this.connectionString);
+        console.log('Connected to PostgreSQL musical database');
 
         await Promise.all([
             this.loadTracks(),
@@ -980,9 +992,9 @@ class MusicalKDTree {
         return stats;
     }
 
-    close() {
+    async close() {
         if (this.db) {
-            this.db.close();
+            await this.db.end();
         }
     }
 }
