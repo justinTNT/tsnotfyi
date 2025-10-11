@@ -790,14 +790,14 @@ class PCAComputer:
 
         return calibration_results
 
-    def validate_pca_integrity(self, db_path: str) -> bool:
+    def validate_pca_integrity(self, db_manager) -> bool:
         """Validate PCA values in database match computed values.
 
         Cross-references database PCA values against freshly computed values.
         Raises ValueError if validation fails.
 
         Args:
-            db_path: Path to database with music_analysis table
+            db_manager: Active DatabaseManager instance
 
         Returns:
             True if validation passes
@@ -808,20 +808,27 @@ class PCAComputer:
         logger.info("\n✅ VALIDATING PCA INTEGRITY")
         logger.info("="*70)
 
-        try:
-            conn = sqlite3.connect(db_path)
+        conn = None
 
-            # Load database PCA values
+        try:
+            if db_manager.config.use_postgres:
+                conn = psycopg2.connect(
+                    host=db_manager.config.pg_host,
+                    port=db_manager.config.pg_port,
+                    database=db_manager.config.pg_database,
+                    user=db_manager.config.pg_user,
+                    password=db_manager.config.pg_password or os.getenv('PGPASSWORD')
+                )
+            else:
+                conn = sqlite3.connect(db_manager.db_path)
+
             db_df = pd.read_sql_query("""
-                SELECT rowid, primary_d, tonal_pc1, tonal_pc2, tonal_pc3,
+                SELECT identifier, primary_d, tonal_pc1, tonal_pc2, tonal_pc3,
                        spectral_pc1, spectral_pc2, spectral_pc3,
                        rhythmic_pc1, rhythmic_pc2, rhythmic_pc3
                 FROM music_analysis
                 WHERE primary_d IS NOT NULL
-                ORDER BY rowid
             """, conn)
-
-            conn.close()
 
             logger.info(f"Loaded {len(db_df):,} database records")
 
@@ -830,10 +837,25 @@ class PCAComputer:
             validation_results = {}
             all_passed = True
 
+            computed_df = pd.DataFrame({
+                'identifier': self.data['identifier'],
+                'primary_d_computed': self.discriminators['primary_d']['values']
+            })
+
+            for domain in ['tonal', 'spectral', 'rhythmic']:
+                values = self.discriminators[domain]['values']
+                for idx in range(self.discriminators[domain]['n_components']):
+                    computed_df[f'{domain}_pc{idx + 1}_computed'] = values[:, idx]
+
+            merged = db_df.merge(computed_df, on='identifier')
+
+            if merged.empty:
+                raise ValueError("No overlapping identifiers between computed PCA data and database records")
+
             # Validate primary_d
-            computed_primary_d = self.discriminators['primary_d']['values']
-            db_primary_d = db_df['primary_d'].values
-            diff = np.abs(db_primary_d - computed_primary_d[:len(db_primary_d)])
+            db_primary_d = merged['primary_d'].values
+            computed_primary_d = merged['primary_d_computed'].values
+            diff = np.abs(db_primary_d - computed_primary_d)
             max_diff = np.max(diff)
             matches = np.sum(diff < tolerance)
             match_pct = (matches / len(db_primary_d)) * 100
@@ -855,27 +877,26 @@ class PCAComputer:
             # Validate domain components
             for domain in ['tonal', 'spectral', 'rhythmic']:
                 n_components = self.discriminators[domain]['n_components']
-                computed_values = self.discriminators[domain]['values']
 
                 for component_idx in range(n_components):
                     column_name = f"{domain}_pc{component_idx + 1}"
-                    db_values = db_df[column_name].values
-                    computed_col = computed_values[:len(db_values), component_idx]
+                    db_column = merged[column_name].values
+                    computed_column = merged[f'{column_name}_computed'].values
 
-                    diff = np.abs(db_values - computed_col)
+                    diff = np.abs(db_column - computed_column)
                     max_diff = np.max(diff)
                     matches = np.sum(diff < tolerance)
-                    match_pct = (matches / len(db_values)) * 100
+                    match_pct = (matches / len(db_column)) * 100
 
                     validation_results[column_name] = {
                         'matches': int(matches),
-                        'total': len(db_values),
+                        'total': len(db_column),
                         'match_pct': match_pct,
                         'max_diff': float(max_diff),
                         'passed': match_pct > 99.9
                     }
 
-                    logger.info(f"{column_name}: {matches:,}/{len(db_values):,} exact matches ({match_pct:.2f}%), max diff: {max_diff:.2e}")
+                    logger.info(f"{column_name}: {matches:,}/{len(db_column):,} exact matches ({match_pct:.2f}%), max diff: {max_diff:.2e}")
 
                     if not validation_results[column_name]['passed']:
                         all_passed = False
@@ -900,6 +921,9 @@ class PCAComputer:
         except Exception as e:
             logger.error(f"❌ PCA integrity validation error: {e}")
             raise
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 class DatabaseManager:
@@ -1097,7 +1121,7 @@ class DatabaseManager:
         else:
             return ', '.join(['?' for _ in range(count)])
 
-    def _execute(self, sql: str, params: tuple = ()):
+    def _execute(self, sql: str, params: tuple = ()):    
         """Execute SQL with cursor handling based on database type"""
         if self.config.use_postgres:
             with self.db.cursor() as cur:
@@ -1105,6 +1129,23 @@ class DatabaseManager:
                 return cur
         else:
             return self.db.execute(sql, params)
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check whether a column exists on a table."""
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND column_name = %s
+                    """,
+                    (table_name, column_name)
+                )
+                return cur.fetchone() is not None
+        else:
+            cursor = self.db.execute(f"PRAGMA table_info({table_name})")
+            return any(row[1] == column_name for row in cursor.fetchall())
 
     def track_exists(self, identifier: str) -> bool:
         """Check if track already processed"""
@@ -1212,19 +1253,32 @@ class DatabaseManager:
 
         for column_def in pca_columns:
             column_name = column_def.split()[0]
-            try:
-                self.db.execute(f"ALTER TABLE music_analysis ADD COLUMN {column_def}")
+            if self._column_exists('music_analysis', column_name):
+                continue
+
+            if self.config.use_postgres:
+                with self.db.cursor() as cur:
+                    cur.execute(f"ALTER TABLE music_analysis ADD COLUMN {column_name} DOUBLE PRECISION")
                 logger.info(f"  ✅ Added column: {column_name}")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            else:
+                try:
+                    self.db.execute(f"ALTER TABLE music_analysis ADD COLUMN {column_def}")
+                    logger.info(f"  ✅ Added column: {column_name}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
 
         # Create indexes
         index_columns = ['primary_d', 'tonal_pc1', 'spectral_pc1', 'rhythmic_pc1']
-        for col in index_columns:
-            try:
-                self.db.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON music_analysis({col})")
-            except:
-                pass
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                for col in index_columns:
+                    cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON music_analysis({col})")
+        else:
+            for col in index_columns:
+                try:
+                    self.db.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON music_analysis({col})")
+                except Exception:
+                    pass
 
         self.db.commit()
         logger.info("✅ PCA columns ready")
@@ -1233,54 +1287,89 @@ class DatabaseManager:
         """Create pca_transformations and pca_calibration_settings tables."""
         logger.info("Creating PCA metadata tables...")
 
-        # pca_transformations table
-        self.db.execute("""
-        CREATE TABLE IF NOT EXISTS pca_transformations (
-            component TEXT NOT NULL,
-            feature_index INTEGER NOT NULL,
-            feature_name TEXT NOT NULL,
-            weight REAL NOT NULL,
-            mean REAL NOT NULL,
-            scale REAL NOT NULL,
-            PRIMARY KEY (component, feature_index)
-        )
-        """)
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS pca_transformations (
+                    component TEXT NOT NULL,
+                    feature_index INTEGER NOT NULL,
+                    feature_name TEXT NOT NULL,
+                    weight DOUBLE PRECISION NOT NULL,
+                    mean DOUBLE PRECISION NOT NULL,
+                    scale DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (component, feature_index)
+                )
+                """)
 
-        self.db.execute("""
-        CREATE INDEX IF NOT EXISTS idx_pca_component
-        ON pca_transformations(component)
-        """)
+                cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pca_component
+                ON pca_transformations(component)
+                """)
 
-        # pca_calibration_settings table
-        self.db.execute("""
-        CREATE TABLE IF NOT EXISTS pca_calibration_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            resolution_level TEXT NOT NULL,
-            discriminator TEXT NOT NULL,
-            base_x REAL NOT NULL,
-            inner_radius REAL NOT NULL,
-            outer_radius REAL NOT NULL,
-            target_percentage REAL NOT NULL,
-            achieved_percentage REAL NOT NULL,
-            library_size INTEGER NOT NULL,
-            calibration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(resolution_level, discriminator)
-        )
-        """)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS pca_calibration_settings (
+                    id SERIAL PRIMARY KEY,
+                    resolution_level TEXT NOT NULL,
+                    discriminator TEXT NOT NULL,
+                    base_x DOUBLE PRECISION NOT NULL,
+                    inner_radius DOUBLE PRECISION NOT NULL,
+                    outer_radius DOUBLE PRECISION NOT NULL,
+                    target_percentage DOUBLE PRECISION NOT NULL,
+                    achieved_percentage DOUBLE PRECISION NOT NULL,
+                    library_size INTEGER NOT NULL,
+                    calibration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(resolution_level, discriminator)
+                )
+                """)
+            self.db.commit()
+        else:
+            # SQLite schema
+            self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pca_transformations (
+                component TEXT NOT NULL,
+                feature_index INTEGER NOT NULL,
+                feature_name TEXT NOT NULL,
+                weight REAL NOT NULL,
+                mean REAL NOT NULL,
+                scale REAL NOT NULL,
+                PRIMARY KEY (component, feature_index)
+            )
+            """)
 
-        self.db.commit()
+            self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pca_component
+            ON pca_transformations(component)
+            """)
+
+            self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pca_calibration_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resolution_level TEXT NOT NULL,
+                discriminator TEXT NOT NULL,
+                base_x REAL NOT NULL,
+                inner_radius REAL NOT NULL,
+                outer_radius REAL NOT NULL,
+                target_percentage REAL NOT NULL,
+                achieved_percentage REAL NOT NULL,
+                library_size INTEGER NOT NULL,
+                calibration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(resolution_level, discriminator)
+            )
+            """)
+
+            self.db.commit()
         logger.info("✅ PCA metadata tables ready")
 
     def insert_pca_transformations(self, weights: List[Tuple]):
         """Bulk insert PCA transformation weights."""
         logger.info(f"Inserting {len(weights)} transformation weights...")
 
+        component_counts = []
+
         if self.config.use_postgres:
             with self.db.cursor() as cur:
-                # Clear existing weights
                 cur.execute("DELETE FROM pca_transformations")
 
-                # Insert new weights using execute_values (fastest for PostgreSQL)
                 insert_sql = """
                 INSERT INTO pca_transformations
                 (component, feature_index, feature_name, weight, mean, scale)
@@ -1290,10 +1379,16 @@ class DatabaseManager:
 
             self.db.commit()
 
-            # Verify
             with self.db.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM pca_transformations")
                 count = cur.fetchone()[0]
+                cur.execute("""
+                    SELECT component, COUNT(*)
+                    FROM pca_transformations
+                    GROUP BY component
+                    ORDER BY component
+                """)
+                component_counts = cur.fetchall()
         else:
             # SQLite
             self.db.execute("DELETE FROM pca_transformations")
@@ -1310,18 +1405,17 @@ class DatabaseManager:
             # Verify
             cursor = self.db.execute("SELECT COUNT(*) FROM pca_transformations")
             count = cursor.fetchone()[0]
+            cursor = self.db.execute("""
+                SELECT component, COUNT(*)
+                FROM pca_transformations
+                GROUP BY component
+                ORDER BY component
+            """)
+            component_counts = cursor.fetchall()
 
         logger.info(f"✅ Inserted {count} transformation weights")
 
-        # Breakdown by component
-        cursor = self.db.execute("""
-        SELECT component, COUNT(*)
-        FROM pca_transformations
-        GROUP BY component
-        ORDER BY component
-        """)
-
-        for component, cnt in cursor.fetchall():
+        for component, cnt in component_counts:
             logger.info(f"   {component}: {cnt} weights")
 
         if count != len(weights):
@@ -1395,18 +1489,18 @@ class DatabaseManager:
 
                 settings = []
                 for resolution_name, resolution_data in calibration_results.items():
-                    target_pct = resolution_data['config']['target_pct']
+                    target_pct = float(resolution_data['config']['target_pct'])
 
                     for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
                         settings.append((
                             resolution_name,
                             disc_name,
-                            disc_results['best_x'],
-                            disc_results['best_inner'],
-                            disc_results['best_outer'],
+                            float(disc_results['best_x']),
+                            float(disc_results['best_inner']),
+                            float(disc_results['best_outer']),
                             target_pct,
-                            disc_results['achieved_percentage'],
-                            library_size
+                            float(disc_results['achieved_percentage']),
+                            int(library_size)
                         ))
 
                 # Use execute_values for bulk insert
@@ -1434,18 +1528,18 @@ class DatabaseManager:
 
             settings = []
             for resolution_name, resolution_data in calibration_results.items():
-                target_pct = resolution_data['config']['target_pct']
+                target_pct = float(resolution_data['config']['target_pct'])
 
                 for disc_name, disc_results in resolution_data['discriminator_calibrations'].items():
                     settings.append((
                         resolution_name,
                         disc_name,
-                        disc_results['best_x'],
-                        disc_results['best_inner'],
-                        disc_results['best_outer'],
+                        float(disc_results['best_x']),
+                        float(disc_results['best_inner']),
+                        float(disc_results['best_outer']),
                         target_pct,
-                        disc_results['achieved_percentage'],
-                        library_size
+                        float(disc_results['achieved_percentage']),
+                        int(library_size)
                     ))
 
             self.db.executemany(insert_sql, settings)
@@ -1838,7 +1932,7 @@ Examples:
             processor.db_manager.insert_calibration_settings(calibration_results)
 
             # 6. Validate integrity
-            pca_computer.validate_pca_integrity(config.output_db_path)
+            pca_computer.validate_pca_integrity(processor.db_manager)
 
             logger.info("\n" + "=" * 80)
             logger.info("✅ PCA COMPUTATION COMPLETE")
