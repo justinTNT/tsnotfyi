@@ -286,15 +286,22 @@ class EssentiaProcessor:
             'errors': {}
         }
 
-    def extract_features(self, track_path: str, track_id: str) -> Optional[Dict]:
-        """Extract Essentia features from audio file"""
+    def extract_features(self, track_path: str, track_id: str) -> Tuple[Optional[Dict], Optional[Dict[str, str]]]:
+        """Extract Essentia features from audio file.
+
+        Returns:
+            tuple: (features, error_info)
+                features: Parsed Essentia JSON when successful, otherwise None
+                error_info: Optional dict with 'type' and 'message' describing the failure
+        """
         try:
             # Validate file exists if enabled
             if self.config.validate_files:
                 if not Path(track_path).exists():
-                    logger.warning(f"File not found: {track_path}")
+                    msg = f"File not found: {track_path}"
+                    logger.warning(msg)
                     self._record_error('file_not_found', track_id)
-                    return None
+                    return None, {'type': 'file_not_found', 'message': msg}
 
             # Create temporary file for Essentia output
             with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp:
@@ -316,33 +323,38 @@ class EssentiaProcessor:
                 )
 
                 if result.returncode != 0:
-                    logger.error(f"Essentia failed for {track_id}: {result.stderr[:200]}")
+                    stderr_snippet = (result.stderr or '').strip()[:200]
+                    msg = f"Essentia failed for {track_id}: {stderr_snippet}" if stderr_snippet else f"Essentia failed for {track_id}"
+                    logger.error(msg)
                     self._record_error('essentia_failed', track_id)
-                    return None
+                    return None, {'type': 'essentia_failed', 'message': msg}
 
                 # Read and parse results
                 with open(tmp_path, 'r', encoding='utf-8') as f:
                     features = json.load(f)
-                return features
+                return features, None
 
             finally:
                 # Cleanup temporary file
                 Path(tmp_path).unlink(missing_ok=True)
 
         except subprocess.TimeoutExpired:
-            logger.error(f"Essentia timeout for {track_id} (>{self.config.essentia_timeout}s)")
+            msg = f"Essentia timeout for {track_id} (>{self.config.essentia_timeout}s)"
+            logger.error(msg)
             self._record_error('timeout', track_id)
-            return None
+            return None, {'type': 'timeout', 'message': msg}
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing failed for {track_id}: {e}")
+            msg = f"JSON parsing failed for {track_id}: {e}"
+            logger.error(msg)
             self._record_error('json_parse', track_id)
-            return None
+            return None, {'type': 'json_parse', 'message': msg}
 
         except Exception as e:
-            logger.error(f"Unexpected error extracting features for {track_id}: {e}")
+            msg = f"Unexpected error extracting features for {track_id}: {e}"
+            logger.error(msg)
             self._record_error('unexpected', track_id)
-            return None
+            return None, {'type': 'unexpected', 'message': msg}
 
     def _record_error(self, error_type: str, track_id: str):
         """Record error statistics"""
@@ -1677,9 +1689,16 @@ class Beets2TsnotProcessor:
                 return True
 
             # Extract Essentia features
-            features = self.essentia_processor.extract_features(track['path_str'], identifier)
+            features, error_info = self.essentia_processor.extract_features(track['path_str'], identifier)
             if not features:
-                self.db_manager.log_error(identifier, 'extraction_failed', 'Essentia feature extraction failed')
+                error_type = 'extraction_failed'
+                error_message = 'Essentia feature extraction failed'
+
+                if error_info:
+                    error_type = error_info.get('type', error_type)
+                    error_message = error_info.get('message', error_message)
+
+                self.db_manager.log_error(identifier, error_type, error_message)
                 self.stats['failed'] += 1
                 return False
 
