@@ -86,3 +86,59 @@ Replace linear PCA-based music exploration in [tsnotfyi](https://github.com/just
 - Current PCA: `src/services/radialSearchService.js` lines 97-112
 - KD-Tree usage: `src/utils/musicalKDTree.js`
 - Track feature schema: `src/db/musicalDB.js`
+
+
+Here's a modified VAE pipeline tailored for Phase 1:
+
+  # Music VAE Pipeline for tsnotfyi Phase 1
+  # Components: AutoEncoder + DataValidator + FeatureStore + DataVersioner
+
+  # Validate incoming 18D music features
+  validator = DataValidator(
+      schema=Schema({
+          'danceability': float,
+          'energy': float,
+          'loudness': float,
+          'spectral_centroid': float,
+          # ... 14 more audio features from Essentia
+      }),
+      strict=True
+  )
+
+  # VAE for non-linear music manifold learning
+  music_vae = AutoEncoder(
+      input_dim=18,          # Existing feature dimensions from PostgreSQL
+      hidden_dims=[64, 32],  # Compress gradually
+      latent_dim=8,          # Expressive but compressed
+      activation='tanh'      # Bounded activations for music
+  )
+
+  # Store learned representations
+  latent_store = FeatureStore(
+      cache_size=100000,      # Cache all track embeddings
+      compute_on_miss=True   # Auto-encode new tracks
+  )
+
+  # Version control for model evolution
+  model_versioner = DataVersioner(
+      storage_backend='disk',
+      deduplicate=True
+  )
+
+  # Pipeline workflow:
+  # 1. Load 18D features from PostgreSQL → Validate
+  # 2. Train VAE to learn non-linear musical manifold
+  # 3. Cache latent representations in FeatureStore
+  # 4. Version trained models for A/B testing
+  # 5. Use latents for musical exploration paths
+
+  # Integration points:
+  # - Replace PCA in radialSearchService.js with VAE latents
+  # - Store latents as vae_latent column in tracks table
+  # - Expose via /api/vae/interpolate endpoint
+
+  This pipeline specifically addresses:
+  - Working with existing 18D features (no recomputation needed)
+  - Learning non-linear manifolds to avoid PCA's "dead zones"
+  - Caching for fast runtime exploration
+  - Model versioning for iterative improvements
