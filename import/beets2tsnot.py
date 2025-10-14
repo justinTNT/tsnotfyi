@@ -104,6 +104,10 @@ class ProcessingConfig:
     validate_files: bool = True
     include_failed: bool = False
 
+    # Path scoping
+    paths: Optional[List[str]] = None
+    path_prefixes: Optional[List[str]] = None
+
     # Debug options
     verbose: bool = False
     dry_run: bool = False
@@ -128,12 +132,23 @@ def compute_path_keywords(path_str: str) -> str:
     )
 
 
+CONTROL_CHAR_MAP = {i: None for i in range(32) if i not in (9, 10, 13)}
+
+
+def _sanitize_string(text: str) -> str:
+    """Remove disallowed control characters that break JSON parsers."""
+    return text.translate(CONTROL_CHAR_MAP)
+
+
 def decode_value(value):
     if isinstance(value, (bytes, memoryview)):
         try:
-            return bytes(value).decode('utf-8')
+            value = bytes(value).decode('utf-8')
         except UnicodeDecodeError:
-            return bytes(value).hex()
+            value = bytes(value).hex()
+
+    if isinstance(value, str):
+        return _sanitize_string(value)
     return value
 
 
@@ -182,6 +197,19 @@ class BeetsMetadataExtractor:
             conditions.append("format = ?")
             params.append(config.format_filter.upper())
 
+        if config.paths:
+            placeholders = ", ".join(["?"] * len(config.paths))
+            conditions.append(f"path IN ({placeholders})")
+            params.extend(path.encode('utf-8') for path in config.paths)
+
+        if config.path_prefixes:
+            prefix_clauses = []
+            for prefix in config.path_prefixes:
+                prefix_clauses.append("CAST(path AS TEXT) LIKE ?")
+                params.append(f"{prefix}%")
+            if prefix_clauses:
+                conditions.append("(" + " OR ".join(prefix_clauses) + ")")
+
         # Combine conditions
         if conditions:
             base_query += " AND " + " AND ".join(conditions)
@@ -220,6 +248,11 @@ class BeetsMetadataExtractor:
             if isinstance(path, bytes):
                 path = path.decode('utf-8', errors='ignore')
             identifier = hashlib.md5(path.encode('utf-8')).hexdigest()
+
+            if config.paths and path not in config.paths:
+                continue
+            if config.path_prefixes and not any(path.startswith(prefix) for prefix in config.path_prefixes):
+                continue
 
             # Add computed fields
             track_data['identifier'] = identifier
@@ -294,49 +327,69 @@ class EssentiaProcessor:
                 features: Parsed Essentia JSON when successful, otherwise None
                 error_info: Optional dict with 'type' and 'message' describing the failure
         """
+        amplified_path = None
+        tried_amplify = False
+        silent_attempted = False
+
         try:
             # Validate file exists if enabled
-            if self.config.validate_files:
-                if not Path(track_path).exists():
-                    msg = f"File not found: {track_path}"
-                    logger.warning(msg)
-                    self._record_error('file_not_found', track_id)
-                    return None, {'type': 'file_not_found', 'message': msg}
+            if self.config.validate_files and not Path(track_path).exists():
+                msg = f"File not found: {track_path}"
+                logger.warning(msg)
+                self._record_error('file_not_found', track_id)
+                return None, {'type': 'file_not_found', 'message': msg}
 
-            # Create temporary file for Essentia output
-            with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp:
-                tmp_path = tmp.name
+            while True:
+                path_to_use = amplified_path or track_path
 
-            try:
-                # Run Essentia extractor
-                cmd = [
-                    '/opt/homebrew/bin/essentia_streaming_extractor_music',
-                    track_path,
-                    tmp_path
-                ]
+                # Create temporary file for Essentia output
+                with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp:
+                    tmp_path = tmp.name
 
-                result = subprocess.run(
-                    cmd,
-                    timeout=self.config.essentia_timeout,
-                    capture_output=True,
-                    text=True
-                )
+                try:
+                    cmd = [
+                        '/opt/homebrew/bin/essentia_streaming_extractor_music',
+                        path_to_use,
+                        tmp_path
+                    ]
 
-                if result.returncode != 0:
-                    stderr_snippet = (result.stderr or '').strip()[:200]
-                    msg = f"Essentia failed for {track_id}: {stderr_snippet}" if stderr_snippet else f"Essentia failed for {track_id}"
-                    logger.error(msg)
-                    self._record_error('essentia_failed', track_id)
-                    return None, {'type': 'essentia_failed', 'message': msg}
+                    result = subprocess.run(
+                        cmd,
+                        timeout=self.config.essentia_timeout,
+                        capture_output=True,
+                        text=True
+                    )
 
-                # Read and parse results
-                with open(tmp_path, 'r', encoding='utf-8') as f:
-                    features = json.load(f)
-                return features, None
+                    if result.returncode != 0:
+                        stderr = (result.stderr or '').strip()
+                        if 'completely silent file' in stderr.lower():
+                            if not tried_amplify and self._can_amplify(track_path):
+                                amplified_path = self._amplify_track(track_path)
+                                if amplified_path:
+                                    tried_amplify = True
+                                    logger.info(f"Amplified quiet track for Essentia: {track_path}")
+                                    continue
 
-            finally:
-                # Cleanup temporary file
-                Path(tmp_path).unlink(missing_ok=True)
+                            if not silent_attempted:
+                                logger.info(f"Essentia reported silence for {track_path}; generating synthetic features")
+                                silent_attempted = True
+                                features = self._generate_silent_features(track_path)
+                                return features, None
+
+                        stderr_snippet = stderr[:200]
+                        msg = f"Essentia failed for {track_id}: {stderr_snippet}" if stderr_snippet else f"Essentia failed for {track_id}"
+                        logger.error(msg)
+                        self._record_error('essentia_failed', track_id)
+                        return None, {'type': 'essentia_failed', 'message': msg}
+
+                    with open(tmp_path, 'r', encoding='utf-8') as f:
+                        raw_json = f.read()
+                    sanitized_json = _sanitize_string(raw_json)
+                    features = json.loads(sanitized_json)
+                    return features, None
+
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
 
         except subprocess.TimeoutExpired:
             msg = f"Essentia timeout for {track_id} (>{self.config.essentia_timeout}s)"
@@ -355,6 +408,78 @@ class EssentiaProcessor:
             logger.error(msg)
             self._record_error('unexpected', track_id)
             return None, {'type': 'unexpected', 'message': msg}
+
+        finally:
+            if amplified_path:
+                Path(amplified_path).unlink(missing_ok=True)
+
+    def _can_amplify(self, track_path: str) -> bool:
+        return Path(track_path).suffix.lower() in {'.flac', '.mp3', '.wav', '.aiff', '.aif', '.aac', '.ogg', '.m4a'}
+
+    def _amplify_track(self, track_path: str) -> Optional[str]:
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_audio:
+                amplified_path = tmp_audio.name
+
+            cmd = [
+                'ffmpeg',
+                '-nostdin',
+                '-y',
+                '-i', track_path,
+                '-af', 'volume=+50dB',
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                amplified_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                stderr_snippet = (result.stderr or '').strip()[:200]
+                logger.warning(f"Failed to amplify {track_path}: {stderr_snippet}")
+                Path(amplified_path).unlink(missing_ok=True)
+                return None
+
+            return amplified_path
+
+        except Exception as e:
+            logger.warning(f"Amplification failed for {track_path}: {e}")
+            return None
+
+    def _generate_silent_features(self, track_path: str) -> Dict[str, Any]:
+        return {
+            'metadata': {
+                'audio_properties': {
+                    'length': 0.0,
+                    'silence_detected': True,
+                    'source_path': track_path
+                }
+            },
+            'rhythm': {
+                'bpm': 0.0,
+                'danceability': 0.0,
+                'onset_rate': 0.0,
+                'beats_loudness': {'mean': 0.0},
+                'bpm_histogram_first_peak_weight': 0.0,
+                'bpm_histogram_second_peak_weight': 0.0
+            },
+            'tonal': {
+                'tuning_diatonic_strength': 0.0,
+                'chords_strength': {'mean': 0.0},
+                'chords_changes_rate': 0.0,
+                'hpcp_crest': {'mean': 0.0},
+                'hpcp_entropy': {'mean': 0.0},
+                'key_edma': {'strength': 0.0},
+                'key_krumhansl': {'strength': 0.0},
+                'key_temperley': {'strength': 0.0}
+            },
+            'lowlevel': {
+                'spectral_centroid': {'mean': 0.0},
+                'spectral_rolloff': {'mean': 0.0},
+                'spectral_kurtosis': {'mean': 0.0},
+                'spectral_energy': {'mean': 0.0},
+                'barkbands_flatness_db': {'mean': 0.0}
+            }
+        }
 
     def _record_error(self, error_type: str, track_id: str):
         """Record error statistics"""
@@ -1840,6 +1965,10 @@ Examples:
     parser.add_argument('--genre', help='Filter by genre')
     parser.add_argument('--year-range', help='Year range filter (e.g., 1970-2000)')
     parser.add_argument('--format', help='Audio format filter')
+    parser.add_argument('--path', dest='paths', action='append',
+                       help='Exact beets path to process (can repeat)')
+    parser.add_argument('--path-prefix', dest='path_prefixes', action='append',
+                       help='Only process tracks whose path starts with this prefix (can repeat)')
 
     # Processing options
     parser.add_argument('--no-resume', action='store_true',
@@ -1886,6 +2015,8 @@ Examples:
         genre_filter=args.genre,
         year_range=year_range,
         format_filter=args.format,
+        paths=[os.path.expanduser(p) for p in args.paths] if args.paths else None,
+        path_prefixes=[os.path.expanduser(p) for p in args.path_prefixes] if args.path_prefixes else None,
         resume=not args.no_resume,
         validate_files=not args.no_validate_files,
         include_failed=args.include_failed,
@@ -1924,6 +2055,9 @@ Examples:
     try:
         processor.initialize()
         processor.process_all()
+
+        if config.dry_run:
+            return
 
         # STAGE 3: PCA COMPUTATION AND CALIBRATION
         logger.info("=" * 80)
