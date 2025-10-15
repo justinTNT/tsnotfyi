@@ -1,0 +1,35 @@
+{
+  "server": {
+    "port": 3001,
+    "pidFile": "server.pid"
+  },
+  "database": {
+    "type": "postgresql",
+    "path": "~/project/dev/manual.db",
+    "postgresql": {
+      "connectionString": "postgresql://localhost/tsnotfyi"
+    }
+  },
+  "session": {
+    "secret": "tsnotfyi-dev-secret-change-in-production",
+    "cookieName": "tsnotfyi.sid",
+    "maxAge": 86400000,
+    "cookieSecure": false
+  },
+  "audio": {
+    "sampleRate": 44100,
+    "channels": 2,
+    "bitRate": 192,
+    "crossfadeDuration": 2.5,
+    "silenceThreshold": 0.005,
+    "chunkDivisor": 25
+  },
+  "cache": {
+    "maxMixdownCacheSize": 20
+  },
+  "explorer": {
+    "stackSize": 12,
+    "randomBackfill": 4,
+    "comment": "stackSize = total tracks per direction. randomBackfill = how many random picks. Difference = strategic picks from 4-pile diversity sort"
+  }
+}
