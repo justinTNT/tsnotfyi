@@ -34,7 +34,9 @@ class RadialSearchService {
             ignoreDimensions = [],
             maxDimensions = 6,
             minExplorationPotential = 0.15,
-            usePCA = true                    // Enable PCA-based search by default
+            usePCA = true,                   // Enable PCA-based search by default
+            useVAE = false,                  // Enable VAE-based search (experimental)
+            searchMode = 'auto'              // 'auto', 'vae', 'pca', 'features'
         } = config;
 
         const startTime = performance.now();
@@ -45,14 +47,51 @@ class RadialSearchService {
                 throw new Error(`Track not found: ${trackId}`);
             }
 
-            // Stage 1: Find musical neighborhood using PCA or legacy method
+            // Stage 1: Find musical neighborhood using intelligent search mode selection
             let neighborhood;
-            if (usePCA && currentTrack.pca) {
-                neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, resolution, discriminator, 500);
-                console.log(`🎯 PCA search: ${resolution}/${discriminator} found ${neighborhood.length} tracks`);
-            } else {
-                neighborhood = this.kdTree.radiusSearch(currentTrack, radius, weights, 500);
-                console.log(`📊 Legacy search: radius ${radius} found ${neighborhood.length} tracks`);
+            let actualSearchMode = searchMode;
+            
+            // Handle legacy parameters for backward compatibility
+            if (useVAE && currentTrack.vae?.latent) {
+                actualSearchMode = 'vae';
+            } else if (usePCA && currentTrack.pca && searchMode === 'auto') {
+                actualSearchMode = 'pca';
+            } else if (searchMode === 'auto' && !usePCA) {
+                actualSearchMode = 'features';
+            }
+
+            try {
+                neighborhood = this.kdTree.smartRadiusSearch(currentTrack, {
+                    mode: actualSearchMode,
+                    radius: radius,
+                    resolution: resolution,
+                    discriminator: discriminator,
+                    weights: weights,
+                    limit: 500
+                });
+                
+                const modeLabels = {
+                    'vae': '🧠 VAE',
+                    'pca': '🎯 PCA', 
+                    'features': '📊 Feature',
+                    'auto': '🤖 Auto'
+                };
+                
+                const modeLabel = modeLabels[actualSearchMode] || actualSearchMode;
+                console.log(`${modeLabel} search found ${neighborhood.length} tracks`);
+                
+            } catch (error) {
+                // Fallback to PCA if VAE fails
+                if (actualSearchMode === 'vae' && currentTrack.pca) {
+                    console.warn('⚠️ VAE search failed, falling back to PCA:', error.message);
+                    neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, resolution, discriminator, 500);
+                    console.log(`🎯 PCA fallback search found ${neighborhood.length} tracks`);
+                } else {
+                    // Final fallback to legacy feature search
+                    console.warn('⚠️ Advanced search failed, falling back to features:', error.message);
+                    neighborhood = this.kdTree.radiusSearch(currentTrack, radius, weights, 500);
+                    console.log(`📊 Feature fallback search found ${neighborhood.length} tracks`);
+                }
             }
 
             // Stage 2: Analyze dimensional diversity within neighborhood
@@ -97,13 +136,19 @@ class RadialSearchService {
                     title: currentTrack.title,
                     artist: currentTrack.artist,
                     features: currentTrack.features,
-                    albumCover: track.albumCover
+                    albumCover: currentTrack.albumCover
                 },
                 neighborhood: {
                     size: neighborhood.length,
                     averageDistance: neighborhood.length > 0
                         ? neighborhood.reduce((sum, r) => sum + r.distance, 0) / neighborhood.length
-                        : 0
+                        : 0,
+                    searchMode: actualSearchMode
+                },
+                searchCapabilities: {
+                    hasVAE: !!currentTrack.vae?.latent,
+                    hasPCA: !!currentTrack.pca,
+                    usedMode: actualSearchMode
                 },
                 relevantDimensions: relevantDimensions.length,
                 directionalOptions: directionalOptions,
@@ -345,6 +390,36 @@ class RadialSearchService {
         return settings;
     }
 
+    // Get available search modes for a specific track
+    getAvailableSearchModes(trackId) {
+        if (!this.initialized || !this.kdTree) {
+            return null;
+        }
+
+        const track = this.kdTree.getTrack(trackId);
+        if (!track) {
+            return null;
+        }
+
+        return {
+            features: true,  // Always available
+            pca: !!track.pca,
+            vae: !!track.vae?.latent,
+            recommended: this.getRecommendedSearchMode(track)
+        };
+    }
+
+    // Get recommended search mode for a track
+    getRecommendedSearchMode(track) {
+        if (track.vae?.latent) {
+            return 'vae';
+        } else if (track.pca) {
+            return 'pca';
+        } else {
+            return 'features';
+        }
+    }
+
     // Enhanced directional search using PCA
     async getPCADirectionalCandidates(trackId, pcaDomain, pcaComponent, direction, config = {}) {
         if (!this.initialized) {
@@ -418,9 +493,24 @@ class RadialSearchService {
             return { initialized: false };
         }
 
+        const tracksWithVAE = this.kdTree.tracks.filter(t => t.vae?.latent !== null).length;
+        const vaeModelVersions = [...new Set(
+            this.kdTree.tracks
+                .filter(t => t.vae?.model_version)
+                .map(t => t.vae.model_version)
+        )];
+
         return {
             initialized: true,
             hasPCA: this.kdTree.tracks.some(t => t.pca),
+            hasVAE: tracksWithVAE > 0,
+            vaeStats: {
+                tracksWithEmbeddings: tracksWithVAE,
+                totalTracks: this.kdTree.tracks.length,
+                coverage: this.kdTree.tracks.length > 0 ? 
+                    (tracksWithVAE / this.kdTree.tracks.length * 100).toFixed(1) + '%' : '0%',
+                modelVersions: vaeModelVersions
+            },
             resolutions: Object.keys(this.kdTree.calibrationSettings),
             discriminators: this.kdTree.calibrationSettings.magnifying_glass ?
                 Object.keys(this.kdTree.calibrationSettings.magnifying_glass) : [],

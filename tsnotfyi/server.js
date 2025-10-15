@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
+const VAEService = require('./services/vaeService');
 const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
 
@@ -156,6 +157,13 @@ function attachEphemeralCleanup(sessionId, session) {
 // Initialize radial search service
 const radialSearch = new RadialSearchService();
 
+// Initialize VAE service
+const vaeService = new VAEService({
+  modelPath: config.vae?.modelPath || path.join(__dirname, 'models/music_vae.pt'),
+  pythonPath: config.vae?.pythonPath || 'python3',
+  scriptPath: path.join(__dirname, 'scripts/vae_inference.py')
+});
+
 // Initialize database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || config.database.postgresql.connectionString,
@@ -176,6 +184,14 @@ async function initializeServices() {
   try {
     await radialSearch.initialize();
     console.log('✅ Radial search service initialized');
+    
+    // Initialize VAE service (optional - may not have model available)
+    try {
+      await vaeService.initialize();
+      console.log('✅ VAE service initialized');
+    } catch (vaeError) {
+      console.warn('⚠️ VAE service initialization failed (continuing without VAE):', vaeError.message);
+    }
   } catch (err) {
     console.error('Failed to initialize services:', err);
   }
@@ -1291,6 +1307,207 @@ app.post('/pca/explore', async (req, res) => {
   }
 });
 
+// ==================== VAE ENDPOINTS ====================
+
+// Get VAE service status and model information
+app.get('/vae/status', (req, res) => {
+  try {
+    const status = vaeService.getStatus();
+    const stats = radialSearch.getStats();
+    
+    res.json({
+      vae: status,
+      coverage: stats.vaeStats || null,
+      isReady: status.isReady
+    });
+  } catch (error) {
+    console.error('VAE status error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get available search modes for a track
+app.get('/vae/search-modes/:trackId', (req, res) => {
+  try {
+    const { trackId } = req.params;
+    const modes = radialSearch.getAvailableSearchModes(trackId);
+    
+    if (!modes) {
+      return res.status(404).json({ error: 'Track not found' });
+    }
+    
+    res.json(modes);
+  } catch (error) {
+    console.error('VAE search modes error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Encode track features to VAE latent space
+app.post('/vae/encode', async (req, res) => {
+  try {
+    const { features } = req.body;
+    
+    if (!features || typeof features !== 'object') {
+      return res.status(400).json({ error: 'Features object required' });
+    }
+    
+    if (!vaeService.isReady()) {
+      return res.status(503).json({ error: 'VAE service not available' });
+    }
+    
+    const latent = await vaeService.encode(features);
+    res.json({ latent });
+    
+  } catch (error) {
+    console.error('VAE encode error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Decode VAE latent vector to features
+app.post('/vae/decode', async (req, res) => {
+  try {
+    const { latent } = req.body;
+    
+    if (!Array.isArray(latent) || latent.length !== 8) {
+      return res.status(400).json({ error: '8D latent vector required' });
+    }
+    
+    if (!vaeService.isReady()) {
+      return res.status(503).json({ error: 'VAE service not available' });
+    }
+    
+    const features = await vaeService.decode(latent);
+    res.json({ features });
+    
+  } catch (error) {
+    console.error('VAE decode error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Interpolate between two tracks in VAE latent space
+app.post('/vae/interpolate', async (req, res) => {
+  try {
+    const { trackIdA, trackIdB, steps = 10 } = req.body;
+    
+    if (!trackIdA || !trackIdB) {
+      return res.status(400).json({ error: 'trackIdA and trackIdB required' });
+    }
+    
+    if (!vaeService.isReady()) {
+      return res.status(503).json({ error: 'VAE service not available' });
+    }
+    
+    // Get track features
+    const trackA = radialSearch.kdTree.getTrack(trackIdA);
+    const trackB = radialSearch.kdTree.getTrack(trackIdB);
+    
+    if (!trackA || !trackB) {
+      return res.status(404).json({ error: 'One or both tracks not found' });
+    }
+    
+    // Perform interpolation
+    const interpolation = await vaeService.interpolate(trackA.features, trackB.features, steps);
+    
+    res.json({
+      trackA: {
+        identifier: trackA.identifier,
+        title: trackA.title,
+        artist: trackA.artist
+      },
+      trackB: {
+        identifier: trackB.identifier, 
+        title: trackB.title,
+        artist: trackB.artist
+      },
+      steps,
+      interpolation
+    });
+    
+  } catch (error) {
+    console.error('VAE interpolate error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Move in VAE latent space (flow operation)
+app.post('/vae/flow', async (req, res) => {
+  try {
+    const { trackId, direction, amount = 1.0 } = req.body;
+    
+    if (!trackId || !Array.isArray(direction) || direction.length !== 8) {
+      return res.status(400).json({ error: 'trackId and 8D direction vector required' });
+    }
+    
+    if (!vaeService.isReady()) {
+      return res.status(503).json({ error: 'VAE service not available' });
+    }
+    
+    // Get track features
+    const track = radialSearch.kdTree.getTrack(trackId);
+    if (!track) {
+      return res.status(404).json({ error: 'Track not found' });
+    }
+    
+    // Perform flow operation
+    const newFeatures = await vaeService.flow(track.features, direction, amount);
+    
+    res.json({
+      originalTrack: {
+        identifier: track.identifier,
+        title: track.title,
+        artist: track.artist,
+        features: track.features
+      },
+      direction,
+      amount,
+      newFeatures
+    });
+    
+  } catch (error) {
+    console.error('VAE flow error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// VAE-enhanced exploration (like PCA explore but with VAE)
+app.post('/vae/explore', async (req, res) => {
+  try {
+    const { trackId, ...config } = req.body;
+    
+    if (!trackId) {
+      return res.status(400).json({ error: 'trackId required' });
+    }
+    
+    // Force VAE mode for this endpoint
+    const vaeConfig = { searchMode: 'vae', ...config };
+    const result = await radialSearch.exploreFromTrack(trackId, vaeConfig);
+    res.json(result);
+    
+  } catch (error) {
+    console.error('VAE explore error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get VAE latent space dimensions and information
+app.get('/vae/dimensions', async (req, res) => {
+  try {
+    if (!vaeService.isReady()) {
+      return res.status(503).json({ error: 'VAE service not available' });
+    }
+    
+    const info = await vaeService.getLatentInfo();
+    res.json(info);
+    
+  } catch (error) {
+    console.error('VAE dimensions error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Reset drift for a session
 app.post('/session/reset-drift', async (req, res) => {
   const session = await getSessionForRequest(req, { createIfMissing: false });
@@ -1740,6 +1957,11 @@ function startServer() {
       }
 
       radialSearch.close();
+      
+      // Cleanup VAE service
+      if (vaeService && typeof vaeService.shutdown === 'function') {
+        vaeService.shutdown().catch(console.error);
+      }
 
       if (cleanupTimer) {
         clearInterval(cleanupTimer);

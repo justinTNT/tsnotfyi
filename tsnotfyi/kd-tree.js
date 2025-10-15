@@ -172,6 +172,18 @@ class MusicalKDTree {
         console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
         console.log('✓ PCA transformation weights loaded');
         
+        // Log VAE embedding availability
+        const tracksWithVAE = this.tracks.filter(t => t.vae?.latent !== null).length;
+        const vaePercentage = this.tracks.length > 0 ? (tracksWithVAE / this.tracks.length * 100).toFixed(1) : 0;
+        console.log(`✓ VAE embeddings available for ${tracksWithVAE}/${this.tracks.length} tracks (${vaePercentage}%)`);
+        
+        if (tracksWithVAE > 0) {
+            const sampleVAE = this.tracks.find(t => t.vae?.latent !== null);
+            if (sampleVAE) {
+                console.log(`✓ VAE model version: ${sampleVAE.vae.model_version || 'unknown'}`);
+            }
+        }
+        
         // Validate PCA recalculation
         if (this.tracks.length > 0 && this.pcaWeights) {
             const sample = this.tracks[0];
@@ -206,6 +218,9 @@ class MusicalKDTree {
                 tonal_pc1, tonal_pc2, tonal_pc3,
                 spectral_pc1, spectral_pc2, spectral_pc3,
                 rhythmic_pc1, rhythmic_pc2, rhythmic_pc3,
+                vae_latent_0, vae_latent_1, vae_latent_2, vae_latent_3,
+                vae_latent_4, vae_latent_5, vae_latent_6, vae_latent_7,
+                vae_model_version, vae_computed_at,
                 love,hate,beets_meta
             FROM music_analysis
             WHERE bpm IS NOT NULL and hate IS 0
@@ -241,6 +256,17 @@ class MusicalKDTree {
                     tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],
                     spectral: [row.spectral_pc1, row.spectral_pc2, row.spectral_pc3],
                     rhythmic: [row.rhythmic_pc1, row.rhythmic_pc2, row.rhythmic_pc3]
+                },
+                vae: {
+                    latent: [
+                        row.vae_latent_0, row.vae_latent_1, row.vae_latent_2, row.vae_latent_3,
+                        row.vae_latent_4, row.vae_latent_5, row.vae_latent_6, row.vae_latent_7
+                    ].every(val => val !== null && val !== undefined) ? [
+                        row.vae_latent_0, row.vae_latent_1, row.vae_latent_2, row.vae_latent_3,
+                        row.vae_latent_4, row.vae_latent_5, row.vae_latent_6, row.vae_latent_7
+                    ] : null,
+                    model_version: row.vae_model_version,
+                    computed_at: row.vae_computed_at
                 },
                 beetsMeta: meta
             };
@@ -366,6 +392,48 @@ class MusicalKDTree {
         return Math.sqrt(sumSquaredDiffs);
     }
 
+    // Calculate VAE-based distance using latent embeddings
+    calculateVAEDistance(trackA, trackB) {
+        if (!trackA.vae?.latent || !trackB.vae?.latent) {
+            throw new Error('Tracks missing VAE embeddings');
+        }
+
+        // Euclidean distance in 8D latent space
+        return this.calculateEuclideanDistance(trackA.vae.latent, trackB.vae.latent);
+    }
+
+    // Calculate distance using specified method (PCA, VAE, or legacy features)
+    calculateSmartDistance(trackA, trackB, mode = 'auto', modeParams = {}) {
+        switch (mode) {
+            case 'vae':
+                if (trackA.vae?.latent && trackB.vae?.latent) {
+                    return this.calculateVAEDistance(trackA, trackB);
+                } else {
+                    throw new Error('VAE embeddings not available for requested tracks');
+                }
+
+            case 'pca':
+                const pcaMode = modeParams.pcaMode || 'primary_d';
+                return this.calculatePCADistance(trackA, trackB, pcaMode);
+
+            case 'features':
+                return this.calculateDistance(trackA, trackB, modeParams.weights, modeParams.ignoreDimensions);
+
+            case 'auto':
+                // Prefer VAE if available, fallback to PCA, then features
+                if (trackA.vae?.latent && trackB.vae?.latent) {
+                    return this.calculateVAEDistance(trackA, trackB);
+                } else if (trackA.pca && trackB.pca) {
+                    return this.calculatePCADistance(trackA, trackB, 'primary_d');
+                } else {
+                    return this.calculateDistance(trackA, trackB, modeParams.weights, modeParams.ignoreDimensions);
+                }
+
+            default:
+                throw new Error(`Unknown distance mode: ${mode}`);
+        }
+    }
+
     // Calculate weighted distance between two tracks (legacy method)
     calculateDistance(trackA, trackB, weights = null, ignoreDimensions = []) {
         const w = weights || this.defaultWeights;
@@ -489,6 +557,110 @@ class MusicalKDTree {
             if (dimDiff <= radius) {
                 this.radiusSearchHelper(node.left, centerTrack, radius, weights, results);
             }
+        }
+    }
+
+    // Find musical neighborhood using VAE-based radial search
+    vaeRadiusSearch(centerTrack, radius = 0.3, limit = 500) {
+        if (!this.root) {
+            throw new Error('KD-tree not initialized');
+        }
+
+        if (!centerTrack.vae?.latent) {
+            throw new Error('Center track missing VAE embeddings');
+        }
+
+        const results = [];
+        this.vaeRadiusSearchHelper(this.root, centerTrack, radius, results);
+
+        // Sort by VAE distance and limit results
+        results.sort((a, b) => a.distance - b.distance);
+        return results.slice(0, limit);
+    }
+
+    vaeRadiusSearchHelper(node, centerTrack, radius, results) {
+        if (!node) return;
+
+        // Skip tracks without VAE embeddings
+        if (!node.point.vae?.latent) {
+            this.vaeRadiusSearchHelper(node.left, centerTrack, radius, results);
+            this.vaeRadiusSearchHelper(node.right, centerTrack, radius, results);
+            return;
+        }
+
+        const distance = this.calculateVAEDistance(centerTrack, node.point);
+        if (distance <= radius && node.point.identifier !== centerTrack.identifier) {
+            results.push({
+                track: node.point,
+                distance: distance
+            });
+        }
+
+        // For VAE search, we still need to traverse the feature-based KD-tree structure
+        // but we're looking for VAE-similar tracks within the tree
+        const dimValue = centerTrack.features[this.dimensions[node.dimension]];
+        const nodeValue = node.point.features[this.dimensions[node.dimension]];
+        const dimDiff = Math.abs(dimValue - nodeValue);
+
+        // Use a more generous traversal for VAE search since the tree is organized by features
+        // but we're searching by VAE distance (which may not correlate with feature similarity)
+        const traversalThreshold = radius * 10; // Generous threshold for VAE search
+
+        if (dimValue <= nodeValue) {
+            this.vaeRadiusSearchHelper(node.left, centerTrack, radius, results);
+            if (dimDiff <= traversalThreshold) {
+                this.vaeRadiusSearchHelper(node.right, centerTrack, radius, results);
+            }
+        } else {
+            this.vaeRadiusSearchHelper(node.right, centerTrack, radius, results);
+            if (dimDiff <= traversalThreshold) {
+                this.vaeRadiusSearchHelper(node.left, centerTrack, radius, results);
+            }
+        }
+    }
+
+    // Smart search method that chooses best available approach
+    smartRadiusSearch(centerTrack, config = {}) {
+        const {
+            mode = 'auto',           // 'auto', 'vae', 'pca', 'features'
+            radius = 0.3,           // Search radius
+            resolution = 'magnifying_glass',  // For PCA mode
+            discriminator = 'primary_d',      // For PCA mode
+            weights = null,         // For feature mode
+            limit = 500
+        } = config;
+
+        switch (mode) {
+            case 'vae':
+                if (!centerTrack.vae?.latent) {
+                    throw new Error('VAE embeddings not available for center track');
+                }
+                return this.vaeRadiusSearch(centerTrack, radius, limit);
+
+            case 'pca':
+                if (!centerTrack.pca) {
+                    throw new Error('PCA data not available for center track');
+                }
+                return this.pcaRadiusSearch(centerTrack, resolution, discriminator, limit);
+
+            case 'features':
+                return this.radiusSearch(centerTrack, radius, weights, limit);
+
+            case 'auto':
+                // Prefer VAE, fallback to PCA, then features
+                if (centerTrack.vae?.latent) {
+                    console.log('🧠 Using VAE-based search');
+                    return this.vaeRadiusSearch(centerTrack, radius, limit);
+                } else if (centerTrack.pca) {
+                    console.log('📊 Using PCA-based search');
+                    return this.pcaRadiusSearch(centerTrack, resolution, discriminator, limit);
+                } else {
+                    console.log('🔢 Using feature-based search');
+                    return this.radiusSearch(centerTrack, radius, weights, limit);
+                }
+
+            default:
+                throw new Error(`Unknown search mode: ${mode}`);
         }
     }
 
