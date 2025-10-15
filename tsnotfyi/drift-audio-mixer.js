@@ -48,6 +48,14 @@ class DriftAudioMixer {
     this.sessionHistory = []; // Array of previous tracks with timestamps and metadata
     this.maxHistorySize = 50; // Keep last 50 tracks in history
 
+    // Stack-based journey state (Named Sessions)
+    this.stack = []; // Journey as sequence of {identifier, direction, scope} objects
+    this.stackIndex = 0; // Current position in stack (0-indexed)
+    this.positionSeconds = 0; // Position within current track
+    this.ephemeral = false; // true = stop persisting changes (past end of stack)
+    this.sessionType = 'anonymous'; // 'anonymous', 'named', 'playlist'
+    this.sessionName = null; // Session identifier for named/playlist sessions
+
     // Session-level filtering flags
     this.noAlbum = true; // Default: prevent album repeats in session
     this.noArtist = true; // Default: prevent artist repeats in session
@@ -125,6 +133,11 @@ class DriftAudioMixer {
         this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
         this.nextTrack = null;
         promoted = true;
+      }
+
+      // Handle stack initialization for first track
+      if (promoted && this.currentTrack && this.currentTrack.identifier) {
+        this.ensureTrackInStack(this.currentTrack.identifier);
       }
 
       if (promoted && this.currentTrack && this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
@@ -909,6 +922,21 @@ class DriftAudioMixer {
 
       const nextTrack = await this.selectNextFromCandidates();
       this.pendingCurrentTrack = this.hydrateTrackRecord(nextTrack) || nextTrack;
+      
+      // Add track to stack (organic exploration)
+      if (this.pendingCurrentTrack && this.pendingCurrentTrack.identifier) {
+        const direction = this.driftPlayer.getDriftState().currentDirection;
+        this.pushToStack(
+          this.pendingCurrentTrack.identifier,
+          direction,
+          this.explorerResolution || 'magnify'
+        );
+        
+        // Advance stack index to new track
+        this.stackIndex = this.stack.length - 1;
+        this.positionSeconds = 0;
+      }
+      
       await this.playCurrentTrack();
 
       this.isTransitioning = false;
@@ -3896,9 +3924,237 @@ class DriftAudioMixer {
       } : null,
       driftDirection: driftState.currentDirection,
       stepCount: driftState.stepCount,
-      recentHistory: driftState.recentHistory
+      recentHistory: driftState.recentHistory,
+      // Stack-based journey info
+      sessionType: this.sessionType,
+      sessionName: this.sessionName,
+      stackLength: this.stack.length,
+      stackIndex: this.stackIndex,
+      positionSeconds: this.positionSeconds,
+      ephemeral: this.ephemeral,
+      canAdvance: !this.isAtStackEnd()
     };
   }
+
+  // ==================== STACK MANAGEMENT METHODS ====================
+
+  // Initialize session as named or playlist session
+  initializeSession(sessionType, sessionName, initialStack = null) {
+    this.sessionType = sessionType; // 'named', 'playlist', 'anonymous'
+    this.sessionName = sessionName;
+    
+    if (initialStack) {
+      this.stack = [...initialStack];
+      this.stackIndex = 0;
+      this.positionSeconds = 0;
+    } else if (sessionType === 'anonymous') {
+      // For anonymous sessions, build retroactive stack when tracks are available
+      // This will be called again from ensureTrackInStack when first track loads
+      this.buildRetroactiveStack();
+    }
+    
+    this.ephemeral = false;
+    console.log(`📚 Initialized session: ${sessionType} (${sessionName || 'anonymous'})`);
+  }
+
+  // Build stack from current session state (for anonymous sessions)
+  buildRetroactiveStack() {
+    this.stack = [];
+    
+    if (this.currentTrack) {
+      this.stack.push({
+        identifier: this.currentTrack.identifier,
+        direction: null, // First track has no incoming direction
+        scope: this.explorerResolution || 'magnify'
+      });
+    }
+    
+    if (this.nextTrack) {
+      this.stack.push({
+        identifier: this.nextTrack.identifier,
+        direction: this.driftPlayer.getDriftState().currentDirection || null,
+        scope: this.explorerResolution || 'magnify'
+      });
+      this.stackIndex = 0; // Currently on first track
+    } else {
+      this.stackIndex = 0;
+    }
+  }
+
+  // Add track to stack (organic exploration)
+  pushToStack(identifier, direction = null, scope = 'magnify') {
+    if (this.ephemeral) {
+      console.log('📚 Session is ephemeral, not adding to stack');
+      return;
+    }
+
+    if (this.sessionType === 'playlist') {
+      console.log('📚 Playlist session is read-only, not adding to stack');
+      return;
+    }
+
+    const stackItem = {
+      identifier,
+      direction,
+      scope
+    };
+
+    this.stack.push(stackItem);
+    console.log(`📚 Added to stack: ${identifier} (${this.stack.length} total)`);
+    
+    // Notify of stack change
+    this.broadcastStackUpdate();
+  }
+
+  // Navigate to specific position in stack
+  jumpToStackPosition(index, positionSeconds = 0) {
+    if (index < 0 || index >= this.stack.length) {
+      throw new Error(`Invalid stack index: ${index} (stack length: ${this.stack.length})`);
+    }
+
+    this.stackIndex = index;
+    this.positionSeconds = positionSeconds;
+    
+    const stackItem = this.stack[index];
+    console.log(`📚 Jumping to stack position ${index}: ${stackItem.identifier} at ${positionSeconds}s`);
+    
+    // Load the track at this position
+    this.loadTrackFromStack(stackItem);
+    
+    // Broadcast position change
+    this.broadcastStackUpdate();
+  }
+
+  // Load track from stack item
+  async loadTrackFromStack(stackItem) {
+    const track = this.radialSearch.kdTree.getTrack(stackItem.identifier);
+    if (!track) {
+      throw new Error(`Track not found: ${stackItem.identifier}`);
+    }
+
+    // Set the track as current
+    this.currentTrack = this.hydrateTrackRecord(track);
+    this.pendingCurrentTrack = null;
+    
+    // Start playback at specified position
+    await this.playCurrentTrack();
+    
+    if (this.positionSeconds > 0) {
+      // TODO: Implement seeking to positionSeconds
+      console.log(`🎵 Would seek to ${this.positionSeconds}s in track`);
+    }
+  }
+
+  // Check if we're at the end of the stack
+  isAtStackEnd() {
+    return this.stackIndex >= this.stack.length - 1;
+  }
+
+  // Move to next track in stack
+  advanceInStack() {
+    if (this.isAtStackEnd()) {
+      console.log('📚 Reached end of stack, entering ephemeral mode');
+      this.ephemeral = true;
+      return false;
+    }
+
+    this.stackIndex++;
+    this.positionSeconds = 0;
+    
+    const stackItem = this.stack[this.stackIndex];
+    console.log(`📚 Advancing to stack position ${this.stackIndex}: ${stackItem.identifier}`);
+    
+    this.loadTrackFromStack(stackItem);
+    this.broadcastStackUpdate();
+    return true;
+  }
+
+  // Get current stack state for export/serialization
+  getStackState() {
+    return {
+      sessionType: this.sessionType,
+      sessionName: this.sessionName,
+      stack: [...this.stack],
+      stackIndex: this.stackIndex,
+      positionSeconds: this.positionSeconds,
+      ephemeral: this.ephemeral,
+      created: this.created || new Date().toISOString(),
+      lastAccess: new Date().toISOString()
+    };
+  }
+
+  // Load state from serialized stack
+  loadStackState(state) {
+    this.sessionType = state.sessionType || 'anonymous';
+    this.sessionName = state.sessionName || null;
+    this.stack = [...(state.stack || [])];
+    this.stackIndex = state.stackIndex || 0;
+    this.positionSeconds = state.positionSeconds || 0;
+    this.ephemeral = state.ephemeral || false;
+    this.created = state.created || new Date().toISOString();
+    
+    console.log(`📚 Loaded stack state: ${this.stack.length} tracks, position ${this.stackIndex}`);
+    
+    // Load current track if stack is not empty
+    if (this.stack.length > 0 && this.stackIndex < this.stack.length) {
+      const currentStackItem = this.stack[this.stackIndex];
+      this.loadTrackFromStack(currentStackItem);
+    }
+  }
+
+  // Broadcast stack update to SSE clients
+  broadcastStackUpdate() {
+    const stackInfo = {
+      stackLength: this.stack.length,
+      stackIndex: this.stackIndex,
+      positionSeconds: this.positionSeconds,
+      ephemeral: this.ephemeral,
+      canAdvance: !this.isAtStackEnd(),
+      currentStackItem: this.stack[this.stackIndex] || null
+    };
+
+    this.broadcastToEventClients('stack_update', stackInfo);
+    
+    // Trigger persistence for named sessions
+    this.persistSessionState();
+  }
+
+  // Persist session state (event-driven)
+  persistSessionState() {
+    if (this.sessionType === 'named' && !this.ephemeral) {
+      // Store in memory for now (in-memory session registry)
+      const stackState = this.getStackState();
+      console.log(`💾 Persisting named session state: ${this.sessionName} (${this.stack.length} tracks)`);
+      
+      // Store in global memory registry
+      if (typeof global !== 'undefined') {
+        global.namedSessionRegistry = global.namedSessionRegistry || new Map();
+        global.namedSessionRegistry.set(this.sessionName, stackState);
+      }
+    }
+  }
+
+  // Ensure track is in stack (for initial track or stack gaps)
+  ensureTrackInStack(identifier) {
+    // Check if stack is empty or track is not at current position
+    if (this.stack.length === 0) {
+      // First track - add as seed with no direction
+      this.pushToStack(identifier, null, this.explorerResolution || 'magnify');
+      this.stackIndex = 0;
+      this.positionSeconds = 0;
+      console.log(`📚 Added seed track to stack: ${identifier}`);
+    } else if (this.stackIndex < this.stack.length && 
+               this.stack[this.stackIndex].identifier !== identifier) {
+      // Track mismatch - this shouldn't happen in normal flow but handle gracefully
+      console.warn(`📚 Track mismatch in stack at position ${this.stackIndex}: expected ${this.stack[this.stackIndex].identifier}, got ${identifier}`);
+      // Could either fix the stack or log for debugging
+    }
+    
+    // Update position tracking
+    this.positionSeconds = 0;
+  }
+
+  // ==================== END STACK MANAGEMENT ====================
 
   // Get the adjusted track duration from advanced audio mixer
   getAdjustedTrackDuration() {

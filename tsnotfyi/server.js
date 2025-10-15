@@ -904,6 +904,726 @@ app.post('/refresh-sse-simple', async (req, res) => {
   }
 });
 
+// ==================== NAMED SESSION HELPER FUNCTIONS ====================
+
+// Validate MD5 format (32-character hex string)
+function isValidMD5(str) {
+  return /^[a-f0-9]{32}$/.test(str);
+}
+
+// Save named session state to database (placeholder)
+async function saveNamedSessionToDatabase(session) {
+  // For now, ensure it's persisted in memory registry
+  session.mixer.persistSessionState();
+  console.log(`💾 Saved session ${session.mixer.sessionName} to memory registry`);
+}
+
+// Load named session state from database (placeholder)
+async function loadNamedSessionFromDatabase(sessionName) {
+  // Load from memory registry
+  global.namedSessionRegistry = global.namedSessionRegistry || new Map();
+  const savedState = global.namedSessionRegistry.get(sessionName);
+  
+  if (savedState) {
+    console.log(`📖 Loaded session ${sessionName} from memory registry`);
+    return savedState;
+  }
+  
+  console.log(`📖 No saved state found for session ${sessionName}`);
+  return null;
+}
+
+// Load playlist from database
+async function loadPlaylistFromDatabase(playlistTitle) {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Get playlist info
+      const playlistResult = await client.query(
+        'SELECT * FROM playlists WHERE name = $1', 
+        [playlistTitle]
+      );
+
+      if (playlistResult.rows.length === 0) {
+        return null; // Playlist not found
+      }
+
+      // Get playlist tracks
+      const tracksResult = await client.query(`
+        SELECT 
+          pi.identifier,
+          pi.direction,
+          pi.scope,
+          pi.position
+        FROM playlist_items pi
+        WHERE pi.playlist_id = $1
+        ORDER BY pi.position ASC
+      `, [playlistResult.rows[0].id]);
+
+      const playlist = playlistResult.rows[0];
+      playlist.tracks = tracksResult.rows;
+
+      console.log(`📖 Loaded playlist ${playlistTitle}: ${playlist.tracks.length} tracks`);
+      return playlist;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error loading playlist from database:', error);
+    throw error;
+  }
+}
+
+// Calculate total duration of stack (placeholder)
+function calculateStackDuration(stack) {
+  // TODO: Implement duration calculation
+  // For now, estimate 3 minutes per track
+  return stack.length * 180;
+}
+
+// ==================== PLAYLIST TRANSFORMATION FUNCTIONS ====================
+
+// Generate similar playlist (different tracks, same directions)
+async function generateSimilarPlaylist(originalTracks) {
+  const similarStack = [];
+  
+  for (const track of originalTracks) {
+    // TODO: Implement actual similarity search
+    // For now, just return the same tracks (placeholder)
+    similarStack.push({
+      identifier: track.identifier, // Would be replaced with similar track
+      direction: track.direction,
+      scope: track.scope || 'magnify'
+    });
+  }
+  
+  console.log(`🔄 Generated similar playlist: ${similarStack.length} tracks (placeholder)`);
+  return similarStack;
+}
+
+// Generate reverse playlist (same tracks, opposite directions)
+function generateReversePlaylist(originalTracks) {
+  const reverseStack = [];
+  
+  // Reverse the track order
+  const reversedTracks = [...originalTracks].reverse();
+  
+  for (let i = 0; i < reversedTracks.length; i++) {
+    const track = reversedTracks[i];
+    let reverseDirection = null;
+    
+    if (track.direction) {
+      // Reverse the direction
+      reverseDirection = reverseDirectionName(track.direction);
+    }
+    
+    reverseStack.push({
+      identifier: track.identifier,
+      direction: i === 0 ? null : reverseDirection, // First track has no direction
+      scope: track.scope || 'magnify'
+    });
+  }
+  
+  console.log(`🔄 Generated reverse playlist: ${reverseStack.length} tracks`);
+  return reverseStack;
+}
+
+// Generate reverse similar playlist (different tracks, opposite directions)
+async function generateReverseSimilarPlaylist(originalTracks) {
+  // First generate reverse, then make similar
+  const reverseStack = generateReversePlaylist(originalTracks);
+  return await generateSimilarPlaylist(reverseStack);
+}
+
+// Generate scaled playlist (same pattern, different density)
+async function generateScaledPlaylist(originalTracks, scaleFactor) {
+  if (scaleFactor === 1.0) {
+    // No scaling needed
+    return originalTracks.map(track => ({
+      identifier: track.identifier,
+      direction: track.direction,
+      scope: track.scope || 'magnify'
+    }));
+  }
+  
+  const scaledStack = [];
+  
+  if (scaleFactor > 1.0) {
+    // Scale up: Add intermediate tracks between existing ones
+    for (let i = 0; i < originalTracks.length; i++) {
+      const track = originalTracks[i];
+      
+      // Add original track
+      scaledStack.push({
+        identifier: track.identifier,
+        direction: track.direction,
+        scope: track.scope || 'magnify'
+      });
+      
+      // Add intermediate tracks (except after last track)
+      if (i < originalTracks.length - 1) {
+        const intermediateCount = Math.floor(scaleFactor) - 1;
+        for (let j = 0; j < intermediateCount; j++) {
+          // TODO: Generate intermediate tracks with similar characteristics
+          // For now, just duplicate the track (placeholder)
+          scaledStack.push({
+            identifier: track.identifier, // Would be similar track
+            direction: track.direction,
+            scope: track.scope || 'magnify'
+          });
+        }
+      }
+    }
+  } else {
+    // Scale down: Skip tracks to compress the journey
+    const skipRate = Math.ceil(1 / scaleFactor);
+    for (let i = 0; i < originalTracks.length; i += skipRate) {
+      const track = originalTracks[i];
+      scaledStack.push({
+        identifier: track.identifier,
+        direction: track.direction,
+        scope: track.scope || 'magnify'
+      });
+    }
+  }
+  
+  console.log(`🔄 Generated ${scaleFactor}x scaled playlist: ${originalTracks.length} → ${scaledStack.length} tracks`);
+  return scaledStack;
+}
+
+// Reverse direction name helper
+function reverseDirectionName(directionName) {
+  if (!directionName) return null;
+  
+  // Handle PCA directions
+  if (directionName.includes('_positive')) {
+    return directionName.replace('_positive', '_negative');
+  }
+  if (directionName.includes('_negative')) {
+    return directionName.replace('_negative', '_positive');
+  }
+  
+  // Handle semantic directions
+  const reverseMap = {
+    'faster': 'slower',
+    'slower': 'faster',
+    'brighter': 'darker',
+    'darker': 'brighter',
+    'more_energetic': 'calmer',
+    'calmer': 'more_energetic',
+    'more_danceable': 'less_danceable',
+    'less_danceable': 'more_danceable',
+    'more_tonal': 'more_atonal',
+    'more_atonal': 'more_tonal',
+    'more_complex': 'simpler',
+    'simpler': 'more_complex',
+    'more_punchy': 'smoother',
+    'smoother': 'more_punchy'
+  };
+  
+  return reverseMap[directionName] || directionName;
+}
+
+// ==================== END PLAYLIST TRANSFORMATION FUNCTIONS ====================
+
+// ==================== PLAYLIST SESSION ROUTES ====================
+
+// Playlist session: /playlist/title
+app.get('/playlist/:title', async (req, res) => {
+  const { title } = req.params;
+  
+  // URL decode the title
+  const playlistTitle = decodeURIComponent(title);
+  
+  try {
+    // Load playlist from database
+    const playlistData = await loadPlaylistFromDatabase(playlistTitle);
+    if (!playlistData) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
+    
+    // Create or get session for this playlist
+    const sessionId = `playlist_${playlistTitle}`;
+    let session = getSessionById(sessionId);
+    
+    if (!session) {
+      console.log(`Creating new playlist session: ${sessionId}`);
+      session = await createSession({ 
+        sessionId,
+        sessionType: 'playlist',
+        sessionName: playlistTitle 
+      });
+      
+      // Initialize as playlist session with loaded tracks
+      const playlistStack = playlistData.tracks.map(track => ({
+        identifier: track.identifier,
+        direction: track.direction,
+        scope: track.scope || 'magnify'
+      }));
+      
+      session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+      console.log(`📚 Loaded playlist: ${playlistTitle} (${playlistStack.length} tracks)`);
+      
+      registerSession(sessionId, session);
+    } else {
+      console.log(`📚 Resuming existing playlist session: ${sessionId}`);
+    }
+    
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error loading playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Playlist session with position navigation: /playlist/title/4/20
+app.get('/playlist/:title/:stackIndex/:positionSeconds', async (req, res) => {
+  const { title, stackIndex, positionSeconds } = req.params;
+  
+  // URL decode the title
+  const playlistTitle = decodeURIComponent(title);
+  
+  // Validate numeric parameters
+  const index = parseInt(stackIndex);
+  const position = parseInt(positionSeconds);
+  if (isNaN(index) || isNaN(position) || index < 0 || position < 0) {
+    return res.status(400).json({ error: 'Invalid stack index or position' });
+  }
+  
+  try {
+    const sessionId = `playlist_${playlistTitle}`;
+    let session = getSessionById(sessionId);
+    
+    if (!session) {
+      // Load playlist and create session
+      const playlistData = await loadPlaylistFromDatabase(playlistTitle);
+      if (!playlistData) {
+        return res.status(404).json({ error: 'Playlist not found' });
+      }
+      
+      session = await createSession({ 
+        sessionId,
+        sessionType: 'playlist',
+        sessionName: playlistTitle 
+      });
+      
+      const playlistStack = playlistData.tracks.map(track => ({
+        identifier: track.identifier,
+        direction: track.direction,
+        scope: track.scope || 'magnify'
+      }));
+      
+      session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+      registerSession(sessionId, session);
+    }
+    
+    // Jump to specific position in playlist
+    await session.mixer.jumpToStackPosition(index, position);
+    
+    console.log(`🎯 Playlist ${playlistTitle} jumped to position ${index}/${position}`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error navigating playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Playlist session with stack index: /playlist/title/4
+app.get('/playlist/:title/:stackIndex', async (req, res) => {
+  const { title, stackIndex } = req.params;
+  
+  // URL decode the title
+  const playlistTitle = decodeURIComponent(title);
+  
+  // Validate numeric parameter
+  const index = parseInt(stackIndex);
+  if (isNaN(index) || index < 0) {
+    return res.status(400).json({ error: 'Invalid stack index' });
+  }
+  
+  try {
+    const sessionId = `playlist_${playlistTitle}`;
+    let session = getSessionById(sessionId);
+    
+    if (!session) {
+      // Load playlist and create session
+      const playlistData = await loadPlaylistFromDatabase(playlistTitle);
+      if (!playlistData) {
+        return res.status(404).json({ error: 'Playlist not found' });
+      }
+      
+      session = await createSession({ 
+        sessionId,
+        sessionType: 'playlist',
+        sessionName: playlistTitle 
+      });
+      
+      const playlistStack = playlistData.tracks.map(track => ({
+        identifier: track.identifier,
+        direction: track.direction,
+        scope: track.scope || 'magnify'
+      }));
+      
+      session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+      registerSession(sessionId, session);
+    }
+    
+    // Jump to specific position in playlist (start from beginning of track)
+    await session.mixer.jumpToStackPosition(index, 0);
+    
+    console.log(`🎯 Playlist ${playlistTitle} jumped to position ${index}`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error navigating playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PLAYLIST TRANSFORMATION ROUTES ====================
+
+// Similar playlist: /similar/playlist_name
+app.get('/similar/:playlistName', async (req, res) => {
+  const { playlistName } = req.params;
+  const playlistTitle = decodeURIComponent(playlistName);
+  
+  try {
+    // Load original playlist
+    const originalPlaylist = await loadPlaylistFromDatabase(playlistTitle);
+    if (!originalPlaylist) {
+      return res.status(404).json({ error: 'Original playlist not found' });
+    }
+    
+    // Generate similar playlist
+    const similarStack = await generateSimilarPlaylist(originalPlaylist.tracks);
+    
+    // Create session for transformed playlist
+    const sessionId = `similar_${playlistTitle}_${Date.now()}`;
+    const session = await createSession({ 
+      sessionId,
+      sessionType: 'playlist',
+      sessionName: `Similar to ${playlistTitle}` 
+    });
+    
+    session.mixer.initializeSession('playlist', sessionId, similarStack);
+    registerSession(sessionId, session);
+    
+    console.log(`📚 Generated similar playlist: ${similarStack.length} tracks`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error generating similar playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reverse playlist: /reverse/playlist_name  
+app.get('/reverse/:playlistName', async (req, res) => {
+  const { playlistName } = req.params;
+  const playlistTitle = decodeURIComponent(playlistName);
+  
+  try {
+    // Load original playlist
+    const originalPlaylist = await loadPlaylistFromDatabase(playlistTitle);
+    if (!originalPlaylist) {
+      return res.status(404).json({ error: 'Original playlist not found' });
+    }
+    
+    // Generate reverse playlist
+    const reverseStack = generateReversePlaylist(originalPlaylist.tracks);
+    
+    // Create session for transformed playlist
+    const sessionId = `reverse_${playlistTitle}_${Date.now()}`;
+    const session = await createSession({ 
+      sessionId,
+      sessionType: 'playlist',
+      sessionName: `Reverse of ${playlistTitle}` 
+    });
+    
+    session.mixer.initializeSession('playlist', sessionId, reverseStack);
+    registerSession(sessionId, session);
+    
+    console.log(`📚 Generated reverse playlist: ${reverseStack.length} tracks`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error generating reverse playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reverse similar playlist: /reverse_similar/playlist_name
+app.get('/reverse_similar/:playlistName', async (req, res) => {
+  const { playlistName } = req.params;
+  const playlistTitle = decodeURIComponent(playlistName);
+  
+  try {
+    // Load original playlist
+    const originalPlaylist = await loadPlaylistFromDatabase(playlistTitle);
+    if (!originalPlaylist) {
+      return res.status(404).json({ error: 'Original playlist not found' });
+    }
+    
+    // Generate reverse similar playlist
+    const reverseSimilarStack = await generateReverseSimilarPlaylist(originalPlaylist.tracks);
+    
+    // Create session for transformed playlist
+    const sessionId = `reverse_similar_${playlistTitle}_${Date.now()}`;
+    const session = await createSession({ 
+      sessionId,
+      sessionType: 'playlist',
+      sessionName: `Reverse Similar to ${playlistTitle}` 
+    });
+    
+    session.mixer.initializeSession('playlist', sessionId, reverseSimilarStack);
+    registerSession(sessionId, session);
+    
+    console.log(`📚 Generated reverse similar playlist: ${reverseSimilarStack.length} tracks`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error generating reverse similar playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Scaled playlist: /scaled/2x/playlist_name
+app.get('/scaled/:scale/:playlistName', async (req, res) => {
+  const { scale, playlistName } = req.params;
+  const playlistTitle = decodeURIComponent(playlistName);
+  
+  // Parse scale factor
+  const scaleMatch = scale.match(/^(\d+(?:\.\d+)?)x$/);
+  if (!scaleMatch) {
+    return res.status(400).json({ error: 'Invalid scale format (use 2x, 0.5x, etc.)' });
+  }
+  const scaleFactor = parseFloat(scaleMatch[1]);
+  
+  try {
+    // Load original playlist
+    const originalPlaylist = await loadPlaylistFromDatabase(playlistTitle);
+    if (!originalPlaylist) {
+      return res.status(404).json({ error: 'Original playlist not found' });
+    }
+    
+    // Generate scaled playlist
+    const scaledStack = await generateScaledPlaylist(originalPlaylist.tracks, scaleFactor);
+    
+    // Create session for transformed playlist
+    const sessionId = `scaled_${scale}_${playlistTitle}_${Date.now()}`;
+    const session = await createSession({ 
+      sessionId,
+      sessionType: 'playlist',
+      sessionName: `${scale} ${playlistTitle}` 
+    });
+    
+    session.mixer.initializeSession('playlist', sessionId, scaledStack);
+    registerSession(sessionId, session);
+    
+    console.log(`📚 Generated ${scale} scaled playlist: ${scaledStack.length} tracks`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error generating scaled playlist:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== END PLAYLIST TRANSFORMATION ROUTES ====================
+
+// ==================== END PLAYLIST SESSION ROUTES ====================
+
+// ==================== NAMED SESSION ROUTES ====================
+
+// Named session management routes
+app.get('/:sessionName/forget', async (req, res) => {
+  const { sessionName } = req.params;
+  
+  // Validate session name (not MD5, not playlist)
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
+    return res.status(400).json({ error: 'Invalid session name' });
+  }
+  
+  try {
+    const session = getSessionById(sessionName);
+    if (session) {
+      // Save final state to database before deletion
+      await saveNamedSessionToDatabase(session);
+      unregisterSession(sessionName);
+      console.log(`🗑️ Deleted named session: ${sessionName}`);
+    }
+    
+    res.json({ message: `Session ${sessionName} deleted` });
+  } catch (error) {
+    console.error('Error deleting session:', error);
+    res.status(500).json({ error: 'Failed to delete session' });
+  }
+});
+
+app.get('/:sessionName/reset', async (req, res) => {
+  const { sessionName } = req.params;
+  
+  // Validate session name
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
+    return res.status(400).json({ error: 'Invalid session name' });
+  }
+  
+  try {
+    const session = getSessionById(sessionName);
+    if (session) {
+      // Reset stack but keep session
+      session.mixer.stack = [];
+      session.mixer.stackIndex = 0;
+      session.mixer.positionSeconds = 0;
+      session.mixer.ephemeral = false;
+      console.log(`🔄 Reset named session: ${sessionName}`);
+    }
+    
+    res.json({ message: `Session ${sessionName} reset` });
+  } catch (error) {
+    console.error('Error resetting session:', error);
+    res.status(500).json({ error: 'Failed to reset session' });
+  }
+});
+
+app.get('/:sessionName/export', async (req, res) => {
+  const { sessionName } = req.params;
+  
+  // Validate session name
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
+    return res.status(400).json({ error: 'Invalid session name' });
+  }
+  
+  try {
+    const session = getSessionById(sessionName);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    const stackState = session.mixer.getStackState();
+    const exportData = {
+      ...stackState,
+      shareUrl: `/${sessionName}`,
+      trackCount: stackState.stack.length,
+      duration: calculateStackDuration(stackState.stack) // TODO: implement
+    };
+    
+    res.json(exportData);
+  } catch (error) {
+    console.error('Error exporting session:', error);
+    res.status(500).json({ error: 'Failed to export session' });
+  }
+});
+
+// Named session with position navigation: /name/4/20
+app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res) => {
+  const { sessionName, stackIndex, positionSeconds } = req.params;
+  
+  // Validate session name (not MD5, not special routes)
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
+      ['forget', 'reset', 'export'].includes(stackIndex)) {
+    return res.status(404).json({ error: 'Route not found' });
+  }
+  
+  // Validate numeric parameters
+  const index = parseInt(stackIndex);
+  const position = parseInt(positionSeconds);
+  if (isNaN(index) || isNaN(position) || index < 0 || position < 0) {
+    return res.status(400).json({ error: 'Invalid stack index or position' });
+  }
+  
+  try {
+    let session = getSessionById(sessionName);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    // Jump to specific position in stack
+    await session.mixer.jumpToStackPosition(index, position);
+    
+    console.log(`🎯 Named session ${sessionName} jumped to position ${index}/${position}`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error navigating named session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Named session with stack index: /name/4  
+app.get('/:sessionName/:stackIndex', async (req, res) => {
+  const { sessionName, stackIndex } = req.params;
+  
+  // Validate session name and avoid conflicts
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
+      ['forget', 'reset', 'export'].includes(stackIndex)) {
+    return res.status(404).json({ error: 'Route not found' });
+  }
+  
+  // Validate numeric parameter
+  const index = parseInt(stackIndex);
+  if (isNaN(index) || index < 0) {
+    return res.status(400).json({ error: 'Invalid stack index' });
+  }
+  
+  try {
+    let session = getSessionById(sessionName);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    // Jump to specific position in stack (start from beginning of track)
+    await session.mixer.jumpToStackPosition(index, 0);
+    
+    console.log(`🎯 Named session ${sessionName} jumped to position ${index}`);
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error navigating named session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Basic named session: /name
+app.get('/:sessionName', async (req, res, next) => {
+  const { sessionName } = req.params;
+  
+  // Skip if this looks like an MD5 or special route
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
+      sessionName.includes('/') || ['api', 'stream', 'events', 'status', 'search', 'track'].includes(sessionName)) {
+    return next();
+  }
+  
+  try {
+    let session = getSessionById(sessionName);
+    
+    if (!session) {
+      // Create new named session
+      session = await createSession({ 
+        sessionId: sessionName,
+        sessionType: 'named',
+        sessionName: sessionName 
+      });
+      
+      // Try to load saved state from database
+      const savedState = await loadNamedSessionFromDatabase(sessionName);
+      if (savedState) {
+        session.mixer.loadStackState(savedState);
+        console.log(`📚 Loaded saved named session: ${sessionName}`);
+      } else {
+        session.mixer.initializeSession('named', sessionName);
+        console.log(`🆕 Created new named session: ${sessionName}`);
+      }
+      
+      registerSession(sessionName, session);
+    } else {
+      console.log(`📚 Resuming existing named session: ${sessionName}`);
+    }
+    
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } catch (error) {
+    console.error('Error handling named session:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== END NAMED SESSION ROUTES ====================
 
 // MD5-based journey endpoints
 // Start journey from specific track: /md5 (SSE-driven)
@@ -924,6 +1644,8 @@ app.get('/:md5', async (req, res, next) => {
     if (!session) {
       console.log(`Creating new session for MD5: ${sessionId}`);
       session = await createSession({ sessionId, autoStart: false, ephemeral: true });
+      // Initialize as anonymous session with retroactive stack
+      session.mixer.initializeSession('anonymous', sessionId);
     }
 
     // Ensure mixer is idle before seeding manual track
@@ -979,6 +1701,12 @@ app.get('/:md51/:md52', async (req, res, next) => {
     if (!session) {
       console.log(`Creating new contrived session: ${sessionId}`);
       session = await createSession({ sessionId, autoStart: false, ephemeral: true });
+      // Initialize as anonymous session with predefined two-track stack
+      const initialStack = [
+        { identifier: md51, direction: null, scope: 'magnify' },
+        { identifier: md52, direction: null, scope: 'magnify' }
+      ];
+      session.mixer.initializeSession('anonymous', sessionId, initialStack);
     }
 
     if (session.mixer.stopStreaming) {
@@ -1174,6 +1902,333 @@ app.get('/track/:identifier/meta', async (req, res) => {
     res.status(500).json({ error: 'failed to load track metadata' });
   }
 });
+
+// ==================== USER DATA ENDPOINTS ====================
+
+// Rate a track (love/hate)
+app.post('/api/track/:id/rate', async (req, res) => {
+  const { id } = req.params;
+  const { rating } = req.body;
+
+  if (!id) {
+    return res.status(400).json({ error: 'Missing track identifier' });
+  }
+
+  if (rating === undefined || ![-1, 0, 1].includes(rating)) {
+    return res.status(400).json({ error: 'Rating must be -1 (hate), 0 (neutral), or 1 (love)' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Verify track exists
+      const trackExists = await client.query(
+        'SELECT identifier FROM music_analysis WHERE identifier = $1', 
+        [id]
+      );
+      
+      if (trackExists.rows.length === 0) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+
+      // Upsert rating
+      const result = await client.query(`
+        INSERT INTO ratings (identifier, rating, rated_at) 
+        VALUES ($1, $2, CURRENT_TIMESTAMP)
+        ON CONFLICT (identifier) 
+        DO UPDATE SET rating = EXCLUDED.rating, rated_at = CURRENT_TIMESTAMP
+        RETURNING *
+      `, [id, rating]);
+
+      res.json({
+        identifier: id,
+        rating: result.rows[0].rating,
+        rated_at: result.rows[0].rated_at
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error updating track rating:', error);
+    res.status(500).json({ error: 'Failed to update rating' });
+  }
+});
+
+// Mark track as completed (successful crossfade)
+app.post('/api/track/:id/complete', async (req, res) => {
+  const { id } = req.params;
+  const { playTime } = req.body; // optional: seconds of listening time
+
+  if (!id) {
+    return res.status(400).json({ error: 'Missing track identifier' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Verify track exists
+      const trackExists = await client.query(
+        'SELECT identifier FROM music_analysis WHERE identifier = $1', 
+        [id]
+      );
+      
+      if (trackExists.rows.length === 0) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+
+      // Upsert completion stats
+      const playTimeSeconds = parseInt(playTime) || 0;
+      const result = await client.query(`
+        INSERT INTO play_stats (identifier, completion_count, last_completed, total_play_time) 
+        VALUES ($1, 1, CURRENT_TIMESTAMP, $2)
+        ON CONFLICT (identifier) 
+        DO UPDATE SET 
+          completion_count = play_stats.completion_count + 1,
+          last_completed = CURRENT_TIMESTAMP,
+          total_play_time = play_stats.total_play_time + EXCLUDED.total_play_time,
+          updated_at = CURRENT_TIMESTAMP
+        RETURNING *
+      `, [id, playTimeSeconds]);
+
+      res.json({
+        identifier: id,
+        completion_count: result.rows[0].completion_count,
+        total_play_time: result.rows[0].total_play_time,
+        last_completed: result.rows[0].last_completed
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error updating track completion:', error);
+    res.status(500).json({ error: 'Failed to update completion count' });
+  }
+});
+
+// Get track stats (ratings + play stats)
+app.get('/api/track/:id/stats', async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ error: 'Missing track identifier' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Get both rating and play stats in one query
+      const result = await client.query(`
+        SELECT 
+          ma.identifier,
+          r.rating,
+          r.rated_at,
+          ps.completion_count,
+          ps.total_play_time,
+          ps.last_completed
+        FROM music_analysis ma
+        LEFT JOIN ratings r ON ma.identifier = r.identifier
+        LEFT JOIN play_stats ps ON ma.identifier = ps.identifier
+        WHERE ma.identifier = $1
+      `, [id]);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+
+      const row = result.rows[0];
+      res.json({
+        identifier: id,
+        rating: row.rating || 0,
+        rated_at: row.rated_at,
+        completion_count: row.completion_count || 0,
+        total_play_time: row.total_play_time || 0,
+        last_completed: row.last_completed
+      });
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error fetching track stats:', error);
+    res.status(500).json({ error: 'Failed to fetch track stats' });
+  }
+});
+
+// Create a new playlist
+app.post('/api/playlists', async (req, res) => {
+  const { name, description } = req.body;
+
+  if (!name || typeof name !== 'string' || name.trim().length === 0) {
+    return res.status(400).json({ error: 'Playlist name is required' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      const result = await client.query(`
+        INSERT INTO playlists (name, description, created_at, updated_at) 
+        VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        RETURNING *
+      `, [name.trim(), description || null]);
+
+      res.status(201).json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error creating playlist:', error);
+    res.status(500).json({ error: 'Failed to create playlist' });
+  }
+});
+
+// Get all playlists
+app.get('/api/playlists', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      const result = await client.query(`
+        SELECT p.*, COUNT(pi.id) as track_count
+        FROM playlists p
+        LEFT JOIN playlist_items pi ON p.id = pi.playlist_id
+        GROUP BY p.id
+        ORDER BY p.updated_at DESC
+      `);
+
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error fetching playlists:', error);
+    res.status(500).json({ error: 'Failed to fetch playlists' });
+  }
+});
+
+// Get playlist with tracks
+app.get('/api/playlists/:id', async (req, res) => {
+  const { id } = req.params;
+
+  if (!id || isNaN(parseInt(id))) {
+    return res.status(400).json({ error: 'Invalid playlist ID' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Get playlist info
+      const playlistResult = await client.query(
+        'SELECT * FROM playlists WHERE id = $1', 
+        [parseInt(id)]
+      );
+
+      if (playlistResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Playlist not found' });
+      }
+
+      // Get playlist items with track info
+      const itemsResult = await client.query(`
+        SELECT 
+          pi.id,
+          pi.identifier,
+          pi.position,
+          pi.direction,
+          pi.scope,
+          pi.added_at,
+          ma.bt_artist,
+          ma.bt_title,
+          ma.bt_album
+        FROM playlist_items pi
+        JOIN music_analysis ma ON pi.identifier = ma.identifier
+        WHERE pi.playlist_id = $1
+        ORDER BY pi.position ASC
+      `, [parseInt(id)]);
+
+      const playlist = playlistResult.rows[0];
+      playlist.tracks = itemsResult.rows;
+
+      res.json(playlist);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error fetching playlist:', error);
+    res.status(500).json({ error: 'Failed to fetch playlist' });
+  }
+});
+
+// Add track to playlist
+app.post('/api/playlists/:id/tracks', async (req, res) => {
+  const { id } = req.params;
+  const { identifier, direction, scope } = req.body;
+
+  if (!id || isNaN(parseInt(id))) {
+    return res.status(400).json({ error: 'Invalid playlist ID' });
+  }
+
+  if (!identifier) {
+    return res.status(400).json({ error: 'Track identifier is required' });
+  }
+
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Verify playlist exists
+      const playlistExists = await client.query(
+        'SELECT id FROM playlists WHERE id = $1', 
+        [parseInt(id)]
+      );
+      
+      if (playlistExists.rows.length === 0) {
+        return res.status(404).json({ error: 'Playlist not found' });
+      }
+
+      // Verify track exists
+      const trackExists = await client.query(
+        'SELECT identifier FROM music_analysis WHERE identifier = $1', 
+        [identifier]
+      );
+      
+      if (trackExists.rows.length === 0) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+
+      // Get next position
+      const positionResult = await client.query(
+        'SELECT COALESCE(MAX(position), -1) + 1 as next_position FROM playlist_items WHERE playlist_id = $1',
+        [parseInt(id)]
+      );
+      const nextPosition = positionResult.rows[0].next_position;
+
+      // Add track to playlist
+      const result = await client.query(`
+        INSERT INTO playlist_items (playlist_id, identifier, position, direction, scope, added_at)
+        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+        RETURNING *
+      `, [parseInt(id), identifier, nextPosition, direction || null, scope || null]);
+
+      // Update playlist updated_at
+      await client.query(
+        'UPDATE playlists SET updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+        [parseInt(id)]
+      );
+
+      res.status(201).json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error adding track to playlist:', error);
+    res.status(500).json({ error: 'Failed to add track to playlist' });
+  }
+});
+
+// ==================== END USER DATA ENDPOINTS ====================
 
 // Main page - serves a UI with 3D visualization
 app.get('/', async (req, res) => {
