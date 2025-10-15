@@ -151,6 +151,7 @@ class MusicalKDTree {
         };
 
         this.epsilon = 1e-12; // For numerical stability in ratios
+        this.pcaWeights = null; // Will store PCA transformation weights
     }
 
     async initialize() {
@@ -163,11 +164,30 @@ class MusicalKDTree {
 
         await Promise.all([
             this.loadTracks(),
-            this.loadCalibrationSettings()
+            this.loadCalibrationSettings(),
+            this.loadPCATransformations()
         ]);
 
         console.log(`Loaded ${this.tracks.length} tracks`);
         console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
+        console.log('✓ PCA transformation weights loaded');
+        
+        // Validate PCA recalculation
+        if (this.tracks.length > 0 && this.pcaWeights) {
+            const sample = this.tracks[0];
+            const recalc = this.recalculatePCA(sample.features, 'primary_d');
+            const stored = sample.pca.primary_d;
+            const error = Math.abs(recalc - stored);
+
+            if (error > 0.001) {
+                console.warn(`⚠️ PCA validation error: ${error.toFixed(6)} (threshold: 0.001)`);
+                console.warn(`   Sample track: ${sample.identifier}`);
+                console.warn(`   Recalculated: ${recalc.toFixed(6)}, Stored: ${stored.toFixed(6)}`);
+            } else {
+                console.log(`✓ PCA validation passed: error = ${error.toFixed(6)}`);
+            }
+        }
+        
         this.buildTree();
         console.log('KD-tree constructed');
     }
@@ -522,29 +542,41 @@ class MusicalKDTree {
                 return;
             }
 
-  // TODO: Locality filter - currently uses raw feature distance
-  // Once PCA weights are stored, recalculate PCA for proper distance check
-  const otherDimensions = this.dimensions.filter(d =>
-      d !== directionDim && !ignoreDimensions.includes(d)
-  );
+            // Locality filter: Reject if other dimensions change too much in PCA space
+            const otherDimensions = this.dimensions.filter(d =>
+                d !== directionDim && !ignoreDimensions.includes(d)
+            );
 
-  let violatesLocality = false;
-  for (const dim of otherDimensions) {
-      const dimDelta = Math.abs(result.track.features[dim] - currentTrack.features[dim]);
+            let violatesLocality = false;
+            for (const dim of otherDimensions) {
+                // Create counterfactual: current track but with ONLY this dimension changed
+                const counterfactual = this.createCounterfactualTrack(currentTrack, {
+                    [dim]: result.track.features[dim]
+                });
 
-      // TODO: This should use PCA distance after recalculating hybrid.pca
-      // For now: raw feature delta check (approximate)
-      const maxAllowedChange = searchRadius * 0.15; // Conservative threshold
+                if (!counterfactual) {
+                    // If we can't create counterfactual, fall back to conservative rejection
+                    violatesLocality = true;
+                    break;
+                }
 
-      if (dimDelta > maxAllowedChange) {
-          violatesLocality = true;
-          break;
-      }
-  }
+                // Measure PCA distance caused by changing just this dimension
+                const isolatedDistance = this.calculatePCADistance(
+                    currentTrack,
+                    counterfactual,
+                    'primary_d'
+                );
 
-  if (violatesLocality) {
-      return; // Skip this candidate
-  }
+                // Reject if isolated change exceeds inner radius
+                if (isolatedDistance > innerRadius) {
+                    violatesLocality = true;
+                    break;
+                }
+            }
+
+            if (violatesLocality) {
+                return; // Skip this candidate
+            }
 
             let primaryDistance = null;
             if (innerRadius > 0 && result.track.pca && currentTrack.pca) {
@@ -564,6 +596,16 @@ class MusicalKDTree {
                 primaryDistance
             });
         });
+
+        // Log locality filter rejection rate
+        const rejectedCount = neighborhood.length - directionalCandidates.length;
+        const rejectionRate = (rejectedCount / neighborhood.length) * 100;
+
+        if (rejectionRate > 20) {
+            console.warn(`⚠️ High locality rejection rate: ${rejectionRate.toFixed(1)}% (${rejectedCount}/${neighborhood.length})`);
+        } else {
+            console.log(`✓ Locality filter: ${rejectionRate.toFixed(1)}% rejected (${rejectedCount}/${neighborhood.length})`);
+        }
 
         let minimumDelta = 0;
         if (innerRadius > 0) {
@@ -732,6 +774,116 @@ class MusicalKDTree {
         return clone;
     }
 
+    async loadPCATransformations() {
+        try {
+            const query = `
+                SELECT component_name, feature_name, weight
+                FROM pca_weights
+                ORDER BY component_name, feature_name
+            `;
+            const rows = await runAll(this.db, query);
+            
+            this.pcaWeights = {};
+            rows.forEach(row => {
+                if (!this.pcaWeights[row.component_name]) {
+                    this.pcaWeights[row.component_name] = {};
+                }
+                this.pcaWeights[row.component_name][row.feature_name] = row.weight;
+            });
+        } catch (err) {
+            console.warn('Could not load PCA transformation weights:', err);
+            this.pcaWeights = null;
+        }
+    }
+
+    recalculatePCA(features, component) {
+        if (!this.pcaWeights || !this.pcaWeights[component]) {
+            console.error(`❌ Cannot recalculate PCA: missing weights for ${component}`);
+            return null;
+        }
+
+        let result = 0;
+        for (const [feature, weight] of Object.entries(this.pcaWeights[component])) {
+            if (features[feature] !== undefined) {
+                result += features[feature] * weight;
+            }
+        }
+        return result;
+    }
+
+    recalculateAllPCA(features) {
+        if (!this.pcaWeights) {
+            console.error('❌ Cannot recalculate PCA: missing transformation weights');
+            return null;
+        }
+
+        const pca = {};
+        
+        // Recalculate primary_d
+        if (this.pcaWeights.primary_d) {
+            pca.primary_d = this.recalculatePCA(features, 'primary_d');
+        }
+
+        // Recalculate domain components
+        ['tonal', 'spectral', 'rhythmic'].forEach(domain => {
+            const components = [];
+            for (let i = 1; i <= 3; i++) {
+                const componentName = `${domain}_pc${i}`;
+                if (this.pcaWeights[componentName]) {
+                    components.push(this.recalculatePCA(features, componentName));
+                }
+            }
+            if (components.length > 0) {
+                pca[domain] = components;
+            }
+        });
+
+        return pca;
+    }
+
+    createCounterfactualTrack(baseTrack, featureModifications) {
+        if (!baseTrack?.features || !this.pcaWeights) {
+            console.error('❌ Cannot create counterfactual: missing base track or PCA weights');
+            return null;
+        }
+
+        // 1. Clone base track structure
+        const counterfactual = {
+            identifier: baseTrack.identifier,
+            title: baseTrack.title,
+            artist: baseTrack.artist,
+            path: baseTrack.path,
+            length: baseTrack.length,
+            albumCover: baseTrack.albumCover,
+            love: baseTrack.love,
+            beetsMeta: baseTrack.beetsMeta,
+            features: this.cloneFeatureSet(baseTrack.features),
+            pca: {} // Will be recalculated
+        };
+
+        // 2. Apply feature modifications
+        for (const [feature, newValue] of Object.entries(featureModifications)) {
+            if (this.dimensions.includes(feature)) {
+                counterfactual.features[feature] = newValue;
+            } else {
+                console.warn(`⚠️ Ignoring unknown feature: ${feature}`);
+            }
+        }
+
+        // 3. Recalculate all PCA values
+        counterfactual.pca = this.recalculateAllPCA(counterfactual.features);
+
+        // Optional validation for no-modification case
+        if (Object.keys(featureModifications).length === 0) {
+            const error = Math.abs(counterfactual.pca.primary_d - baseTrack.pca.primary_d);
+            if (error > 1e-6) {
+                console.warn(`⚠️ Counterfactual validation failed: ${error}`);
+            }
+        }
+
+        return counterfactual;
+    }
+
     calculateFeatureContributionFractions(currentTrack, candidateTrack, dimensions, weights = null, contextLabel = '', referenceDimension = null) {
         if (!currentTrack?.features || !candidateTrack?.features) {
             return { total: 0, referenceDistance: 0, slices: [] };
@@ -754,11 +906,9 @@ class MusicalKDTree {
             const candidateValue = candidateTrack.features?.[referenceDimension];
             const currentValue = currentTrack.features?.[referenceDimension];
             if (candidateValue !== undefined && currentValue !== undefined) {
-                const hybrid = {
-                    features: this.cloneFeatureSet(currentTrack.features),
-                    pca: this.clonePcaSet(currentTrack.pca)
-                };
-                hybrid.features[referenceDimension] = candidateValue;
+                const hybrid = this.createCounterfactualTrack(currentTrack, {
+                    [referenceDimension]: candidateValue
+                });
 
                 referenceDistance = this.calculateDimensionSimilarity(currentTrack, hybrid, [referenceDimension], appliedWeights);
                 const fraction = (safeTotal > this.epsilon && referenceDistance > 0)
@@ -791,11 +941,9 @@ class MusicalKDTree {
                 return;
             }
 
-            const hybrid = {
-                features: this.cloneFeatureSet(currentTrack.features),
-                pca: this.clonePcaSet(currentTrack.pca)
-            };
-            hybrid.features[dimension] = candidateValue;
+            const hybrid = this.createCounterfactualTrack(currentTrack, {
+                [dimension]: candidateValue
+            });
 
             const sliceDistance = this.calculateDimensionSimilarity(currentTrack, hybrid, [dimension], appliedWeights);
             const fraction = (safeTotal > this.epsilon && sliceDistance > 0)
@@ -845,6 +993,8 @@ class MusicalKDTree {
                 features: this.cloneFeatureSet(currentTrack.features),
                 pca: this.clonePcaSet(currentTrack.pca)
             };
+            // NOTE: Intentionally modifying PCA without updating features
+            // This is a pseudo-track for measuring PCA contribution in isolation
             hybrid.pca.primary_d = candidateValue;
 
             referenceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, 'primary_d'));
@@ -897,6 +1047,8 @@ class MusicalKDTree {
                 if (!Array.isArray(hybrid.pca[domain])) {
                     hybrid.pca[domain] = currentComponents.slice();
                 }
+                // NOTE: Intentionally modifying PCA component without updating features
+                // This is a pseudo-track for measuring component contribution in isolation
                 hybrid.pca[domain][referenceIndex] = candidateValue;
 
                 referenceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, domain));
@@ -939,6 +1091,8 @@ class MusicalKDTree {
             if (!Array.isArray(hybrid.pca[domain])) {
                 hybrid.pca[domain] = currentComponents.slice();
             }
+            // NOTE: Intentionally modifying PCA component without updating features
+            // This is a pseudo-track for measuring component contribution in isolation
             hybrid.pca[domain][index] = candidateValue;
 
             const sliceDistance = Math.abs(this.calculatePCADistance(currentTrack, hybrid, domain));
