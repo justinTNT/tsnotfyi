@@ -1,11 +1,5 @@
 # ML Primitives & Embedding Space Analysis Plan
 
-## Overview
-Build a reusable ML primitives library and comprehensive analysis toolkit to understand and optimize the embedding space. Focus on measuring distribution, reachability, and system health to inform discovery mechanisms.
-
-**Priority:** After TypeScript upgrade
-**Philosophy:** Agents generate ML components easily → use them more liberally
-
 ### Dimension Toolkit Approach
 The system treats all available dimensions as a **36-dimensional toolkit**:
 - **Core features (18D):** Raw Essentia audio analysis (bpm, spectral_centroid, etc.)

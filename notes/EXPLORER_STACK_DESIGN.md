@@ -10,9 +10,9 @@ Named sessions provide persistent, resumable journeys through the music space. E
 {
   sessionId: "myname",              // Session identifier
   stack: [                          // Journey as sequence of (track, direction) pairs
-    { md5: "abc123...", direction: null },           // Seed track (no incoming direction)
-    { md5: "def456...", direction: "bpm_positive" }, // Reached via bpm_positive from previous
-    { md5: "ghi789...", direction: "entropy_negative" }, // Reached via entropy- from previous
+    { md5: "abc123...", scope: 'magnify', direction: null },           // Seed track (no incoming direction)
+    { md5: "def456...", scope: 'magnify', direction: "bpm_positive" }, // Reached via bpm_positive from previous
+    { md5: "ghi789...", scope: 'micro', direction: "entropy_negative" }, // Reached via entropy- from previous at microscope scope
     // ... continues as user explores or pre-loaded playlist
   ],
   stackIndex: 2,                    // Currently on 3rd track (0-indexed)
@@ -24,11 +24,14 @@ Named sessions provide persistent, resumable journeys through the music space. E
 ```
 
 ### Direction Semantics
-
 The `direction` field represents **how we arrived at this track from the previous one**:
 - `null` for first track (seed/starting point)
-- Explorer direction key (e.g., `"bpm_positive"`, `"entropy_negative"`) for subsequent tracks
+- Explorer direction key (e.g., `"bpm_positive"`, `"entropy_negative"`) for tracks via card clock search
 - Preserves the "journey path" for UI visualization and replay
+
+### Scope Semantics
+- `micro|magnify|tele` for tracks chosen by search
+- `jump` for tracks injected into the playlist in defiance of the search payload
 
 ## URL Routes
 
@@ -104,9 +107,9 @@ if (stackIndex >= stack.length - 1 && trackEnded) {
 **Key Insight:** Any journey/playlist compiles to the same simple structure:
 ```javascript
 [
-  { md5: "track1", direction: null },
-  { md5: "track2", direction: "how_we_got_here" },
-  { md5: "track3", direction: "how_we_got_here" },
+  { md5: "track1", scope: 'magnify', direction: null },
+  { md5: "track2", scope: 'magnify', direction: "how_we_got_here" },
+  { md5: "track3", scope: 'micro', direction: "how_we_got_here" },
 ]
 ```
 
