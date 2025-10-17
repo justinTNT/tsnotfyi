@@ -1318,6 +1318,45 @@ class MusicalKDTree {
         return stats;
     }
 
+    // Get features that are significantly impacted by DJ transforms at different resolutions
+    getDJImpactFeatures(resolution) {
+        // Features affected by ±5% BPM and ±1 semitone changes at each scope level
+        switch(resolution) {
+            case 'micro':
+                // Tight similarity - small changes matter
+                return ['bpm', 'onset_rate', 'chord_change_rate', 'spectral_centroid'];
+            case 'magnifying_glass': 
+                // Moderate similarity - some tolerance for variations
+                return ['bpm', 'onset_rate'];
+            case 'telescope':
+                // Broad similarity - only major characteristics matter
+                return ['bpm'];
+            default:
+                return ['bpm', 'onset_rate'];
+        }
+    }
+
+    // Apply DJ transform compensation to weights during live mixing
+    getTransformAdjustedWeights(baseWeights, resolution, djState = null) {
+        if (!djState || (!djState.tempoShift && !djState.pitchShift)) {
+            return baseWeights; // No transforms active
+        }
+
+        const impactFeatures = this.getDJImpactFeatures(resolution);
+        const adjustedWeights = { ...baseWeights };
+
+        // Reduce weight of transform-sensitive features during mixing
+        impactFeatures.forEach(feature => {
+            if (adjustedWeights[feature]) {
+                adjustedWeights[feature] *= 0.3; // Reduce to 30% weight
+            }
+        });
+
+        console.log(`🎛️  DJ transform compensation active at ${resolution} resolution: reducing weights for [${impactFeatures.join(', ')}]`);
+        
+        return adjustedWeights;
+    }
+
     async close() {
         if (this.db) {
             await this.db.end();

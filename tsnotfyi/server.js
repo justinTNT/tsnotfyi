@@ -2228,6 +2228,453 @@ app.post('/api/playlists/:id/tracks', async (req, res) => {
   }
 });
 
+// ==================== DIMENSION ANALYSIS ENDPOINTS ====================
+
+// Get dimension statistics and availability
+app.get('/api/dimensions/stats', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Count total tracks
+      const totalResult = await client.query('SELECT COUNT(*) as count FROM music_analysis');
+      const totalTracks = parseInt(totalResult.rows[0].count);
+      
+      // Define dimension sets
+      const coreDimensions = [
+        'bpm', 'danceability', 'onset_rate', 'beat_punch',
+        'tonal_clarity', 'tuning_purity', 'fifths_strength',
+        'chord_strength', 'chord_change_rate', 'crest', 'entropy',
+        'spectral_centroid', 'spectral_rolloff', 'spectral_kurtosis',
+        'spectral_energy', 'spectral_flatness', 'sub_drive', 'air_sizzle'
+      ];
+      
+      const pcaDimensions = [
+        'primary_d', 'tonal_pc1', 'tonal_pc2', 'tonal_pc3',
+        'spectral_pc1', 'spectral_pc2', 'spectral_pc3',
+        'rhythmic_pc1', 'rhythmic_pc2', 'rhythmic_pc3'
+      ];
+      
+      // Check which VAE dimensions exist
+      const columnsResult = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'music_analysis' AND column_name LIKE 'vae_%'
+        ORDER BY column_name
+      `);
+      const vaeDimensions = columnsResult.rows.map(row => row.column_name);
+      
+      // Count tracks with complete data for each dimension set
+      const coreCompleteResult = await client.query(`
+        SELECT COUNT(*) as count FROM music_analysis 
+        WHERE ${coreDimensions.map(dim => `${dim} IS NOT NULL`).join(' AND ')}
+      `);
+      
+      const pcaCompleteResult = await client.query(`
+        SELECT COUNT(*) as count FROM music_analysis 
+        WHERE ${pcaDimensions.map(dim => `${dim} IS NOT NULL`).join(' AND ')}
+      `);
+      
+      let vaeCompleteCount = 0;
+      if (vaeDimensions.length > 0) {
+        const vaeCompleteResult = await client.query(`
+          SELECT COUNT(*) as count FROM music_analysis 
+          WHERE ${vaeDimensions.map(dim => `${dim} IS NOT NULL`).join(' AND ')}
+        `);
+        vaeCompleteCount = parseInt(vaeCompleteResult.rows[0].count);
+      }
+      
+      const allDimensions = [...coreDimensions, ...pcaDimensions, ...vaeDimensions];
+      let allCompleteCount = 0;
+      if (allDimensions.length > 0) {
+        const allCompleteResult = await client.query(`
+          SELECT COUNT(*) as count FROM music_analysis 
+          WHERE ${allDimensions.map(dim => `${dim} IS NOT NULL`).join(' AND ')}
+        `);
+        allCompleteCount = parseInt(allCompleteResult.rows[0].count);
+      }
+      
+      res.json({
+        total_tracks: totalTracks,
+        available_dimensions: {
+          core: coreDimensions.length,
+          pca: pcaDimensions.length,
+          vae: vaeDimensions.length,
+          total: allDimensions.length
+        },
+        dimension_names: {
+          core: coreDimensions,
+          pca: pcaDimensions,
+          vae: vaeDimensions
+        },
+        complete_data_counts: {
+          core: parseInt(coreCompleteResult.rows[0].count),
+          pca: parseInt(pcaCompleteResult.rows[0].count),
+          vae: vaeCompleteCount,
+          all_dimensions: allCompleteCount
+        }
+      });
+      
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error getting dimension stats:', error);
+    res.status(500).json({ error: 'Failed to get dimension statistics' });
+  }
+});
+
+// Get all dimensions for a specific track
+app.get('/api/dimensions/track/:id', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    const client = await pool.connect();
+    
+    try {
+      // Get all available columns for music_analysis table
+      const columnsResult = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'music_analysis' 
+        AND column_name NOT IN ('identifier', 'processed_at')
+        ORDER BY 
+          CASE 
+            WHEN column_name LIKE 'bt_%' THEN 3
+            WHEN column_name IN ('bpm', 'danceability', 'onset_rate', 'beat_punch',
+                                'tonal_clarity', 'tuning_purity', 'fifths_strength',
+                                'chord_strength', 'chord_change_rate', 'crest', 'entropy',
+                                'spectral_centroid', 'spectral_rolloff', 'spectral_kurtosis',
+                                'spectral_energy', 'spectral_flatness', 'sub_drive', 'air_sizzle') THEN 1
+            WHEN column_name LIKE '%_pc%' OR column_name = 'primary_d' THEN 2
+            WHEN column_name LIKE 'vae_%' THEN 2
+            ELSE 4
+          END,
+          column_name
+      `);
+      
+      const allColumns = ['identifier', ...columnsResult.rows.map(row => row.column_name)];
+      
+      // Query track data
+      const result = await client.query(
+        `SELECT ${allColumns.join(', ')} FROM music_analysis WHERE identifier = $1`,
+        [id]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+      
+      const track = result.rows[0];
+      
+      // Organize dimensions by type
+      const coreDimensions = [
+        'bpm', 'danceability', 'onset_rate', 'beat_punch',
+        'tonal_clarity', 'tuning_purity', 'fifths_strength',
+        'chord_strength', 'chord_change_rate', 'crest', 'entropy',
+        'spectral_centroid', 'spectral_rolloff', 'spectral_kurtosis',
+        'spectral_energy', 'spectral_flatness', 'sub_drive', 'air_sizzle'
+      ];
+      
+      const pcaDimensions = [
+        'primary_d', 'tonal_pc1', 'tonal_pc2', 'tonal_pc3',
+        'spectral_pc1', 'spectral_pc2', 'spectral_pc3',
+        'rhythmic_pc1', 'rhythmic_pc2', 'rhythmic_pc3'
+      ];
+      
+      const vaeDimensions = allColumns.filter(col => col.startsWith('vae_'));
+      const metadataFields = allColumns.filter(col => col.startsWith('bt_'));
+      
+      // Build response
+      const response = {
+        track_id: track.identifier,
+        dimensions: {
+          core: {},
+          pca: {},
+          vae: {}
+        },
+        metadata: {}
+      };
+      
+      // Add core dimensions
+      coreDimensions.forEach(dim => {
+        if (track[dim] !== null && track[dim] !== undefined) {
+          response.dimensions.core[dim] = track[dim];
+        }
+      });
+      
+      // Add PCA dimensions
+      pcaDimensions.forEach(dim => {
+        if (track[dim] !== null && track[dim] !== undefined) {
+          response.dimensions.pca[dim] = track[dim];
+        }
+      });
+      
+      // Add VAE dimensions
+      vaeDimensions.forEach(dim => {
+        if (track[dim] !== null && track[dim] !== undefined) {
+          response.dimensions.vae[dim] = track[dim];
+        }
+      });
+      
+      // Add metadata (subset for API)
+      ['bt_artist', 'bt_title', 'bt_album', 'bt_year', 'bt_length'].forEach(field => {
+        if (track[field] !== null && track[field] !== undefined) {
+          response.metadata[field] = track[field];
+        }
+      });
+      
+      res.json(response);
+      
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error getting track dimensions:', error);
+    res.status(500).json({ error: 'Failed to get track dimensions' });
+  }
+});
+
+// Get neighbors for a track using KD-tree search
+app.get('/api/kd-tree/neighbors/:id', async (req, res) => {
+  const { id } = req.params;
+  const { 
+    radius = 0.3, 
+    limit = 100, 
+    embedding = 'auto',  // 'auto', 'core', 'pca', 'vae', 'combined'
+    include_distances = false
+  } = req.query;
+  
+  try {
+    // Ensure radial search service is initialized
+    if (!radialSearchService.initialized) {
+      await radialSearchService.initialize();
+    }
+    
+    // Get the track
+    const centerTrack = radialSearchService.kdTree.getTrack(id);
+    if (!centerTrack) {
+      return res.status(404).json({ error: 'Track not found' });
+    }
+    
+    // Determine search method based on embedding parameter
+    let neighbors = [];
+    
+    if (embedding === 'auto' || embedding === 'pca') {
+      // Use PCA-based search (default)
+      neighbors = radialSearchService.kdTree.radiusSearch(
+        centerTrack, 
+        parseFloat(radius), 
+        null, 
+        parseInt(limit)
+      );
+    } else if (embedding === 'vae') {
+      // Use VAE-based search if available
+      try {
+        neighbors = radialSearchService.kdTree.vaeRadiusSearch(
+          centerTrack, 
+          parseFloat(radius), 
+          parseInt(limit)
+        );
+      } catch (error) {
+        // Fall back to PCA if VAE not available
+        console.warn('VAE search failed, falling back to PCA:', error.message);
+        neighbors = radialSearchService.kdTree.radiusSearch(
+          centerTrack, 
+          parseFloat(radius), 
+          null, 
+          parseInt(limit)
+        );
+      }
+    } else if (embedding === 'core') {
+      // Use core features only
+      neighbors = radialSearchService.kdTree.radiusSearch(
+        centerTrack, 
+        parseFloat(radius), 
+        radialSearchService.kdTree.defaultWeights, // Use feature weights
+        parseInt(limit)
+      );
+    } else {
+      // Default to auto
+      neighbors = radialSearchService.kdTree.radiusSearch(
+        centerTrack, 
+        parseFloat(radius), 
+        null, 
+        parseInt(limit)
+      );
+    }
+    
+    // Format response
+    const response = {
+      track_id: id,
+      search_params: {
+        radius: parseFloat(radius),
+        limit: parseInt(limit),
+        embedding: embedding,
+        include_distances: include_distances === 'true'
+      },
+      neighbors: neighbors.map(neighbor => {
+        const result = {
+          id: neighbor.track.identifier,
+          metadata: {
+            bt_artist: neighbor.track.bt_artist,
+            bt_title: neighbor.track.bt_title,
+            bt_album: neighbor.track.bt_album
+          }
+        };
+        
+        if (include_distances === 'true') {
+          result.distance = neighbor.distance;
+        }
+        
+        return result;
+      }),
+      count: neighbors.length
+    };
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error('Error finding neighbors:', error);
+    res.status(500).json({ error: 'Failed to find neighbors' });
+  }
+});
+
+// Batch neighbor search for multiple tracks
+app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
+  const { 
+    track_ids, 
+    radius = 0.3, 
+    limit = 50, 
+    embedding = 'auto' 
+  } = req.body;
+  
+  if (!Array.isArray(track_ids) || track_ids.length === 0) {
+    return res.status(400).json({ error: 'track_ids array is required' });
+  }
+  
+  if (track_ids.length > 100) {
+    return res.status(400).json({ error: 'Maximum 100 tracks per batch request' });
+  }
+  
+  try {
+    // Ensure radial search service is initialized
+    if (!radialSearchService.initialized) {
+      await radialSearchService.initialize();
+    }
+    
+    const results = {};
+    
+    for (const trackId of track_ids) {
+      try {
+        const centerTrack = radialSearchService.kdTree.getTrack(trackId);
+        if (!centerTrack) {
+          results[trackId] = { error: 'Track not found' };
+          continue;
+        }
+        
+        // Use the same search logic as single track endpoint
+        let neighbors = [];
+        
+        if (embedding === 'auto' || embedding === 'pca') {
+          neighbors = radialSearchService.kdTree.radiusSearch(
+            centerTrack, 
+            parseFloat(radius), 
+            null, 
+            parseInt(limit)
+          );
+        } else if (embedding === 'vae') {
+          try {
+            neighbors = radialSearchService.kdTree.vaeRadiusSearch(
+              centerTrack, 
+              parseFloat(radius), 
+              parseInt(limit)
+            );
+          } catch (error) {
+            neighbors = radialSearchService.kdTree.radiusSearch(
+              centerTrack, 
+              parseFloat(radius), 
+              null, 
+              parseInt(limit)
+            );
+          }
+        } else {
+          neighbors = radialSearchService.kdTree.radiusSearch(
+            centerTrack, 
+            parseFloat(radius), 
+            null, 
+            parseInt(limit)
+          );
+        }
+        
+        results[trackId] = {
+          neighbors: neighbors.map(n => ({
+            id: n.track.identifier,
+            distance: n.distance
+          })),
+          count: neighbors.length
+        };
+        
+      } catch (error) {
+        results[trackId] = { error: error.message };
+      }
+    }
+    
+    res.json({
+      search_params: {
+        radius: parseFloat(radius),
+        limit: parseInt(limit),
+        embedding: embedding
+      },
+      results: results,
+      processed_count: track_ids.length
+    });
+    
+  } catch (error) {
+    console.error('Error in batch neighbor search:', error);
+    res.status(500).json({ error: 'Failed to process batch neighbor search' });
+  }
+});
+
+// Get random tracks sample for analysis
+app.get('/api/kd-tree/random-tracks', async (req, res) => {
+  const { count = 100 } = req.query;
+  
+  try {
+    const client = await pool.connect();
+    
+    try {
+      const maxCount = Math.min(parseInt(count), 1000); // Limit to 1000 tracks
+      
+      const result = await client.query(`
+        SELECT identifier, bt_artist, bt_title, bt_album 
+        FROM music_analysis 
+        WHERE identifier IS NOT NULL 
+        ORDER BY RANDOM() 
+        LIMIT $1
+      `, [maxCount]);
+      
+      res.json({
+        tracks: result.rows.map(row => ({
+          id: row.identifier,
+          metadata: {
+            bt_artist: row.bt_artist,
+            bt_title: row.bt_title,
+            bt_album: row.bt_album
+          }
+        })),
+        count: result.rows.length
+      });
+      
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error getting random tracks:', error);
+    res.status(500).json({ error: 'Failed to get random tracks' });
+  }
+});
+
 // ==================== END USER DATA ENDPOINTS ====================
 
 // Main page - serves a UI with 3D visualization
