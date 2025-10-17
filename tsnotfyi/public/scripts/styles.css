@@ -308,6 +308,7 @@ body {
     font-weight: 400;
     color: #0a0; /* Volume bar green */
     opacity: 0.3;
+    transition: opacity 1s linear;
     letter-spacing: 0.02em;
     line-height: 1.4;
     user-select: none;
@@ -1101,21 +1102,6 @@ audio {
     background-position: center;
 }
 
-.next-track-tray-item::after {
-    content: attr(data-direction-label);
-    position: absolute;
-    left: 8px;
-    bottom: 8px;
-    right: 8px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: rgba(255, 255, 255, 0.82);
-    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
-}
-
-
 .beets-chip {
     background: rgba(0, 0, 0, 0.55);
     border: 1px solid rgba(255, 255, 255, 0.12);
@@ -1595,7 +1581,7 @@ audio {
     gap: 8px;
     opacity: 0.2;
     pointer-events: none;
-    transition: opacity 0.3s ease, transform 0.3s ease;
+    transition: opacity 1s linear, transform 0.3s ease;
     transform-origin: center;
     z-index: 1;
     transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)

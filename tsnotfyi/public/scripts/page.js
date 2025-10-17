@@ -1,4 +1,7 @@
   // Global state like it's 1989!
+const STREAM_ENDPOINT_BASE = '/stream';
+const EVENTS_ENDPOINT_BASE = '/events';
+
 const state = {
     lastSSEMessageTime: null,
     latestExplorerData: null,
@@ -9,6 +12,8 @@ const state = {
     lastDirectionSignature: null,
     lastRefreshSummary: null,
     usingOppositeDirection: false,
+    reversePreference: null,
+    lastSelectionGeneration: null,
     journeyMode: true,
     selectedIdentifier: null,
     stackIndex: 0,
@@ -23,10 +28,10 @@ const state = {
     currentOppositeDirectionKey: null,
     sessionId: null,
     streamFingerprint: null,
-  streamUrl: '/stream',
-  eventsEndpoint: '/events',
-  streamUrlBase: '/stream',
-  eventsEndpointBase: '/events',
+    useMediaSource: false,
+    streamController: null,
+  streamUrl: STREAM_ENDPOINT_BASE,
+  eventsEndpoint: EVENTS_ENDPOINT_BASE,
   currentResolution: 'magnifying',
     manualNextTrackOverride: false,
     nextTrackAnimationTimer: null,
@@ -62,6 +67,14 @@ const DEBUG_FLAGS = {
   colors: false,
   consistency: false
 };
+
+
+const MEDIA_STREAM_SUPPORTED = Boolean(
+  window.MediaStreamController &&
+  typeof window.MediaStreamController.isSupported === 'function' &&
+  window.MediaStreamController.isSupported()
+);
+state.useMediaSource = MEDIA_STREAM_SUPPORTED;
 
 
 const PANEL_VARIANTS = ['red-variant', 'green-variant', 'yellow-variant', 'blue-variant'];
@@ -288,15 +301,6 @@ function colorLog(...args) {
   }
 }
 
-(function hydrateStateFromLocation() {
-  state.streamUrlBase = '/stream';
-  state.eventsEndpointBase = '/events';
-  state.streamUrl = state.streamUrlBase;
-  state.eventsEndpoint = state.eventsEndpointBase;
-  window.streamUrl = state.streamUrl;
-  window.eventsUrl = state.eventsEndpoint;
-})();
-
 const RADIUS_MODES = ['microscope', 'magnifying', 'binoculars'];
 
 function explorerContainsTrack(explorerData, identifier) {
@@ -384,7 +388,7 @@ function normalizeResolution(resolution) {
 }
 
 function composeStreamEndpoint(fingerprint, cacheBust = false) {
-  const base = state.streamUrlBase || '/stream';
+  const base = STREAM_ENDPOINT_BASE;
   const params = [];
   if (fingerprint) {
     params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
@@ -400,7 +404,7 @@ function composeStreamEndpoint(fingerprint, cacheBust = false) {
 }
 
 function composeEventsEndpoint(fingerprint) {
-  const base = state.eventsEndpointBase || '/events';
+  const base = EVENTS_ENDPOINT_BASE;
   if (!fingerprint) {
     return base;
   }
@@ -410,14 +414,12 @@ function composeEventsEndpoint(fingerprint) {
 function syncStreamEndpoint(fingerprint, { cacheBust = false } = {}) {
   const url = composeStreamEndpoint(fingerprint, cacheBust);
   state.streamUrl = url;
-  window.streamUrl = url;
   return url;
 }
 
 function syncEventsEndpoint(fingerprint) {
   const url = composeEventsEndpoint(fingerprint);
   state.eventsEndpoint = url;
-  window.eventsUrl = url;
   return url;
 }
 
@@ -769,6 +771,7 @@ async function initializeApp() {
   };
 
   const LOCKOUT_THRESHOLD_SECONDS = 30;
+  const METADATA_FADE_WINDOW_SECONDS = 30;
 
   const elements = {
 	  clickCatcher:        document.getElementById('clickCatcher'),
@@ -786,6 +789,214 @@ async function initializeApp() {
           beetsSegments:       document.getElementById('beetsSegments')
   }
   elements.audio.volume = 0.85;
+
+  function ensureBaseOpacity(node) {
+      if (!node) {
+          return 1;
+      }
+      const dataset = node.dataset || {};
+      if (!dataset.baseOpacity) {
+          const computedOpacity = parseFloat(window.getComputedStyle(node).opacity || '1');
+          const base = Number.isFinite(computedOpacity) ? computedOpacity : 1;
+          if (node.dataset) {
+              node.dataset.baseOpacity = base.toString();
+          }
+          return base;
+      }
+      const parsed = parseFloat(node.dataset.baseOpacity);
+      return Number.isFinite(parsed) ? parsed : 1;
+  }
+
+  function applyMetadataOpacity(fadeRatio) {
+      const ratio = Math.max(0, Math.min(fadeRatio, 1));
+      const directionTextNodes = document.querySelectorAll('.directionKeyText');
+      directionTextNodes.forEach(node => {
+          const baseOpacity = ensureBaseOpacity(node);
+          node.style.opacity = (baseOpacity * ratio).toFixed(3);
+      });
+
+      if (elements.beetsSegments) {
+          const baseOpacity = ensureBaseOpacity(elements.beetsSegments);
+          const targetOpacity = baseOpacity * ratio;
+          elements.beetsSegments.style.opacity = targetOpacity.toFixed(3);
+      }
+  }
+
+  function setReversePreference(trackId, updates = {}) {
+      if (!trackId) {
+          state.reversePreference = null;
+          return;
+      }
+
+      if (!state.reversePreference || state.reversePreference.trackId !== trackId) {
+          state.reversePreference = {
+              trackId,
+              generation: updates.generation ?? null,
+              usingOpposite: updates.usingOpposite ?? state.usingOppositeDirection
+          };
+          return;
+      }
+
+      if (updates.generation !== undefined) {
+          state.reversePreference.generation = updates.generation;
+      }
+      if (updates.usingOpposite !== undefined) {
+          state.reversePreference.usingOpposite = updates.usingOpposite;
+      }
+  }
+
+  function clearReversePreference() {
+      state.reversePreference = null;
+      state.lastSelectionGeneration = null;
+  }
+
+  function getPreferredOppositeState(trackId, generation) {
+      const pref = state.reversePreference;
+      if (!pref || pref.trackId !== trackId) {
+          return null;
+      }
+      if (pref.generation != null && generation != null && pref.generation !== generation) {
+          return null;
+      }
+      return pref.usingOpposite;
+  }
+
+  function updateMetadataFadeFromProgress(progressFraction) {
+      const duration = state.playbackDurationSeconds || 0;
+
+      if (!Number.isFinite(duration) || duration <= 0) {
+          applyMetadataOpacity(0);
+          return;
+      }
+
+      const clampedProgress = Math.max(0, Math.min(progressFraction, 1));
+      const elapsedSeconds = clampedProgress * duration;
+      const fadeWindow = Math.max(Math.min(METADATA_FADE_WINDOW_SECONDS, duration / 2), 0.001);
+
+      const fadeInFactor = Math.min(elapsedSeconds / fadeWindow, 1);
+      const remainingSeconds = Math.max(duration - elapsedSeconds, 0);
+      const fadeOutFactor = Math.min(remainingSeconds / fadeWindow, 1);
+      const fadeRatio = Math.max(0, Math.min(fadeInFactor, fadeOutFactor));
+
+      applyMetadataOpacity(fadeRatio);
+  }
+
+  applyMetadataOpacity(0);
+
+  function playAudioElement(reason = 'unknown') {
+      try {
+          return elements.audio.play()
+              .then(() => {
+                  connectionHealth.audio.status = 'connected';
+                  connectionHealth.audio.reconnectAttempts = 0;
+                  connectionHealth.audio.reconnectDelay = 2000;
+                  updateConnectionHealthUI();
+                  return true;
+              })
+              .catch(err => {
+                  console.error(`🎵 Play failed (${reason}):`, err);
+                  console.error('🎵 Audio state when play failed:', {
+                      error: elements.audio.error,
+                      networkState: elements.audio.networkState,
+                      readyState: elements.audio.readyState,
+                      src: elements.audio.src
+                  });
+                  connectionHealth.audio.status = 'error';
+                  updateConnectionHealthUI();
+                  if (!connectionHealth.currentEventSource) {
+                      connectSSE();
+                  }
+                  return false;
+              });
+      } catch (err) {
+          console.error(`🎵 Play threw (${reason}):`, err);
+          connectionHealth.audio.status = 'error';
+          updateConnectionHealthUI();
+          if (!connectionHealth.currentEventSource) {
+              connectSSE();
+          }
+          return Promise.resolve(false);
+      }
+  }
+
+  function connectAudioStream(streamUrl, { forceFallback = false, reason = 'initial' } = {}) {
+      if (!streamUrl) {
+          console.warn('connectAudioStream called without streamUrl');
+          return false;
+      }
+
+      state.streamUrl = streamUrl;
+
+      if (!forceFallback && state.useMediaSource && state.streamController) {
+          try {
+              state.streamController.start(streamUrl);
+              return true;
+          } catch (err) {
+              console.warn(`🎧 MediaSource start failed (${reason}); falling back`, err);
+              return connectAudioStream(streamUrl, { forceFallback: true, reason: `${reason}_fallback` });
+          }
+      }
+
+      if (state.streamController) {
+          try {
+              state.streamController.stop();
+          } catch (err) {
+              console.warn('🎧 MediaSource stop failed during fallback:', err);
+          }
+      }
+
+      state.streamController = null;
+      state.useMediaSource = false;
+
+      elements.audio.src = streamUrl;
+      elements.audio.load();
+      return false;
+  }
+
+  function initializeMediaStreamController() {
+      if (!state.useMediaSource) {
+          return;
+      }
+      const ControllerCtor = window.MediaStreamController;
+      if (typeof ControllerCtor !== 'function') {
+          state.useMediaSource = false;
+          return;
+      }
+
+      const streamLogger = (event) => {
+          if (!event) return;
+          const level = event.level || 'info';
+          if (level === 'error') {
+              console.error('🎧 MSE error:', event.message, event.error || event);
+          } else if (level === 'warn') {
+              console.warn('🎧 MSE warn:', event.message, event.error || event);
+          }
+      };
+
+      try {
+          state.streamController = new ControllerCtor(elements.audio, {
+              log: streamLogger,
+              onError: (err) => {
+                  console.warn('🎧 MediaSource streaming error; falling back to direct audio', err);
+                  connectionHealth.audio.status = 'connecting';
+                  updateConnectionHealthUI();
+                  audioHealth.isHealthy = false;
+                  audioHealth.lastTimeUpdate = null;
+                  audioHealth.bufferingStarted = Date.now();
+                  startAudioHealthMonitoring();
+                  state.awaitingSSE = true;
+                  connectAudioStream(state.streamUrl, { forceFallback: true, reason: 'mse-error' });
+                  playAudioElement('mse-fallback');
+              }
+          });
+      } catch (err) {
+          console.warn('🎧 Failed to initialize MediaSource controller; using direct audio element', err);
+          state.streamController = null;
+          state.useMediaSource = false;
+      }
+  }
+
+  initializeMediaStreamController();
 
   if (elements.nowPlayingCard && elements.beetsSegments) {
       const showBeets = () => {
@@ -828,6 +1039,14 @@ async function initializeApp() {
 
     connectionHealth.audio.status = 'error';
     updateConnectionHealthUI();
+
+    if (state.streamController) {
+      try {
+        state.streamController.stop();
+      } catch (err) {
+        console.warn('⚠️ Failed to stop media stream controller during restart:', err);
+      }
+    }
 
     try {
       elements.audio.pause();
@@ -1034,12 +1253,99 @@ function createDimensionCards(explorerData, options = {}) {
       if (!state.hasRenderedDeck) {
           skipExitAnimation = true;
       }
-      const normalizeTracks = (direction) => {
-          if (!direction || !Array.isArray(direction.sampleTracks)) return;
-          direction.sampleTracks = direction.sampleTracks.map(entry => entry.track || entry);
+  const normalizeTracks = (direction) => {
+      if (!direction || !Array.isArray(direction.sampleTracks)) {
+          return;
+      }
+
+          direction.sampleTracks = direction.sampleTracks
+              .map(entry => {
+                  if (!entry) return null;
+                  if (entry.track && typeof entry.track === 'object') {
+                      return entry;
+                  }
+                  if (typeof entry === 'object') {
+                      return { track: entry };
+                  }
+                  return null;
+              })
+              .filter(Boolean);
+
           if (direction.oppositeDirection) {
               normalizeTracks(direction.oppositeDirection);
+      }
+  };
+
+      const ensureSyntheticOpposites = (data) => {
+          if (!data || !data.directions) {
+              return;
           }
+
+          const directionsMap = data.directions;
+          const pendingAdds = [];
+
+          Object.entries(directionsMap).forEach(([key, direction]) => {
+              const oppositeKey = getOppositeDirection(key);
+              if (!oppositeKey) {
+                  return;
+              }
+
+              const hasExistingOpposite = directionsMap[oppositeKey]?.sampleTracks?.length;
+              const baseSamples = Array.isArray(direction.sampleTracks)
+                  ? direction.sampleTracks.map(entry => (
+                      entry && typeof entry === 'object' && entry.track
+                          ? { track: { ...entry.track } }
+                          : entry && typeof entry === 'object'
+                              ? { track: { ...entry } }
+                              : null
+                  )).filter(Boolean)
+                  : [];
+
+              if (!baseSamples.length) {
+                  return;
+              }
+
+              if (!hasExistingOpposite) {
+                  const polarity = direction.polarity === 'positive'
+                      ? 'negative'
+                      : direction.polarity === 'negative'
+                          ? 'positive'
+                          : 'negative';
+
+                  const synthetic = {
+                      ...direction,
+                      key: oppositeKey,
+                      direction: direction.direction || oppositeKey,
+                      sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } })),
+                      trackCount: direction.trackCount || baseSamples.length,
+                      hasOpposite: true,
+                      generatedOpposite: true,
+                      polarity
+                  };
+
+                  synthetic.oppositeDirection = {
+                      key,
+                      sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } }))
+                  };
+
+                  pendingAdds.push({ key: oppositeKey, value: synthetic });
+              }
+
+              if (!direction.oppositeDirection) {
+                  direction.oppositeDirection = {
+                      key: oppositeKey,
+                      sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } }))
+                  };
+              }
+
+              direction.hasOpposite = true;
+          });
+
+          pendingAdds.forEach(({ key, value }) => {
+              if (!directionsMap[key]) {
+                  directionsMap[key] = value;
+              }
+          });
       };
 
       const previousExplorerData = state.latestExplorerData;
@@ -1086,6 +1392,7 @@ function createDimensionCards(explorerData, options = {}) {
       state.remainingCounts = {};
 
       Object.values(explorerData.directions || {}).forEach(normalizeTracks);
+      ensureSyntheticOpposites(explorerData);
 
       if (DEBUG_FLAGS.duplicates) {
           performDuplicateAnalysis(explorerData, "createDimensionCards");
@@ -1187,10 +1494,28 @@ function createDimensionCards(explorerData, options = {}) {
           return;
       }
 
-  state.latestExplorerData = explorerData;
+      state.latestExplorerData = explorerData;
 
-      // Reset reverse state when rendering fresh explorer data
-      state.usingOppositeDirection = false;
+      const preserveOppositeView = Boolean(
+          state.usingOppositeDirection && previousNextId && incomingNextId && previousNextId === incomingNextId
+      );
+
+      const currentNextTrackObj = (state.latestExplorerData?.nextTrack?.track)
+          || state.latestExplorerData?.nextTrack
+          || explorerData.nextTrack?.track
+          || explorerData.nextTrack
+          || null;
+      const currentNextId = currentNextTrackObj?.identifier || null;
+      const preferredOpposite = getPreferredOppositeState(currentNextId, state.lastSelectionGeneration);
+
+      if (preferredOpposite != null) {
+          state.usingOppositeDirection = preferredOpposite;
+          deckLog('🔁 Restoring opposite view from preference', state.reversePreference);
+      } else if (!preserveOppositeView) {
+          state.usingOppositeDirection = false;
+      } else {
+          deckLog('🔁 Preserving opposite-direction view during deck redraw');
+      }
 
       const existingNextTrackCard = container.querySelector('.dimension-card.next-track');
 
@@ -1885,8 +2210,6 @@ function createDimensionCards(explorerData, options = {}) {
       }, 800);
 
       const streamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
-      state.streamUrl = streamUrl;
-      window.streamUrl = streamUrl;
       console.log(`🎵 Audio connecting to ${streamUrl}`);
 
       startAudioHealthMonitoring();
@@ -1897,31 +2220,10 @@ function createDimensionCards(explorerData, options = {}) {
       connectionHealth.audio.status = 'connecting';
       updateConnectionHealthUI();
 
-      elements.audio.src = streamUrl;
-      elements.audio.load();
+      connectAudioStream(streamUrl, { reason: 'initial-start' });
       state.awaitingSSE = true;
 
-      elements.audio.play()
-        .then(() => {
-          connectionHealth.audio.status = 'connected';
-          connectionHealth.audio.reconnectAttempts = 0;
-          connectionHealth.audio.reconnectDelay = 2000;
-          updateConnectionHealthUI();
-        })
-        .catch(e => {
-          console.error('🎵 Play failed:', e);
-          console.error('🎵 Audio state when play failed:', {
-              error: elements.audio.error,
-              networkState: elements.audio.networkState,
-              readyState: elements.audio.readyState,
-              src: elements.audio.src
-          });
-          connectionHealth.audio.status = 'error';
-          updateConnectionHealthUI();
-          if (!connectionHealth.currentEventSource) {
-              connectSSE();
-          }
-        });
+      playAudioElement('initial-start');
   }
 
   // Click to start
@@ -2371,15 +2673,6 @@ function hideNextTrackPreview({ immediate = false } = {}) {
     }, 600);
 }
 
-function formatTrayDirectionLabel(directionKey) {
-    if (!directionKey) return '';
-    try {
-        return formatDirectionName(directionKey);
-    } catch (err) {
-        return directionKey;
-    }
-}
-
 function normalizeTrayTrack(track) {
     if (!track) {
         return null;
@@ -2463,12 +2756,9 @@ function addNextTrackTrayItem({ track, directionKey }, { deferReveal = false } =
 
     const item = document.createElement('div');
     item.className = 'next-track-tray-item';
+    const resolvedDirectionKey = directionKey || track.directionKey || '';
     item.dataset.trackId = track.identifier;
-    item.dataset.directionKey = directionKey || track.directionKey || '';
-    item.dataset.trackTitle = track.title || '';
-    item.dataset.trackArtist = track.artist || '';
-    item.dataset.trackAlbum = track.album || '';
-    item.dataset.directionLabel = formatTrayDirectionLabel(directionKey || track.directionKey || '');
+    item.dataset.directionKey = resolvedDirectionKey;
 
     const cover = document.createElement('div');
     cover.className = 'next-track-tray-cover';
@@ -2483,7 +2773,7 @@ function addNextTrackTrayItem({ track, directionKey }, { deferReveal = false } =
 
     items.prepend(item);
 
-    state.nextTrackHistory.unshift({ track, directionKey: directionKey || track.directionKey || null });
+    state.nextTrackHistory.unshift({ track, directionKey: resolvedDirectionKey || null });
 
     requestAnimationFrame(() => {
         if (deferReveal) return;
@@ -2594,7 +2884,11 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}) {
     // Force reflow
     void card.offsetWidth;
 
+    let animationFinished = false;
+
     const finalize = () => {
+        if (animationFinished) return;
+        animationFinished = true;
         card.removeEventListener('transitionend', handleTransitionEnd);
         card.remove();
         if (normalizedTrack && state.nextTrackPreviewTrackId === normalizedTrack.identifier) {
@@ -2614,26 +2908,43 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}) {
 
     card.addEventListener('transitionend', handleTransitionEnd);
 
+    const cardAnimationDuration = 620;
+    const trayAnimationDuration = cardAnimationDuration * 3;
+    let deltaX = 160;
+    let deltaY = 180;
+    let targetScale = 0.4;
+
+    if (trayItem) {
+        const itemRect = trayItem.getBoundingClientRect();
+        const trayCenterX = itemRect.left + itemRect.width / 2 - containerRect.left;
+        const trayCenterY = itemRect.top + itemRect.height / 2 - containerRect.top;
+        deltaX = trayCenterX - startLeft;
+        deltaY = trayCenterY - startTop;
+        const scaleX = itemRect.width / cardRect.width;
+        const scaleY = itemRect.height / cardRect.height;
+        targetScale = Math.max(0.32, Math.min(scaleX, scaleY));
+    }
+
+    card.style.willChange = 'transform, opacity';
+
+    const stage1Duration = Math.max(180, Math.round(trayAnimationDuration * 0.45));
+    const stage2Duration = Math.max(200, trayAnimationDuration - stage1Duration);
+    const intermediateX = trayItem ? deltaX * 0.35 : deltaX;
+    const intermediateY = deltaY;
+
     requestAnimationFrame(() => {
-        const duration = 700;
-        card.style.transition = `left ${duration}ms cubic-bezier(0.22, 0.61, 0.36, 1), top ${duration}ms cubic-bezier(0.22, 0.61, 0.36, 1), transform ${duration}ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity 520ms ease`;
+        card.style.transition = `transform ${stage1Duration}ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity ${trayAnimationDuration}ms ease`;
+        card.style.transform = `translate(-50%, -50%) translate(${intermediateX}px, ${intermediateY}px) translateZ(-820px) scale(${targetScale})`;
+        card.style.opacity = '0.35';
 
-        let targetLeft = startLeft + 120;
-        let targetTop = startTop + 160;
-
-        if (trayItem) {
-            const itemRect = trayItem.getBoundingClientRect();
-            targetLeft = itemRect.left + itemRect.width / 2 - containerRect.left;
-            targetTop = itemRect.top + itemRect.height / 2 - containerRect.top;
-        }
-
-        card.style.left = `${targetLeft}px`;
-        card.style.top = `${targetTop}px`;
-        card.style.transform = 'translate(-50%, -50%) translateZ(-1400px) scale(0.35)';
-        card.style.opacity = '0';
+        setTimeout(() => {
+            card.style.transition = `transform ${stage2Duration}ms cubic-bezier(0.18, 0.8, 0.3, 1), opacity ${stage2Duration}ms ease-out`;
+            card.style.transform = `translate(-50%, -50%) translate(${deltaX}px, ${deltaY}px) translateZ(-900px) scale(${targetScale})`;
+            card.style.opacity = '0';
+        }, stage1Duration + 16);
     });
 
-    setTimeout(finalize, 900);
+    setTimeout(finalize, stage1Duration + stage2Duration + 240);
 }
 
 function enterCardsDormantState() {
@@ -2953,6 +3264,8 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       const clamped = Math.min(Math.max(progressFraction, 0), 1);
       const background = document.getElementById('background');
 
+      updateMetadataFadeFromProgress(clamped);
+
       if (clamped <= 0.5) {
           const widthPercent = clamped * 2 * 100; // 0 → 100
           elements.progressWipe.style.left = '0%';
@@ -3056,6 +3369,9 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
           cardsLocked = false;
           cardsInactiveTilted = false;
 
+          state.usingOppositeDirection = false;
+          clearReversePreference();
+
           // Unlock cards at start of new track
           unlockCardInteractions();
 
@@ -3154,6 +3470,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       cardsLocked = false;
       console.log('🛑 Stopped progress animation');
       clearPlaybackClock();
+      applyMetadataOpacity(0);
   }
 
   function triggerMidpointActions() {
@@ -3367,6 +3684,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
           state.manualNextDirectionKey = null;
           state.pendingManualTrackId = null;
           state.selectedIdentifier = currentTrackId;
+          clearReversePreference();
           updateRadiusControlsUI();
         }
       }
@@ -3386,6 +3704,13 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
         state.manualNextDirectionKey = event.direction;
       }
       state.selectedIdentifier = trackId;
+
+      if (Number.isFinite(event.generation)) {
+        state.lastSelectionGeneration = event.generation;
+        setReversePreference(trackId, { generation: event.generation });
+      } else if (state.reversePreference && state.reversePreference.trackId === trackId) {
+        setReversePreference(trackId);
+      }
 
       const match = findTrackInExplorer(state.latestExplorerData, trackId);
       if (match?.track) {
@@ -3413,6 +3738,11 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       if (trackId && state.pendingManualTrackId === trackId) {
         state.manualNextTrackOverride = true;
       }
+
+      if (trackId && Number.isFinite(event.generation)) {
+        state.lastSelectionGeneration = event.generation;
+        setReversePreference(trackId, { generation: event.generation });
+      }
     };
 
     const handleSelectionFailed = (event) => {
@@ -3423,6 +3753,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
         state.manualNextTrackOverride = false;
         state.manualNextDirectionKey = null;
         state.pendingManualTrackId = null;
+        clearReversePreference();
       }
 
       updateNextTrackMetadata(null);
@@ -3761,6 +4092,11 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
           || getOppositeDirection(baseKey);
 
       console.log(`🔄 About to call redrawNextTrackStack with baseDirectionKey: ${baseKey}, oppositeHint: ${oppositeHint}`);
+      const preferredTrackId = state.selectedIdentifier || state.pendingManualTrackId || state.serverNextTrack || null;
+      setReversePreference(preferredTrackId, {
+          generation: state.lastSelectionGeneration,
+          usingOpposite: state.usingOppositeDirection
+      });
       const redrawOk = redrawNextTrackStack(baseKey, { oppositeKey: oppositeHint });
       if (!redrawOk) {
           state.usingOppositeDirection = previousOppositeState;
@@ -3782,7 +4118,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
           || state.baseDirectionKey
           || state.latestExplorerData.nextTrack.directionKey;
       state.baseDirectionKey = baseDimensionKey;
-      const baseDirection = state.latestExplorerData.directions[baseDimensionKey];
+      let baseDirection = state.latestExplorerData.directions[baseDimensionKey];
 
       const embeddedOppositeKey = baseDirection?.oppositeDirection?.key
           || baseDirection?.oppositeDirection?.direction
@@ -4020,6 +4356,9 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
 
       state.stackIndex = 0;
       state.selectedIdentifier = trackForCard?.identifier || null;
+      if (state.selectedIdentifier) {
+          setReversePreference(state.selectedIdentifier, { generation: state.lastSelectionGeneration, usingOpposite: state.usingOppositeDirection });
+      }
       console.log(`🔄 Updated selection to first track of ${state.usingOppositeDirection ? 'OPPOSITE' : 'ORIGINAL'} stack (${displayDimensionKey}): ${trackForCard?.title || trackToShow?.title} (${state.selectedIdentifier})`);
 
       if (!state.latestExplorerData) {
@@ -4427,21 +4766,32 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
                          console.log(`🔄 Cycling stack for ${direction.key}, current card shows ${currentCardDirection}, usingOppositeDirection = ${state.usingOppositeDirection}`);
 
                          // Determine which tracks to cycle through based on reverse flag
-                         let tracksToUse, dimensionToShow;
-                         if (state.usingOppositeDirection && direction.oppositeDirection?.sampleTracks) {
-                             tracksToUse = direction.oppositeDirection.sampleTracks;
-                             dimensionToShow = direction.oppositeDirection;
-                             console.log(`🔄 Cycling through opposite direction tracks`);
-                         } else {
-                             tracksToUse = direction.sampleTracks;
-                             dimensionToShow = direction;
-                             console.log(`🔄 Cycling through original direction tracks`);
-                         }
+                        let tracksToUse, dimensionToShow;
+                        if (state.usingOppositeDirection && Array.isArray(direction.oppositeDirection?.sampleTracks) && direction.oppositeDirection.sampleTracks.length) {
+                            tracksToUse = direction.oppositeDirection.sampleTracks;
+                            dimensionToShow = direction.oppositeDirection;
+                            console.log(`🔄 Cycling through opposite direction tracks`);
+                        } else {
+                            tracksToUse = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+                            dimensionToShow = direction;
+                            console.log(`🔄 Cycling through original direction tracks`);
+                        }
 
-                         // Cycle the appropriate tracks
-                         tracksToUse.push(tracksToUse.shift());
-                         const track = tracksToUse[0].track || tracksToUse[0];
-                         updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
+                        if (!tracksToUse.length) {
+                            console.warn(`⚠️ No sample tracks available to cycle for ${direction.key}`);
+                            return;
+                        }
+
+                        // Cycle the appropriate tracks
+                        const nextSample = tracksToUse.shift();
+                        tracksToUse.push(nextSample);
+
+                        const track = nextSample && (nextSample.track || nextSample);
+                        if (!track) {
+                            console.warn(`⚠️ Sample entry missing track data for ${direction.key}`);
+                            return;
+                        }
+                        updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           console.log(`🎬 Found existing next track: ${existingNextTrackCard.dataset.directionKey}, rotating to next clock position`);
                           rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
@@ -5596,14 +5946,12 @@ async function createNewJourneySession(reason = 'unknown') {
 
         const newStreamUrl = composeStreamEndpoint(null, Date.now());
         state.streamUrl = newStreamUrl;
-        window.streamUrl = newStreamUrl;
 
         if (streamElement) {
             audioHealth.isHealthy = false;
             audioHealth.lastTimeUpdate = null;
             audioHealth.bufferingStarted = Date.now();
-            streamElement.src = newStreamUrl;
-            streamElement.load();
+            connectAudioStream(newStreamUrl, { reason: `new-session-${reason}` });
             state.awaitingSSE = true;
         }
 
@@ -5635,9 +5983,7 @@ async function createNewJourneySession(reason = 'unknown') {
 
         if (streamElement && state.isStarted) {
             startAudioHealthMonitoring();
-            streamElement.play().catch(err => {
-                console.error('🎵 Audio play failed after new session:', err);
-            });
+            playAudioElement('new-session');
         }
 
         // TODO(lean-comms): revisit auto heartbeat after new session once staged recovery validated

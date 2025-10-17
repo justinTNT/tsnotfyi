@@ -1567,13 +1567,44 @@ function helpersDuplicateLog(...args) {
           ? direction.sampleTracks.map(entry => entry?.track || entry).filter(Boolean)
           : [];
 
+      console.debug('🃏 STACK PREVIEW INPUT', {
+          directionKey: direction?.key || card?.dataset?.directionKey || null,
+          sampleCount: samples.length,
+          providedSelectedIndex: selectedIndex,
+          cardTrackId: card.dataset?.trackMd5 || null
+      });
+
       const currentId = card.dataset.trackMd5 || null;
       let activeIndex = samples.findIndex(sample => sample?.identifier === currentId);
       if (activeIndex < 0 && Number.isFinite(selectedIndex)) {
           activeIndex = selectedIndex;
       }
 
-      const remaining = activeIndex >= 0 ? samples.slice(activeIndex + 1) : samples.slice(1);
+      if (samples.length > 0) {
+          if (activeIndex < 0) {
+              const fallbackIndex = Number.isFinite(selectedIndex) ? selectedIndex : 0;
+              activeIndex = Math.min(Math.max(fallbackIndex, 0), samples.length - 1);
+          } else {
+              activeIndex = activeIndex % samples.length;
+          }
+      }
+
+      const remaining = [];
+      if (samples.length > 1) {
+          for (let i = 1; i < samples.length; i++) {
+              const nextIndex = (activeIndex + i) % samples.length;
+              const candidate = samples[nextIndex];
+              if (candidate) {
+                  remaining.push(candidate);
+              }
+          }
+      }
+
+      console.debug('🃏 STACK PREVIEW REMAINING', {
+          activeIndex,
+          remainingCount: remaining.length,
+          remainingIds: remaining.map(sample => sample?.identifier).filter(Boolean)
+      });
 
       if (!remaining.length) {
           clearStackedPreviewLayer();

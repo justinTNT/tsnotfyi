@@ -206,6 +206,7 @@ class MusicalKDTree {
 
     async loadTracks() {
         // Load all tracks with their audio features and PCA values
+        //  -- TODO(play-history-db): reintroduce love/hate join once migrated
         const query = `
             SELECT
                 identifier,
@@ -221,15 +222,43 @@ class MusicalKDTree {
                 vae_latent_0, vae_latent_1, vae_latent_2, vae_latent_3,
                 vae_latent_4, vae_latent_5, vae_latent_6, vae_latent_7,
                 vae_model_version, vae_computed_at,
-                love,hate,beets_meta
+                beets_meta
             FROM music_analysis
-            WHERE bpm IS NOT NULL and hate IS 0
+            WHERE bpm IS NOT NULL
             AND spectral_centroid IS NOT NULL
             AND primary_d IS NOT NULL
             ORDER BY identifier
         `;
 
         const rows = await runAll(this.db, query);
+
+        const decodePath = (value) => {
+            if (!value) {
+                return null;
+            }
+
+            // (Buffer.isBuffer(value)) {
+                return value.toString('utf8');
+            }
+
+            if (typeof value === 'string') {
+                if (value.startsWith('\\x')) {
+                    try {
+                        return Buffer.from(value.slice(2), 'hex').toString('utf8');
+                    } catch (err) {
+                        console.warn('⚠️ Failed to decode bytea path string:', err?.message || err);
+                        return value;
+                    }
+                }
+                return value;
+            }
+
+            if (value?.type === 'Buffer' && Array.isArray(value.data)) {
+                return Buffer.from(value.data).toString('utf8');
+            }
+
+            return String(value);
+        };
 
         this.tracks = rows.map(row => {
             let meta = null;
@@ -246,11 +275,12 @@ class MusicalKDTree {
                 identifier: row.identifier,
                 title: row.title,
                 artist: row.artist,
-                path: row.path,
+                path: decodePath(row.path),
                 length: row.length,
                 features: {},
                 albumCover: artPath,
-                love: row.love,
+                // TODO(play-history-db): hydrate love once migrated to dedicated table
+                love: undefined,
                 pca: {
                     primary_d: row.primary_d,
                     tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],
@@ -281,7 +311,7 @@ class MusicalKDTree {
 
     async loadCalibrationSettings() {
         const query = `
-            SELECT resolution_level as resolution, discriminator, base_x, inner_radius, outer_radius, achieved_percentage, scaling_factor
+            SELECT resolution_level as resolution, discriminator, base_x, inner_radius, outer_radius, target_percentage, achieved_percentage, library_size
             FROM pca_calibration_settings
             ORDER BY resolution_level, discriminator
         `;
@@ -294,12 +324,22 @@ class MusicalKDTree {
                 if (!this.calibrationSettings[row.resolution]) {
                     this.calibrationSettings[row.resolution] = {};
                 }
+                const derivedScaling = (() => {
+                    const target = Number(row.target_percentage);
+                    const achieved = Number(row.achieved_percentage);
+                    if (Number.isFinite(target) && Number.isFinite(achieved) && achieved !== 0) {
+                        return target / achieved;
+                    }
+                    return 1.0;
+                })();
                 this.calibrationSettings[row.resolution][row.discriminator] = {
                     base_x: row.base_x,
                     inner_radius: row.inner_radius,
                     outer_radius: row.outer_radius,
                     achieved_percentage: row.achieved_percentage,
-                    scaling_factor: row.scaling_factor || 1.0
+                    target_percentage: row.target_percentage,
+                    library_size: row.library_size,
+                    scaling_factor: derivedScaling
                 };
             });
         } catch (err) {
