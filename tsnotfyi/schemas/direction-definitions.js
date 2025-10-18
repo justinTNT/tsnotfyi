@@ -1,28 +1,33 @@
 // Direction Object Definitions - Musical Exploration Structure
 // Pure type definitions for shared lexicon - no validation, just clarity
+// 
+// VOCABULARY:
+// - Dimension: A measurable musical property (tempo, brightness) - an index into feature space
+// - Direction: The relationship between two tracks on a specific dimension (increase/decrease)
+// - Stack: The curated track selection representing that directional relationship
 
 const { z } = require('zod');
 const { AnyTrack, ExplorerTrack } = require('./track-definitions');
 
-// ==================== DIRECTION DOMAINS & TYPES ====================
+// ==================== DIMENSION DOMAINS & COMPONENTS ====================
 
-// Direction domains classify the type of musical analysis
-const DirectionDomain = z.enum([
+// Dimension domains classify the type of musical analysis
+const DimensionDomain = z.enum([
   'tonal',        // Harmonic, chord-based analysis
   'spectral',     // Frequency-based analysis  
   'rhythmic',     // Timing and beat-based analysis
   'original',     // Original feature-based (not PCA)
 ]);
 
-// Direction components indicate which PCA dimension
-const DirectionComponent = z.enum([
+// Dimension components indicate which analysis space
+const DimensionComponent = z.enum([
   'pc1',          // Principal Component 1
   'pc2',          // Principal Component 2  
   'pc3',          // Principal Component 3
   'feature',      // Original feature (for domain=original)
 ]);
 
-// Direction polarity indicates the direction along the axis
+// Direction polarity indicates the direction along the dimension
 const DirectionPolarity = z.enum([
   'positive',     // Moving toward higher values
   'negative',     // Moving toward lower values
@@ -46,7 +51,7 @@ const DirectionKeyPattern = z.union([
   // PCA-based keys: "domain_pc1_polarity"
   z.string().regex(/^(tonal|spectral|rhythmic)_pc[123]_(positive|negative)$/),
   
-  // Feature-based keys: "feature_polarity" 
+  // Feature-based keys: semantic direction labels
   z.string().regex(/^(faster|slower|brighter|darker|more_energetic|calmer)$/),
   z.string().regex(/^(more_danceable|less_danceable|more_tonal|more_atonal)$/),
   z.string().regex(/^(more_complex|simpler|more_punchy|smoother)$/),
@@ -57,24 +62,25 @@ const DirectionKeyPattern = z.union([
 
 // ==================== CORE DIRECTION STRUCTURE ====================
 
+// A Direction represents movement along a dimension from a reference track
 const DirectionCore = z.object({
-  direction: z.string(),                    // e.g., "faster", "complex_textured"
-  description: z.string(),                  // e.g., "Tempo", "Texture vs punch"  
-  domain: DirectionDomain,                  // Musical analysis domain
-  component: DirectionComponent,            // PCA component or "feature"
-  polarity: DirectionPolarity,              // Direction along axis
+  direction: z.string(),                    // e.g., "faster", "complex_textured" (the direction key)
+  description: z.string(),                  // e.g., "Tempo", "Texture vs punch" (the dimension name)
+  domain: DimensionDomain,                  // Musical analysis domain of the dimension
+  component: DimensionComponent,            // PCA component or "feature"
+  polarity: DirectionPolarity,              // Direction along dimension axis
   
-  // Track statistics
-  trackCount: z.number(),                   // Number of tracks in this direction
-  totalNeighborhoodSize: z.number(),        // Total tracks considered
+  // Stack statistics (tracks representing this direction)
+  trackCount: z.number(),                   // Number of tracks in direction stack
+  totalNeighborhoodSize: z.number(),        // Total tracks considered for stack
   splitRatio: z.number(),                   // trackCount/totalNeighborhoodSize
   
   // Quality metrics
   diversityScore: z.number(),               // Calculated diversity metric
   isOutlier: z.boolean(),                   // True if trackCount < 3
   
-  // Track samples for this direction
-  sampleTracks: z.array(ExplorerTrack),     // Tracks in this direction
+  // The Stack: curated track selection for this direction
+  sampleTracks: z.array(ExplorerTrack),     // Tracks showing this direction from current track
   originalSampleTracks: z.array(z.any()),   // Raw track data before formatting
 });
 
@@ -205,8 +211,8 @@ const DirectionKeyUtilities = {
 
 module.exports = {
   // Core enums and types
-  DirectionDomain,
-  DirectionComponent, 
+  DimensionDomain,
+  DimensionComponent, 
   DirectionPolarity,
   DirectionType,
   DirectionKeyPattern,
@@ -220,4 +226,8 @@ module.exports = {
   
   // Utilities
   DirectionKeyUtilities,
+  
+  // Legacy exports (for backward compatibility)
+  DirectionDomain: DimensionDomain,
+  DirectionComponent: DimensionComponent,
 };

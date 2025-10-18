@@ -19,6 +19,11 @@ const ExplorerSchemas = require('./explorer-definitions');
  * The goal is to enable precise, high-bandwidth communication between human and AI agents
  * by establishing clear definitions of polymorphic and nested structures.
  * 
+ * CORE VOCABULARY:
+ * - Dimension: A measurable musical property (tempo, brightness) - an index into feature space
+ * - Direction: The relationship between two tracks on a specific dimension (increase/decrease)
+ * - Stack: The curated track selection representing that directional relationship
+ * 
  * PHILOSOPHY:
  * - Pure definitions, no validation ceremony
  * - Separation of data vs UI state vs runtime state
@@ -56,17 +61,17 @@ const TSNotFYISchemas = {
   },
   
   // ==================== DIRECTION OBJECTS ====================
-  // Musical exploration dimensions with embedded tracks and opposites
+  // Musical exploration: directions along dimensions with track stacks
   Direction: {
     // Core enums
-    Domain: DirectionSchemas.DirectionDomain,    // tonal/spectral/rhythmic/original
-    Component: DirectionSchemas.DirectionComponent, // pc1/pc2/pc3/feature
+    DimensionDomain: DirectionSchemas.DimensionDomain,    // tonal/spectral/rhythmic/original
+    DimensionComponent: DirectionSchemas.DimensionComponent, // pc1/pc2/pc3/feature
     Polarity: DirectionSchemas.DirectionPolarity, // positive/negative
     Type: DirectionSchemas.DirectionType,        // For UI styling classification
     KeyPattern: DirectionSchemas.DirectionKeyPattern, // Regex patterns for direction keys
     
     // Direction structures
-    Core: DirectionSchemas.DirectionCore,        // Basic direction with sample tracks
+    Core: DirectionSchemas.DirectionCore,        // Direction with track stack
     Bidirectional: DirectionSchemas.BidirectionalDirection, // With embedded opposite
     Complete: DirectionSchemas.Direction,        // Full direction object
     Map: DirectionSchemas.DirectionMap,          // Record<string, Direction>
@@ -172,6 +177,11 @@ const CommunicationPatterns = {
   "get Direction type": () => `
     Use DirectionSchemas.DirectionKeyUtilities.getDirectionType()
     Returns classification for UI styling: rhythmic_core, tonal_pca, etc.
+  `,
+  
+  "cycle through Direction stack": () => `
+    Navigate through sampleTracks array representing directional relationship
+    Stack contains nearest, furthest, and random tracks showing dimension change
   `,
   
   // Card state management
