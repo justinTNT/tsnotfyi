@@ -132,9 +132,15 @@ class MusicVAETrainer:
         self.model = model.to(device)
         self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.8, patience=10, verbose=True
-        )
+        try:
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.8, patience=10, verbose=True
+            )
+        except TypeError:
+            # PyTorch <1.4 does not accept the verbose kwarg on ReduceLROnPlateau
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.8, patience=10
+            )
         
     def train_epoch(self, dataloader):
         """Train for one epoch"""

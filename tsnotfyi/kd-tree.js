@@ -57,7 +57,12 @@ class MusicalKDTree {
         this.db = null;
         this.root = null;
         this.tracks = [];
-        this.calibrationSettings = {};
+        this.calibrationSettingsByMode = { pca: {}, vae: {} };
+        this.calibrationSettings = this.calibrationSettingsByMode.pca; // Back-compat alias
+        this.calibrationMetadata = { pca: [], vae: [] };
+        this.allowMissingCalibration = process.env.ALLOW_MISSING_CALIBRATION === 'true';
+        this.defaultVaeRadius = 0.3;
+        this.loggedMissingVaeCalibration = false;
 
         // Core indices from Indices Bible v2 (18 core + 3 algebraic)
         this.dimensions = [
@@ -169,7 +174,8 @@ class MusicalKDTree {
         ]);
 
         console.log(`Loaded ${this.tracks.length} tracks`);
-        console.log(`Loaded calibration settings for ${Object.keys(this.calibrationSettings).length} resolutions`);
+        this.ensureCalibrationAvailability();
+        this.logCalibrationSummary();
         console.log('✓ PCA transformation weights loaded');
         
         // Log VAE embedding availability
@@ -237,7 +243,7 @@ class MusicalKDTree {
                 return null;
             }
 
-            // (Buffer.isBuffer(value)) {
+            if (Buffer.isBuffer(value)) {
                 return value.toString('utf8');
             }
 
@@ -311,19 +317,39 @@ class MusicalKDTree {
 
     async loadCalibrationSettings() {
         const query = `
-            SELECT resolution_level as resolution, discriminator, base_x, inner_radius, outer_radius, target_percentage, achieved_percentage, library_size
+            SELECT
+                COALESCE(mode, 'pca') AS mode,
+                resolution_level AS resolution,
+                discriminator,
+                base_x,
+                inner_radius,
+                outer_radius,
+                target_percentage,
+                achieved_percentage,
+                library_size,
+                sample_size,
+                calibrated_at,
+                checksum
             FROM pca_calibration_settings
-            ORDER BY resolution_level, discriminator
+            ORDER BY mode, resolution_level, discriminator
         `;
 
         try {
             const rows = await runAll(this.db, query);
 
-            this.calibrationSettings = {};
+            this.calibrationSettingsByMode = { pca: {}, vae: {} };
+            this.calibrationMetadata = { pca: [], vae: [] };
+
             rows.forEach(row => {
-                if (!this.calibrationSettings[row.resolution]) {
-                    this.calibrationSettings[row.resolution] = {};
+                const mode = row.mode || 'pca';
+                if (!this.calibrationSettingsByMode[mode]) {
+                    this.calibrationSettingsByMode[mode] = {};
+                    this.calibrationMetadata[mode] = [];
                 }
+                if (!this.calibrationSettingsByMode[mode][row.resolution]) {
+                    this.calibrationSettingsByMode[mode][row.resolution] = {};
+                }
+
                 const derivedScaling = (() => {
                     const target = Number(row.target_percentage);
                     const achieved = Number(row.achieved_percentage);
@@ -332,19 +358,30 @@ class MusicalKDTree {
                     }
                     return 1.0;
                 })();
-                this.calibrationSettings[row.resolution][row.discriminator] = {
-                    base_x: row.base_x,
-                    inner_radius: row.inner_radius,
-                    outer_radius: row.outer_radius,
-                    achieved_percentage: row.achieved_percentage,
-                    target_percentage: row.target_percentage,
-                    library_size: row.library_size,
+
+                this.calibrationSettingsByMode[mode][row.resolution][row.discriminator] = {
+                    base_x: Number(row.base_x),
+                    inner_radius: Number(row.inner_radius),
+                    outer_radius: Number(row.outer_radius),
+                    achieved_percentage: Number(row.achieved_percentage),
+                    target_percentage: Number(row.target_percentage),
+                    library_size: Number(row.library_size),
+                    sample_size: row.sample_size ? Number(row.sample_size) : null,
+                    calibrated_at: row.calibrated_at,
+                    checksum: row.checksum,
                     scaling_factor: derivedScaling
                 };
+
+                this.calibrationMetadata[mode].push(row);
             });
+
+            // Maintain legacy alias for PCA callers
+            this.calibrationSettings = this.calibrationSettingsByMode.pca;
         } catch (err) {
             console.warn('Could not load calibration settings:', err);
-            this.calibrationSettings = {}; // Use defaults
+            this.calibrationSettingsByMode = { pca: {}, vae: {} };
+            this.calibrationMetadata = { pca: [], vae: [] };
+            this.calibrationSettings = this.calibrationSettingsByMode.pca;
         }
     }
 
@@ -361,6 +398,65 @@ class MusicalKDTree {
         }));
 
         this.root = this.buildKDTree(points, 0);
+    }
+
+    logCalibrationSummary() {
+        const modes = Object.keys(this.calibrationSettingsByMode);
+        modes.forEach(mode => {
+            const resolutionMap = this.calibrationSettingsByMode[mode] || {};
+            const resolutionCount = Object.keys(resolutionMap).length;
+            const bucketCount = Object.values(resolutionMap)
+                .reduce((acc, discMap) => acc + Object.keys(discMap).length, 0);
+
+            if (bucketCount === 0) {
+                const message = `⚠️ No ${mode.toUpperCase()} calibration buckets loaded`;
+                if (this.allowMissingCalibration) {
+                    console.warn(`${message} (override enabled)`);
+                } else {
+                    console.error(message);
+                }
+                return;
+            }
+
+            const metadata = this.calibrationMetadata[mode] || [];
+            const latestTimestamp = metadata.reduce((acc, row) => {
+                if (!row.calibrated_at) {
+                    return acc;
+                }
+                const value = new Date(row.calibrated_at).getTime();
+                return Number.isFinite(value) && value > acc ? value : acc;
+            }, 0);
+
+            const summaryParts = [`${bucketCount} buckets across ${resolutionCount} resolutions`];
+            if (latestTimestamp) {
+                summaryParts.push(`latest ${new Date(latestTimestamp).toISOString()}`);
+            }
+            const lastChecksum = metadata
+                .map(row => row.checksum)
+                .filter(Boolean)
+                .pop();
+            if (lastChecksum) {
+                summaryParts.push(`checksum ${lastChecksum.slice(0, 8)}…`);
+            }
+
+            console.log(`✓ ${mode.toUpperCase()} calibration loaded (${summaryParts.join(', ')})`);
+        });
+    }
+
+    ensureCalibrationAvailability() {
+        const criticalModes = ['pca', 'vae'];
+        const missing = criticalModes.filter(mode => {
+            const modeBuckets = this.calibrationSettingsByMode[mode] || {};
+            return Object.values(modeBuckets).every(discMap => Object.keys(discMap).length === 0);
+        });
+
+        if (missing.length && !this.allowMissingCalibration) {
+            throw new Error(`Missing calibration data for modes: ${missing.join(', ')}. Run scripts/calibrate_embeddings.py first or set ALLOW_MISSING_CALIBRATION=true to override.`);
+        }
+
+        if (missing.length && this.allowMissingCalibration) {
+            console.warn(`⚠️ Calibration missing for modes ${missing.join(', ')} (override allows startup)`);
+        }
     }
 
     buildKDTree(points, depth) {
@@ -616,6 +712,46 @@ class MusicalKDTree {
         // Sort by VAE distance and limit results
         results.sort((a, b) => a.distance - b.distance);
         return results.slice(0, limit);
+    }
+
+    vaeCalibratedSearch(centerTrack, resolution = 'magnifying_glass', limit = 500) {
+        const bucket = this.calibrationSettingsByMode?.vae?.[resolution]?.latent;
+        if (!bucket) {
+            if (!this.loggedMissingVaeCalibration) {
+                console.warn('⚠️ VAE calibration bucket missing – falling back to literal radius search');
+                this.loggedMissingVaeCalibration = true;
+            }
+            const fallback = this.vaeRadiusSearch(centerTrack, this.defaultVaeRadius, limit);
+            return {
+                neighbors: fallback,
+                appliedRadius: this.defaultVaeRadius,
+                calibration: null
+            };
+        }
+
+        const outer = Number.isFinite(bucket.outer_radius) ? bucket.outer_radius : this.defaultVaeRadius;
+        const inner = Number.isFinite(bucket.inner_radius) ? bucket.inner_radius : 0;
+        const rawResults = this.vaeRadiusSearch(centerTrack, outer, limit * 2);
+        const filtered = rawResults
+            .filter(candidate => candidate.distance >= inner && candidate.distance <= outer)
+            .slice(0, limit);
+
+        return {
+            neighbors: filtered,
+            appliedRadius: outer,
+            calibration: {
+                mode: 'vae',
+                resolution,
+                discriminator: 'latent',
+                inner_radius: bucket.inner_radius,
+                outer_radius: bucket.outer_radius,
+                sample_size: bucket.sample_size,
+                target_percentage: bucket.target_percentage,
+                achieved_percentage: bucket.achieved_percentage,
+                calibrated_at: bucket.calibrated_at,
+                checksum: bucket.checksum
+            }
+        };
     }
 
     vaeRadiusSearchHelper(node, centerTrack, radius, results) {
@@ -989,18 +1125,22 @@ class MusicalKDTree {
     async loadPCATransformations() {
         try {
             const query = `
-                SELECT component_name, feature_name, weight
-                FROM pca_weights
-                ORDER BY component_name, feature_name
+                SELECT component, feature_name, weight, mean, scale
+                FROM pca_transformations
+                ORDER BY component, feature_index
             `;
             const rows = await runAll(this.db, query);
-            
+
             this.pcaWeights = {};
             rows.forEach(row => {
-                if (!this.pcaWeights[row.component_name]) {
-                    this.pcaWeights[row.component_name] = {};
+                if (!this.pcaWeights[row.component]) {
+                    this.pcaWeights[row.component] = {};
                 }
-                this.pcaWeights[row.component_name][row.feature_name] = row.weight;
+                this.pcaWeights[row.component][row.feature_name] = {
+                    weight: row.weight,
+                    mean: row.mean,
+                    scale: row.scale
+                };
             });
         } catch (err) {
             console.warn('Could not load PCA transformation weights:', err);
@@ -1015,9 +1155,17 @@ class MusicalKDTree {
         }
 
         let result = 0;
-        for (const [feature, weight] of Object.entries(this.pcaWeights[component])) {
-            if (features[feature] !== undefined) {
-                result += features[feature] * weight;
+        for (const [feature, params] of Object.entries(this.pcaWeights[component])) {
+            const value = features[feature];
+            if (value !== undefined) {
+                const mean = params.mean ?? 0;
+                const scale = params.scale ?? 1;
+                const weight = params.weight ?? 0;
+
+                if (scale !== 0) {
+                    const standardized = (value - mean) / scale;
+                    result += standardized * weight;
+                }
             }
         }
         return result;

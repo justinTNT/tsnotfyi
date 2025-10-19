@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import traceback
+from datetime import datetime
+from urllib.parse import urlparse
 
 # PostgreSQL support
 try:
@@ -46,6 +48,12 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
+
+try:
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset, random_split
+except ImportError:
+    torch = None
 
 # Configure logging
 logging.basicConfig(
@@ -82,6 +90,7 @@ class ProcessingConfig:
     pg_database: str = "tsnotfyi"
     pg_user: str = "postgres"
     pg_password: Optional[str] = None  # From env var if not provided
+    pg_connection_string: Optional[str] = None
 
     # Processing strategy
     tranche: str = "proof_tools"
@@ -111,6 +120,19 @@ class ProcessingConfig:
     # Debug options
     verbose: bool = False
     dry_run: bool = False
+
+    # Embedding post-processing options
+    skip_pca: bool = False
+    train_vae: bool = False
+    vae_epochs: int = 50
+    vae_batch_size: int = 512
+    vae_learning_rate: float = 1e-3
+    vae_latent_dim: int = 8
+    vae_beta: float = 4.0
+    vae_beta_start: Optional[float] = None
+    vae_beta_warmup_epochs: int = 0
+    vae_model_version: Optional[str] = None
+    vae_model_path: str = "music_vae.pt"
 
 def compute_path_keywords(path_str: str) -> str:
     if not path_str:
@@ -1063,6 +1085,191 @@ class PCAComputer:
                 conn.close()
 
 
+class VAEEmbeddingTrainer:
+    """Train VAE embeddings and persist them to the database."""
+
+    def __init__(self, config: ProcessingConfig, db_manager: 'DatabaseManager',
+                 core_indices: Optional[List[str]] = None):
+        self.config = config
+        self.db_manager = db_manager
+        if core_indices is not None:
+            self.core_indices = core_indices
+        else:
+            self.core_indices = PCAComputer().core_indices
+
+        if torch is None:
+            raise ImportError("PyTorch is required for --train-vae. Install it with `pip install torch`.")
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.MusicVAE = None
+        self.MusicVAETrainer = None
+        self.save_model = None
+        self._load_vae_dependencies()
+
+    def _load_vae_dependencies(self):
+        try:
+            from services.musicVAE import MusicVAE, MusicVAETrainer, save_model
+        except ImportError:
+            project_root = Path(__file__).resolve().parents[3] / 'streaming-webapp'
+            services_dir = project_root / 'services'
+            if str(project_root) not in sys.path:
+                sys.path.append(str(project_root))
+            if str(services_dir) not in sys.path:
+                sys.path.append(str(services_dir))
+            from services.musicVAE import MusicVAE, MusicVAETrainer, save_model
+
+        self.MusicVAE = MusicVAE
+        self.MusicVAETrainer = MusicVAETrainer
+        self.save_model = save_model
+
+    def _prepare_dataframe(self, existing_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if existing_df is not None:
+            columns = ['identifier'] + self.core_indices
+            missing = [col for col in columns if col not in existing_df.columns]
+            if missing:
+                raise ValueError(f"Existing dataframe missing required columns: {missing}")
+            df = existing_df[columns].copy()
+        else:
+            columns = ['identifier'] + self.core_indices
+            query = f"SELECT {', '.join(columns)} FROM music_analysis WHERE identifier IS NOT NULL"
+            df = pd.read_sql_query(query, self.db_manager.db)
+
+        df = df.dropna(subset=self.core_indices)
+        df = df.reset_index(drop=True)
+        return df
+
+    def train_and_store(self, existing_df: Optional[pd.DataFrame] = None):
+        df = self._prepare_dataframe(existing_df)
+        if df.empty:
+            logger.warning("No tracks available with complete features for VAE training; skipping.")
+            return
+
+        features = df[self.core_indices].astype(np.float32).values
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features).astype(np.float32)
+
+        tensor_data = torch.from_numpy(features_scaled)
+        dataset = TensorDataset(tensor_data)
+
+        if len(dataset) >= 20:
+            val_size = max(1, int(len(dataset) * 0.1))
+            train_size = len(dataset) - val_size
+            train_dataset, val_dataset = random_split(
+                dataset,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(42)
+            )
+        else:
+            train_dataset, val_dataset = dataset, None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.vae_batch_size,
+            shuffle=True,
+            drop_last=len(train_dataset) > self.config.vae_batch_size
+        )
+        val_loader = DataLoader(val_dataset, batch_size=self.config.vae_batch_size) if val_dataset else None
+
+        model = self.MusicVAE(
+            input_dim=features_scaled.shape[1],
+            latent_dim=self.config.vae_latent_dim,
+            beta=self.config.vae_beta
+        )
+        trainer = self.MusicVAETrainer(model, lr=self.config.vae_learning_rate, device=self.device)
+        self.model = model
+        self.trainer = trainer
+
+        logger.info("🚀 Starting VAE training")
+        history = []
+        beta_start = self.config.vae_beta_start if self.config.vae_beta_start is not None else self.config.vae_beta
+        beta_target = self.config.vae_beta
+        warmup_epochs = max(0, self.config.vae_beta_warmup_epochs)
+        for epoch in range(1, self.config.vae_epochs + 1):
+            if warmup_epochs > 0:
+                if epoch <= warmup_epochs:
+                    progress = (epoch - 1) / max(1, warmup_epochs - 1)
+                    current_beta = beta_start + (beta_target - beta_start) * progress
+                else:
+                    current_beta = beta_target
+            else:
+                current_beta = beta_target
+            model.beta = current_beta
+
+            train_metrics = trainer.train_epoch(train_loader)
+            if val_loader:
+                val_metrics = trainer.validate(val_loader)
+                trainer.scheduler.step(val_metrics['loss'])
+            else:
+                val_metrics = None
+                trainer.scheduler.step(train_metrics['loss'])
+
+            history.append({
+                'epoch': epoch,
+                'train': train_metrics,
+                'val': val_metrics,
+                'beta': current_beta
+            })
+
+            if epoch == 1 or epoch == self.config.vae_epochs or epoch % 5 == 0:
+                if val_metrics:
+                    logger.info(
+                        f"Epoch {epoch}/{self.config.vae_epochs}: train={train_metrics['loss']:.4f} "
+                        f"val={val_metrics['loss']:.4f} beta={current_beta:.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"Epoch {epoch}/{self.config.vae_epochs}: train={train_metrics['loss']:.4f} "
+                        f"beta={current_beta:.4f}"
+                    )
+
+        model.eval()
+        with torch.no_grad():
+            mean_latent, _ = model.encode(torch.from_numpy(features_scaled).to(self.device))
+            latents = mean_latent.cpu().numpy()
+
+        computed_at = datetime.utcnow()
+        model_version = self.config.vae_model_version or f"music_vae_{computed_at.strftime('%Y%m%d%H%M%S')}"
+
+        model_path = Path(self.config.vae_model_path).expanduser()
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_config = {
+            'input_dim': model.input_dim,
+            'latent_dim': model.latent_dim,
+            'hidden_dims': list(getattr(model, 'hidden_dims', [64, 32])),
+            'beta': model.beta,
+            'dropout': getattr(model, 'dropout', 0.1)
+        }
+
+        metadata = {
+            'trained_at': computed_at.isoformat(),
+            'feature_names': self.core_indices,
+            'core_features': self.core_indices,
+            'scaler_mean': scaler.mean_.tolist(),
+            'scaler_scale': scaler.scale_.tolist(),
+            'beta': self.config.vae_beta,
+            'beta_start': beta_start,
+            'beta_warmup_epochs': warmup_epochs,
+            'latent_dim': self.config.vae_latent_dim,
+            'history': history,
+            'model_version': model_version,
+            'model_config': model_config,
+            'hidden_dims': model_config['hidden_dims'],
+            'dropout': model_config['dropout']
+        }
+        self.save_model(model, str(model_path), metadata=metadata)
+        logger.info(f"✅ Saved VAE model to {model_path}")
+
+        self.db_manager.add_vae_columns(self.config.vae_latent_dim)
+        self.db_manager.batch_update_vae_values(
+            df['identifier'].tolist(),
+            latents,
+            model_version,
+            computed_at
+        )
+
+        logger.info("✅ VAE embeddings updated in database")
+
+
 class DatabaseManager:
     """Manages the output database with comprehensive beets metadata integration"""
 
@@ -1080,13 +1287,16 @@ class DatabaseManager:
                 raise ImportError("PostgreSQL requested but psycopg2 not installed. Run: pip install psycopg2-binary")
 
             try:
-                self.db = psycopg2.connect(
-                    host=self.config.pg_host,
-                    port=self.config.pg_port,
-                    database=self.config.pg_database,
-                    user=self.config.pg_user,
-                    password=self.config.pg_password or os.getenv('PGPASSWORD')
-                )
+                if self.config.pg_connection_string:
+                    self.db = psycopg2.connect(self.config.pg_connection_string)
+                else:
+                    self.db = psycopg2.connect(
+                        host=self.config.pg_host,
+                        port=self.config.pg_port,
+                        database=self.config.pg_database,
+                        user=self.config.pg_user,
+                        password=self.config.pg_password or os.getenv('PGPASSWORD')
+                    )
                 self.db.autocommit = False  # Explicit transaction control
 
                 # Set session parameters (equivalent to SQLite PRAGMA)
@@ -1420,6 +1630,49 @@ class DatabaseManager:
         self.db.commit()
         logger.info("✅ PCA columns ready")
 
+    def add_vae_columns(self, latent_dim: int):
+        """Ensure VAE columns exist on music_analysis."""
+        logger.info("Adding VAE columns to music_analysis...")
+
+        float_type = "DOUBLE PRECISION" if self.config.use_postgres else "REAL"
+        latent_columns = [f"vae_latent_{i}" for i in range(latent_dim)]
+
+        for column in latent_columns:
+            if self._column_exists('music_analysis', column):
+                continue
+
+            if self.config.use_postgres:
+                with self.db.cursor() as cur:
+                    cur.execute(f"ALTER TABLE music_analysis ADD COLUMN {column} {float_type}")
+            else:
+                try:
+                    self.db.execute(f"ALTER TABLE music_analysis ADD COLUMN {column} {float_type}")
+                except sqlite3.OperationalError:
+                    pass
+            logger.info(f"  ✅ Added column: {column}")
+
+        metadata_columns = {
+            'vae_model_version': "TEXT",
+            'vae_computed_at': "TIMESTAMP"
+        }
+
+        for column, col_type in metadata_columns.items():
+            if self._column_exists('music_analysis', column):
+                continue
+
+            if self.config.use_postgres:
+                with self.db.cursor() as cur:
+                    cur.execute(f"ALTER TABLE music_analysis ADD COLUMN {column} {col_type}")
+            else:
+                try:
+                    self.db.execute(f"ALTER TABLE music_analysis ADD COLUMN {column} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+            logger.info(f"  ✅ Added column: {column}")
+
+        self.db.commit()
+        logger.info("✅ VAE columns ready")
+
     def create_pca_tables(self):
         """Create pca_transformations and pca_calibration_settings tables."""
         logger.info("Creating PCA metadata tables...")
@@ -1441,6 +1694,15 @@ class DatabaseManager:
                 cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_pca_component
                 ON pca_transformations(component)
+                """)
+
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS pca_weights (
+                    component_name TEXT NOT NULL,
+                    feature_name   TEXT NOT NULL,
+                    weight         DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (component_name, feature_name)
+                )
                 """)
 
                 cur.execute("""
@@ -1479,6 +1741,15 @@ class DatabaseManager:
             """)
 
             self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pca_weights (
+                component_name TEXT NOT NULL,
+                feature_name   TEXT NOT NULL,
+                weight         REAL NOT NULL,
+                PRIMARY KEY (component_name, feature_name)
+            )
+            """)
+
+            self.db.execute("""
             CREATE TABLE IF NOT EXISTS pca_calibration_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 resolution_level TEXT NOT NULL,
@@ -1502,10 +1773,15 @@ class DatabaseManager:
         logger.info(f"Inserting {len(weights)} transformation weights...")
 
         component_counts = []
+        simple_weights = [
+            (component, feature_name, weight)
+            for component, _feature_index, feature_name, weight, _mean, _scale in weights
+        ]
 
         if self.config.use_postgres:
             with self.db.cursor() as cur:
                 cur.execute("DELETE FROM pca_transformations")
+                cur.execute("DELETE FROM pca_weights")
 
                 insert_sql = """
                 INSERT INTO pca_transformations
@@ -1513,6 +1789,12 @@ class DatabaseManager:
                 VALUES %s
                 """
                 psycopg2.extras.execute_values(cur, insert_sql, weights, page_size=1000)
+
+                insert_weights_sql = """
+                INSERT INTO pca_weights (component_name, feature_name, weight)
+                VALUES %s
+                """
+                psycopg2.extras.execute_values(cur, insert_weights_sql, simple_weights, page_size=1000)
 
             self.db.commit()
 
@@ -1526,9 +1808,12 @@ class DatabaseManager:
                     ORDER BY component
                 """)
                 component_counts = cur.fetchall()
+                cur.execute("SELECT COUNT(*) FROM pca_weights")
+                weights_count = cur.fetchone()[0]
         else:
             # SQLite
             self.db.execute("DELETE FROM pca_transformations")
+            self.db.execute("DELETE FROM pca_weights")
 
             insert_sql = """
             INSERT INTO pca_transformations
@@ -1537,6 +1822,12 @@ class DatabaseManager:
             """
 
             self.db.executemany(insert_sql, weights)
+
+            insert_weights_sql = """
+            INSERT INTO pca_weights (component_name, feature_name, weight)
+            VALUES (?, ?, ?)
+            """
+            self.db.executemany(insert_weights_sql, simple_weights)
             self.db.commit()
 
             # Verify
@@ -1549,14 +1840,20 @@ class DatabaseManager:
                 ORDER BY component
             """)
             component_counts = cursor.fetchall()
+            cursor = self.db.execute("SELECT COUNT(*) FROM pca_weights")
+            weights_count = cursor.fetchone()[0]
 
         logger.info(f"✅ Inserted {count} transformation weights")
+        logger.info(f"✅ Inserted {weights_count} simple weights into pca_weights")
 
         for component, cnt in component_counts:
             logger.info(f"   {component}: {cnt} weights")
 
         if count != len(weights):
             raise ValueError(f"Insertion mismatch: expected {len(weights)}, inserted {count}")
+
+        if weights_count != len(simple_weights):
+            raise ValueError(f"Simple weight insertion mismatch: expected {len(simple_weights)}, inserted {weights_count}")
 
     def batch_update_pca_values(self, pca_computer):
         """Batch update PCA values for all tracks."""
@@ -1608,6 +1905,32 @@ class DatabaseManager:
 
         self.db.commit()
         logger.info(f"✅ Updated {n_tracks:,} tracks with PCA values")
+
+    def batch_update_vae_values(self, identifiers: List[str], latents: np.ndarray,
+                                model_version: str, computed_at: datetime):
+        """Bulk update VAE latent vectors for the supplied identifiers."""
+        if latents.shape[0] != len(identifiers):
+            raise ValueError("Latent matrix row count does not match identifiers length")
+
+        ph = '%s' if self.config.use_postgres else '?'
+        latent_columns = [f"vae_latent_{i}" for i in range(latents.shape[1])]
+        set_clause = ', '.join([f"{col} = {ph}" for col in latent_columns])
+        set_clause += f", vae_model_version = {ph}, vae_computed_at = {ph}"
+        update_sql = f"UPDATE music_analysis SET {set_clause} WHERE identifier = {ph}"
+
+        updates = []
+        for identifier, latent in zip(identifiers, latents):
+            latent_values = [float(value) for value in latent]
+            updates.append((*latent_values, model_version, computed_at, identifier))
+
+        if self.config.use_postgres:
+            with self.db.cursor() as cur:
+                psycopg2.extras.execute_batch(cur, update_sql, updates, page_size=1000)
+        else:
+            self.db.executemany(update_sql, updates)
+
+        self.db.commit()
+        logger.info(f"✅ Updated {len(identifiers):,} tracks with VAE embeddings")
 
     def insert_calibration_settings(self, calibration_results: Dict):
         """Insert calibration settings into database."""
@@ -1936,6 +2259,8 @@ Examples:
                        help='Output database path')
     parser.add_argument('--checkpoint-db',
                        help='Checkpoint database for resumable processing')
+    parser.add_argument('--tsnot-config', default='~/project/streaming-webapp/tsnotfyi-config.json',
+                       help='Path to tsnotfyi-config.json for database defaults (set empty to disable)')
 
     # PostgreSQL options
     parser.add_argument('--postgres', action='store_true',
@@ -1977,6 +2302,28 @@ Examples:
                        help='Skip file existence validation')
     parser.add_argument('--include-failed', action='store_true',
                        help='Include previously failed tracks')
+    parser.add_argument('--skip-pca', action='store_true',
+                       help='Skip PCA computation stage after ingestion')
+    parser.add_argument('--train-vae', action='store_true',
+                       help='Train VAE embeddings and update database after import')
+    parser.add_argument('--vae-epochs', type=int, default=50,
+                       help='Number of epochs for VAE training (default: 50)')
+    parser.add_argument('--vae-batch-size', type=int, default=512,
+                       help='Batch size for VAE training (default: 512)')
+    parser.add_argument('--vae-lr', type=float, default=1e-3,
+                       help='Learning rate for VAE optimizer (default: 1e-3)')
+    parser.add_argument('--vae-latent-dim', type=int, default=8,
+                       help='Latent dimension for the VAE (default: 8)')
+    parser.add_argument('--vae-beta', type=float, default=4.0,
+                       help='Beta coefficient for VAE KL term (default: 4.0)')
+    parser.add_argument('--vae-beta-start', type=float, default=None,
+                       help='Starting beta value for KL warm-up (default: same as final beta)')
+    parser.add_argument('--vae-beta-warmup', type=int, default=0,
+                       help='Epochs to linearly warm beta from start to final value')
+    parser.add_argument('--vae-model-version',
+                       help='Optional override for the VAE model version label')
+    parser.add_argument('--vae-output', default='music_vae.pt',
+                       help='Path to save trained VAE model (default: ./music_vae.pt)')
 
     # Debug options
     parser.add_argument('--verbose', action='store_true',
@@ -2000,10 +2347,64 @@ Examples:
             logger.error("Year range must be in format: START-END (e.g., 1970-2000)")
             sys.exit(1)
 
+    # Load defaults from tsnot config if available
+    output_path = args.output
+    use_postgres = args.postgres
+    pg_connection_string = None
+    pg_host = args.pg_host
+    pg_port = args.pg_port
+    pg_database = args.pg_database
+    pg_user = args.pg_user
+    pg_password = args.pg_password
+
+    config_path_value = args.tsnot_config.strip() if args.tsnot_config else ''
+    if config_path_value:
+        config_path = Path(os.path.expanduser(config_path_value))
+        if config_path.exists():
+            try:
+                with config_path.open('r', encoding='utf-8') as f:
+                    tsnot_config = json.load(f)
+                db_config = tsnot_config.get('database', {})
+                db_type = (db_config.get('type') or '').lower()
+
+                if db_type == 'postgresql' and not args.postgres:
+                    use_postgres = True
+                    pg_conf = db_config.get('postgresql', {})
+                    conn_str = pg_conf.get('connectionString') or pg_conf.get('url')
+                    if conn_str:
+                        pg_connection_string = conn_str
+                        parsed = urlparse(conn_str)
+                        if parsed.hostname:
+                            pg_host = parsed.hostname
+                        if parsed.port:
+                            pg_port = parsed.port
+                        if parsed.path and parsed.path != '/':
+                            pg_database = parsed.path.lstrip('/')
+                        if parsed.username:
+                            pg_user = parsed.username
+                        if parsed.password:
+                            pg_password = parsed.password
+                    else:
+                        pg_host = pg_conf.get('host', pg_host)
+                        pg_port = int(pg_conf.get('port', pg_port))
+                        pg_database = pg_conf.get('database', pg_database)
+                        pg_user = pg_conf.get('user', pg_user)
+                        pg_password = pg_conf.get('password', pg_password)
+
+                elif db_type == 'sqlite' and not args.postgres:
+                    db_path = db_config.get('path')
+                    if db_path:
+                        output_path = os.path.expanduser(db_path)
+
+            except Exception as exc:
+                logger.warning(f"⚠️  Failed to load tsnot config from {config_path}: {exc}")
+        else:
+            logger.debug(f"tsnot config not found at {config_path}, using CLI/database defaults")
+
     # Build configuration
     config = ProcessingConfig(
         beets_db_path=os.path.expanduser(args.beets_db),
-        output_db_path=args.output,
+        output_db_path=output_path,
         checkpoint_db_path=args.checkpoint_db,
         tranche=args.tranche,
         limit=args.limit,
@@ -2022,13 +2423,25 @@ Examples:
         include_failed=args.include_failed,
         verbose=args.verbose,
         dry_run=args.dry_run,
+        skip_pca=args.skip_pca,
+        train_vae=args.train_vae,
+        vae_epochs=args.vae_epochs,
+        vae_batch_size=args.vae_batch_size,
+        vae_learning_rate=args.vae_lr,
+        vae_latent_dim=args.vae_latent_dim,
+        vae_beta=args.vae_beta,
+        vae_beta_start=args.vae_beta_start,
+        vae_beta_warmup_epochs=args.vae_beta_warmup,
+        vae_model_version=args.vae_model_version,
+        vae_model_path=os.path.abspath(os.path.expanduser(args.vae_output)),
         # PostgreSQL options
-        use_postgres=args.postgres,
-        pg_host=args.pg_host,
-        pg_port=args.pg_port,
-        pg_database=args.pg_database,
-        pg_user=args.pg_user,
-        pg_password=args.pg_password
+        use_postgres=use_postgres,
+        pg_host=pg_host,
+        pg_port=pg_port,
+        pg_database=pg_database,
+        pg_user=pg_user,
+        pg_password=pg_password,
+        pg_connection_string=pg_connection_string
     )
 
     # Validate beets database exists
@@ -2059,47 +2472,69 @@ Examples:
         if config.dry_run:
             return
 
-        # STAGE 3: PCA COMPUTATION AND CALIBRATION
-        logger.info("=" * 80)
-        logger.info("STAGE 3: PCA COMPUTATION AND CALIBRATION")
-        logger.info("=" * 80)
+        pca_computer = None
 
-        try:
-            # 1. Create PCA tables
-            processor.db_manager.create_pca_tables()
-            processor.db_manager.add_pca_columns()
-
-            # 2. Initialize PCA computer and fit models
-            pca_computer = PCAComputer()
-            pca_computer.fit_pca_on_library(config)
-
-            # 3. Extract and store transformation weights
-            weights = pca_computer.extract_transformation_weights()
-            processor.db_manager.insert_pca_transformations(weights)
-
-            # 4. Update all tracks with PCA values
-            processor.db_manager.batch_update_pca_values(pca_computer)
-
-            # 5. Calibrate resolution controls
-            calibration_results = pca_computer.calibrate_resolution_controls()
-            processor.db_manager.insert_calibration_settings(calibration_results)
-
-            # 6. Validate integrity
-            pca_computer.validate_pca_integrity(processor.db_manager)
-
-            logger.info("\n" + "=" * 80)
-            logger.info("✅ PCA COMPUTATION COMPLETE")
+        if config.skip_pca:
             logger.info("=" * 80)
-            logger.info("   - 72 transformation weights stored")
-            logger.info("   - 12 calibration settings computed")
-            logger.info("   - All values validated")
-            logger.info(f"   - Database ready: {config.output_db_path}")
+            logger.info("Skipping PCA computation (--skip-pca)")
+            logger.info("=" * 80)
+        else:
+            logger.info("=" * 80)
+            logger.info("STAGE 3: PCA COMPUTATION AND CALIBRATION")
+            logger.info("=" * 80)
 
-        except Exception as e:
-            logger.error(f"❌ PCA computation failed: {e}")
-            if config.verbose:
-                logger.error(traceback.format_exc())
-            raise RuntimeError("PCA computation failed - import incomplete")
+            try:
+                # 1. Create PCA tables
+                processor.db_manager.create_pca_tables()
+                processor.db_manager.add_pca_columns()
+
+                # 2. Initialize PCA computer and fit models
+                pca_computer = PCAComputer()
+                pca_computer.fit_pca_on_library(config)
+
+                # 3. Extract and store transformation weights
+                weights = pca_computer.extract_transformation_weights()
+                processor.db_manager.insert_pca_transformations(weights)
+
+                # 4. Update all tracks with PCA values
+                processor.db_manager.batch_update_pca_values(pca_computer)
+
+                # 5. Calibrate resolution controls
+                calibration_results = pca_computer.calibrate_resolution_controls()
+                processor.db_manager.insert_calibration_settings(calibration_results)
+
+                # 6. Validate integrity
+                pca_computer.validate_pca_integrity(processor.db_manager)
+
+                logger.info("\n" + "=" * 80)
+                logger.info("✅ PCA COMPUTATION COMPLETE")
+                logger.info("=" * 80)
+                logger.info("   - 72 transformation weights stored")
+                logger.info("   - 12 calibration settings computed")
+                logger.info("   - All values validated")
+                logger.info(f"   - Database ready: {config.output_db_path}")
+
+            except Exception as e:
+                logger.error(f"❌ PCA computation failed: {e}")
+                if config.verbose:
+                    logger.error(traceback.format_exc())
+                raise RuntimeError("PCA computation failed - import incomplete")
+
+        if config.train_vae:
+            logger.info("=" * 80)
+            logger.info("STAGE 4: VAE TRAINING AND EMBEDDING GENERATION")
+            logger.info("=" * 80)
+
+            try:
+                vae_trainer = VAEEmbeddingTrainer(config, processor.db_manager,
+                                                  core_indices=(pca_computer.core_indices if pca_computer else None))
+                existing_df = pca_computer.data if pca_computer else None
+                vae_trainer.train_and_store(existing_df)
+            except Exception as e:
+                logger.error(f"❌ VAE training failed: {e}")
+                if config.verbose:
+                    logger.error(traceback.format_exc())
+                raise RuntimeError("VAE training failed - import incomplete")
 
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")

@@ -17,30 +17,39 @@ Usage:
 import argparse
 import json
 import logging
-import os
-import sys
 import time
-from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
-from sklearn.neighbors import NearestNeighbors
+
+try:
+    import warnings
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+except Exception:
+    # Silently continue if urllib3 or the warning class is unavailable
+    pass
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class DimensionUtilityAnalyzer:
-    def __init__(self, server_url='http://localhost:3001'):
+    def __init__(self, server_url='http://localhost:3001', embedding='vae', resolution='magnifying_glass', discriminator='primary_d', radius=None):
         self.server_url = server_url
         self.session = requests.Session()
         self.all_dimensions = []
         self.dimension_names = {}
         self.tracks_data = None
+        self.track_cache = {}
+        self.neighborhoods_processed = 0
+        self.embedding_mode = embedding
+        self.resolution = resolution
+        self.discriminator = discriminator
+        self.radius = radius
         
     def initialize(self):
         """Initialize by fetching dimension information from server"""
@@ -70,6 +79,52 @@ class DimensionUtilityAnalyzer:
             logger.error(f"Failed to connect to server: {e}")
             logger.info("Make sure the tsnotfyi server is running on port 3001")
             raise
+
+    def _flatten_track_dimensions(self, track_payload):
+        flattened = {'identifier': track_payload['track_id']}
+
+        for space in ('core', 'pca', 'vae'):
+            dims = track_payload['dimensions'].get(space, {})
+            if dims:
+                flattened.update(dims)
+
+        return flattened
+
+    def _is_complete_track(self, flattened):
+        for dim in self.all_dimensions:
+            if dim not in flattened or pd.isna(flattened[dim]):
+                return False
+        return True
+
+    def ensure_track_cached(self, track_id):
+        if track_id in self.track_cache:
+            return True
+
+        try:
+            response = self.session.get(
+                f"{self.server_url}/api/dimensions/track/{track_id}",
+                timeout=10
+            )
+            response.raise_for_status()
+            track_payload = response.json()
+            flattened = self._flatten_track_dimensions(track_payload)
+
+            if not self._is_complete_track(flattened):
+                logger.debug(f"Skipping track {track_id} due to incomplete dimension data")
+                return False
+
+            self.track_cache[track_id] = flattened
+
+            if self.tracks_data is not None:
+                new_row = pd.DataFrame([flattened])
+                self.tracks_data = pd.concat([self.tracks_data, new_row], ignore_index=True)
+                self.tracks_data = self.tracks_data.drop_duplicates(subset='identifier', keep='last')
+
+            return True
+
+        except requests.RequestException as e:
+            logger.warning(f"Failed to fetch dimension data for track {track_id}: {e}")
+            return False
     
     def load_sample_tracks(self, sample_size=1000):
         """Load a random sample of tracks for analysis"""
@@ -91,37 +146,28 @@ class DimensionUtilityAnalyzer:
             tracks_data = []
             
             for i, track_id in enumerate(track_ids):
-                try:
-                    response = self.session.get(f"{self.server_url}/api/dimensions/track/{track_id}")
-                    if response.status_code == 200:
-                        track_data = response.json()
-                        
-                        # Flatten dimensions into single dict
-                        flattened = {'identifier': track_data['track_id']}
-                        flattened.update(track_data['dimensions']['core'])
-                        flattened.update(track_data['dimensions']['pca'])
-                        flattened.update(track_data['dimensions']['vae'])
-                        
-                        tracks_data.append(flattened)
-                        
-                        if (i + 1) % 100 == 0:
-                            logger.info(f"  Processed {i+1}/{len(track_ids)} tracks")
-                            
-                except requests.RequestException as e:
-                    logger.warning(f"Failed to fetch data for track {track_id}: {e}")
-                    continue
+                if self.ensure_track_cached(track_id):
+                    tracks_data.append(self.track_cache[track_id])
+
+                if (i + 1) % 100 == 0:
+                    logger.info(f"  Processed {i+1}/{len(track_ids)} tracks")
             
             # Convert to DataFrame
             self.tracks_data = pd.DataFrame(tracks_data)
-            
+
             # Remove tracks with missing data in any dimension
-            before_count = len(self.tracks_data)
-            self.tracks_data = self.tracks_data.dropna(subset=self.all_dimensions)
-            after_count = len(self.tracks_data)
-            
-            if before_count != after_count:
-                logger.warning(f"Removed {before_count - after_count} tracks with missing dimension data")
-            
+            if not self.tracks_data.empty:
+                before_count = len(self.tracks_data)
+                self.tracks_data = self.tracks_data.dropna(subset=self.all_dimensions)
+                after_count = len(self.tracks_data)
+
+                if before_count != after_count:
+                    logger.warning(f"Removed {before_count - after_count} tracks with missing dimension data")
+
+                # Keep cache aligned with filtered dataset
+                valid_ids = set(self.tracks_data['identifier'])
+                self.track_cache = {tid: self.track_cache[tid] for tid in valid_ids}
+
             logger.info(f"Final dataset: {len(self.tracks_data)} tracks with complete {len(self.all_dimensions)}D data")
             return self.tracks_data
             
@@ -201,17 +247,27 @@ class DimensionUtilityAnalyzer:
             'utility_score': utility_score
         }
     
-    def analyze_all_dimensions(self, sample_tracks=1000, radius=0.3):
+    def analyze_all_dimensions(self, sample_tracks=1000, radius=None):
         """Analyze utility of all dimensions across random neighborhoods"""
         logger.info(f"Analyzing dimension utility across {sample_tracks} random neighborhoods...")
-        
-        if self.tracks_data is None:
+        self.neighborhoods_processed = 0
+
+        if radius is None:
+            radius = self.radius
+
+        if self.tracks_data is None or self.tracks_data.empty:
             self.load_sample_tracks(sample_tracks)
-        
+
+        if self.tracks_data is None or self.tracks_data.empty:
+            logger.warning("No tracks available with complete dimension data; aborting analysis")
+            return {}, 0
+
         # Sample random center tracks
+        total_tracks = len(self.tracks_data)
+        sample_size = min(sample_tracks, total_tracks)
         center_indices = np.random.choice(
-            len(self.tracks_data), 
-            min(sample_tracks, len(self.tracks_data)), 
+            total_tracks,
+            sample_size,
             replace=False
         )
         
@@ -221,36 +277,44 @@ class DimensionUtilityAnalyzer:
         for i, center_idx in enumerate(center_indices):
             center_track = self.tracks_data.iloc[center_idx]
             center_id = center_track['identifier']
-            
+
             # Get neighbors for this track from server
             try:
+                params = {
+                    'limit': 100,
+                    'embedding': self.embedding_mode,
+                    'include_distances': 'true',
+                    'resolution': self.resolution,
+                    'discriminator': self.discriminator
+                }
+                if radius is not None:
+                    params['radius'] = radius
+
                 response = self.session.get(
                     f"{self.server_url}/api/kd-tree/neighbors/{center_id}",
-                    params={
-                        'radius': radius,
-                        'limit': 100,
-                        'embedding': 'pca',  # Use PCA by default
-                        'include_distances': 'true'
-                    }
+                    params=params,
+                    timeout=max(5, 2 * len(params))
                 )
                 
                 if response.status_code != 200:
-                    logger.warning(f"Failed to get neighbors for track {center_id}")
+                    logger.warning(f"Failed to get neighbors for track {center_id}: status {response.status_code}")
                     continue
                 
                 neighbors_response = response.json()
                 neighbor_ids = [n['id'] for n in neighbors_response['neighbors']]
-                
+
                 if len(neighbor_ids) < 3:
                     continue  # Skip neighborhoods that are too small
-                
-                # Get neighbor data from our dataset
-                neighbors_data = self.tracks_data[
-                    self.tracks_data['identifier'].isin(neighbor_ids)
-                ]
-                
-                if len(neighbors_data) < 3:
+
+                neighbor_rows = []
+                for neighbor_id in neighbor_ids:
+                    if self.ensure_track_cached(neighbor_id):
+                        neighbor_rows.append(self.track_cache[neighbor_id])
+
+                if len(neighbor_rows) < 3:
                     continue
+
+                neighbors_data = pd.DataFrame(neighbor_rows)
                 
                 # Analyze each dimension in this neighborhood
                 for dim_name in self.all_dimensions:
@@ -266,6 +330,8 @@ class DimensionUtilityAnalyzer:
                             **utility_metrics
                         }
                         dimension_results[dim_name].append(result)
+
+                self.neighborhoods_processed += 1
                 
                 if (i + 1) % 50 == 0:
                     logger.info(f"  Processed {i+1}/{len(center_indices)} neighborhoods")
@@ -275,12 +341,12 @@ class DimensionUtilityAnalyzer:
                 continue
         
         logger.info(f"Completed analysis across {len(center_indices)} neighborhoods")
-        return dict(dimension_results)
+        return dict(dimension_results), self.neighborhoods_processed
     
-    def generate_utility_report(self, dimension_results, output_path):
+    def generate_utility_report(self, dimension_results, output_path, neighborhoods_processed, radius):
         """Generate comprehensive utility analysis report"""
         logger.info("Generating dimension utility report...")
-        
+
         # Calculate aggregate statistics for each dimension
         aggregated_results = []
         
@@ -343,10 +409,14 @@ class DimensionUtilityAnalyzer:
                 by_space[result['space']].append(result)
         
         # Create final report
+        radius_descriptor = radius if radius is not None else 'calibrated'
         report = {
             'analysis_params': {
-                'sample_tracks': len(dimension_results.get(self.all_dimensions[0], [])),
-                'radius': 0.3,  # TODO: get from actual parameters
+                'sample_tracks': neighborhoods_processed,
+                'radius': radius_descriptor,
+                'embedding': self.embedding_mode,
+                'resolution': self.resolution,
+                'discriminator': self.discriminator,
                 'total_dimensions': len(self.all_dimensions),
                 'analysis_timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
             },
@@ -372,6 +442,7 @@ class DimensionUtilityAnalyzer:
         print(f"  Total dimensions analyzed: {len(aggregated_results)}")
         print(f"  Neighborhoods sampled: {report['analysis_params']['sample_tracks']}")
         print(f"  Search radius: {report['analysis_params']['radius']}")
+        print(f"  Embedding mode: {report['analysis_params']['embedding']} @ {report['analysis_params']['resolution']} ({report['analysis_params']['discriminator']})")
         
         print(f"\n🏆 Top 10 Most Useful Dimensions:")
         for i, result in enumerate(aggregated_results[:10]):
@@ -403,28 +474,48 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze dimension utility across embedding spaces')
     parser.add_argument('--sample-tracks', type=int, default=1000, 
                        help='Number of random neighborhoods to analyze')
-    parser.add_argument('--radius', type=float, default=0.3, 
-                       help='Search radius for neighborhood discovery')
+    parser.add_argument('--radius', type=float, default=None, 
+                       help='Search radius for neighborhood discovery (omit to use calibrated defaults)')
     parser.add_argument('--server-url', default='http://localhost:3001',
                        help='URL of tsnotfyi server')
     parser.add_argument('--output', default='dimension_utility_report.json',
                        help='Output report path')
+    parser.add_argument('--embedding', default='vae', choices=['auto', 'pca', 'vae', 'core'],
+                       help='Embedding mode for neighborhood discovery (default: vae)')
+    parser.add_argument('--resolution', default='magnifying_glass',
+                       help='Resolution bucket for calibrated searches (default: magnifying_glass)')
+    parser.add_argument('--discriminator', default='primary_d',
+                       help='Discriminator used for calibrated searches (default: primary_d)')
     
     args = parser.parse_args()
     
     try:
         # Initialize analyzer
-        analyzer = DimensionUtilityAnalyzer(args.server_url)
+        analyzer = DimensionUtilityAnalyzer(
+            server_url=args.server_url,
+            embedding=args.embedding,
+            resolution=args.resolution,
+            discriminator=args.discriminator,
+            radius=args.radius
+        )
         analyzer.initialize()
-        
+
         # Run analysis
-        dimension_results = analyzer.analyze_all_dimensions(
+        dimension_results, neighborhoods_processed = analyzer.analyze_all_dimensions(
             sample_tracks=args.sample_tracks,
             radius=args.radius
         )
         
+        if neighborhoods_processed == 0:
+            logger.warning("No neighborhoods processed; report may be empty")
+
         # Generate report
-        report = analyzer.generate_utility_report(dimension_results, args.output)
+        report = analyzer.generate_utility_report(
+            dimension_results,
+            args.output,
+            neighborhoods_processed,
+            args.radius
+        )
         
         logger.info("🎉 Dimension utility analysis complete!")
         

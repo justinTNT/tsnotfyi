@@ -1442,6 +1442,21 @@ class DriftAudioMixer {
     }
   }
 
+  broadcastToEventClients(eventType, payload = {}) {
+    if (!eventType) {
+      return;
+    }
+
+    const eventPayload = {
+      sessionId: this.sessionId,
+      timestamp: Date.now(),
+      ...payload,
+      type: eventType
+    };
+
+    this.broadcastEvent(eventPayload);
+  }
+
   broadcastSelectionEvent(type, payload = {}) {
     if (!type) {
       return;

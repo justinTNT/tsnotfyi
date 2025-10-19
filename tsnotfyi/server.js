@@ -67,7 +67,19 @@ function checkSingleton() {
   }
 
   // Write our PID
-  fs.writeFileSync(pidFile, process.pid.toString());
+  console.log(`🔒 1 Server singleton locking with PID ${process.pid}`);
+
+  console.log(`🔒 2 Server singleton locking with PID ${process.pid}`);
+
+  console.log(`🔒 3 Server singleton locking with PID ${process.pid}`);
+
+  console.log(`🔒 4 Server singleton locking with PID ${process.pid}`);
+
+
+  try { fs.writeFileSync(pidFile, process.pid.toString()); } catch (err) {
+console.dir(err);
+exit(2);
+}
   console.log(`🔒 Server singleton locked with PID ${process.pid}`);
 
   // Clean up PID file on exit
@@ -1511,13 +1523,19 @@ app.get('/:sessionName/export', async (req, res) => {
   }
 });
 
+const RESERVED_SESSION_PREFIXES = new Set(['api', 'sessions', 'playlist', 'stream', 'events', 'status', 'search', 'track', 'vae']);
+
 // Named session with position navigation: /name/4/20
-app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res) => {
+app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res, next) => {
   const { sessionName, stackIndex, positionSeconds } = req.params;
   
   // Validate session name (not MD5, not special routes)
-  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
+      RESERVED_SESSION_PREFIXES.has(sessionName) ||
       ['forget', 'reset', 'export'].includes(stackIndex)) {
+    if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
+      return next();
+    }
     return res.status(404).json({ error: 'Route not found' });
   }
   
@@ -1547,12 +1565,16 @@ app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res) => {
 });
 
 // Named session with stack index: /name/4  
-app.get('/:sessionName/:stackIndex', async (req, res) => {
+app.get('/:sessionName/:stackIndex', async (req, res, next) => {
   const { sessionName, stackIndex } = req.params;
   
   // Validate session name and avoid conflicts
-  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
+      RESERVED_SESSION_PREFIXES.has(sessionName) ||
       ['forget', 'reset', 'export'].includes(stackIndex)) {
+    if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
+      return next();
+    }
     return res.status(404).json({ error: 'Route not found' });
   }
   
@@ -1585,8 +1607,11 @@ app.get('/:sessionName', async (req, res, next) => {
   const { sessionName } = req.params;
   
   // Skip if this looks like an MD5 or special route
-  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') || 
-      sessionName.includes('/') || ['api', 'stream', 'events', 'status', 'search', 'track'].includes(sessionName)) {
+  if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
+      sessionName.includes('/') || RESERVED_SESSION_PREFIXES.has(sessionName)) {
+    if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
+      return next();
+    }
     return next();
   }
   
@@ -2259,10 +2284,13 @@ app.get('/api/dimensions/stats', async (req, res) => {
       const columnsResult = await client.query(`
         SELECT column_name 
         FROM information_schema.columns 
-        WHERE table_name = 'music_analysis' AND column_name LIKE 'vae_%'
+        WHERE table_name = 'music_analysis' 
+          AND column_name LIKE 'vae_latent_%'
         ORDER BY column_name
       `);
-      const vaeDimensions = columnsResult.rows.map(row => row.column_name);
+      const vaeDimensions = columnsResult.rows
+        .map(row => row.column_name)
+        .filter(name => /^vae_latent_\d+$/.test(name));
       
       // Count tracks with complete data for each dimension set
       const coreCompleteResult = await client.query(`
@@ -2382,8 +2410,8 @@ app.get('/api/dimensions/track/:id', async (req, res) => {
         'rhythmic_pc1', 'rhythmic_pc2', 'rhythmic_pc3'
       ];
       
-      const vaeDimensions = allColumns.filter(col => col.startsWith('vae_'));
-      const metadataFields = allColumns.filter(col => col.startsWith('bt_'));
+      const vaeDimensions = allColumns.filter(col => /^vae_latent_\d+$/.test(col));
+      const vaeMetadataFields = allColumns.filter(col => col.startsWith('vae_') && !/^vae_latent_\d+$/.test(col));
       
       // Build response
       const response = {
@@ -2416,6 +2444,18 @@ app.get('/api/dimensions/track/:id', async (req, res) => {
           response.dimensions.vae[dim] = track[dim];
         }
       });
+
+      if (vaeMetadataFields.length > 0) {
+        response.metadata.vae = {};
+        vaeMetadataFields.forEach(field => {
+          if (track[field] !== null && track[field] !== undefined) {
+            response.metadata.vae[field] = track[field];
+          }
+        });
+        if (Object.keys(response.metadata.vae).length === 0) {
+          delete response.metadata.vae;
+        }
+      }
       
       // Add metadata (subset for API)
       ['bt_artist', 'bt_title', 'bt_album', 'bt_year', 'bt_length'].forEach(field => {
@@ -2438,80 +2478,101 @@ app.get('/api/dimensions/track/:id', async (req, res) => {
 // Get neighbors for a track using KD-tree search
 app.get('/api/kd-tree/neighbors/:id', async (req, res) => {
   const { id } = req.params;
-  const { 
-    radius = 0.3, 
-    limit = 100, 
-    embedding = 'auto',  // 'auto', 'core', 'pca', 'vae', 'combined'
-    include_distances = false
-  } = req.query;
+  const { embedding = 'auto', include_distances = false } = req.query;
+  const resolution = req.query.resolution || 'magnifying_glass';
+  const discriminator = req.query.discriminator || 'primary_d';
+  const radiusSupplied = Object.prototype.hasOwnProperty.call(req.query, 'radius');
+  const limitSupplied = Object.prototype.hasOwnProperty.call(req.query, 'limit');
+  const parsedRadius = radiusSupplied ? parseFloat(req.query.radius) : null;
+  const radiusValue = Number.isFinite(parsedRadius) ? parsedRadius : null;
+  const parsedLimit = limitSupplied ? parseInt(req.query.limit, 10) : 100;
+  const limitValue = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 100;
   
   try {
     // Ensure radial search service is initialized
-    if (!radialSearchService.initialized) {
-      await radialSearchService.initialize();
+    if (!radialSearch.initialized) {
+      await radialSearch.initialize();
     }
     
     // Get the track
-    const centerTrack = radialSearchService.kdTree.getTrack(id);
+    const centerTrack = radialSearch.kdTree.getTrack(id);
     if (!centerTrack) {
       return res.status(404).json({ error: 'Track not found' });
     }
     
     // Determine search method based on embedding parameter
     let neighbors = [];
+    let appliedRadius = radiusValue ?? 0.3;
+    let calibrationMeta = null;
     
     if (embedding === 'auto' || embedding === 'pca') {
       // Use PCA-based search (default)
-      neighbors = radialSearchService.kdTree.radiusSearch(
+      neighbors = radialSearch.kdTree.radiusSearch(
         centerTrack, 
-        parseFloat(radius), 
+        radiusValue ?? 0.3, 
         null, 
-        parseInt(limit)
+        limitValue
       );
+      appliedRadius = radiusValue ?? 0.3;
     } else if (embedding === 'vae') {
       // Use VAE-based search if available
       try {
-        neighbors = radialSearchService.kdTree.vaeRadiusSearch(
-          centerTrack, 
-          parseFloat(radius), 
-          parseInt(limit)
-        );
+        if (radiusSupplied) {
+          neighbors = radialSearch.kdTree.vaeRadiusSearch(
+            centerTrack,
+            radiusValue,
+            limitValue
+          );
+          appliedRadius = radiusValue;
+        } else {
+          const { neighbors: calibratedNeighbors, appliedRadius: calibratedRadius, calibration } =
+            radialSearch.kdTree.vaeCalibratedSearch(centerTrack, resolution, limitValue);
+          neighbors = calibratedNeighbors;
+          appliedRadius = calibratedRadius;
+          calibrationMeta = calibration;
+        }
       } catch (error) {
         // Fall back to PCA if VAE not available
         console.warn('VAE search failed, falling back to PCA:', error.message);
-        neighbors = radialSearchService.kdTree.radiusSearch(
+        neighbors = radialSearch.kdTree.radiusSearch(
           centerTrack, 
-          parseFloat(radius), 
+          radiusValue ?? 0.3, 
           null, 
-          parseInt(limit)
+          limitValue
         );
+        appliedRadius = radiusValue ?? 0.3;
       }
     } else if (embedding === 'core') {
       // Use core features only
-      neighbors = radialSearchService.kdTree.radiusSearch(
+      neighbors = radialSearch.kdTree.radiusSearch(
         centerTrack, 
-        parseFloat(radius), 
-        radialSearchService.kdTree.defaultWeights, // Use feature weights
-        parseInt(limit)
+        radiusValue ?? 0.3, 
+        radialSearch.kdTree.defaultWeights, // Use feature weights
+        limitValue
       );
+      appliedRadius = radiusValue ?? 0.3;
     } else {
       // Default to auto
-      neighbors = radialSearchService.kdTree.radiusSearch(
+      neighbors = radialSearch.kdTree.radiusSearch(
         centerTrack, 
-        parseFloat(radius), 
+        radiusValue ?? 0.3, 
         null, 
-        parseInt(limit)
+        limitValue
       );
+      appliedRadius = radiusValue ?? 0.3;
     }
     
     // Format response
     const response = {
       track_id: id,
       search_params: {
-        radius: parseFloat(radius),
-        limit: parseInt(limit),
+        radius: appliedRadius,
+        limit: limitValue,
         embedding: embedding,
-        include_distances: include_distances === 'true'
+        include_distances: include_distances === 'true',
+        resolution,
+        discriminator,
+        calibration: calibrationMeta
       },
       neighbors: neighbors.map(neighbor => {
         const result = {
@@ -2559,15 +2620,15 @@ app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
   
   try {
     // Ensure radial search service is initialized
-    if (!radialSearchService.initialized) {
-      await radialSearchService.initialize();
+    if (!radialSearch.initialized) {
+      await radialSearch.initialize();
     }
     
     const results = {};
     
     for (const trackId of track_ids) {
       try {
-        const centerTrack = radialSearchService.kdTree.getTrack(trackId);
+        const centerTrack = radialSearch.kdTree.getTrack(trackId);
         if (!centerTrack) {
           results[trackId] = { error: 'Track not found' };
           continue;
@@ -2577,7 +2638,7 @@ app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
         let neighbors = [];
         
         if (embedding === 'auto' || embedding === 'pca') {
-          neighbors = radialSearchService.kdTree.radiusSearch(
+          neighbors = radialSearch.kdTree.radiusSearch(
             centerTrack, 
             parseFloat(radius), 
             null, 
@@ -2585,13 +2646,13 @@ app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
           );
         } else if (embedding === 'vae') {
           try {
-            neighbors = radialSearchService.kdTree.vaeRadiusSearch(
+            neighbors = radialSearch.kdTree.vaeRadiusSearch(
               centerTrack, 
               parseFloat(radius), 
               parseInt(limit)
             );
           } catch (error) {
-            neighbors = radialSearchService.kdTree.radiusSearch(
+            neighbors = radialSearch.kdTree.radiusSearch(
               centerTrack, 
               parseFloat(radius), 
               null, 
@@ -2599,7 +2660,7 @@ app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
             );
           }
         } else {
-          neighbors = radialSearchService.kdTree.radiusSearch(
+          neighbors = radialSearch.kdTree.radiusSearch(
             centerTrack, 
             parseFloat(radius), 
             null, 
