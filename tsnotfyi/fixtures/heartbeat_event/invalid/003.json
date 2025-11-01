@@ -1,0 +1,15 @@
+{
+  "_notes": "currentTrack block is mandatory.",
+  "type": "heartbeat",
+  "timestamp": 1731889400000,
+  "reason": "status",
+  "timing": {},
+  "session": {
+    "id": "test",
+    "audioClients": 0,
+    "eventClients": 0
+  },
+  "drift": {
+    "currentDirection": null
+  }
+}

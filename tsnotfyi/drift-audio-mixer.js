@@ -1,6 +1,7 @@
 const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
+const { setImmediate: setImmediatePromise } = require('timers/promises');
 const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
 const fingerprintRegistry = require('./fingerprint-registry');
@@ -92,6 +93,10 @@ class DriftAudioMixer {
 
     // Track loading state to prevent concurrent playCurrentTrack calls
     this.currentTrackLoadingPromise = null; // Seeding vs seeded distinction
+    this.visualCurrentTrack = null;
+    this.visualTrackStartTime = null;
+    this.pendingVisualCurrentTrack = null;
+    this.pendingVisualTrackStartTime = null;
 
     // Audio configuration
     this.sampleRate = config.audio.sampleRate;
@@ -169,6 +174,10 @@ class DriftAudioMixer {
 
       const engineStartTime = this.audioMixer?.engine?.streamingStartTime;
       this.trackStartTime = engineStartTime || Date.now();
+      const visualStartTime = this.pendingVisualTrackStartTime || this.trackStartTime;
+      this.setDisplayCurrentTrack(this.currentTrack, { startTime: visualStartTime });
+      this.pendingVisualCurrentTrack = null;
+      this.pendingVisualTrackStartTime = null;
 
       if (!this.currentTrack) {
         console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
@@ -208,6 +217,10 @@ class DriftAudioMixer {
     this.audioMixer.onCrossfadeStart = (info) => {
       console.log(`🔄 Advanced mixer: Crossfade started (${info.currentBPM} → ${info.nextBPM} BPM)`);
       this.crossfadeStartedAt = Date.now();
+      this.pendingVisualCurrentTrack = this.nextTrack
+        ? this.hydrateTrackRecord(this.nextTrack) || this.nextTrack
+        : null;
+      this.pendingVisualTrackStartTime = this.crossfadeStartedAt;
     };
 
     this.audioMixer.onError = (error) => {
@@ -261,6 +274,44 @@ class DriftAudioMixer {
       'smoother': 'more_punchy'
     };
     return oppositeDirections[directionKey];
+  }
+
+  setDisplayCurrentTrack(track, { startTime = Date.now() } = {}) {
+    if (!track) {
+      return;
+    }
+    const liveIdentifier = this.currentTrack?.identifier || null;
+    if (liveIdentifier && track.identifier && track.identifier !== liveIdentifier) {
+      console.warn('🛰️ [display] Ignoring visual update for non-current track', {
+        sessionId: this.sessionId,
+        requestedId: track.identifier,
+        liveIdentifier,
+        pendingVisualId: this.pendingVisualCurrentTrack?.identifier || null
+      });
+      return;
+    }
+    const previousDisplayId = this.visualCurrentTrack?.identifier || null;
+    this.visualCurrentTrack = track;
+    this.visualTrackStartTime = startTime;
+    if (previousDisplayId !== track.identifier) {
+      console.log('🛰️ [display] Visual current track updated', {
+        sessionId: this.sessionId,
+        previousDisplayId,
+        newDisplayId: track.identifier,
+        startTime,
+        liveCurrentId: this.currentTrack?.identifier || null,
+        lockedNextId: this.lockedNextTrackIdentifier || null,
+        preparedNextId: this.nextTrack?.identifier || null
+      });
+    }
+  }
+
+  getDisplayCurrentTrack() {
+    return this.visualCurrentTrack || this.currentTrack || null;
+  }
+
+  getDisplayTrackStartTime() {
+    return this.visualTrackStartTime || this.trackStartTime || null;
   }
 
   // Start the drift playback
@@ -778,6 +829,14 @@ class DriftAudioMixer {
           }
 
           this.lockedNextTrackIdentifier = hydratedNextTrack.identifier;
+          console.log('🛰️ [override] Locked next track after user selection', {
+            sessionId: this.sessionId,
+            lockedId: this.lockedNextTrackIdentifier,
+            preparedNextId: this.nextTrack?.identifier || null,
+            pendingOverrideId: this.pendingUserOverrideTrackId || null,
+            manualGenerationAtStart,
+            currentTrackId: this.currentTrack?.identifier || null
+          });
           await this.broadcastHeartbeat('user-next-prepared', { force: true });
         } else if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== hydratedNextTrack.identifier) {
           // Lock no longer applies if a different track is queued
@@ -1703,14 +1762,24 @@ class DriftAudioMixer {
   }
 
   buildHeartbeatPayload(reason = 'status') {
-    if (!this.currentTrack) {
+    const displayTrack = this.getDisplayCurrentTrack();
+    if (!displayTrack) {
       return null;
     }
 
     const now = Date.now();
-    const durationSeconds = this.getAdjustedTrackDuration();
+    const displayStartTime = this.getDisplayTrackStartTime();
+
+    let durationSeconds = null;
+    if (displayTrack.identifier && this.currentTrack?.identifier === displayTrack.identifier) {
+      durationSeconds = this.getAdjustedTrackDuration(this.currentTrack, { logging: false });
+    }
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      durationSeconds = displayTrack.length || displayTrack.duration || null;
+    }
+
     const durationMs = Number.isFinite(durationSeconds) ? Math.max(Math.round(durationSeconds * 1000), 0) : null;
-    const elapsedMs = this.trackStartTime ? Math.max(now - this.trackStartTime, 0) : null;
+    const elapsedMs = displayStartTime ? Math.max(now - displayStartTime, 0) : null;
     const remainingMs = durationMs != null && elapsedMs != null
       ? Math.max(durationMs - elapsedMs, 0)
       : null;
@@ -1728,14 +1797,14 @@ class DriftAudioMixer {
       }
     }
 
-    const beetsMeta = this.currentTrack.beetsMeta || this.lookupTrackBeetsMeta(this.currentTrack.identifier) || null;
+    const beetsMeta = displayTrack.beetsMeta || this.lookupTrackBeetsMeta(displayTrack.identifier) || null;
 
     const currentTrackPayload = {
-      identifier: this.currentTrack.identifier,
-      title: this.currentTrack.title,
-      artist: this.currentTrack.artist,
-      startTime: this.trackStartTime,
-      durationMs: durationMs
+      identifier: displayTrack.identifier,
+      title: displayTrack.title,
+      artist: displayTrack.artist,
+      startTime: displayStartTime,
+      durationMs
     };
 
     if (beetsMeta) {
@@ -1774,7 +1843,8 @@ class DriftAudioMixer {
   }
 
   async broadcastHeartbeat(reason = 'status', { force = false } = {}) {
-    if (!this.currentTrack) {
+    const displayTrack = this.getDisplayCurrentTrack();
+    if (!displayTrack) {
       return;
     }
 
@@ -1804,8 +1874,9 @@ class DriftAudioMixer {
   }
 
   async broadcastExplorerSnapshot(force = false, reason = 'snapshot') {
-    if (!this.currentTrack) {
-      console.log('📡 No current track, skipping explorer snapshot');
+    const displayTrack = this.getDisplayCurrentTrack();
+    if (!displayTrack) {
+      console.log('📡 No current track available for snapshot');
       return;
     }
 
@@ -1813,8 +1884,13 @@ class DriftAudioMixer {
       fingerprintRegistry.touch(this.currentFingerprint);
     }
 
-    const currentTrackId = this.currentTrack.identifier;
+    const displayStartTime = this.getDisplayTrackStartTime();
+    const currentTrackId = displayTrack.identifier;
     const preparedNextId = this.nextTrack?.identifier || this.lockedNextTrackIdentifier || null;
+
+    const activeTrack = this.currentTrack && this.currentTrack.identifier === currentTrackId
+      ? this.currentTrack
+      : null;
 
     const lastSnapshotMatches = this._lastBroadcastTrackId === currentTrackId
       && this.lastExplorerSnapshotPayload
@@ -1829,11 +1905,11 @@ class DriftAudioMixer {
     let snapshotEvent = null;
 
     try {
-      console.log(`📡 Building explorer snapshot for: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
+      console.log(`📡 Building explorer snapshot for: ${displayTrack.title} by ${displayTrack.artist}`);
 
       if (this.sessionHistory.length === 0 ||
-          this.sessionHistory[this.sessionHistory.length - 1].identifier !== this.currentTrack.identifier) {
-        this.addToHistory(this.currentTrack, this.trackStartTime, this.driftPlayer.currentDirection);
+          this.sessionHistory[this.sessionHistory.length - 1].identifier !== currentTrackId) {
+        this.addToHistory(displayTrack, displayStartTime, this.driftPlayer.currentDirection);
         console.log(`📡 Added track to history, total: ${this.sessionHistory.length}`);
       }
 
@@ -1887,36 +1963,84 @@ class DriftAudioMixer {
         return;
       }
 
+      const nominatedDirectionKey =
+        explorerData.nextTrack?.directionKey ||
+        explorerData.nextTrack?.nextTrackDirection ||
+        explorerData.nextTrack?.direction;
+      if (nominatedDirectionKey && !(explorerData.directions || {}).hasOwnProperty(nominatedDirectionKey)) {
+        const availableKeys = Object.keys(explorerData.directions || {});
+        console.error('📉 Explorer snapshot missing direction payload for nominated nextTrack', {
+          sessionId: this.sessionId,
+          currentTrackId,
+          nominatedDirectionKey,
+          availableDirectionKeys: availableKeys.slice(0, 24),
+          totalDirectionKeys: availableKeys.length
+        });
+      }
+
       let nextTrackSummary = explorerData.nextTrack;
       if (!nextTrackSummary || !nextTrackSummary.track) {
         nextTrackSummary = this.buildNextTrackSummary();
         explorerData.nextTrack = nextTrackSummary;
       }
 
-      const featuresFallback = this.lookupTrackFeatures(this.currentTrack.identifier);
-      const pcaFallback = this.lookupTrackPca(this.currentTrack.identifier);
-      const artFallback = this.lookupTrackAlbumCover(this.currentTrack.identifier);
-      const beetsFallback = this.lookupTrackBeetsMeta(this.currentTrack.identifier);
+      const featuresFallback = this.lookupTrackFeatures(currentTrackId);
+      const pcaFallback = this.lookupTrackPca(currentTrackId);
+      const artFallback = this.lookupTrackAlbumCover(currentTrackId);
+      const beetsFallback = this.lookupTrackBeetsMeta(currentTrackId);
 
-      const currentTrackPayload = {
-        identifier: this.currentTrack.identifier,
-        title: this.currentTrack.title,
-        artist: this.currentTrack.artist,
-        duration: this.getAdjustedTrackDuration(),
-        features: this.currentTrack.features || featuresFallback || {},
-        albumCover: this.currentTrack.albumCover || artFallback || null,
-        pca: this.currentTrack.pca || pcaFallback || null,
-        startTime: this.trackStartTime
-      };
+      let durationSeconds = null;
+      if (activeTrack) {
+        durationSeconds = this.getAdjustedTrackDuration(activeTrack, { logging: false });
+      }
+      if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+        const fallbackDuration = Number(displayTrack.length ?? displayTrack.duration);
+        durationSeconds = Number.isFinite(fallbackDuration) && fallbackDuration > 0
+          ? fallbackDuration
+          : 0;
+      }
 
-      const beetsMeta = this.currentTrack.beetsMeta || beetsFallback || null;
+      const hydratedCurrent = this.hydrateTrackRecord(displayTrack, {
+        startTime: displayStartTime,
+        duration: durationSeconds,
+        albumCover: displayTrack.albumCover || activeTrack?.albumCover || artFallback || null,
+        features: displayTrack.features || activeTrack?.features || featuresFallback || {},
+        pca: displayTrack.pca || activeTrack?.pca || pcaFallback || null
+      }) || {};
+
+      const beetsMeta = displayTrack.beetsMeta || activeTrack?.beetsMeta || beetsFallback || null;
       if (beetsMeta) {
         try {
-          currentTrackPayload.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
+          hydratedCurrent.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
         } catch (err) {
-          currentTrackPayload.beetsMeta = beetsMeta;
+          hydratedCurrent.beetsMeta = beetsMeta;
         }
       }
+
+      const currentTrackPayload = this.sanitizeTrackForClient(hydratedCurrent, {
+        includeFeatures: true,
+        includePca: true
+      }) || {
+        identifier: currentTrackId,
+        title: displayTrack.title,
+        artist: displayTrack.artist,
+        duration: durationSeconds,
+        albumCover: displayTrack.albumCover || activeTrack?.albumCover || artFallback || null,
+        startTime: displayStartTime
+      };
+      if (currentTrackPayload && !currentTrackPayload.startTime && displayStartTime) {
+        currentTrackPayload.startTime = displayStartTime;
+      }
+      if (currentTrackPayload && !currentTrackPayload.duration && Number.isFinite(durationSeconds)) {
+        currentTrackPayload.duration = durationSeconds;
+        currentTrackPayload.length = durationSeconds;
+      }
+
+      const sanitizedExplorer = this.serializeExplorerSnapshotForClient(explorerData);
+      const sanitizedNextTrack = this.serializeNextTrackForClient(nextTrackSummary || explorerData.nextTrack || null, {
+        includeFeatures: true,
+        includePca: true
+      });
 
       snapshotEvent = {
         type: 'explorer_snapshot',
@@ -1924,7 +2048,7 @@ class DriftAudioMixer {
         reason,
         fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
         currentTrack: currentTrackPayload,
-        nextTrack: nextTrackSummary || null,
+        nextTrack: sanitizedNextTrack || null,
         sessionHistory: this.sessionHistory.slice(-10).map(entry => ({
           identifier: entry.identifier,
           title: entry.title,
@@ -1938,7 +2062,7 @@ class DriftAudioMixer {
           stepCount: this.driftPlayer.stepCount,
           sessionDuration: Date.now() - (this.sessionHistory[0]?.startTime || Date.now())
         },
-        explorer: explorerData,
+        explorer: sanitizedExplorer,
         session: {
           id: this.sessionId,
           clients: this.clients.size,
@@ -1953,7 +2077,7 @@ class DriftAudioMixer {
         }
       };
 
-      console.log(`📡 Broadcasting explorer snapshot: ${this.currentTrack.title} by ${this.currentTrack.artist}`);
+      console.log(`📡 Broadcasting explorer snapshot: ${displayTrack.title} by ${displayTrack.artist}`);
       if (snapshotEvent.nextTrack?.track?.identifier) {
         console.log(`📊 Next track candidate: ${snapshotEvent.nextTrack.track.identifier.substring(0, 8)} (${snapshotEvent.nextTrack.transitionReason || 'unknown'})`);
       }
@@ -1961,18 +2085,31 @@ class DriftAudioMixer {
       console.error('📡 Explorer snapshot error:', error);
 
       try {
+        const fallbackCurrent = this.sanitizeTrackForClient({
+          identifier: displayTrack.identifier,
+          title: displayTrack.title,
+          artist: displayTrack.artist,
+          duration: this.getAdjustedTrackDuration(activeTrack || displayTrack, { logging: false }),
+          albumCover: displayTrack.albumCover || activeTrack?.albumCover || null,
+          startTime: displayStartTime
+        }, {
+          includeFeatures: true,
+          includePca: true
+        }) || {
+          identifier: displayTrack.identifier,
+          title: displayTrack.title,
+          artist: displayTrack.artist,
+          duration: this.getAdjustedTrackDuration(activeTrack || displayTrack, { logging: false }),
+          albumCover: displayTrack.albumCover || activeTrack?.albumCover || null,
+          startTime: displayStartTime
+        };
+
         snapshotEvent = {
           type: 'explorer_snapshot',
           timestamp: Date.now(),
           reason,
           fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
-          currentTrack: {
-            identifier: this.currentTrack.identifier,
-            title: this.currentTrack.title,
-            artist: this.currentTrack.artist,
-            duration: this.getAdjustedTrackDuration(),
-            albumCover: this.currentTrack.albumCover || null
-          },
+          currentTrack: fallbackCurrent,
           explorer: { error: true, message: error.message },
           session: {
             id: this.sessionId,
@@ -2157,8 +2294,39 @@ class DriftAudioMixer {
       await this.exploreOriginalFeatureDirection(explorerData, feature, 'negative', totalNeighborhoodSize);
     }
 
+    if (currentTrackData.vae?.latent && Array.isArray(currentTrackData.vae.latent)) {
+      console.log(`🧠 Exploring VAE latent directions (${currentTrackData.vae.latent.length} axes)`);
+      await this.exploreVaeDirections(explorerData);
+    }
+
+    const summarizeDirectionsByDomain = (label, directions) => {
+      const summary = Object.entries(directions || {}).reduce((acc, [key, info]) => {
+        const domain = info?.domain || 'unknown';
+        if (!acc[domain]) {
+          acc[domain] = { count: 0, keys: [] };
+        }
+        acc[domain].count += 1;
+        if (acc[domain].keys.length < 8) {
+          acc[domain].keys.push(key);
+        }
+        return acc;
+      }, {});
+      console.log('🧭 Explorer direction domain summary', {
+        label,
+        summary,
+        total: Object.keys(directions || {}).length
+      });
+      if (!summary.vae) {
+        console.log('🧠 VAE directions missing at stage:', label);
+      }
+    };
+
+    summarizeDirectionsByDomain('pre-limit', explorerData.directions);
+
     // Limit to maximum 12 dimensions for UI performance
-    explorerData.directions = this.limitToTopDimensions(explorerData.directions, 12);
+    explorerData.directions = await this.limitToTopDimensions(explorerData.directions, 12);
+
+    summarizeDirectionsByDomain('post-limit', explorerData.directions);
 
     // Strategic deduplication: PCA directions take precedence over similar core directions
     // TODO explorerData.directions = this.deduplicateTracksStrategically(explorerData.directions);
@@ -2497,6 +2665,79 @@ class DriftAudioMixer {
         isOutlier: true,
         error: error.message
       };
+    }
+  }
+
+  async exploreVaeDirection(explorerData, latentIndex, polarity, options = {}) {
+    const directionKey = `vae_latent_${latentIndex}_${polarity}`;
+    const description = `Latent axis ${latentIndex + 1} (${polarity === 'positive' ? '+' : '-'})`;
+
+    try {
+      const result = await this.radialSearch.getVAEDirectionalCandidates(
+        this.currentTrack.identifier,
+        latentIndex,
+        polarity,
+        {
+          resolution: this.explorerResolution || 'magnifying_glass',
+          limit: options.limit || 24
+        }
+      );
+
+      const candidates = result?.candidates || [];
+      if (candidates.length === 0) {
+        console.log(`🚫 VAE direction ${directionKey} returned no candidates`);
+        return;
+      }
+
+      const formattedTracks = candidates.map(candidate => {
+        const track = candidate.track || {};
+        return {
+          identifier: track.identifier,
+          title: track.title,
+          artist: track.artist,
+          albumCover: track.albumCover,
+          duration: track.length,
+          distance: candidate.distance,
+          latentValue: candidate.latentValue,
+          latentDelta: candidate.delta,
+          vae: track.vae,
+          features: track.features
+        };
+      });
+
+      const totalAvailable = result.totalAvailable || formattedTracks.length;
+      const neighborhoodSize = totalAvailable > 0 ? totalAvailable : formattedTracks.length;
+
+      explorerData.directions[directionKey] = {
+        direction: polarity === 'positive'
+          ? `increase latent ${latentIndex + 1}`
+          : `decrease latent ${latentIndex + 1}`,
+        description,
+        domain: 'vae',
+        component: `latent_${latentIndex}`,
+        polarity,
+        trackCount: formattedTracks.length,
+        totalNeighborhoodSize: neighborhoodSize,
+        diversityScore: this.calculateDirectionDiversity(formattedTracks.length, neighborhoodSize),
+        isOutlier: formattedTracks.length < 3,
+        splitRatio: neighborhoodSize > 0 ? (formattedTracks.length / neighborhoodSize) : 0,
+        sampleTracks: formattedTracks,
+        originalSampleTracks: formattedTracks.map(track => ({ ...track }))
+      };
+    } catch (error) {
+      console.error(`🚨 VAE SEARCH ERROR: Failed to explore latent direction ${directionKey}:`, error);
+    }
+  }
+
+  async exploreVaeDirections(explorerData) {
+    const latentVector = this.currentTrack?.vae?.latent;
+    if (!Array.isArray(latentVector) || latentVector.length === 0) {
+      return;
+    }
+
+    for (let index = 0; index < latentVector.length; index += 1) {
+      await this.exploreVaeDirection(explorerData, index, 'positive');
+      await this.exploreVaeDirection(explorerData, index, 'negative');
     }
   }
 
@@ -3038,6 +3279,23 @@ class DriftAudioMixer {
     return clone;
   }
 
+  cloneVaeData(vae) {
+    if (!vae || typeof vae !== 'object') return null;
+    const clone = {};
+    if (Array.isArray(vae.latent)) {
+      clone.latent = vae.latent.slice();
+    } else {
+      clone.latent = null;
+    }
+    if (vae.model_version !== undefined) {
+      clone.model_version = vae.model_version;
+    }
+    if (vae.computed_at !== undefined) {
+      clone.computed_at = vae.computed_at;
+    }
+    return clone;
+  }
+
   cloneBaseTrack(track) {
     if (!track || typeof track !== 'object') return null;
     const clone = {
@@ -3060,6 +3318,9 @@ class DriftAudioMixer {
     if (track.pca) {
       clone.pca = this.clonePcaMap(track.pca);
     }
+    if (track.vae) {
+      clone.vae = this.cloneVaeData(track.vae);
+    }
     if (track.beetsMeta) {
       try {
         clone.beetsMeta = JSON.parse(JSON.stringify(track.beetsMeta));
@@ -3076,6 +3337,204 @@ class DriftAudioMixer {
     }
 
     return clone;
+  }
+
+  sanitizeTrackForClient(track, options = {}) {
+    if (!track || typeof track !== 'object') {
+      return null;
+    }
+
+    const {
+      includeFeatures = true,
+      includePca = true
+    } = options;
+
+    const duration = Number.isFinite(track.duration)
+      ? track.duration
+      : (Number.isFinite(track.length) ? track.length : null);
+
+    const payload = {
+      identifier: track.identifier,
+      title: track.title,
+      artist: track.artist,
+      album: track.album || null,
+      albumCover: track.albumCover || null,
+      duration,
+      length: duration,
+      directionKey: track.directionKey || track.baseDirection || track.dimensionKey || null,
+      direction: track.direction || track.baseDirection || null,
+      transitionReason: track.transitionReason || track.reason || null
+    };
+
+    if (track.stackDirection) {
+      payload.stackDirection = track.stackDirection;
+    }
+    if (track.baseDirection) {
+      payload.baseDirection = track.baseDirection;
+    }
+    if (track.baseDirectionKey) {
+      payload.baseDirectionKey = track.baseDirectionKey;
+    }
+    if (track.startTime) {
+      payload.startTime = track.startTime;
+    }
+    if (track.previewDirectionKey) {
+      payload.previewDirectionKey = track.previewDirectionKey;
+    }
+    if (track.directionMeta) {
+      payload.directionMeta = { ...track.directionMeta };
+    }
+
+    if (includeFeatures && track.features) {
+      const features = this.cloneFeatureMap(track.features);
+      if (features && Object.keys(features).length > 0) {
+        payload.features = features;
+      }
+    }
+
+    if (includePca && track.pca) {
+      const pca = this.clonePcaMap(track.pca);
+      if (pca) {
+        payload.pca = pca;
+      }
+    }
+
+    return payload;
+  }
+
+  sanitizeSampleTrackEntry(entry, options = {}) {
+    if (!entry) {
+      return null;
+    }
+
+    const { includeFeatures = true, includePca = true } = options;
+    const track = entry.track || entry;
+    const sanitizedTrack = this.sanitizeTrackForClient(track, { includeFeatures, includePca });
+    if (!sanitizedTrack) {
+      return null;
+    }
+
+    if (entry.track) {
+      const wrapper = { ...entry };
+      delete wrapper.track;
+      delete wrapper.distance;
+      delete wrapper.similarity;
+      delete wrapper.distanceSlices;
+      delete wrapper.featureDistanceSlices;
+      delete wrapper.analysis;
+      delete wrapper.beets;
+      delete wrapper.beetsMeta;
+      delete wrapper.features;
+      delete wrapper.pca;
+      return { ...wrapper, track: sanitizedTrack };
+    }
+
+    return sanitizedTrack;
+  }
+
+  sanitizeSampleTrackList(entries, options = {}) {
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+    return entries
+      .map(entry => this.sanitizeSampleTrackEntry(entry, options))
+      .filter(Boolean);
+  }
+
+  sanitizeExplorerDirection(direction, options = {}) {
+    if (!direction) {
+      return direction;
+    }
+
+    const sanitized = { ...direction };
+    sanitized.sampleTracks = this.sanitizeSampleTrackList(
+      direction.sampleTracks,
+      options
+    );
+
+    if (direction.oppositeDirection) {
+      sanitized.oppositeDirection = {
+        ...direction.oppositeDirection,
+        sampleTracks: this.sanitizeSampleTrackList(
+          direction.oppositeDirection.sampleTracks,
+          options
+        )
+      };
+    }
+
+    delete sanitized.originalSampleTracks;
+    delete sanitized.distanceSlices;
+    delete sanitized.featureDistanceSlices;
+    delete sanitized.analysis;
+    delete sanitized.beets;
+    delete sanitized.beetsMeta;
+
+    return sanitized;
+  }
+
+  serializeNextTrackForClient(nextTrack, options = {}) {
+    if (!nextTrack) {
+      return null;
+    }
+
+    if (typeof nextTrack === 'string') {
+      return nextTrack;
+    }
+
+    const sanitized = { ...nextTrack };
+    if (nextTrack.track) {
+      sanitized.track = this.sanitizeTrackForClient(nextTrack.track, options);
+    }
+    delete sanitized.distanceSlices;
+    delete sanitized.featureDistanceSlices;
+    delete sanitized.analysis;
+    delete sanitized.beets;
+    delete sanitized.beetsMeta;
+    return sanitized;
+  }
+
+  serializeExplorerSnapshotForClient(explorerData) {
+    if (!explorerData) {
+      return null;
+    }
+
+    const sanitized = { ...explorerData };
+
+    if (explorerData.directions) {
+      const sanitizedDirections = {};
+      for (const [key, direction] of Object.entries(explorerData.directions)) {
+        sanitizedDirections[key] = this.sanitizeExplorerDirection(direction, {
+          includeFeatures: true,
+          includePca: true
+        });
+      }
+      sanitized.directions = sanitizedDirections;
+    }
+
+    if (explorerData.outliers) {
+      const sanitizedOutliers = {};
+      for (const [key, direction] of Object.entries(explorerData.outliers)) {
+        sanitizedOutliers[key] = this.sanitizeExplorerDirection(direction, {
+          includeFeatures: true,
+          includePca: true
+        });
+      }
+      sanitized.outliers = sanitizedOutliers;
+    }
+
+    sanitized.nextTrack = this.serializeNextTrackForClient(
+      explorerData.nextTrack,
+      { includeFeatures: true, includePca: true }
+    );
+
+    if (explorerData.currentTrack) {
+      sanitized.currentTrack = this.sanitizeTrackForClient(
+        explorerData.currentTrack,
+        { includeFeatures: true, includePca: true }
+      );
+    }
+
+    return sanitized;
   }
 
   mergeFeatureMaps(...sources) {
@@ -3218,6 +3677,16 @@ class DriftAudioMixer {
       result.pca = this.clonePcaMap(result.pca);
     } else {
       result.pca = null;
+    }
+
+    const vaeSources = [overlay.vae, annotations.vae, nestedCandidate?.vae, baseClone.vae].filter(Boolean);
+    const resolvedVae = vaeSources.find(source => Array.isArray(source?.latent)) || vaeSources[0] || null;
+    if (resolvedVae) {
+      result.vae = this.cloneVaeData(resolvedVae);
+    } else if (result.vae) {
+      result.vae = this.cloneVaeData(result.vae);
+    } else {
+      result.vae = null;
     }
 
     return result;
@@ -3571,7 +4040,7 @@ class DriftAudioMixer {
   }
 
   // Limit directions to top N dimensions with quota system ensuring 1/3 are core indices
-  limitToTopDimensions(directions, maxDimensions = 12) {
+  async limitToTopDimensions(directions, maxDimensions = 12) {
     // Define core indices that should be prioritized
     const coreIndices = [
       'bpm', 'danceability', 'onset_rate', 'beat_punch', 'tonal_clarity',
@@ -3580,13 +4049,32 @@ class DriftAudioMixer {
     ];
     console.log(`📊 Defined core indices: [${coreIndices.join(', ')}]`);
 
+    const logVaeSummary = (tag, map) => {
+      const vaeDimensions = Array.from(map.entries())
+        .filter(([_, dirs]) => Array.isArray(dirs) && dirs.some(dir => dir?.domain === 'vae'))
+        .map(([name, dirs]) => ({
+          name,
+          count: dirs.filter(dir => dir?.domain === 'vae').length,
+          total: dirs.length
+        }));
+
+      if (vaeDimensions.length > 0) {
+        console.log(`🧠 VAE visibility (${tag}):`, vaeDimensions);
+      } else {
+        console.log(`🧠 VAE visibility (${tag}): none`);
+      }
+    };
+
     const dimensionMap = new Map();
     const coreMap = new Map();
     const pcaMap = new Map();
+    const vaeMap = new Map();
 
     // Group directions by their base dimension and classify as core or PCA
-    console.log(`🔍 Processing ${Object.keys(directions).length} directions for dimension classification...`);
-    Object.entries(directions).forEach(([key, directionInfo]) => {
+    const directionEntries = Object.entries(directions);
+    console.log(`🔍 Processing ${directionEntries.length} directions for dimension classification...`);
+    for (let idx = 0; idx < directionEntries.length; idx++) {
+      const [key, directionInfo] = directionEntries[idx];
       let dimensionName = key;
       console.log(`🔍 Processing direction: ${key}`);
 
@@ -3601,16 +4089,38 @@ class DriftAudioMixer {
       }
 
       const directionObj = { key, ...directionInfo };
+      if (directionObj.vae && !directionObj.domain) {
+        directionObj.domain = 'vae';
+      }
 
       // Classify as core or PCA dimension
+      const domain = directionObj.domain || null;
       const isCore = coreIndices.includes(dimensionName);
+      if (domain === 'vae') {
+        console.log('🧠 VAE direction candidate detected', {
+          key,
+          dimensionName,
+          trackCount: directionObj.sampleTracks?.length || 0,
+          diversityScore: directionObj.diversityScore,
+          isOutlier: directionObj.isOutlier
+        });
+      }
       console.log(`🔍   Is '${dimensionName}' a core index? ${isCore}`);
       if (isCore) {
         console.log(`✅   Adding '${dimensionName}' to CORE map`);
+      } else if (domain === 'vae') {
+        console.log(`🧠   Adding '${dimensionName}' to VAE map`);
       } else {
         console.log(`🧮   Adding '${dimensionName}' to PCA map`);
       }
-      const targetMap = isCore ? coreMap : pcaMap;
+      let targetMap;
+      if (isCore) {
+        targetMap = coreMap;
+      } else if (domain === 'vae') {
+        targetMap = vaeMap;
+      } else {
+        targetMap = pcaMap;
+      }
 
       if (!targetMap.has(dimensionName)) {
         targetMap.set(dimensionName, []);
@@ -3622,7 +4132,16 @@ class DriftAudioMixer {
         dimensionMap.set(dimensionName, []);
       }
       dimensionMap.get(dimensionName).push(directionObj);
-    });
+      // Yield to the event loop periodically so audio streaming keeps flowing
+      if ((idx + 1) % 5 === 0) {
+        await setImmediatePromise();
+      }
+    }
+
+    logVaeSummary('post-grouping', dimensionMap);
+    logVaeSummary('core-map', coreMap);
+    logVaeSummary('pca-map', pcaMap);
+    logVaeSummary('vae-map', vaeMap);
 
     console.log(`🔍 Classification complete:`);
     console.log(`🔍   Core indices found: [${Array.from(coreMap.keys()).join(', ')}]`);
@@ -3632,11 +4151,12 @@ class DriftAudioMixer {
     const selectedDirections = {};
 
     // Calculate quota: 50/50 split between core and PCA indices
-    const coreQuota = Math.floor(maxDimensions / 2);
-    const pcaQuota = maxDimensions - coreQuota;
-
+    const totalVaeDirections = Array.from(vaeMap.values()).reduce((sum, dirs) => sum + dirs.length, 0);
+    const remainingSlots = Math.max(maxDimensions - totalVaeDirections, 0);
+    const coreQuota = Math.floor(remainingSlots / 2);
+    const pcaQuota = remainingSlots - coreQuota;
     console.log(`🎯 Dimension quota: ${coreQuota} core indices, ${pcaQuota} PCA dimensions (max: ${maxDimensions})`);
-    console.log(`🎯 Available dimensions: ${coreMap.size} core, ${pcaMap.size} PCA, ${dimensionMap.size} total`);
+    console.log(`🎯 Available dimensions: ${coreMap.size} core, ${pcaMap.size} PCA, ${vaeMap.size} VAE groups (${totalVaeDirections} directions), ${dimensionMap.size} total`);
 
     // Helper function to select best directions from dimension list
     // Returns both directions if they form a good discriminator (75/25 split)
@@ -3666,6 +4186,11 @@ class DriftAudioMixer {
       const topDirection = sortedDirs[0];
 
       if (sortedDirs.length >= 2) {
+        const isVaeDimension = sortedDirs.some(dir => dir.domain === 'vae');
+        if (isVaeDimension) {
+          console.log(`✅   -> Keeping all VAE directions for '${dimName}' (${sortedDirs.length} variants)`);
+          return sortedDirs;
+        }
         const limited = sortedDirs.slice(0, 2);
         console.log(`✅   -> Keeping both polarities for '${dimName}' (primary '${limited[0].key}', secondary '${limited[1].key}')`);
         return limited;
@@ -3686,14 +4211,33 @@ class DriftAudioMixer {
         }))
     );
 
-    const sortedCoreDimensions = Array.from(coreMap.entries())
-      .map(([dimName, dirList]) => ({
+    const coreCandidates = [];
+    const coreEntries = Array.from(coreMap.entries());
+    for (let idx = 0; idx < coreEntries.length; idx++) {
+      const [dimName, dirList] = coreEntries[idx];
+      const candidate = {
         dimName,
         bestDirections: selectBestDirections(dirList, dimName),
         isCore: true,
         allDirections: dirList.length,
         validDirections: dirList.filter(dir => dir.trackCount > 0 && !dir.isOutlier).length
-      }))
+      };
+      coreCandidates.push(candidate);
+      if ((idx + 1) % 3 === 0) {
+        await setImmediatePromise();
+      }
+    }
+
+    const vaeCandidates = Array.from(vaeMap.entries()).map(([dimName, dirList]) => ({
+      dimName,
+      bestDirections: selectBestDirections(dirList, dimName),
+      isCore: false,
+      isVae: true
+    })).filter(dim => dim.bestDirections.length > 0);
+
+    const limitedVaeDimensions = vaeCandidates.slice(0, maxDimensions);
+
+    const sortedCoreDimensions = coreCandidates
       .filter(dim => {
         if (dim.bestDirections.length === 0) {
           console.log(`🚫 Core dimension '${dim.dimName}' has no valid directions (${dim.validDirections}/${dim.allDirections})`);
@@ -3708,12 +4252,21 @@ class DriftAudioMixer {
       sortedCoreDimensions.map(d => `${d.dimName} (${d.bestDirections.length} directions, primary diversity: ${d.bestDirections[0].diversityScore.toFixed(1)})`));
 
     // Step 2: Select PCA/other dimensions for remaining slots
-    const sortedPcaDimensions = Array.from(pcaMap.entries())
-      .map(([dimName, dirList]) => ({
+    const pcaCandidates = [];
+    const pcaEntries = Array.from(pcaMap.entries());
+    for (let idx = 0; idx < pcaEntries.length; idx++) {
+      const [dimName, dirList] = pcaEntries[idx];
+      pcaCandidates.push({
         dimName,
         bestDirections: selectBestDirections(dirList, dimName),
         isCore: false
-      }))
+      });
+      if ((idx + 1) % 3 === 0) {
+        await setImmediatePromise();
+      }
+    }
+
+    const sortedPcaDimensions = pcaCandidates
       .filter(dim => dim.bestDirections.length > 0) // Only dimensions with valid directions
       .sort((a, b) => b.bestDirections[0].diversityScore - a.bestDirections[0].diversityScore)
       .slice(0, pcaQuota);
@@ -3722,18 +4275,28 @@ class DriftAudioMixer {
       sortedPcaDimensions.map(d => d.dimName));
 
     // Combine core and PCA selections
-    const finalDimensions = [...sortedCoreDimensions, ...sortedPcaDimensions];
+    const finalDimensions = [...limitedVaeDimensions, ...sortedCoreDimensions, ...sortedPcaDimensions];
 
     // If we don't have enough dimensions (shouldn't happen), fill from general pool
     if (finalDimensions.length < maxDimensions) {
       const usedDimensions = new Set(finalDimensions.map(d => d.dimName));
-      const remainingDimensions = Array.from(dimensionMap.entries())
-        .filter(([dimName]) => !usedDimensions.has(dimName))
-        .map(([dimName, dirList]) => ({
+      const remainingCandidates = [];
+      const dimensionEntries = Array.from(dimensionMap.entries())
+        .filter(([dimName]) => !usedDimensions.has(dimName));
+
+      for (let idx = 0; idx < dimensionEntries.length; idx++) {
+        const [dimName, dirList] = dimensionEntries[idx];
+        remainingCandidates.push({
           dimName,
           bestDirections: selectBestDirections(dirList, dimName),
           isCore: false
-        }))
+        });
+        if ((idx + 1) % 5 === 0) {
+          await setImmediatePromise();
+        }
+      }
+
+      const remainingDimensions = remainingCandidates
         .filter(dim => dim.bestDirections.length > 0)
         .sort((a, b) => b.bestDirections[0].diversityScore - a.bestDirections[0].diversityScore)
         .slice(0, maxDimensions - finalDimensions.length);
@@ -4318,27 +4881,34 @@ class DriftAudioMixer {
   // ==================== END STACK MANAGEMENT ====================
 
   // Get the adjusted track duration from advanced audio mixer
-  getAdjustedTrackDuration() {
-    // Try to get the adjusted duration from the advanced audio mixer
+  getAdjustedTrackDuration(track = this.currentTrack, { logging = true } = {}) {
+    // Try to get the adjusted duration from the advanced audio mixer when querying the active track
     const mixerStatus = typeof this.audioMixer?.getStatus === 'function' ? this.audioMixer.getStatus() : null;
     const estimatedDuration = mixerStatus?.currentTrack?.estimatedDuration;
+    const usingActiveTrack = track && this.currentTrack && track.identifier === this.currentTrack.identifier;
 
-    if (Number.isFinite(estimatedDuration) && estimatedDuration > 0) {
-      if (this.currentTrack?.length) {
-        console.log(`📏 Using adjusted track duration: ${estimatedDuration.toFixed(1)}s (original: ${this.currentTrack.length}s)`);
-      } else {
-        console.log(`📏 Using adjusted track duration: ${estimatedDuration.toFixed(1)}s (no original length available)`);
+    if (usingActiveTrack && Number.isFinite(estimatedDuration) && estimatedDuration > 0) {
+      if (logging) {
+        if (track?.length) {
+          console.log(`📏 Using adjusted track duration: ${estimatedDuration.toFixed(1)}s (original: ${track.length}s)`);
+        } else {
+          console.log(`📏 Using adjusted track duration: ${estimatedDuration.toFixed(1)}s (no original length available)`);
+        }
       }
       return estimatedDuration;
     }
 
     // Fallback to original duration if mixer doesn't have adjusted duration yet
-    if (this.currentTrack?.length) {
-      console.log(`📏 Using original track duration: ${this.currentTrack.length}s (mixer not ready)`);
-      return this.currentTrack.length;
+    if (track?.length) {
+      if (logging) {
+        console.log(`📏 Using original track duration: ${track.length}s (mixer not ready)`);
+      }
+      return track.length;
     }
 
-    console.warn('📏 Unable to determine track duration; returning 0');
+    if (logging) {
+      console.warn('📏 Unable to determine track duration; returning 0');
+    }
     return 0;
   }
 

@@ -1,0 +1,17 @@
+{
+  "sessionId": "beta-lab",
+  "md5": "00112233445566778899aabbccddeeff",
+  "title": null,
+  "artist": null,
+  "nextTrack": {
+    "identifier": "ffffffffffffffffffffffffffffffff",
+    "title": null,
+    "artist": "Unknown",
+    "direction": null
+  },
+  "durationMs": 240000,
+  "elapsedMs": 210000,
+  "remainingMs": 30000,
+  "clients": 0,
+  "isEphemeral": false
+}

@@ -1,0 +1,39 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`DriftAudioMixer heartbeat + snapshot contracts heartbeat payload matches contract reference: heartbeat-normalized 1`] = `
+{
+  "currentTrack": {
+    "artist": "Test Artist",
+    "durationMs": 180000,
+    "identifier": "aaaabbbbccccddddeeeeffff11112222",
+    "startTime": 1704067050000,
+    "title": "Test Track",
+  },
+  "drift": {
+    "currentDirection": "beat_punch_positive",
+  },
+  "fingerprint": "fingerprint-mock",
+  "nextTrack": {
+    "direction": null,
+    "track": {
+      "artist": "Future Artist",
+      "direction": null,
+      "identifier": "9999aaaabbbbccccddddeeeeffff0000",
+      "title": "Next Track",
+    },
+  },
+  "override": null,
+  "reason": "user-next-prepared",
+  "session": {
+    "audioClients": 1,
+    "eventClients": 1,
+    "id": "test-session",
+  },
+  "timestamp": 1704067200000,
+  "timing": {
+    "elapsedMs": 150000,
+    "remainingMs": 30000,
+  },
+  "type": "heartbeat",
+}
+`;

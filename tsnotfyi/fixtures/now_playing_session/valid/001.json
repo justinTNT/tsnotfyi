@@ -1,0 +1,29 @@
+{
+  "_notes": "Standard library session with full metadata and next track preview.",
+  "sessionId": "alpha-main",
+  "md5": "f1e2d3c4b5a697887766554433221100",
+  "title": "Ambient Study",
+  "artist": "The Reference Tones",
+  "nextTrack": {
+    "identifier": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "title": "Beat Pulse",
+    "artist": "Frequency Works",
+    "direction": "beat_punch_positive",
+    "directionKey": "beat_punch_positive"
+  },
+  "elapsedMs": 120000,
+  "durationMs": 240000,
+  "clients": 2,
+  "isEphemeral": false,
+  "albumCover": "/covers/demo.png",
+  "features": {
+    "bpm": 120
+  },
+  "currentTrack": {
+    "identifier": "aaaabbbbccccddddeeeeffff00001111",
+    "title": "Ambient Study",
+    "artist": "The Reference Tones",
+    "duration": 240,
+    "albumCover": "/covers/demo.png"
+  }
+}

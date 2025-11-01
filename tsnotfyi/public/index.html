@@ -2,6 +2,7 @@
 <html>
 <head>
     <meta charset="UTF-8">
+    <base href="/">
     <title>Stream</title>
     <link href="fonts/inter.css" rel="stylesheet">
     <link href="fonts/jetbrains-mono.css" rel="stylesheet">
@@ -13,6 +14,7 @@
     <script src="scripts/scene.js"></script>
     <script src="scripts/helpers.js"></script>
     <script src="scripts/fzf.js"></script>
+    <script src="scripts/stream-controller.js"></script>
 </head>
 <body>
     <!-- Background layer -->
@@ -39,6 +41,14 @@
         </div>
     </div>
 
+    <!-- Next Track Tray -->
+    <div id="nextTrackTray" aria-label="Upcoming selections">
+        <div class="next-track-tray-preview" aria-hidden="true"></div>
+    </div>
+
+    <!-- Beets metadata chips -->
+    <div id="beetsSegments" class="beets-hidden"></div>
+
 
     <!-- Dimension Cards in Circular Layout -->
     <div id="dimensionCards"></div>
@@ -52,6 +62,14 @@
     <div id="volumeControl">
         <div id="volumeBar"></div>
     </div>
+    <div class="diagnostic-bar">
+        <div id="playbackClock" class="playback-clock is-hidden" title="Current playback time"></div>
+        <div id="radiusControls" class="radius-controls" title="Search scope">
+            <button type="button" class="radius-button" data-radius-mode="microscope" aria-label="Microscope scope">🔬</button>
+            <button type="button" class="radius-button" data-radius-mode="magnifying" aria-label="Magnifying scope">🔍</button>
+            <button type="button" class="radius-button" data-radius-mode="binoculars" aria-label="Binoculars scope">🔭</button>
+        </div>
+    </div>
 
 
     <!-- Search icon for fzf activation -->
@@ -63,15 +81,6 @@
     <div id="directionKeyOverlay">
         <span class="directionKeyText" id="dkt1"></span>
         <span class="directionKeyText" id="dkt2"></span>
-    </div>
-
-    <!-- Connection health indicator -->
-    <div id="connectionHealth" class="healthy" title="Connection status">
-        <div class="health-dot"></div>
-        <div class="connection-tooltip">
-            <div>SSE: <span id="sseStatus">connected</span></div>
-            <div>Audio: <span id="audioStatus">connected</span></div>
-        </div>
     </div>
 
     <!-- Manual refresh button -->
@@ -96,6 +105,5 @@
     <audio id="audio"></audio>
 
     <script src="scripts/page.js"></script>
-    </script>
 </body>
 </html>

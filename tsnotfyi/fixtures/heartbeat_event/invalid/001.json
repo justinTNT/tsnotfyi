@@ -1,0 +1,21 @@
+{
+  "_notes": "Type must be the literal string 'heartbeat'.",
+  "type": "status",
+  "timestamp": 1731889200000,
+  "reason": "status",
+  "currentTrack": {
+    "identifier": "aaaabbbbccccddddeeeeffff11112222"
+  },
+  "timing": {
+    "elapsedMs": 1000,
+    "remainingMs": 1000
+  },
+  "session": {
+    "id": "test",
+    "audioClients": 1,
+    "eventClients": 1
+  },
+  "drift": {
+    "currentDirection": null
+  }
+}

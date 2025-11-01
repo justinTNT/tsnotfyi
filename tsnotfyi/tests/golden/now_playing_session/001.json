@@ -1,0 +1,17 @@
+{
+  "sessionId": "alpha-main",
+  "md5": "f1e2d3c4b5a697887766554433221100",
+  "title": "Ambient Study",
+  "artist": "The Reference Tones",
+  "nextTrack": {
+    "identifier": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "title": "Beat Pulse",
+    "artist": "Frequency Works",
+    "direction": "beat_punch_positive"
+  },
+  "durationMs": 240000,
+  "elapsedMs": 120000,
+  "remainingMs": 120000,
+  "clients": 2,
+  "isEphemeral": false
+}

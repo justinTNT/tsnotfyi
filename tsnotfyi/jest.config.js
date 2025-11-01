@@ -1,4 +1,6 @@
 module.exports = {
+  detectOpenHandles: true,
+  testTimeout: 15000,
   projects: [
     {
       displayName: 'api',

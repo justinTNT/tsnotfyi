@@ -1,0 +1,9 @@
+{
+  "_notes": "Elapsed greater than duration should be rejected",
+  "sessionId": "bad-timing",
+  "md5": "1234567890abcdef1234567890abcdef",
+  "elapsedMs": 5000,
+  "durationMs": 1000,
+  "clients": 1,
+  "isEphemeral": false
+}

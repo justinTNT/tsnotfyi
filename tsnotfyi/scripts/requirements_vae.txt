@@ -1,0 +1,14 @@
+# VAE Training Dependencies for tsnotfyi
+# Install with: pip install -r requirements_vae.txt
+
+# Core ML dependencies
+torch>=2.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+
+# Database connectivity
+psycopg2-binary>=2.9.0
+
+# Optional: for enhanced logging and progress bars
+tqdm>=4.64.0

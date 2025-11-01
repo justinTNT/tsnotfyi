@@ -247,16 +247,34 @@ function scrollSelectedIntoView() {
 }
 
 // Select current result and jump to track
-function selectFzfResult() {
+async function selectFzfResult() {
     if (fzfState.currentResults.length === 0 || fzfState.selectedIndex < 0) return;
 
     const selectedResult = fzfState.currentResults[fzfState.selectedIndex];
 
     if (selectedResult) {
-        console.log(`🔍 Selected track: ${selectedResult.displayText} (${selectedResult.identifier})`);
+        const trackId =
+            selectedResult.identifier ||
+            selectedResult.trackMd5 ||
+            selectedResult.md5 ||
+            selectedResult.id ||
+            null;
+
+        if (!trackId) {
+            console.warn('🔍 Selected search result is missing an identifier', selectedResult);
+            return;
+        }
+
+        console.log(`🔍 Selected track: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
 
         // Jump to this track (use the SHA endpoint)
-        jumpToTrack(selectedResult.identifier);
+        try {
+            await jumpToTrack(trackId, selectedResult);
+        } catch (error) {
+            console.error('🎯 Fuzzy jump failed:', error);
+            showFzfError('Failed to queue track – see console');
+            return;
+        }
 
         // Close fzf interface
         closeFzfSearch();
@@ -264,15 +282,42 @@ function selectFzfResult() {
 }
 
 // Jump to a specific track by MD5
-async function jumpToTrack(trackMd5) {
+async function jumpToTrack(trackMd5, metadata = {}) {
+    if (!trackMd5) {
+        console.warn('🎯 jumpToTrack called without a track ID');
+        return;
+    }
+
     try {
         console.log(`🎯 Jumping to track: ${trackMd5}`);
 
-        // Navigate to the track using the existing SHA endpoint
-        window.location.href = `/${trackMd5}`;
+        if (typeof window.sendNextTrack === 'function') {
+            if (window.state) {
+                window.state.suppressPreviewTrackId = trackMd5;
+            }
+            if (typeof window.hideNextTrackPreview === 'function') {
+                window.hideNextTrackPreview({ immediate: true });
+            }
+            const preferredDirection = metadata.directionKey || metadata.direction || null;
+            await window.sendNextTrack(trackMd5, preferredDirection, {
+                source: 'user',
+                origin: 'fzf-search'
+            });
+        } else {
+            console.warn('🎯 sendNextTrack not available; falling back to page navigation');
+            window.location.href = `/${trackMd5}`;
+        }
 
     } catch (error) {
         console.error('🎯 Failed to jump to track:', error);
+        throw error;
+    }
+}
+
+function showFzfError(message) {
+    const fzfResults = document.getElementById('fzfResults');
+    if (fzfResults) {
+        fzfResults.innerHTML = `<div class="fzf-no-results">${message}</div>`;
     }
 }
 
@@ -286,4 +331,3 @@ function clearFzfResults() {
     fzfState.currentResults = [];
     fzfState.selectedIndex = 0;
 }
-

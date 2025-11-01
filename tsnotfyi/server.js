@@ -8,10 +8,23 @@ const RadialSearchService = require('./radial-search');
 const VAEService = require('./services/vaeService');
 const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
+const serverLogger = require('./server-logger');
+
+const startupLog = serverLogger.createLogger('startup');
+const serverLog = serverLogger.createLogger('server');
+const sessionLog = serverLogger.createLogger('session');
+const dbLog = serverLogger.createLogger('database');
+const timingLog = serverLogger.createLogger('timing');
+const sseLog = serverLogger.createLogger('sse');
+const searchLog = serverLogger.createLogger('search');
 
 // Load configuration
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+if (config.logging?.channels) {
+  serverLogger.configureFromSpec(config.logging.channels);
+}
 
 const app = express();
 const port = config.server.port;
@@ -36,7 +49,7 @@ async function persistAudioSessionBinding(req, sessionId) {
   await new Promise((resolve) => {
     req.session.save((err) => {
       if (err) {
-        console.error('⚠️ Failed to persist express session binding:', err);
+        sessionLog.error('⚠️ Failed to persist express session binding', err);
       }
       resolve();
     });
@@ -52,45 +65,43 @@ function checkSingleton() {
       // Check if process is actually running
       try {
         process.kill(existingPid, 0); // Signal 0 just checks if process exists
-        console.error(`❌ SINGLETON VIOLATION: Server already running with PID ${existingPid}`);
-        console.error(`❌ Kill the existing server first: kill ${existingPid}`);
+        startupLog.error(`❌ SINGLETON VIOLATION: Server already running with PID ${existingPid}`);
+        startupLog.error(`❌ Kill the existing server first: kill ${existingPid}`);
         process.exit(1);
       } catch (err) {
         // Process doesn't exist, remove stale PID file
-        console.log(`🧹 Removing stale PID file for non-existent process ${existingPid}`);
+        startupLog.info(`🧹 Removing stale PID file for non-existent process ${existingPid}`);
         fs.unlinkSync(pidFile);
       }
     } catch (err) {
-      console.log(`🧹 Removing corrupted PID file`);
+      startupLog.info(`🧹 Removing corrupted PID file`);
       fs.unlinkSync(pidFile);
     }
   }
 
   // Write our PID
-  console.log(`🔒 1 Server singleton locking with PID ${process.pid}`);
+  startupLog.info(`🔒 1 Server singleton locking with PID ${process.pid}`);
+  startupLog.info(`🔒 2 Server singleton locking with PID ${process.pid}`);
+  startupLog.info(`🔒 3 Server singleton locking with PID ${process.pid}`);
+  startupLog.info(`🔒 4 Server singleton locking with PID ${process.pid}`);
 
-  console.log(`🔒 2 Server singleton locking with PID ${process.pid}`);
-
-  console.log(`🔒 3 Server singleton locking with PID ${process.pid}`);
-
-  console.log(`🔒 4 Server singleton locking with PID ${process.pid}`);
-
-
-  try { fs.writeFileSync(pidFile, process.pid.toString()); } catch (err) {
-console.dir(err);
-exit(2);
-}
-  console.log(`🔒 Server singleton locked with PID ${process.pid}`);
+  try {
+    fs.writeFileSync(pidFile, process.pid.toString());
+  } catch (err) {
+    startupLog.error('Failed writing PID file', err);
+    process.exit(2);
+  }
+  startupLog.info(`🔒 Server singleton locked with PID ${process.pid}`);
 
   // Clean up PID file on exit
   process.on('exit', () => {
     try {
       if (fs.existsSync(pidFile)) {
         fs.unlinkSync(pidFile);
-        console.log(`🔓 Released singleton lock`);
+        startupLog.info(`🔓 Released singleton lock`);
       }
     } catch (err) {
-      console.error('Error removing PID file:', err);
+      startupLog.error('Error removing PID file:', err);
     }
   });
 }
@@ -100,6 +111,15 @@ exit(2);
 const audioSessions = new Map(); // Keep for backward compatibility
 const ephemeralSessions = new Map(); // One-off MD5 journey sessions
 const lastHealthySessionByIp = new Map();
+
+const primedSessionIds = new Set();
+let primingSessionsInFlight = 0;
+const desiredPrimedSessions = Math.max(
+  0,
+  Number.isFinite(Number(config.server?.primedSessionCount))
+    ? Number(config.server.primedSessionCount)
+    : 0
+);
 
 function extractRequestIp(req) {
   return req?.ip || req?.socket?.remoteAddress || null;
@@ -114,11 +134,11 @@ function logSessionEvent(event, details = {}, { level = 'log' } = {}) {
 
   const message = `🛰️ session ${JSON.stringify(payload)}`;
   if (level === 'warn') {
-    console.warn(message);
+    sessionLog.warn(message);
   } else if (level === 'error') {
-    console.error(message);
+    sessionLog.error(message);
   } else {
-    console.log(message);
+    sessionLog.info(message);
   }
 }
 
@@ -154,13 +174,77 @@ function getSessionById(sessionId) {
   return audioSessions.get(sessionId) || ephemeralSessions.get(sessionId) || null;
 }
 
+async function primeSession(reason = 'unspecified') {
+  if (desiredPrimedSessions <= 0) {
+    return;
+  }
+
+  primingSessionsInFlight += 1;
+  try {
+    const session = await createSession({ autoStart: true });
+    if (session) {
+      session.isPrimed = true;
+      session.primeReason = reason;
+      primedSessionIds.add(session.sessionId);
+      sessionLog.info(`🔥 Primed drift session ready: ${session.sessionId} (${reason})`);
+    }
+  } catch (error) {
+    sessionLog.error('🔥 Failed to prime drift session:', error);
+  } finally {
+    primingSessionsInFlight -= 1;
+  }
+}
+
+function schedulePrimedSessions(reason = 'unspecified') {
+  if (desiredPrimedSessions <= 0) {
+    return;
+  }
+
+  const needed = desiredPrimedSessions - primedSessionIds.size - primingSessionsInFlight;
+  if (needed <= 0) {
+    return;
+  }
+
+  for (let i = 0; i < needed; i += 1) {
+    primeSession(reason).catch(err => {
+      sessionLog.error('🔥 Primed session creation failed:', err);
+    });
+  }
+}
+
+function checkoutPrimedSession(resolution = 'request') {
+  if (!primedSessionIds.size) {
+    return null;
+  }
+
+  const iterator = primedSessionIds.values().next();
+  if (iterator.done) {
+    return null;
+  }
+
+  const sessionId = iterator.value;
+  primedSessionIds.delete(sessionId);
+
+  const session = getSessionById(sessionId);
+  if (!session) {
+    sessionLog.warn(`🔥 Primed session ${sessionId} missing during checkout (${resolution})`);
+    schedulePrimedSessions('stale-removal');
+    return null;
+  }
+
+  session.isPrimed = false;
+  sessionLog.info(`🔥 Primed session ${sessionId} assigned (${resolution})`);
+  schedulePrimedSessions('replenish');
+  return session;
+}
+
 function attachEphemeralCleanup(sessionId, session) {
   if (!session || !session.mixer) {
     return;
   }
 
   session.mixer.onIdle = () => {
-    console.log(`🧹 Cleaning up ephemeral session: ${sessionId}`);
+    sessionLog.info(`🧹 Cleaning up ephemeral session: ${sessionId}`);
     unregisterSession(sessionId);
     session.mixer.onIdle = null;
   };
@@ -177,6 +261,7 @@ const vaeService = new VAEService({
 });
 
 // Initialize database connection
+const TRIGRAM_SIMILARITY_THRESHOLD = parseFloat(process.env.SEARCH_SIMILARITY_THRESHOLD || '0.18');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || config.database.postgresql.connectionString,
   max: 20,
@@ -185,27 +270,37 @@ const pool = new Pool({
 });
 
 pool.on('connect', () => {
-  console.log('📊 Connected to PostgreSQL music database');
+  dbLog.info('📊 Connected to PostgreSQL music database');
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected database error:', err);
+  dbLog.error('Unexpected database error:', err);
+});
+
+pool.on('connect', (client) => {
+  client.query('SELECT set_limit($1)', [TRIGRAM_SIMILARITY_THRESHOLD]).catch(err => {
+    dbLog.warn('⚠️ Failed to set pg_trgm similarity threshold:', err?.message || err);
+  });
 });
 
 async function initializeServices() {
+  if (process.env.SKIP_SERVICE_INIT) {
+    startupLog.info('Skipping service initialization (SKIP_SERVICE_INIT set)');
+    return;
+  }
   try {
     await radialSearch.initialize();
-    console.log('✅ Radial search service initialized');
+    searchLog.info('✅ Radial search service initialized');
     
     // Initialize VAE service (optional - may not have model available)
     try {
       await vaeService.initialize();
-      console.log('✅ VAE service initialized');
+      serverLog.info('✅ VAE service initialized');
     } catch (vaeError) {
-      console.warn('⚠️ VAE service initialization failed (continuing without VAE):', vaeError.message);
+      serverLog.warn('⚠️ VAE service initialization failed (continuing without VAE):', vaeError.message);
     }
   } catch (err) {
-    console.error('Failed to initialize services:', err);
+    startupLog.error('Failed to initialize services:', err);
   }
 }
 
@@ -217,7 +312,7 @@ async function createSession(options = {}) {
     ephemeral = false
   } = options;
 
-  console.log(`🎯 Creating session: ${sessionId}`);
+  sessionLog.info(`🎯 Creating session: ${sessionId}`);
 
   const mixer = new DriftAudioMixer(sessionId, radialSearch);
   mixer.pendingClientBootstrap = true;
@@ -225,9 +320,9 @@ async function createSession(options = {}) {
   if (autoStart) {
     try {
       await mixer.startDriftPlayback();
-      console.log(`✅ Session ${sessionId} started with initial track`);
+      sessionLog.info(`✅ Session ${sessionId} started with initial track`);
     } catch (error) {
-      console.error(`❌ Failed to start session ${sessionId}:`, error);
+      sessionLog.error(`❌ Failed to start session ${sessionId}:`, error);
     }
   }
 
@@ -249,14 +344,55 @@ async function createSession(options = {}) {
   return session;
 }
 
-initializeServices();
+function findTrackInExplorerSnapshot(explorer, trackId) {
+  if (!explorer || !trackId) return null;
+
+  const inspectSamples = (directionKey, direction) => {
+    if (!direction) return null;
+    const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+    for (const sample of samples) {
+      const track = sample && typeof sample === 'object' && sample.track ? sample.track : sample;
+      if (track && track.identifier === trackId) {
+        return { directionKey, track };
+      }
+    }
+    return null;
+  };
+
+  const directions = explorer.directions || {};
+  for (const [key, direction] of Object.entries(directions)) {
+    const match = inspectSamples(key, direction);
+    if (match) return match;
+
+    if (direction?.oppositeDirection) {
+      const oppositeKey = direction.oppositeDirection.key || direction.oppositeDirection.direction || null;
+      const oppositeMatch = inspectSamples(oppositeKey || key, direction.oppositeDirection);
+      if (oppositeMatch) return oppositeMatch;
+    }
+  }
+
+  const nextTrack = explorer.nextTrack?.track || explorer.nextTrack;
+  if (nextTrack?.identifier === trackId) {
+    const directionKey = explorer.nextTrack?.directionKey || explorer.nextTrack?.direction || null;
+    return { directionKey, track: nextTrack };
+  }
+
+  return null;
+}
+
+const servicesReady = initializeServices();
+servicesReady.then(() => {
+  schedulePrimedSessions('startup');
+}).catch(err => {
+  serverLog.error('🔥 Failed to schedule startup primed sessions:', err);
+});
 
 // Prune stale fingerprints every minute (5 minute TTL)
 setInterval(() => {
   try {
     fingerprintRegistry.pruneStale(60 * 60 * 1000); // prune entries older than 1 hour
   } catch (err) {
-    console.warn('⚠️ Fingerprint prune failed:', err?.message || err);
+    serverLog.warn('⚠️ Fingerprint prune failed:', err?.message || err);
   }
 }, 10 * 60 * 1000);
 
@@ -290,7 +426,7 @@ app.post('/create-session', async (req, res) => {
       webUrl: '/'
     });
   } catch (error) {
-    console.error('Failed to create session:', error);
+    sessionLog.error('Failed to create session:', error);
     res.status(500).json({ error: 'Failed to create session' });
   }
 });
@@ -366,7 +502,11 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
     let session = existingId ? getSessionById(existingId) : null;
 
     if (!session && createIfMissing) {
-      session = await createSession();
+      session = checkoutPrimedSession('cookie');
+      if (!session) {
+        session = await createSession();
+        schedulePrimedSessions('cookie-backfill');
+      }
     }
 
     if (session) {
@@ -400,7 +540,11 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
     return null;
   }
 
-  const session = await createSession();
+  let session = checkoutPrimedSession('fallback');
+  if (!session) {
+    session = await createSession();
+    schedulePrimedSessions('fallback-backfill');
+  }
   session.lastAccess = new Date();
   await persistAudioSessionBinding(req, session.sessionId);
   logSessionResolution(req, 'fallback', {
@@ -477,7 +621,7 @@ app.get('/stream', async (req, res) => {
 
 // Stream endpoint - this is where browsers connect for audio (backward compatibility)
 app.get('/stream/:sessionId', (req, res) => {
-  console.log(`⚠️ Deprecated stream URL requested: /stream/${req.params.sessionId}`);
+  serverLog.warn(`⚠️ Deprecated stream URL requested: /stream/${req.params.sessionId}`);
   res.status(410).json({ error: 'Session-specific stream URLs have been removed. Connect to /stream instead.' });
 });
 
@@ -495,9 +639,9 @@ app.get('/session/:sessionId', async (req, res) => {
       await persistAudioSessionBinding(req, session.sessionId);
     }
 
-    console.log(`${isFollowMode ? '👁️' : '🎮'} Legacy session request for ${requestedId}; redirecting to '/'`);
+    serverLog.info(`${isFollowMode ? '👁️' : '🎮'} Legacy session request for ${requestedId}; redirecting to '/'`);
   } catch (error) {
-    console.error('Failed to resolve session for legacy /session/:sessionId route:', error);
+    serverLog.error('Failed to resolve session for legacy /session/:sessionId route:', error);
   }
 
   res.redirect(302, isFollowMode ? '/?mode=follow' : '/');
@@ -506,7 +650,7 @@ app.get('/session/:sessionId', async (req, res) => {
 
 // Simplified events endpoint - resolves session from request context
 app.get('/events', async (req, res) => {
-  console.log('📡 SSE connection attempt');
+  sseLog.info('📡 SSE connection attempt');
 
   try {
     res.writeHead(200, {
@@ -655,13 +799,13 @@ app.get('/events', async (req, res) => {
         session.mixer.isActive &&
         session.mixer.currentTrack.title &&
         session.mixer.currentTrack.title.trim() !== '') {
-      console.log('📡 Sending heartbeat and explorer snapshot to new SSE client');
+      sseLog.info('📡 Sending heartbeat and explorer snapshot to new SSE client');
       await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
       session.mixer.broadcastExplorerSnapshot(true, 'sse-connected').catch(err => {
-        console.error('📡 Failed to broadcast explorer snapshot on connect:', err);
+        sseLog.error('📡 Failed to broadcast explorer snapshot on connect:', err);
       });
     } else {
-      console.log('📡 No valid current track to broadcast, skipping initial snapshot');
+      sseLog.info('📡 No valid current track to broadcast, skipping initial snapshot');
     }
 
     req.on('close', () => {
@@ -671,7 +815,7 @@ app.get('/events', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('📡 SSE connection error:', error);
+    sseLog.error('📡 SSE connection error:', error);
     try {
       res.write('data: {"type":"error","message":"connection_failed"}\n\n');
       res.end();
@@ -683,7 +827,7 @@ app.get('/events', async (req, res) => {
 
 // Server-Sent Events endpoint for real-time updates (backward compatibility)
 app.get('/events/:sessionId', (req, res) => {
-  console.log(`⚠️ Deprecated SSE URL requested: /events/${req.params.sessionId}`);
+  sseLog.warn(`⚠️ Deprecated SSE URL requested: /events/${req.params.sessionId}`);
   res.status(410).json({ error: 'Session-specific SSE URLs have been removed. Connect to /events instead.' });
 });
 
@@ -1795,10 +1939,12 @@ app.get('/:md51/:md52', async (req, res, next) => {
 
 // Fuzzy search endpoint
 app.get('/search', async (req, res) => {
-  const query = req.query.q;
+  const rawQuery = req.query.q;
+  const query = typeof rawQuery === 'string' ? rawQuery.trim() : '';
+  const normalizedQuery = query.toLowerCase();
   const limit = parseInt(req.query.limit) || 50;
 
-  if (!query || query.length < 2) {
+  if (!normalizedQuery || normalizedQuery.length < 2) {
     return res.json({ results: [], query: query, total: 0 });
   }
 
@@ -1821,7 +1967,13 @@ app.get('/search', async (req, res) => {
   `;
 
   try {
-    const result = await pool.query(searchQuery, [query, limit]);
+    const client = await pool.connect();
+    let result;
+    try {
+      result = await client.query(searchQuery, [normalizedQuery, limit]);
+    } finally {
+      client.release();
+    }
     const rows = result.rows;
 
     const results = rows.map(row => {
@@ -3213,8 +3365,16 @@ app.post('/session/:sessionId/zoom/:mode', (req, res) => {
 
 // Simplified next track endpoint - resolves session from request context
 app.post('/next-track', async (req, res) => {
-  const { trackMd5, direction, source = 'user', fingerprint: requestFingerprint } = req.body;
+  const {
+    trackMd5,
+    direction,
+    source = 'user',
+    origin = null,
+    explorerSignature = null, // Reserved for future validation
+    fingerprint: requestFingerprint
+  } = req.body;
   const normalizedSource = typeof source === 'string' ? source.toLowerCase() : 'user';
+  const normalizedOrigin = typeof origin === 'string' ? origin.toLowerCase() : null;
 
   if (!trackMd5) {
     return res.status(400).json({ error: 'Track MD5 is required' });
@@ -3243,9 +3403,90 @@ app.post('/next-track', async (req, res) => {
   try {
     const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;
     const advertisedDirection = typeof direction === 'string' ? direction : null;
+    const isDeckSelection = normalizedSource === 'user' && normalizedOrigin === 'deck';
+
+    let deckMatch = null;
+    if (isDeckSelection) {
+      const lastExplorer = session.mixer.lastExplorerSnapshotPayload?.explorer || null;
+      deckMatch = findTrackInExplorerSnapshot(lastExplorer, cleanMd5);
+    }
+
+    if (isDeckSelection && deckMatch) {
+      const deckDirection = advertisedDirection || deckMatch.directionKey || null;
+      const hydrated = session.mixer.hydrateTrackRecord(deckMatch.track || cleanMd5, {
+        nextTrackDirection: deckDirection,
+        transitionReason: 'deck-selection'
+      });
+
+      if (hydrated && hydrated.identifier) {
+        if (session.mixer.nextTrack?.identifier !== hydrated.identifier) {
+          try {
+            await session.mixer.prepareNextTrackForCrossfade({
+              forceRefresh: true,
+              reason: 'deck-selection',
+              overrideTrackId: hydrated.identifier,
+              overrideDirection: deckDirection
+            });
+          } catch (prepErr) {
+            console.warn('⚠️ Deck selection preparation failed:', prepErr?.message || prepErr);
+            session.mixer.nextTrack = hydrated;
+          }
+        }
+
+        session.mixer.nextTrack = session.mixer.nextTrack || hydrated;
+        if (typeof session.mixer.clearPendingUserSelection === 'function') {
+          session.mixer.clearPendingUserSelection();
+        } else {
+          session.mixer.pendingUserOverrideTrackId = null;
+          session.mixer.pendingUserOverrideDirection = null;
+          session.mixer.isUserSelectionPending = false;
+        }
+        session.mixer.lockedNextTrackIdentifier = hydrated.identifier;
+
+        if (typeof session.mixer.broadcastSelectionEvent === 'function') {
+          session.mixer.broadcastSelectionEvent('selection_ack', {
+            status: 'promoted',
+            trackId: cleanMd5,
+            direction: deckDirection,
+            origin: 'deck'
+          });
+        }
+
+        const durationMs = session.mixer.getAdjustedTrackDuration() * 1000;
+        const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
+        const remainingMs = Math.max(0, durationMs - elapsed);
+
+        const currentTrackId = session.mixer.currentTrack?.identifier || null;
+        const preparedNextId = session.mixer.nextTrack?.identifier || null;
+        const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
+
+        console.log(`📤 /next-track deck promotion: ${cleanMd5?.substring(0,8) || 'none'} via ${deckDirection || 'unknown'}`);
+
+        return res.json({
+          status: 'deck_ack',
+          origin: 'deck',
+          sessionId: session.sessionId,
+          fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
+          currentTrack: currentTrackId,
+          nextTrack: preparedNextId,
+          pendingTrack: pendingCurrentId,
+          trackId: cleanMd5,
+          direction: deckDirection,
+          duration: Math.round(durationMs),
+          remaining: Math.round(remainingMs)
+        });
+      }
+
+      console.warn(`⚠️ Deck selection hydrate failed for ${cleanMd5}; falling back to override flow`);
+    }
+
+    if (isDeckSelection) {
+      console.warn(`🎯 Deck selection for ${cleanMd5} not found in current explorer data; treating as override`);
+    }
 
     if (normalizedSource === 'user') {
-      console.log(`🎯 User selected specific track: ${trackMd5} (direction: ${direction})`);
+      const originLabel = normalizedOrigin ? `/${normalizedOrigin}` : '';
+      console.log(`🎯 User selected specific track${originLabel}: ${trackMd5} (direction: ${direction})`);
 
       if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
         await session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
@@ -3293,6 +3534,7 @@ app.post('/next-track', async (req, res) => {
 
     const responsePayload = {
       status: normalizedSource === 'user' ? 'locked' : 'ok',
+      origin: normalizedOrigin || null,
       sessionId: session.sessionId,
       fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
       currentTrack: currentTrackId,
@@ -3305,6 +3547,7 @@ app.post('/next-track', async (req, res) => {
     if (normalizedSource === 'user') {
       responsePayload.trackId = cleanMd5 || null;
       responsePayload.direction = advertisedDirection || session.mixer.pendingUserOverrideDirection || null;
+      responsePayload.origin = normalizedOrigin || responsePayload.origin;
     }
 
     res.json(responsePayload);
@@ -3408,52 +3651,10 @@ app.get('/health', (req, res) => {
   });
 });
 
+const { buildNowPlayingSessions } = require('./routes/nowPlaying');
+
 app.get('/sessions/now-playing', (req, res) => {
-  const sessions = [];
-
-  const collectSessions = (collection, isEphemeral = false) => {
-    for (const [sessionId, session] of collection) {
-      const mixer = session.mixer;
-      if (!mixer || !mixer.currentTrack) {
-        continue;
-      }
-
-      const track = mixer.currentTrack;
-      let durationSeconds = null;
-      if (typeof mixer.getAdjustedTrackDuration === 'function') {
-        const adjusted = Number(mixer.getAdjustedTrackDuration());
-        if (Number.isFinite(adjusted) && adjusted > 0) {
-          durationSeconds = adjusted;
-        }
-      }
-      if (durationSeconds === null && typeof track.length === 'number') {
-        durationSeconds = track.length;
-      }
-
-      const trackStart = mixer.trackStartTime || session.lastAccess || null;
-      const elapsedMs = trackStart ? Date.now() - trackStart : null;
-
-      sessions.push({
-        sessionId,
-        md5: track.identifier || null,
-        title: track.title || null,
-        artist: track.artist || null,
-        nextTrack: mixer.nextTrack ? {
-          identifier: mixer.nextTrack.identifier || null,
-          title: mixer.nextTrack.title || null,
-          artist: mixer.nextTrack.artist || null
-        } : null,
-        elapsedMs: elapsedMs !== null ? Math.max(elapsedMs, 0) : null,
-        durationMs: durationSeconds !== null ? Math.round(durationSeconds * 1000) : null,
-        clients: mixer.clients ? mixer.clients.size : 0,
-        isEphemeral: isEphemeral || Boolean(session.isEphemeral)
-      });
-    }
-  };
-
-  collectSessions(audioSessions, false);
-  collectSessions(ephemeralSessions, true);
-
+  const sessions = buildNowPlayingSessions(audioSessions, ephemeralSessions, { now: Date.now() });
   res.json({
     status: 'ok',
     timestamp: Date.now(),

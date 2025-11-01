@@ -473,6 +473,82 @@ class RadialSearchService {
         }
     }
 
+    async getVAEDirectionalCandidates(trackId, latentIndex, direction, config = {}) {
+        if (!this.initialized) {
+            throw new Error('Radial search service not initialized');
+        }
+
+        const {
+            resolution = 'magnifying_glass',
+            limit = 20
+        } = config;
+
+        try {
+            const currentTrack = this.kdTree.getTrack(trackId);
+            if (!currentTrack || !currentTrack.vae?.latent) {
+                throw new Error(`Track not found or missing VAE data: ${trackId}`);
+            }
+
+            const latentVector = currentTrack.vae.latent;
+            if (!Array.isArray(latentVector) || latentIndex < 0 || latentIndex >= latentVector.length) {
+                throw new Error(`Invalid latent index ${latentIndex} for track ${trackId}`);
+            }
+
+            const calibrated = this.kdTree.vaeCalibratedSearch(currentTrack, resolution, limit * 4);
+            const neighbors = Array.isArray(calibrated?.neighbors) ? calibrated.neighbors : [];
+            const currentValue = latentVector[latentIndex];
+
+            const candidates = neighbors
+                .filter(result => {
+                    const track = result?.track;
+                    if (!track?.identifier || track.identifier === currentTrack.identifier) {
+                        return false;
+                    }
+                    const latent = track.vae?.latent;
+                    if (!Array.isArray(latent) || latent[latentIndex] === undefined || latent[latentIndex] === null) {
+                        return false;
+                    }
+                    const candidateValue = latent[latentIndex];
+                    return direction === 'positive'
+                        ? candidateValue > currentValue
+                        : candidateValue < currentValue;
+                })
+                .map(result => {
+                    const trackLatent = result.track.vae.latent;
+                    const candidateValue = trackLatent[latentIndex];
+                    return {
+                        track: result.track,
+                        distance: result.distance,
+                        latentValue: candidateValue,
+                        delta: candidateValue - currentValue
+                    };
+                })
+                .sort((a, b) => direction === 'positive'
+                    ? b.delta - a.delta
+                    : a.delta - b.delta);
+
+            return {
+                candidates: candidates.slice(0, limit),
+                totalAvailable: candidates.length,
+                currentTrack: {
+                    identifier: currentTrack.identifier,
+                    title: currentTrack.title,
+                    artist: currentTrack.artist,
+                    latentValue: currentValue
+                },
+                searchParameters: {
+                    latentIndex,
+                    direction,
+                    resolution,
+                    appliedRadius: calibrated?.appliedRadius || null
+                }
+            };
+        } catch (error) {
+            console.error('Error in getVAEDirectionalCandidates:', error);
+            throw error;
+        }
+    }
+
     isInPCADirection(currentTrack, candidateTrack, pcaDomain, pcaComponent, direction) {
         let currentValue, candidateValue;
 

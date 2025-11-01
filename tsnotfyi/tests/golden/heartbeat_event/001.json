@@ -1,0 +1,39 @@
+{
+  "type": "heartbeat",
+  "timestamp": 1731888000000,
+  "reason": "user-selection-pending",
+  "fingerprint": "session-alpha",
+  "currentTrack": {
+    "identifier": "aaaabbbbccccddddeeeeffff00001111",
+    "title": "Deep Mix",
+    "artist": "DJ Reference",
+    "startTime": 1731887970000,
+    "durationMs": 300000
+  },
+  "timing": {
+    "elapsedMs": 150000,
+    "remainingMs": 150000
+  },
+  "nextTrack": {
+    "track": {
+      "identifier": "22223333444455556666777788889999",
+      "title": "Rise",
+      "artist": "Voltage",
+      "direction": null
+    },
+    "direction": "beat_punch_positive"
+  },
+  "override": {
+    "identifier": "22223333444455556666777788889999",
+    "status": "prepared",
+    "direction": "beat_punch_positive"
+  },
+  "session": {
+    "id": "alpha-main",
+    "audioClients": 2,
+    "eventClients": 1
+  },
+  "drift": {
+    "currentDirection": "beat_punch_positive"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "_notes": "Missing sessionId entirely",
+  "md5": "abcdefabcdefabcdefabcdefabcdefab",
+  "elapsedMs": 1000,
+  "durationMs": 2000,
+  "clients": 1,
+  "isEphemeral": false
+}

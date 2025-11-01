@@ -1,0 +1,90 @@
+{
+  "name": "NowPlayingSession",
+  "description": "Represents a single entry in GET /sessions/now-playing.",
+  "normalization": [
+    "Trim string fields and lower-case MD5 hashes.",
+    "Clamp elapsedMs within [0, durationMs] when both metrics exist.",
+    "Coerce optional text fields to null when empty."
+  ],
+  "fields": {
+    "sessionId": {
+      "type": "string",
+      "required": true,
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
+    "md5": {
+      "type": "string",
+      "required": true,
+      "pattern": "^[a-f0-9]{32}$",
+      "case": "lower"
+    },
+    "title": {
+      "type": "string",
+      "required": false,
+      "allowNull": true
+    },
+    "artist": {
+      "type": "string",
+      "required": false,
+      "allowNull": true
+    },
+    "nextTrack": {
+      "type": "object",
+      "required": false,
+      "allowNull": true,
+      "fields": {
+        "identifier": {
+          "type": "string",
+          "required": true,
+          "pattern": "^[a-f0-9]{32}$"
+        },
+        "title": {
+          "type": "string",
+          "required": false,
+          "allowNull": true
+        },
+        "artist": {
+          "type": "string",
+          "required": false,
+          "allowNull": true
+        },
+        "direction": {
+          "type": "string",
+          "required": false,
+          "allowNull": true
+        }
+      }
+    },
+    "elapsedMs": {
+      "type": "number",
+      "required": false,
+      "allowNull": true,
+      "min": 0
+    },
+    "durationMs": {
+      "type": "number",
+      "required": false,
+      "allowNull": true,
+      "min": 0
+    },
+    "clients": {
+      "type": "number",
+      "required": true,
+      "integer": true,
+      "min": 0
+    },
+    "isEphemeral": {
+      "type": "boolean",
+      "required": true
+    }
+  },
+  "invariants": [
+    {
+      "type": "comparison",
+      "left": "durationMs",
+      "op": ">=",
+      "right": "elapsedMs",
+      "nullable": true
+    }
+  ]
+}

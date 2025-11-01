@@ -1,0 +1,16 @@
+{
+  "_notes": "Minimal telemetry where elapsed exceeds duration; normalization should clamp.",
+  "sessionId": "beta-lab",
+  "md5": "00112233445566778899aabbccddeeff",
+  "title": "",
+  "artist": null,
+  "nextTrack": {
+    "identifier": "ffffffffffffffffffffffffffffffff",
+    "title": "",
+    "artist": "Unknown"
+  },
+  "elapsedMs": 210000,
+  "durationMs": 240000,
+  "clients": 0,
+  "isEphemeral": false
+}

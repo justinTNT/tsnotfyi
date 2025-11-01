@@ -5,6 +5,7 @@ Adapted from agent-vomit for tsnotfyi music exploration
 Provides VAE model definition and utilities for music feature learning.
 """
 
+import sys
 import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional
@@ -126,28 +127,76 @@ class MusicVAEInference:
         self.model_config = None
         self.is_loaded = False
         
-        print(f"MusicVAE inference using device: {self.device}")
+        print(f"MusicVAE inference using device: {self.device}", file=sys.stderr)
     
     def load_model(self, model_path: str) -> Dict:
         """Load trained VAE model and preprocessing components."""
         try:
-            # Load model checkpoint
             checkpoint = torch.load(model_path, map_location=self.device)
-            
-            # Extract components
+
             model_state = checkpoint['model_state_dict']
-            self.scaler = checkpoint['scaler']
-            self.feature_names = checkpoint['core_features']
-            self.model_config = checkpoint['model_config']
-            
-            # Initialize model with saved configuration
+
+            # Support newer checkpoints that use fc_* parameter names
+            if 'latent_mu.weight' not in model_state and 'fc_mu.weight' in model_state:
+                remapped_state = model_state.copy()
+                rename_map = {
+                    'fc_mu.weight': 'latent_mu.weight',
+                    'fc_mu.bias': 'latent_mu.bias',
+                    'fc_logvar.weight': 'latent_logvar.weight',
+                    'fc_logvar.bias': 'latent_logvar.bias'
+                }
+                for old_key, new_key in rename_map.items():
+                    if old_key in remapped_state:
+                        remapped_state[new_key] = remapped_state.pop(old_key)
+                model_state = remapped_state
+
+            # Preferred: scaler serialized directly in checkpoint (legacy format)
+            scaler_obj = checkpoint.get('scaler')
+            if scaler_obj is not None:
+                self.scaler = scaler_obj
+            else:
+                mean = checkpoint.get('scaler_mean')
+                scale = checkpoint.get('scaler_scale')
+                if mean is None or scale is None:
+                    raise KeyError('Scaler information missing from checkpoint')
+
+                scaler = StandardScaler()
+                scaler.mean_ = np.array(mean, dtype=np.float64)
+                scaler.scale_ = np.array(scale, dtype=np.float64)
+                scaler.var_ = scaler.scale_ ** 2
+                scaler.n_features_in_ = scaler.mean_.shape[0]
+                scaler.n_samples_seen_ = 1
+                self.scaler = scaler
+
+            # Feature ordering may be stored under different keys
+            self.feature_names = checkpoint.get('core_features') or checkpoint.get('feature_names')
+            if not self.feature_names:
+                raise KeyError('Feature names missing from checkpoint')
+
+            # Resolve model configuration from checkpoint metadata
+            model_config = checkpoint.get('model_config', {})
+            if not model_config:
+                model_config = {
+                    'input_dim': checkpoint.get('input_dim', len(self.feature_names)),
+                    'latent_dim': checkpoint.get('latent_dim', 8),
+                    'hidden_dims': checkpoint.get('hidden_dims') or [64, 32],
+                    'beta': checkpoint.get('beta', 4.0),
+                    'dropout': checkpoint.get('dropout', 0.1),
+                }
+
+            # Ensure hidden_dims defaults when serialized value is None
+            if not model_config.get('hidden_dims'):
+                model_config['hidden_dims'] = [64, 32]
+
+            self.model_config = model_config
+
             self.model = MusicVAE(**self.model_config)
             self.model.load_state_dict(model_state)
             self.model.to(self.device)
             self.model.eval()
-            
+
             self.is_loaded = True
-            
+
             return {
                 'status': 'success',
                 'model_info': {
@@ -158,7 +207,7 @@ class MusicVAEInference:
                     'device': str(self.device)
                 }
             }
-            
+
         except Exception as e:
             return {
                 'status': 'error',

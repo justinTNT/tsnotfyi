@@ -1,0 +1,9 @@
+{
+  "_notes": "MD5 not 32 hex characters",
+  "sessionId": "bad-md5",
+  "md5": "not-a-hash",
+  "elapsedMs": 5000,
+  "durationMs": 10000,
+  "clients": 1,
+  "isEphemeral": false
+}

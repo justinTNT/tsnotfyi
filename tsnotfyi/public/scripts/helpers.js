@@ -300,6 +300,24 @@ function helpersDuplicateLog(...args) {
       );
   }
 
+  function hasActualOpposite(direction, resolvedKey) {
+      const stateRef = window.state || {};
+      const directionsMap = stateRef.latestExplorerData?.directions || {};
+      const inlineOpposite = direction?.oppositeDirection;
+      const inlineSamples = Array.isArray(inlineOpposite?.sampleTracks)
+          ? inlineOpposite.sampleTracks
+          : [];
+      const oppositeKey = resolveOppositeDirectionKey(direction) || getOppositeDirection(resolvedKey);
+      const externalDirection = oppositeKey ? directionsMap[oppositeKey] : null;
+      const externalSamples = Array.isArray(externalDirection?.sampleTracks)
+          ? externalDirection.sampleTracks
+          : [];
+
+      const inlineValid = inlineSamples.length > 0 && inlineOpposite?.isSynthetic !== true;
+      const externalValid = externalSamples.length > 0 && externalDirection?.isSynthetic !== true;
+      return inlineValid || externalValid;
+  }
+
   function applyReverseBadge(card, direction, context, { interactive = false, extraClasses = '', highlightOverride = null } = {}) {
       const panel = card.querySelector('.panel');
       const existing = card.querySelector('.uno-reverse');
@@ -307,28 +325,51 @@ function helpersDuplicateLog(...args) {
           existing.remove();
       }
 
-      const hasOpposite = hasOppositeForDirection(direction, context.resolvedKey);
-      if (!hasOpposite || !panel) {
+      const oppositeKey = resolveOppositeDirectionKey(direction) || getOppositeDirection(context.resolvedKey);
+      const hasOppositeStack = hasActualOpposite(direction, context.resolvedKey);
+
+      if (!hasOppositeStack || !panel) {
           delete card.dataset.oppositeBorderColor;
+          delete card.dataset.oppositeDirectionKey;
+          if (direction && direction.oppositeDirection && !Array.isArray(direction.oppositeDirection.sampleTracks)) {
+              delete direction.oppositeDirection;
+          }
+          if (direction) {
+              direction.hasOpposite = false;
+          }
           return;
       }
 
-      const reverseColor = resolveOppositeBorderColor(direction, context.directionColors.border);
-      if (reverseColor) {
-          card.dataset.oppositeBorderColor = reverseColor;
+      const baseBorder = card.dataset.borderColor || context.directionColors.border;
+      const baseGlow = card.dataset.glowColor || context.directionColors.glow;
+
+      const oppositeDirectionKey = oppositeKey || getOppositeDirection(context.resolvedKey);
+      card.dataset.oppositeDirectionKey = oppositeDirectionKey || '';
+
+      const reverseColor = resolveOppositeBorderColor(direction, baseBorder);
+      card.dataset.oppositeBorderColor = reverseColor || baseBorder;
+
+      const topColor = context.isNegative ? (reverseColor || baseBorder) : baseBorder;
+      const bottomColor = context.isNegative ? baseBorder : (reverseColor || baseBorder);
+      const enableInteraction = interactive && hasOppositeStack;
+      const highlight = enableInteraction ? (highlightOverride || (context.isNegative ? 'top' : 'bottom')) : null;
+
+      direction.hasOpposite = true;
+
+      const classSet = new Set();
+      classSet.add('has-opposite');
+      if (enableInteraction) {
+          classSet.add('enabled');
       } else {
-          delete card.dataset.oppositeBorderColor;
+          classSet.add('disabled');
       }
-
-      const topColor = context.isNegative ? (reverseColor || context.directionColors.border) : context.directionColors.border;
-      const bottomColor = context.isNegative ? context.directionColors.border : (reverseColor || context.directionColors.border);
-      const highlight = interactive ? (highlightOverride || (context.isNegative ? 'top' : 'bottom')) : null;
-
-      const baseClass = interactive ? 'enabled' : 'has-opposite';
-      const combinedExtra = extraClasses ? `${baseClass} ${extraClasses}` : baseClass;
+      if (extraClasses) {
+          extraClasses.split(/\s+/).filter(Boolean).forEach(cls => classSet.add(cls));
+      }
+      const combinedExtra = Array.from(classSet).join(' ');
 
       const badgeHtml = renderReverseIcon({
-          interactive,
+          interactive: enableInteraction,
           topColor,
           bottomColor,
           highlight,
@@ -505,6 +546,11 @@ function helpersDuplicateLog(...args) {
 
   function evaluateDirectionConsistency(direction, { card = null, sampleTracks = [], currentTrack = null } = {}) {
       if (!direction) {
+          return;
+      }
+
+      if (direction.skipConsistencyCheck) {
+          helpersColorLog(`🧮 Skipping consistency check for ${direction.key} (flagged synthetic)`);
           return;
       }
 
@@ -1412,6 +1458,11 @@ function helpersDuplicateLog(...args) {
       } else {
           delete card.dataset.trackAlbumCover;
       }
+      if (track.albumCover) {
+          card.dataset.trackAlbumCover = track.albumCover;
+      } else {
+          delete card.dataset.trackAlbumCover;
+      }
       card.dataset.trackAlbumCover = track.albumCover || '';
 
       const context = getDirectionVisualContext({ direction, card, track });
@@ -1842,6 +1893,14 @@ function helpersDuplicateLog(...args) {
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
 
+      if (track && typeof window !== 'undefined' && typeof window.hydrateTrackDetails === 'function') {
+          try {
+              window.hydrateTrackDetails(track, { reason: 'card-update' }).catch(() => {});
+          } catch (err) {
+              // Swallow hydration errors - cards can render with partial metadata
+          }
+      }
+
       const context = getDirectionVisualContext({
           direction,
           card,
@@ -1867,28 +1926,67 @@ function helpersDuplicateLog(...args) {
           window.setCardVariant(card, variantFromDirectionType(directionType));
       }
 
-      if (state.usingOppositeDirection) {
-          if (!card.dataset.baseDirectionKey) {
-              card.dataset.baseDirectionKey = state.baseDirectionKey || resolvedKey;
+      const baseDirectionKeyForCard = card.dataset.baseDirectionKey
+          || state.baseDirectionKey
+          || resolvedKey;
+
+      const declaredOpposite = direction?.hasOpposite === true
+          || !!resolveOppositeDirectionKey(direction)
+          || hasOppositeForDirection(direction, resolvedKey);
+      const oppositeAvailable = hasActualOpposite(direction, resolvedKey);
+
+      if (state.usingOppositeDirection && oppositeAvailable) {
+          card.dataset.baseDirectionKey = baseDirectionKeyForCard;
+          const reversedTargetKey = baseDirectionKeyForCard && baseDirectionKeyForCard !== resolvedKey
+              ? baseDirectionKeyForCard
+              : (state.currentOppositeDirectionKey && state.currentOppositeDirectionKey !== resolvedKey
+                  ? state.currentOppositeDirectionKey
+                  : getOppositeDirection(resolvedKey) || baseDirectionKeyForCard);
+
+          if (reversedTargetKey && reversedTargetKey !== resolvedKey) {
+              card.dataset.oppositeDirectionKey = reversedTargetKey;
+          } else {
+              delete card.dataset.oppositeDirectionKey;
           }
-          card.dataset.oppositeDirectionKey = resolvedKey;
       } else {
-          if (!card.dataset.baseDirectionKey || card.dataset.baseDirectionKey !== resolvedKey) {
-              card.dataset.baseDirectionKey = resolvedKey;
-          }
-          if (state.currentOppositeDirectionKey) {
-              card.dataset.oppositeDirectionKey = state.currentOppositeDirectionKey;
+          card.dataset.baseDirectionKey = resolvedKey;
+          const forwardTargetKey = (oppositeAvailable || declaredOpposite)
+              ? (state.currentOppositeDirectionKey && state.currentOppositeDirectionKey !== resolvedKey
+                  ? state.currentOppositeDirectionKey
+                  : getOppositeDirection(resolvedKey))
+              : null;
+
+          if (forwardTargetKey && forwardTargetKey !== resolvedKey) {
+              card.dataset.oppositeDirectionKey = forwardTargetKey;
           } else {
               delete card.dataset.oppositeDirectionKey;
           }
       }
 
+      if (oppositeAvailable && card.dataset.oppositeDirectionKey) {
+          direction.hasOpposite = true;
+          direction.oppositeDirection = {
+              ...(direction.oppositeDirection || {}),
+              key: direction.oppositeDirection?.key || card.dataset.oppositeDirectionKey,
+              direction: direction.oppositeDirection?.direction || card.dataset.oppositeDirectionKey
+          };
+      } else if (declaredOpposite) {
+          direction.hasOpposite = true;
+          if (!direction.oppositeDirection && card.dataset.oppositeDirectionKey) {
+              direction.oppositeDirection = { key: card.dataset.oppositeDirectionKey };
+          }
+      } else {
+          direction.hasOpposite = false;
+          if (direction.oppositeDirection && !Array.isArray(direction.oppositeDirection.sampleTracks)) {
+              delete direction.oppositeDirection;
+          }
+      }
+
       const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
-      const hasOpposite = hasOppositeForDirection(direction, resolvedKey);
-      const wantsInteractiveReverse = hasOpposite && (card.classList.contains('next-track') || card.classList.contains('track-detail-card'));
-      const highlight = wantsInteractiveReverse ? (isNegative ? 'top' : 'bottom') : null;
+      const hasOpposite = declaredOpposite || oppositeAvailable;
+      const wantsInteractiveReverse = oppositeAvailable && (card.classList.contains('next-track') || card.classList.contains('track-detail-card'));
       card.dataset.directionType = directionType;
-      const intrinsicNegative = isNegative;
+      let maskIsNegative = isNegative;
 
       const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
       const currentIndex = sampleTracks.findIndex(sample => {
@@ -1959,16 +2057,15 @@ function helpersDuplicateLog(...args) {
       card.dataset.borderColor = borderColor;
       card.dataset.glowColor = glowColor;
 
-      const computeRimBackground = () => {
-          if (intrinsicNegative) {
-              return `conic-gradient(from 180deg, ${glowColor}, ${borderColor}, ${glowColor})`;
-          }
-          return `conic-gradient(${borderColor}, ${glowColor}, ${borderColor})`;
-      };
-
-      const applyRimBackground = (rimEl) => {
+      const applyNegativeMask = (mask) => {
+          card.classList.toggle('negative-direction', mask);
+          const rimEl = card.querySelector('.rim');
           if (!rimEl) return;
-          const rimStyle = computeRimBackground();
+          const rimBorder = card.dataset.borderColor || borderColor;
+          const rimGlow = card.dataset.glowColor || glowColor;
+          const rimStyle = mask
+              ? `conic-gradient(from 180deg, ${rimGlow}, ${rimBorder}, ${rimGlow})`
+              : `conic-gradient(${rimBorder}, ${rimGlow}, ${rimBorder})`;
           rimEl.style.background = rimStyle;
       };
 
@@ -1996,17 +2093,27 @@ function helpersDuplicateLog(...args) {
       `;
 
       card.innerHTML = newHTML;
+      card.dataset.directionKey = resolvedKey;
 
-      const shouldUseNegativeMask = intrinsicNegative;
-      card.classList.toggle('negative-direction', shouldUseNegativeMask);
+      applyNegativeMask(maskIsNegative);
 
-      applyRimBackground(card.querySelector('.rim'));
+      maskIsNegative = isNegativeDirection(card.dataset.directionKey || resolvedKey);
+      applyNegativeMask(maskIsNegative);
+      context.isNegative = maskIsNegative;
 
-      applyReverseBadge(card, direction, context, {
-          interactive: wantsInteractiveReverse,
-          highlightOverride: highlight,
-          extraClasses: wantsInteractiveReverse ? 'enabled' : 'has-opposite'
-      });
+      if (wantsInteractiveReverse) {
+          const highlight = maskIsNegative ? 'top' : 'bottom';
+          applyReverseBadge(card, direction, context, {
+              interactive: true,
+              highlightOverride: highlight,
+              extraClasses: 'enabled'
+          });
+      } else {
+          applyReverseBadge(card, direction, context, {
+              interactive: false,
+              extraClasses: 'has-opposite'
+          });
+      }
 
       const reverseButton = card.querySelector('.uno-reverse.next-track-reverse');
       if (reverseButton) {
@@ -2026,7 +2133,6 @@ function helpersDuplicateLog(...args) {
           });
       }
 
-      card.dataset.directionKey = resolvedKey;
       const stackIndex = Array.isArray(direction.sampleTracks)
           ? direction.sampleTracks.findIndex(sample => {
               const candidate = sample?.track || sample;
@@ -2045,7 +2151,13 @@ function helpersDuplicateLog(...args) {
           updateStackSizeIndicator(direction, card, stackIndex >= 0 ? stackIndex : undefined);
           updateDirectionKeyOverlay(direction, track);
           const numericIndex = Number(card.dataset.trackIndex ?? stackIndex ?? 0);
-          renderStackedPreviews(card, direction, Number.isFinite(numericIndex) ? numericIndex : 0);
+          const resolvedIndex = Number.isFinite(numericIndex) ? numericIndex : 0;
+          // TODO(deck-orchestration): Replace double rAF with orchestrated render once deck render pipeline is centralised.
+          requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                  renderStackedPreviews(card, direction, resolvedIndex);
+              });
+          });
       } else {
           card.style.marginLeft = '0px';
           if (typeof applyDirectionStackIndicator === 'function') {

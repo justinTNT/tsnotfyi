@@ -1,0 +1,27 @@
+{
+  "type": "heartbeat",
+  "timestamp": 1731889000000,
+  "reason": "status",
+  "fingerprint": null,
+  "currentTrack": {
+    "identifier": "ffffffffffffffffffffffffffffffff",
+    "title": null,
+    "artist": null,
+    "startTime": null,
+    "durationMs": 180000
+  },
+  "timing": {
+    "elapsedMs": 60000,
+    "remainingMs": 120000
+  },
+  "nextTrack": null,
+  "override": null,
+  "session": {
+    "id": "hallway_ephemeral",
+    "audioClients": 0,
+    "eventClients": 0
+  },
+  "drift": {
+    "currentDirection": null
+  }
+}
