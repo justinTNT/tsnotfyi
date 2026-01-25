@@ -7,7 +7,7 @@
 const http = require('http');
 const { URL } = require('url');
 
-const BASE_URL = 'http://localhost:3000'; // Adjust to your server port
+const BASE_URL = process.env.API_BASE_URL || 'http://mini.local:3001';
 
 class VAEAPITester {
     constructor(baseUrl = BASE_URL) {
@@ -88,6 +88,7 @@ class VAEAPITester {
                 return isReady;
             } else {
                 this.logTest('VAE status endpoint', false, `Status: ${response.status}`);
+                this.logTest(`Status: ${response.status}`, false );
                 return false;
             }
         } catch (error) {
@@ -142,6 +143,7 @@ class VAEAPITester {
                 this.logTest('VAE encode successful', true);
                 this.logTest('Latent vector returned', Array.isArray(latent) && latent.length === 8, `Length: ${latent?.length}`);
             } else {
+                this.logTest(`Status: ${response.status}, Data: ${JSON.stringify(response.data)}`, false);
                 this.logTest('VAE encode endpoint', false, `Status: ${response.status}, Data: ${JSON.stringify(response.data)}`);
             }
             
@@ -334,6 +336,10 @@ class VAEAPITester {
             }
             
         } catch (error) {
+console.dir("CAUGHT");
+console.dir(error.message);
+console.dir(error);
+            this.logTest(error.message, false, error.message);
             this.logTest('Enhanced existing endpoints', false, error.message);
         }
     }

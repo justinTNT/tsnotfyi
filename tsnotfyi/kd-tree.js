@@ -49,6 +49,46 @@ class KDTreeNode {
     }
 }
 
+function pruneEmptyStrings(value) {
+    if (value === null || value === undefined) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        return trimmed === '' ? undefined : trimmed;
+    }
+    if (Array.isArray(value)) {
+        const cleaned = value
+            .map(item => pruneEmptyStrings(item))
+            .filter(item => item !== undefined);
+        return cleaned;
+    }
+    if (typeof value === 'object') {
+        const result = {};
+        let hasValue = false;
+        Object.entries(value).forEach(([key, val]) => {
+            const sanitized = pruneEmptyStrings(val);
+            if (sanitized !== undefined) {
+                result[key] = sanitized;
+                hasValue = true;
+            }
+        });
+        return hasValue ? result : undefined;
+    }
+    return value;
+}
+
+function sanitizeMetadataObject(meta) {
+    if (!meta || typeof meta !== 'object') {
+        return null;
+    }
+    const cleaned = pruneEmptyStrings(meta);
+    if (!cleaned || (typeof cleaned === 'object' && Object.keys(cleaned).length === 0)) {
+        return null;
+    }
+    return cleaned;
+}
+
 class MusicalKDTree {
     constructor(connectionString = null) {
         this.connectionString = connectionString ||
@@ -274,6 +314,7 @@ class MusicalKDTree {
                 console.warn('⚠️ Failed to parse beets metadata for', row.identifier, err?.message || err);
                 meta = null;
             }
+            meta = sanitizeMetadataObject(meta);
 
             const artPath = meta?.album?.artpath?.length > 0 ? meta.album.artpath : '/images/albumcover.png';
 
@@ -587,29 +628,56 @@ class MusicalKDTree {
     }
 
     // Find musical neighborhood using PCA-based radial search with calibrated settings
-    pcaRadiusSearch(centerTrack, resolution = 'magnifying_glass', discriminator = 'primary_d', limit = 500) {
+    pcaRadiusSearch(centerTrack, resolution = 'magnifying_glass', discriminator = 'primary_d', limit = 500, overrideSettings = null) {
         if (!this.root) {
             throw new Error('KD-tree not initialized');
         }
 
-        const settings = this.calibrationSettings[resolution]?.[discriminator];
-        if (!settings) {
-            console.warn(`No calibration settings for ${resolution}/${discriminator}, falling back to defaults`);
-            // Increased fallback radius from 1.0 to 2.0 to ensure bidirectional pairs
-            return this.radiusSearch(centerTrack, 2.0, null, limit);
+        const resolveValue = (value, fallback) => (value !== undefined && value !== null ? value : fallback);
+
+        let rawSettings;
+        let applyScalingFactor = true;
+
+        if (overrideSettings) {
+            rawSettings = {
+                inner_radius: resolveValue(overrideSettings.inner_radius, resolveValue(overrideSettings.innerRadius, 0)),
+                outer_radius: resolveValue(overrideSettings.outer_radius, resolveValue(overrideSettings.outerRadius, resolveValue(overrideSettings.radius, null))),
+                scaling_factor: resolveValue(overrideSettings.scaling_factor, resolveValue(overrideSettings.scalingFactor, 1)),
+            };
+            applyScalingFactor = overrideSettings.applyScalingFactor === true;
+
+            if (!Number.isFinite(rawSettings.outer_radius) || rawSettings.outer_radius <= 0) {
+                console.warn(`⚠️ Override PCA radius missing/invalid outer radius for ${discriminator}; falling back to calibrated settings`);
+                rawSettings = null;
+            }
         }
 
-        // Use the stored scaling factor to adjust radii for unnormalized data
-        let adjustedSettings = settings;
-
-        if (settings.scaling_factor && settings.scaling_factor !== 1.0) {
-            console.log(`🔧 Applying stored scaling factor ${settings.scaling_factor.toFixed(1)}x for ${resolution}/${discriminator}`);
-
-            adjustedSettings = {
-                ...settings,
-                inner_radius: settings.inner_radius * settings.scaling_factor,
-                outer_radius: settings.outer_radius * settings.scaling_factor
+        if (!rawSettings) {
+            const calibrated = this.calibrationSettings[resolution]?.[discriminator];
+            if (!calibrated) {
+                console.warn(`No calibration settings for ${resolution}/${discriminator}, falling back to defaults`);
+                const fallbackRadius = resolveValue(overrideSettings && overrideSettings.fallbackRadius, 2.0);
+                return this.radiusSearch(centerTrack, fallbackRadius, null, limit);
+            }
+            rawSettings = {
+                inner_radius: calibrated.inner_radius,
+                outer_radius: calibrated.outer_radius,
+                scaling_factor: calibrated.scaling_factor || 1
             };
+            applyScalingFactor = true;
+        }
+
+        const adjustedSettings = {
+            inner_radius: resolveValue(rawSettings.inner_radius, 0),
+            outer_radius: resolveValue(rawSettings.outer_radius, 0.1)
+        };
+
+        const scalingFactor = resolveValue(rawSettings.scaling_factor, 1);
+
+        if (applyScalingFactor && scalingFactor && scalingFactor !== 1.0) {
+            console.log(`🔧 Applying stored scaling factor ${scalingFactor.toFixed(1)}x for ${resolution}/${discriminator}`);
+            adjustedSettings.inner_radius *= scalingFactor;
+            adjustedSettings.outer_radius *= scalingFactor;
         }
 
         const results = [];

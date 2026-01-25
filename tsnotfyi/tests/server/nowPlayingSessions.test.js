@@ -65,4 +65,14 @@ describe('buildNowPlayingSessions', () => {
     expect(result).toHaveLength(1);
     expect(result[0].isEphemeral).toBe(true);
   });
+
+  test('skips sessions without connected clients', () => {
+    const audioSessions = new Map([
+      ['session-empty', createSession({
+        mixer: createMixer({ clients: new Set() })
+      })]
+    ]);
+    const result = buildNowPlayingSessions(audioSessions, new Map());
+    expect(result).toHaveLength(0);
+  });
 });

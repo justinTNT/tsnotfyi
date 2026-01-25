@@ -1,928 +1,111 @@
-  // Global state like it's 1989!
-const STREAM_ENDPOINT_BASE = '/stream';
-const EVENTS_ENDPOINT_BASE = '/events';
+// Main page orchestrator - imports from all other modules
+import { state, elements, connectionHealth, audioHealth, rootElement, PANEL_VARIANTS, debugLog, getCardBackgroundColor, initializeElements } from './globals.js';
+import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
+import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
+import { renderBeetsSegments, hideBeetsSegments } from './beets-ui.js';
+import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
+import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, mergeTrackMetadata } from './explorer-utils.js';
+import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer, clearPendingExplorerLookahead, forceApplyPendingExplorerSnapshot } from './deck-state.js';
+import { setCardVariant, getDeckFrameBuilder, runDeckFrameBuild, initDeckRenderWorker, requestDeckRenderFrame, resolveTrackColorAssignment, cacheTrackColorAssignment } from './deck-render.js';
+import { exitDangerZoneVisualState, safelyExitCardsDormantState, enterDangerZoneVisualState, ensureDeckHydratedAfterTrackChange, enterCardsDormantState, exitCardsDormantState, ensureTrayPreviewForDangerZone, collapseDeckForDangerZone } from './danger-zone.js';
+import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, formatTimecode, startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, maybeApplyPendingTrackUpdate, getVisualProgressFraction } from './progress-ui.js';
+import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
+import { connectSSE } from './sse-client.js';
+import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, hideDirectionKeyOverlay, updateDirectionKeyOverlay, resolveOppositeBorderColor } from './helpers.js';
 
-const state = {
-    lastSSEMessageTime: null,
-    latestExplorerData: null,
-    latestCurrentTrack: null,
-    previousNextTrack: null,
-    serverNextTrack: null,
-    serverNextDirection: null,
-    lastDirectionSignature: null,
-    lastRefreshSummary: null,
-    usingOppositeDirection: false,
-    reversePreference: null,
-    lastSelectionGeneration: null,
-    journeyMode: true,
-    selectedIdentifier: null,
-    stackIndex: 0,
-    forceLayout: null,
-    isStarted: false,
-    progressAnimation: null,
-    heartbeatTimeout: null,
-    renderer: null,
-    camera: null,
-    scene: null,
-    baseDirectionKey: null,
-    currentOppositeDirectionKey: null,
-    sessionId: null,
-    streamFingerprint: null,
-    useMediaSource: false,
-    streamController: null,
-  streamUrl: STREAM_ENDPOINT_BASE,
-  eventsEndpoint: EVENTS_ENDPOINT_BASE,
-  currentResolution: 'magnifying',
-    manualNextTrackOverride: false,
-    nextTrackAnimationTimer: null,
-    manualNextDirectionKey: null,
-    playbackStartTimestamp: null,
-    playbackDurationSeconds: 0,
-    lastTrackUpdateTs: 0,
-    pendingInitialTrackTimer: null,
-    pendingResyncCheckTimer: null,
-    pendingAudioConfirmTimer: null,
-    creatingNewSession: false,
-    remainingCounts: {},
-    pendingManualTrackId: null,
-    pendingSnapshotTrackId: null,
-    awaitingSSE: false,
-    cardsDormant: false,
-    nextTrackPreviewTrackId: null,
-    skipTrayDemotionForTrack: null,
-    trayPreviewState: null,
-    trackMetadataCache: {},
-    trackColorAssignments: {},
-    nowPlayingSequence: 0,
-    lastNowPlayingIdentity: null,
-    nowPlayingInitialized: false,
-    pendingCenterPromotionKey: null,
-    pendingCenterPromotionOptions: null,
-    selectionRetryCount: 0,
-    selectionRetryTimer: null,
-    pendingSelectionUpdate: null,
-    skipNextExitAnimation: false,
-    hasRenderedDeck: false,
-    tailProgress: 0,
-    awaitingManualCard: false,
-    awaitingDirectionRefresh: false
-  };
-
-const DEFAULT_DEBUG_FLAGS = {
-  all: false,
-  deck: false,
-  duplicates: false,
-  colors: false,
-  consistency: false,
-  progress: false,
-  timing: false,
-  sse: false
-};
-
-const DEBUG_FLAGS = (() => {
-  if (typeof window !== 'undefined' && window.DEBUG_FLAGS) {
-    return { ...DEFAULT_DEBUG_FLAGS, ...window.DEBUG_FLAGS };
-  }
-  return { ...DEFAULT_DEBUG_FLAGS };
+(function hydrateStateFromLocation() {
+  state.streamUrlBase = '/stream';
+  state.eventsEndpointBase = '/events';
+  state.streamUrl = state.streamUrlBase;
+  state.eventsEndpoint = state.eventsEndpointBase;
+  window.streamUrl = state.streamUrl;
+  window.eventsUrl = state.eventsEndpoint;
 })();
-
-if (typeof window !== 'undefined') {
-  window.DEBUG_FLAGS = DEBUG_FLAGS;
-  window.setDebugFlags = function setDebugFlags(overrides = {}) {
-    if (!overrides || typeof overrides !== 'object') return;
-    Object.assign(DEBUG_FLAGS, overrides);
-    console.log('🛠 Debug flags updated', DEBUG_FLAGS);
-  };
-  window.getDebugFlags = function getDebugFlags() {
-    return { ...DEBUG_FLAGS };
-  };
-}
-
-function debugLog(channel, ...args) {
-  if (!channel) return;
-  if (DEBUG_FLAGS.all || DEBUG_FLAGS[channel]) {
-    console.log(`[${channel}]`, ...args);
-  }
-}
-
-
-const MEDIA_STREAM_SUPPORTED = Boolean(
-  window.MediaStreamController &&
-  typeof window.MediaStreamController.isSupported === 'function' &&
-  window.MediaStreamController.isSupported()
-);
-state.useMediaSource = MEDIA_STREAM_SUPPORTED;
-
-
-const PANEL_VARIANTS = ['red-variant', 'green-variant', 'yellow-variant', 'blue-variant'];
-const VARIANT_TO_DIRECTION_TYPE = {
-  'red-variant': 'rhythmic_core',
-  'green-variant': 'tonal_core',
-  'blue-variant': 'spectral_core',
-  'yellow-variant': 'outlier'
-};
-
-const CARD_BACKGROUND_BY_DIRECTION_TYPE = {
-  rhythmic_core: '#2a1818',
-  rhythmic_pca: '#2a1818',
-  tonal_core: '#182a1a',
-  tonal_pca: '#182a1a',
-  spectral_core: '#18222a',
-  spectral_pca: '#18222a',
-  outlier: '#2a1810'
-};
-
-function getReconnectDelay(attempt) {
-  const base = 1000, max = 30000;
-  const exponential = Math.min(base * Math.pow(2, attempt), max);
-  const jitter = Math.random * 1000;
-  return Math.min(base * Math.pow(2, attempt), max) + Math.random() * 1000;
-}
-
-function getCardBackgroundColor(directionType) {
-  return CARD_BACKGROUND_BY_DIRECTION_TYPE[directionType] || '#1b1b1b';
-}
-
-function setCardVariant(card, variant) {
-  if (!card) return;
-  if (variant) {
-    card.dataset.colorVariant = variant;
-  } else {
-    delete card.dataset.colorVariant;
-  }
-}
-
-function pickPanelVariant() {
-  return PANEL_VARIANTS[Math.floor(Math.random() * PANEL_VARIANTS.length)];
-}
-
-function normalizeDirectionKey(value, directionMap) {
-  const visited = new Set();
-
-  const resolveString = (candidate) => {
-    if (typeof candidate !== 'string') return null;
-    const trimmed = candidate.trim();
-    if (!trimmed) return null;
-
-    if (directionMap && typeof directionMap === 'object') {
-      if (Object.prototype.hasOwnProperty.call(directionMap, trimmed)) {
-        return trimmed;
-      }
-      for (const [key, direction] of Object.entries(directionMap)) {
-        if (!direction) continue;
-        if (
-          direction.direction === trimmed ||
-          direction.name === trimmed ||
-          direction.label === trimmed
-        ) {
-          return key;
-        }
-      }
-    }
-
-    if (trimmed.includes('_') || trimmed.includes('-')) {
-      return trimmed;
-    }
-
-    return null;
-  };
-
-  const helper = (candidate) => {
-    if (!candidate) return null;
-
-    if (typeof candidate === 'string') {
-      return resolveString(candidate);
-    }
-
-    if (typeof candidate === 'object') {
-      if (visited.has(candidate)) {
-        return null;
-      }
-      visited.add(candidate);
-
-      const propertiesToInspect = [
-        'directionKey',
-        'key',
-        'id',
-        'identifier',
-        'baseDirection',
-        'baseDirectionKey',
-        'dimensionKey',
-        'dimension',
-        'direction'
-      ];
-
-      for (const property of propertiesToInspect) {
-        if (Object.prototype.hasOwnProperty.call(candidate, property)) {
-          const result = helper(candidate[property]);
-          if (result) {
-            return result;
-          }
-        }
-      }
-    }
-
-    return null;
-  };
-
-  return helper(value);
-}
-
-function normalizeNextTrackPayload(nextTrack, directionMap) {
-  if (!nextTrack || typeof nextTrack !== 'object') {
-    return nextTrack;
-  }
-
-  const normalizedKey = normalizeDirectionKey(
-    nextTrack.directionKey || nextTrack.direction || nextTrack.stackDirection || null,
-    directionMap
-  );
-
-  if (normalizedKey) {
-    if (nextTrack.direction && typeof nextTrack.direction === 'object' && !nextTrack.directionMeta) {
-      nextTrack.directionMeta = nextTrack.direction;
-    }
-    nextTrack.directionKey = normalizedKey;
-    nextTrack.direction = normalizedKey;
-    if (nextTrack.track && typeof nextTrack.track === 'object') {
-      if (!nextTrack.track.directionKey) {
-        nextTrack.track.directionKey = normalizedKey;
-      }
-    }
-  }
-
-  return nextTrack;
-}
-
-function colorsForVariant(variant) {
-  const directionType = VARIANT_TO_DIRECTION_TYPE[variant] || 'outlier';
-  const colors = getDirectionColor(directionType, `${directionType}_positive`);
-  return {
-    border: colors.border,
-    glow: colors.glow
-  };
-}
-
-function extractNextTrackIdentifier(candidate) {
-  if (!candidate) {
-    return null;
-  }
-
-  if (typeof candidate === 'string') {
-    return candidate;
-  }
-
-  if (candidate.track) {
-    const nested = extractNextTrackIdentifier(candidate.track);
-    if (nested) {
-      return nested;
-    }
-  }
-
-  const keyOrder = ['trackMd5', 'track_md5', 'md5', 'identifier', 'id'];
-  for (const key of keyOrder) {
-    if (candidate[key]) {
-      return candidate[key];
-    }
-  }
-
-  return null;
-}
-
-function normalizeSampleTrack(sample) {
-  if (!sample) {
-      return null;
-  }
-
-  const raw = (sample && typeof sample === 'object' && 'track' in sample)
-      ? sample.track
-      : sample;
-  if (!raw || typeof raw !== 'object') {
-      return null;
-  }
-
-  const normalized = { ...raw };
-  const identifier = extractNextTrackIdentifier(normalized);
-  if (!identifier) {
-      return null;
-  }
-
-  if (!normalized.identifier) {
-      normalized.identifier = identifier;
-  }
-
-  return normalized;
-}
-
-function getTrackMetadataCache() {
-  if (!state.trackMetadataCache) {
-    state.trackMetadataCache = {};
-  }
-  return state.trackMetadataCache;
-}
-
-function mergeTrackMetadata(target, source) {
-  if (!target || !source || typeof target !== 'object' || typeof source !== 'object') {
-    return target;
-  }
-
-  Object.entries(source).forEach(([key, value]) => {
-    if (value === undefined || value === null) {
-      return;
-    }
-
-    if (key === 'features' && typeof value === 'object') {
-      target.features = target.features && typeof target.features === 'object'
-        ? { ...target.features, ...value }
-        : { ...value };
-      return;
-    }
-
-    if (key === 'pca' && typeof value === 'object') {
-      target.pca = target.pca && typeof target.pca === 'object'
-        ? { ...target.pca, ...value }
-        : { ...value };
-      return;
-    }
-
-    if (key === 'beetsMeta' || key === 'beets') {
-      target.beetsMeta = value;
-      return;
-    }
-
-    if (key === 'albumCover' && !value) {
-      return;
-    }
-
-    target[key] = value;
-  });
-
-  return target;
-}
-
-function applyTrackDetailsToExplorer(identifier, details) {
-  if (!identifier || !details || !state.latestExplorerData) {
-    return;
-  }
-
-  const mergeIntoSample = (sample) => {
-    if (!sample) return;
-    const target = sample.track || sample;
-    if (target && (target.identifier === identifier || target.trackMd5 === identifier || target.md5 === identifier)) {
-      mergeTrackMetadata(target, details);
-    }
-  };
-
-  const directions = state.latestExplorerData.directions || {};
-  Object.values(directions).forEach(direction => {
-    if (!direction) return;
-    (direction.sampleTracks || []).forEach(mergeIntoSample);
-    if (direction.oppositeDirection && Array.isArray(direction.oppositeDirection.sampleTracks)) {
-      direction.oppositeDirection.sampleTracks.forEach(mergeIntoSample);
-    }
-  });
-
-  const nextTrack = state.latestExplorerData.nextTrack;
-  if (nextTrack) {
-    if (nextTrack.identifier === identifier) {
-      mergeTrackMetadata(nextTrack, details);
-    }
-    if (nextTrack.track && nextTrack.track.identifier === identifier) {
-      mergeTrackMetadata(nextTrack.track, details);
-    }
-  }
-
-  if (state.previousNextTrack && state.previousNextTrack.identifier === identifier) {
-    mergeTrackMetadata(state.previousNextTrack, details);
-  }
-
-  if (state.latestCurrentTrack && state.latestCurrentTrack.identifier === identifier) {
-    mergeTrackMetadata(state.latestCurrentTrack, details);
-  }
-}
-
-function hydrateTrackDetails(trackOrIdentifier, options = {}) {
-  const identifier = typeof trackOrIdentifier === 'string'
-    ? trackOrIdentifier
-    : (trackOrIdentifier && (trackOrIdentifier.identifier || trackOrIdentifier.trackMd5 || trackOrIdentifier.md5));
-
-  if (!identifier) {
-    return Promise.resolve(null);
-  }
-
-  const cache = getTrackMetadataCache();
-  const entry = cache[identifier] || (cache[identifier] = { id: identifier, meta: null, details: null, promise: null });
-
-  if (entry.details) {
-    if (trackOrIdentifier && typeof trackOrIdentifier === 'object') {
-      mergeTrackMetadata(trackOrIdentifier, entry.details);
-    }
-    applyTrackDetailsToExplorer(identifier, entry.details);
-    if (entry.details.beetsMeta && state.selectedIdentifier === identifier) {
-      renderBeetsSegments(entry.details);
-    }
-    return Promise.resolve(entry.details);
-  }
-
-  if (entry.promise) {
-    return entry.promise.then(details => {
-      if (details && trackOrIdentifier && typeof trackOrIdentifier === 'object') {
-        mergeTrackMetadata(trackOrIdentifier, details);
-      }
-      return details;
-    }).catch(() => null);
-  }
-
-  const fetchPromise = fetch(`/track/${encodeURIComponent(identifier)}/meta`)
-    .then(response => {
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      return response.json();
-    })
-    .then(result => {
-      const payload = result?.track || null;
-      if (!payload) {
-        return null;
-      }
-
-      entry.details = payload;
-      if (payload.beetsMeta && !entry.meta) {
-        entry.meta = payload.beetsMeta;
-      }
-
-      if (trackOrIdentifier && typeof trackOrIdentifier === 'object') {
-        mergeTrackMetadata(trackOrIdentifier, payload);
-      }
-      applyTrackDetailsToExplorer(identifier, payload);
-
-      if (payload.beetsMeta && state.selectedIdentifier === identifier) {
-        renderBeetsSegments(payload);
-      }
-
-      return payload;
-    })
-    .catch(error => {
-      console.warn('⚠️ Failed to hydrate track metadata:', error);
-      return null;
-    })
-    .finally(() => {
-      entry.promise = null;
-    });
-
-  entry.promise = fetchPromise;
-  return fetchPromise;
-}
-
-if (typeof window !== 'undefined') {
-  window.hydrateTrackDetails = hydrateTrackDetails;
-}
-
-function extractTrackFromCard(card, trackId = null) {
-    if (!card) {
-        return null;
-    }
-
-    const identifier = trackId
-        || card.dataset.trackMd5
-        || card.dataset.trackIdentifier
-        || null;
-    if (!identifier) {
-        return null;
-    }
-
-    const durationSeconds = Number(card.dataset.trackDurationSeconds);
-    let albumCover = card.dataset.trackAlbumCover || null;
-    if (!albumCover) {
-        const photoEl = card.querySelector('.photo');
-        if (photoEl) {
-            const inlineBackground = photoEl.style.background || '';
-            const match = inlineBackground.match(/url\(['"]?(.*?)['"]?\)/i);
-            if (match && match[1]) {
-                albumCover = match[1];
-            }
-        }
-    }
-
-    return {
-        identifier,
-        title: card.dataset.trackTitle || '',
-        artist: card.dataset.trackArtist || '',
-        album: card.dataset.trackAlbum || '',
-        duration: Number.isFinite(durationSeconds) ? durationSeconds : undefined,
-        albumCover: albumCover || undefined,
-        directionKey: card.dataset.directionKey || undefined
-    };
-}
-
-function safelyExitCardsDormantState(options = {}) {
-    if (typeof exitCardsDormantState === 'function') {
-        exitCardsDormantState(options);
-    }
-}
-
-function extractNextTrackDirection(candidate, directionMap) {
-  if (!candidate) {
-    return null;
-  }
-
-  if (candidate.track) {
-    const nested = extractNextTrackDirection(candidate.track, directionMap);
-    if (nested) {
-      return nested;
-    }
-  }
-
-  const keyOrder = ['directionKey', 'direction', 'key', 'baseDirection'];
-  for (const key of keyOrder) {
-    if (Object.prototype.hasOwnProperty.call(candidate, key)) {
-      const normalized = normalizeDirectionKey(candidate[key], directionMap);
-      if (normalized) {
-        return normalized;
-      }
-    }
-  }
-
-  return null;
-}
-
-function cacheTrackColorAssignment(trackId, info) {
-  if (!trackId || !info) {
-    return info || null;
-  }
-  state.trackColorAssignments = state.trackColorAssignments || {};
-  const key = info.directionKey || '__default__';
-  const store = state.trackColorAssignments[trackId] || {};
-  store[key] = {
-    variant: info.variant,
-    border: info.border,
-    glow: info.glow,
-    directionKey: info.directionKey || null
-  };
-  store.__last = store[key];
-  state.trackColorAssignments[trackId] = store;
-  return store[key];
-}
-
-function resolveTrackColorAssignment(trackData, { directionKey } = {}) {
-  if (!trackData || !trackData.identifier) {
-    return null;
-  }
-
-  const trackId = trackData.identifier;
-  const store = state.trackColorAssignments?.[trackId] || null;
-  const keyForLookup = directionKey || null;
-  const existing = keyForLookup && store ? store[keyForLookup] : null;
-  const fallbackExisting = !existing && store
-    ? (store.__last || Object.values(store).find(entry => entry && entry.directionKey))
-    : existing;
-
-  let resolvedDirectionKey = directionKey || existing?.directionKey || fallbackExisting?.directionKey || null;
-
-  if (!resolvedDirectionKey) {
-    const explorerMatch = findTrackInExplorer(state.latestExplorerData, trackId);
-    if (explorerMatch?.directionKey) {
-      resolvedDirectionKey = explorerMatch.directionKey;
-    }
-  }
-
-  if (!resolvedDirectionKey && state.serverNextTrack === trackId && state.serverNextDirection) {
-    resolvedDirectionKey = state.serverNextDirection;
-  }
-
-  if (!resolvedDirectionKey && state.previousNextTrack?.identifier === trackId) {
-    resolvedDirectionKey = state.previousNextTrack.directionKey || null;
-  }
-
-  if (existing && (!resolvedDirectionKey || existing.directionKey === resolvedDirectionKey)) {
-    return existing;
-  }
-
-  if (fallbackExisting && !resolvedDirectionKey) {
-    return fallbackExisting;
-  }
-
-  let assignment;
-
-  if (resolvedDirectionKey) {
-    const directionType = getDirectionType(resolvedDirectionKey);
-    const colors = getDirectionColor(directionType, resolvedDirectionKey);
-    assignment = {
-      variant: variantFromDirectionType(directionType),
-      border: colors.border,
-      glow: colors.glow,
-      directionKey: resolvedDirectionKey
-    };
-  } else {
-    const variant = pickPanelVariant();
-    const colors = colorsForVariant(variant);
-    assignment = {
-      variant,
-      border: colors.border,
-      glow: colors.glow,
-      directionKey: null
-    };
-  }
-
-  return cacheTrackColorAssignment(trackId, assignment);
-}
-
-function computeDirectionSignature(explorerData) {
-  if (!explorerData) return null;
-
-  const directions = explorerData.directions || {};
-  const entries = Object.keys(directions).sort().map((key) => {
-    const direction = directions[key] || {};
-    const primaryIds = (direction.sampleTracks || [])
-      .map(sample => (sample.track || sample)?.identifier || '?')
-      .join(',');
-    const oppositeIds = direction.oppositeDirection
-      ? (direction.oppositeDirection.sampleTracks || [])
-          .map(sample => (sample.track || sample)?.identifier || '?')
-          .join(',')
-      : '';
-    const trackCount = direction.trackCount || (direction.sampleTracks || []).length;
-    const descriptor = direction.direction || '';
-    return `${key}|${trackCount}|${descriptor}|${primaryIds}|${oppositeIds}`;
-  });
-
-  const nextTrack = explorerData.nextTrack || {};
-  const nextIdentifier = nextTrack.track?.identifier || nextTrack.identifier || '';
-  const nextDirection = nextTrack.directionKey || nextTrack.direction || '';
-
-  return `${nextDirection}::${nextIdentifier}::${entries.join('||')}`;
-}
-
-function deckLog(...args) {
-  debugLog('deck', ...args);
-}
-
-function duplicateLog(...args) {
-  debugLog('duplicates', ...args);
-}
-
-function colorLog(...args) {
-  debugLog('colors', ...args);
-}
 
 const RADIUS_MODES = ['microscope', 'magnifying', 'binoculars'];
 
-function explorerContainsTrack(explorerData, identifier) {
-  if (!explorerData || !identifier) return false;
+// Explorer track lookup functions moved to explorer-utils.js
 
-  const nextTrack = explorerData.nextTrack;
-  if (nextTrack) {
-    const candidate = nextTrack.track || nextTrack;
-    if (candidate && candidate.identifier === identifier) {
-      return true;
-    }
+function getTrayPreviewElement() {
+  if (elements.nextTrackTrayPreview && elements.nextTrackTrayPreview.isConnected) {
+    return elements.nextTrackTrayPreview;
   }
-
-  const directions = explorerData.directions || {};
-  for (const direction of Object.values(directions)) {
-    const samples = direction?.sampleTracks || [];
-    for (const sample of samples) {
-      const track = sample.track || sample;
-      if (track?.identifier === identifier) {
-        return true;
-      }
-    }
-
-    const opposite = direction?.oppositeDirection;
-    if (opposite && Array.isArray(opposite.sampleTracks)) {
-      for (const sample of opposite.sampleTracks) {
-        const track = sample.track || sample;
-        if (track?.identifier === identifier) {
-          return true;
-        }
-      }
-    }
+  const resolved = document.querySelector('#nextTrackTray .next-track-tray-preview');
+  if (resolved) {
+    elements.nextTrackTrayPreview = resolved;
   }
-
-  return false;
+  return resolved;
 }
 
-function findTrackInExplorer(explorerData, identifier) {
-  if (!explorerData || !identifier) return null;
-
-  const directions = explorerData.directions || {};
-
-  const considerSamples = (directionKey, direction) => {
-    if (!direction) return null;
-    const samples = direction.sampleTracks || [];
-    for (const sample of samples) {
-      const track = sample?.track || sample;
-      if (track?.identifier === identifier) {
-        return { directionKey, track };
-      }
-    }
-    return null;
-  };
-
-  for (const [key, direction] of Object.entries(directions)) {
-    const match = considerSamples(key, direction);
-    if (match) return match;
-
-    if (direction?.oppositeDirection) {
-      const oppositeKey = direction.oppositeDirection.key || getOppositeDirection(key);
-      const oppositeMatch = considerSamples(oppositeKey || key, direction.oppositeDirection);
-      if (oppositeMatch) return oppositeMatch;
-    }
-  }
-
-  const nextTrack = explorerData.nextTrack?.track || explorerData.nextTrack;
-  if (nextTrack?.identifier === identifier) {
-    const directionKeyRaw = explorerData.nextTrack?.directionKey || explorerData.nextTrack?.direction || null;
-    const resolvedDirectionKey = normalizeDirectionKey(directionKeyRaw, explorerData.directions);
-    return {
-      directionKey: resolvedDirectionKey || directionKeyRaw || null,
-      track: nextTrack
-    };
-  }
-
-  return null;
-}
-
-function reapplyManualOverrideToExplorerData(explorerData, manualTrackId, manualDirectionKey, fallbackExplorerData = null, fallbackTrack = null) {
-  if (!explorerData || !manualTrackId) return;
-
-  let match = findTrackInExplorer(explorerData, manualTrackId);
-  if (!match && fallbackExplorerData) {
-    match = findTrackInExplorer(fallbackExplorerData, manualTrackId);
-  }
-
-  let trackRecord = match?.track ? { ...match.track } : null;
-  if (!trackRecord && fallbackTrack) {
-    const candidate = fallbackTrack.track || fallbackTrack;
-    trackRecord = candidate ? { ...candidate } : null;
-  }
-
-  if (!trackRecord) {
-    trackRecord = { identifier: manualTrackId };
-  }
-
-  const directionCandidate =
-    manualDirectionKey ||
-    match?.directionKey ||
-    (fallbackTrack?.directionKey ?? null) ||
-    explorerData.nextTrack?.directionKey ||
-    explorerData.nextTrack?.direction ||
-    null;
-
-  const resolvedDirectionKey =
-    normalizeDirectionKey(directionCandidate, explorerData.directions) ||
-    directionCandidate ||
-    manualDirectionKey ||
-    match?.directionKey ||
-    null;
-
-  explorerData.nextTrack = {
-    directionKey: resolvedDirectionKey,
-    direction: resolvedDirectionKey,
-    track: {
-      ...trackRecord,
-      identifier: manualTrackId
-    }
-  };
-
-  if (resolvedDirectionKey && explorerData.directions) {
-    const targetDirection = explorerData.directions[resolvedDirectionKey];
-    let samplesContainer = targetDirection?.sampleTracks;
-    if (!Array.isArray(samplesContainer)) {
-      samplesContainer = [];
-    }
-    const alreadyPresent = samplesContainer.some(sample => {
-      const candidate = sample?.track || sample;
-      return candidate?.identifier === manualTrackId;
-    });
-    if (!alreadyPresent) {
-      const sampleEntry = trackRecord.track ? { ...trackRecord } : { track: { ...trackRecord } };
-      if (!sampleEntry.track) {
-        sampleEntry.track = { ...trackRecord };
-      }
-      sampleEntry.track.identifier = manualTrackId;
-      samplesContainer.unshift(sampleEntry);
-      explorerData.directions[resolvedDirectionKey] = {
-        ...(targetDirection || {}),
-        sampleTracks: samplesContainer
-      };
-    }
-  }
-}
-
-function normalizeResolution(resolution) {
-  if (!resolution) return null;
-  const value = resolution.toLowerCase();
-  if (value === 'magnifying_glass' || value === 'magnifying') {
-    return 'magnifying';
-  }
-  if (value === 'microscope' || value === 'binoculars') {
-    return value;
-  }
-  return value;
-}
-
-function composeStreamEndpoint(fingerprint, cacheBust = false) {
-  const base = STREAM_ENDPOINT_BASE;
-  const params = [];
-  if (fingerprint) {
-    params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
-  }
-  if (cacheBust !== false) {
-    const value = cacheBust === true ? Date.now() : cacheBust;
-    params.push(`t=${value}`);
-  }
-  if (!params.length) {
-    return base;
-  }
-  return `${base}?${params.join('&')}`;
-}
-
-function composeEventsEndpoint(fingerprint) {
-  const base = EVENTS_ENDPOINT_BASE;
-  if (!fingerprint) {
-    return base;
-  }
-  return `${base}?fingerprint=${encodeURIComponent(fingerprint)}`;
-}
-
-function syncStreamEndpoint(fingerprint, { cacheBust = false } = {}) {
-  const url = composeStreamEndpoint(fingerprint, cacheBust);
-  state.streamUrl = url;
-  return url;
-}
-
-function syncEventsEndpoint(fingerprint) {
-  const url = composeEventsEndpoint(fingerprint);
-  state.eventsEndpoint = url;
-  return url;
-}
-
-const fingerprintWaiters = [];
-let nextTrackPreviewFadeTimer = null;
-
-function notifyFingerprintWaiters() {
-  if (!fingerprintWaiters.length) {
+function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
+  const immediate = options.immediate === true;
+  if (!card) {
+    onComplete();
     return;
   }
 
-  const waiters = fingerprintWaiters.splice(0, fingerprintWaiters.length);
-  for (const entry of waiters) {
-    clearTimeout(entry.timer);
-    entry.resolve(true);
-  }
-}
+  state.skipNextExitAnimation = true;
 
-function applyFingerprint(fingerprint) {
-  if (!fingerprint) {
+  if (typeof clearStackedPreviewLayer === 'function') {
+    clearStackedPreviewLayer();
+  }
+
+  const skipTargetId = state.skipTrayDemotionForTrack || null;
+  const datasetTrackId = card.dataset.trackMd5 || card.dataset.trackIdentifier || null;
+  if (skipTargetId && datasetTrackId && skipTargetId === datasetTrackId) {
+    state.skipTrayDemotionForTrack = null;
+    card.remove();
+    onComplete();
     return;
   }
 
-  state.streamFingerprint = fingerprint;
-  syncEventsEndpoint(fingerprint);
-  notifyFingerprintWaiters();
-}
-
-function clearFingerprint({ reason = 'unknown' } = {}) {
-  if (state.streamFingerprint) {
-    console.log(`🧹 Clearing fingerprint (${reason})`);
+  if (immediate) {
+    card.remove();
+    onComplete();
+    return;
   }
 
-  state.streamFingerprint = null;
-  syncEventsEndpoint(null);
-  syncStreamEndpoint(null, { cacheBust: false });
-}
+  card.classList.add('card-exit');
+  card.style.pointerEvents = 'none';
+  card.style.willChange = 'transform, opacity';
+  card.style.transition = 'transform 0.45s cubic-bezier(0.18, 0.8, 0.3, 1), opacity 0.4s ease';
 
-function waitForFingerprint(timeoutMs = 8000) {
-  if (state.streamFingerprint) {
-    return Promise.resolve(true);
-  }
-
-  return new Promise((resolve) => {
-    const entry = {
-      resolve,
-      timer: null
-    };
-
-    entry.timer = setTimeout(() => {
-      const index = fingerprintWaiters.indexOf(entry);
-      if (index !== -1) {
-        fingerprintWaiters.splice(index, 1);
-      }
-      resolve(false);
-    }, timeoutMs);
-
-    fingerprintWaiters.push(entry);
+  requestAnimationFrame(() => {
+    card.style.transform = 'translate(-50%, -50%) translateZ(-900px) scale(0.45)';
+    card.style.opacity = '0';
   });
+
+  const cleanup = () => {
+    card.removeEventListener('transitionend', handler);
+    if (card.parentElement) {
+      card.parentElement.removeChild(card);
+    }
+    onComplete();
+  };
+
+  const handler = (event) => {
+    if (event.target === card) {
+      cleanup();
+    }
+  };
+
+  card.addEventListener('transitionend', handler);
+  setTimeout(() => {
+    if (card.parentElement) {
+      cleanup();
+    }
+  }, 500);
 }
+
+// Fingerprint/session utilities moved to session-utils.js
+
+let nextTrackPreviewFadeTimer = null;
 
   function updateNowPlayingCard(trackData, driftState) {
       state.latestCurrentTrack = trackData;
       window.state = window.state || {};
       window.state.latestCurrentTrack = trackData;
       state.lastTrackUpdateTs = Date.now();
-
-      hydrateTrackDetails(trackData, { reason: 'now-playing' }).catch(() => {});
 
       if (state.pendingResyncCheckTimer) {
         clearTimeout(state.pendingResyncCheckTimer);
@@ -987,75 +170,69 @@ function waitForFingerprint(timeoutMs = 8000) {
       state.lastNowPlayingIdentity = trackIdentity;
       state.nowPlayingInitialized = true;
 
-      if (identityChanged) {
-          applyTailProgress(0);
-          midpointReached = false;
-          cardsLocked = false;
-          state.cardsDormant = false;
-          safelyExitCardsDormantState({ immediate: true });
-          const currentTrackId = trackData.identifier || trackData.trackMd5 || trackData.md5 || null;
-      }
-
       let assignment = null;
 
-      if (state.previousNextTrack?.identifier === trackId) {
-          const prior = state.previousNextTrack;
-          const directionMatches = prior.directionKey && currentDirectionKey
-              ? prior.directionKey === currentDirectionKey
-              : true;
-          if (directionMatches && prior.variant && prior.borderColor && prior.glowColor) {
-              assignment = {
-                  variant: prior.variant,
-                  border: prior.borderColor,
-                  glow: prior.glowColor,
-                  directionKey: prior.directionKey || currentDirectionKey || null
-              };
+      if (isFirstTrack) {
+          if (panel) {
+              PANEL_VARIANTS.forEach(v => panel.classList.remove(v));
+              panel.style.setProperty('--border-color', '#ffffff');
+              panel.style.setProperty('--glow-color', '#ffffff');
           }
-      }
+          if (rim) {
+              rim.style.background = '#ffffff';
+              rim.style.boxShadow = '0 0 18px rgba(255, 255, 255, 0.35)';
+          }
+          if (cardFrame) {
+              cardFrame.style.setProperty('--card-background', '#ffffff');
+              cardFrame.style.setProperty('--card-border-color', '#ffffff');
+          }
+      } else {
+          if (state.previousNextTrack?.identifier === trackId) {
+              const prior = state.previousNextTrack;
+              const directionMatches = prior.directionKey && currentDirectionKey
+                  ? prior.directionKey === currentDirectionKey
+                  : true;
+              if (directionMatches && prior.variant && prior.borderColor && prior.glowColor) {
+                  assignment = {
+                      variant: prior.variant,
+                      border: prior.borderColor,
+                      glow: prior.glowColor,
+                      directionKey: prior.directionKey || currentDirectionKey || null
+                  };
+              }
+          }
 
-      if (!assignment) {
-          assignment = resolveTrackColorAssignment(trackData, { directionKey: currentDirectionKey || assignment?.directionKey || null });
-      }
+          if (!assignment) {
+              assignment = resolveTrackColorAssignment(trackData, { directionKey: currentDirectionKey || assignment?.directionKey || null });
+          } else if (trackId) {
+              cacheTrackColorAssignment(trackId, assignment);
+          }
 
-      if (trackId && assignment) {
-          cacheTrackColorAssignment(trackId, assignment);
-      }
+          if (panel && assignment) {
+              PANEL_VARIANTS.forEach(v => panel.classList.remove(v));
+              panel.classList.add(assignment.variant);
+              panel.style.setProperty('--border-color', assignment.border);
+              panel.style.setProperty('--glow-color', assignment.glow);
+          }
 
-      if (!assignment) {
-          const fallbackVariant = variantFromDirectionType(getDirectionType(currentDirectionKey));
-          const fallbackColors = colorsForVariant(fallbackVariant);
-          assignment = {
-              variant: fallbackVariant,
-              border: fallbackColors.border,
-              glow: fallbackColors.glow,
-              directionKey: currentDirectionKey || null
-          };
-      }
+          if (cardFrame && assignment) {
+              cardFrame.style.setProperty('--card-background', assignment.border);
+              cardFrame.style.setProperty('--card-border-color', assignment.border);
+          }
 
-      if (panel && assignment) {
-          PANEL_VARIANTS.forEach(v => panel.classList.remove(v));
-          panel.classList.add(assignment.variant);
-          panel.style.setProperty('--border-color', assignment.border);
-          panel.style.setProperty('--glow-color', assignment.glow);
-      }
+          if (rim && assignment) {
+              rim.style.background = assignment.border;
+              rim.style.boxShadow = `0 0 15px rgba(255, 255, 255, 0.18), 0 0 30px ${assignment.glow}, 0 0 45px ${assignment.glow}`;
+          }
 
-      if (cardFrame && assignment) {
-          cardFrame.style.setProperty('--card-background', assignment.border);
-          cardFrame.style.setProperty('--card-border-color', assignment.border);
-      }
-
-      if (rim && assignment) {
-          rim.style.background = assignment.border;
-          rim.style.boxShadow = `0 0 15px rgba(255, 255, 255, 0.18), 0 0 30px ${assignment.glow}, 0 0 45px ${assignment.glow}`;
-      }
-
-      if (assignment) {
-          state.previousNextTrack = state.previousNextTrack || {};
-          if (state.previousNextTrack.identifier === trackId) {
-              state.previousNextTrack.borderColor = assignment.border;
-              state.previousNextTrack.glowColor = assignment.glow;
-              state.previousNextTrack.variant = assignment.variant;
-              state.previousNextTrack.directionKey = assignment.directionKey || currentDirectionKey || state.previousNextTrack.directionKey || null;
+          if (assignment) {
+              state.previousNextTrack = state.previousNextTrack || {};
+              if (state.previousNextTrack.identifier === trackId) {
+                  state.previousNextTrack.borderColor = assignment.border;
+                  state.previousNextTrack.glowColor = assignment.glow;
+                  state.previousNextTrack.variant = assignment.variant;
+                  state.previousNextTrack.directionKey = assignment.directionKey || currentDirectionKey || state.previousNextTrack.directionKey || null;
+              }
           }
       }
 
@@ -1076,16 +253,7 @@ function waitForFingerprint(timeoutMs = 8000) {
 
       // Show card with zoom-in animation
       const card = document.getElementById('nowPlayingCard');
-      if (card) {
-          card.classList.add('visible');
-      }
-
-      applyMetadataOpacity(1);
-      state.awaitingManualCard = false;
-
-      if (typeof tryFlushPendingCenterPromotion === 'function') {
-          tryFlushPendingCenterPromotion();
-      }
+      card.classList.add('visible');
   }
 
 
@@ -1104,8 +272,7 @@ function updateRadiusControlsUI() {
   });
 }
 
-async function triggerZoomMode(mode) {
-  const previousResolution = normalizeResolution(state.currentResolution) || 'magnifying';
+function triggerZoomMode(mode) {
   const normalizedMode = normalizeResolution(mode) || 'magnifying';
 
   state.currentResolution = normalizedMode;
@@ -1113,37 +280,26 @@ async function triggerZoomMode(mode) {
 
   const endpointMode = normalizedMode === 'magnifying' ? 'magnifying' : normalizedMode;
 
-  try {
-    const response = await fetch(`/session/zoom/${endpointMode}`, {
-      method: 'POST'
-    });
-
+  fetch(`/session/zoom/${endpointMode}`, {
+    method: 'POST'
+  }).then(response => {
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
-
-    const result = await response.json().catch(() => ({}));
+    return response.json().catch(() => ({}));
+  }).then(result => {
     const returnedResolution = normalizeResolution(result.resolution) || normalizedMode;
-
     state.currentResolution = returnedResolution;
     state.manualNextTrackOverride = false;
-    state.skipTrayDemotionForTrack = null;
     state.manualNextDirectionKey = null;
     state.pendingManualTrackId = null;
     updateRadiusControlsUI();
-
     if (typeof rejig === 'function') {
       rejig();
     }
-
-    await requestSSERefresh({ escalate: false, stage: 'zoom-change' });
-    return true;
-  } catch (error) {
+  }).catch(error => {
     console.error('Zoom request failed:', error);
-    state.currentResolution = previousResolution;
-    updateRadiusControlsUI();
-    return false;
-  }
+  });
 }
 
 function setupRadiusControls() {
@@ -1172,82 +328,54 @@ async function initializeApp() {
 
   console.log('🆔 Audio-first session management');
 
-  // Connection health management
-  const connectionHealth = {
-    sse: {
-      status: 'connecting',
-      lastMessage: Date.now(),
-      reconnectAttempts: 0,
-      reconnectDelay: 2000,
-      maxReconnectDelay: 30000,
-      stuckTimeout: null,
-    },
-    audio: {
-      status: 'connecting',
-      reconnectAttempts: 0,
-      reconnectDelay: 2000,
-      maxReconnectDelay: 30000,
-      maxAttempts: 10,
-    },
-    currentEventSource: null,
-  };
+  // Initialize DOM element references (connectionHealth, audioHealth, elements defined in globals.js)
+  initializeElements();
 
-  // Update connection health UI
-  function updateConnectionHealthUI() {
-    const healthIndicator = document.getElementById('connectionHealth');
-    const sseStatus = document.getElementById('sseStatus');
-    const audioStatus = document.getElementById('audioStatus');
+  // Setup audio manager callbacks (functions now in separate modules)
+  setAudioCallbacks({
+    connectSSE,
+    maybeApplyPendingTrackUpdate,
+    startProgressAnimationFromPosition,
+    clearPendingProgressStart,
+    verifyExistingSessionOrRestart,
+    createNewJourneySession,
+    clearFingerprint,
+    composeStreamEndpoint,
+    fullResync
+  });
 
-    if (!healthIndicator) return;
+  // Initialize audio manager (attaches event listeners, sets up health monitoring)
+  initializeAudioManager();
 
-    // Update status text
-    if (sseStatus) sseStatus.textContent = connectionHealth.sse.status;
-    if (audioStatus) audioStatus.textContent = connectionHealth.audio.status;
+  // Reset connection health timestamps on app init
+  connectionHealth.sse.lastMessage = Date.now();
 
-    // Determine overall health
-    const sseOk = connectionHealth.sse.status === 'connected';
-    const audioOk = connectionHealth.audio.status === 'connected';
+  let lastProgressPhase = null;
 
-    healthIndicator.classList.remove('healthy', 'degraded', 'error');
+  // Setup beets hover interaction
+  if (elements.nowPlayingCard && elements.beetsSegments) {
+      const showBeets = () => {
+          if (elements.beetsSegments.dataset.hasData === 'true') {
+              elements.beetsSegments.classList.remove('hidden');
+          }
+      };
 
-    if (sseOk && audioOk) {
-      healthIndicator.classList.add('healthy');
-    } else if (sseOk || audioOk) {
-      healthIndicator.classList.add('degraded');
-    } else {
-      healthIndicator.classList.add('error');
-    }
+      const hideBeets = () => {
+          elements.beetsSegments.classList.add('hidden');
+      };
+
+      elements.nowPlayingCard.addEventListener('mouseenter', showBeets);
+      elements.nowPlayingCard.addEventListener('mouseleave', hideBeets);
+      elements.nowPlayingCard.addEventListener('focus', showBeets, true);
+      elements.nowPlayingCard.addEventListener('blur', hideBeets, true);
+
+      elements.beetsSegments.addEventListener('mouseenter', showBeets);
+      elements.beetsSegments.addEventListener('mouseleave', hideBeets);
   }
 
-  const audioHealth = {
-    lastTimeUpdate: null,
-    bufferingStarted: null,
-    isHealthy: false,
-    checkInterval: null,
-    handlingRestart: false,
-    lastObservedTime: 0,
-    stallTimer: null
-  };
-
-  const LOCKOUT_THRESHOLD_SECONDS = 30;
-  const TAIL_LOCK_THRESHOLD = 0.75;
-  const METADATA_FADE_WINDOW_SECONDS = 30;
-
-  const elements = {
-	  clickCatcher:        document.getElementById('clickCatcher'),
-          volumeControl:       document.getElementById('volumeControl'),
-          volumeBar:           document.getElementById('volumeBar'),
-          fullscreenProgress:  document.getElementById('fullscreenProgress'),
-	  progressWipe:        document.getElementById('progressWipe'),
-          audio:               document.getElementById('audio'),
-          playbackClock:       document.getElementById('playbackClock'),
-          nowPlayingCard:      document.getElementById('nowPlayingCard'),
-          dimensionCards:      document.getElementById('dimensionCards'),
-          nextTrackTray:       document.getElementById('nextTrackTray'),
-          nextTrackTrayPreview: document.querySelector('#nextTrackTray .next-track-tray-preview'),
-          beetsSegments:       document.getElementById('beetsSegments')
+  if (elements.beetsSegments) {
+      elements.beetsSegments.dataset.hasData = elements.beetsSegments.dataset.hasData || 'false';
   }
-  elements.audio.volume = 0.85;
 
   function ensureBaseOpacity(node) {
       if (!node) {
@@ -1255,7 +383,9 @@ async function initializeApp() {
       }
       const dataset = node.dataset || {};
       if (!dataset.baseOpacity) {
-          const computedOpacity = parseFloat(window.getComputedStyle(node).opacity || '1');
+          const computedOpacity = typeof window !== 'undefined'
+              ? parseFloat(window.getComputedStyle(node).opacity || '1')
+              : 1;
           const base = Number.isFinite(computedOpacity) ? computedOpacity : 1;
           if (node.dataset) {
               node.dataset.baseOpacity = base.toString();
@@ -1266,8 +396,11 @@ async function initializeApp() {
       return Number.isFinite(parsed) ? parsed : 1;
   }
 
-  function applyMetadataOpacity(fadeRatio) {
+function applyMetadataOpacity(fadeRatio) {
       const ratio = Math.max(0, Math.min(fadeRatio, 1));
+      if (state.metadataRevealPending && ratio > 0) {
+          return;
+      }
       const directionTextNodes = document.querySelectorAll('.directionKeyText');
       directionTextNodes.forEach(node => {
           const baseOpacity = ensureBaseOpacity(node);
@@ -1282,7 +415,31 @@ async function initializeApp() {
   }
   if (typeof window !== 'undefined') {
       window.applyMetadataOpacity = applyMetadataOpacity;
+      window.updateNowPlayingCard = updateNowPlayingCard;
+      window.updateRadiusControlsUI = updateRadiusControlsUI;
   }
+
+  function updateMetadataFadeFromProgress(progressFraction) {
+      const duration = state.playbackDurationSeconds || 0;
+
+      if (!Number.isFinite(duration) || duration <= 0) {
+          applyMetadataOpacity(0);
+          return;
+      }
+
+      const clampedProgress = Math.max(0, Math.min(progressFraction, 1));
+      const elapsedSeconds = clampedProgress * duration;
+      const fadeWindow = Math.max(Math.min(METADATA_FADE_WINDOW_SECONDS, duration / 2), 0.001);
+
+      const fadeInFactor = Math.min(elapsedSeconds / fadeWindow, 1);
+      const remainingSeconds = Math.max(duration - elapsedSeconds, 0);
+      const fadeOutFactor = Math.min(remainingSeconds / fadeWindow, 1);
+      const fadeRatio = Math.max(0, Math.min(fadeInFactor, fadeOutFactor));
+
+      applyMetadataOpacity(fadeRatio);
+  }
+
+  applyMetadataOpacity(0);
 
   function setReversePreference(trackId, updates = {}) {
       if (!trackId) {
@@ -1323,520 +480,158 @@ async function initializeApp() {
       return pref.usingOpposite;
   }
 
-  function updateMetadataFadeFromProgress(progressFraction) {
-      const duration = state.playbackDurationSeconds || 0;
-
-      if (!Number.isFinite(duration) || duration <= 0) {
-          applyMetadataOpacity(0);
-          return;
+  const albumCoverCache = typeof window !== 'undefined' ? new Map() : null;
+  let preloadContainer = null;
+  let preloadQueue = [];
+  
+  function ensurePreloadContainer() {
+      if (typeof document === 'undefined') {
+          return null;
       }
-
-      const clampedProgress = Math.max(0, Math.min(progressFraction, 1));
-      const elapsedSeconds = clampedProgress * duration;
-      const fadeWindow = Math.max(Math.min(METADATA_FADE_WINDOW_SECONDS, duration / 2), 0.001);
-
-      const fadeInFactor = Math.min(elapsedSeconds / fadeWindow, 1);
-      const remainingSeconds = Math.max(duration - elapsedSeconds, 0);
-      const fadeOutFactor = Math.min(remainingSeconds / fadeWindow, 1);
-      const fadeRatio = Math.max(0, Math.min(fadeInFactor, fadeOutFactor));
-
-      applyMetadataOpacity(fadeRatio);
-  }
-
-  applyMetadataOpacity(0);
-
-  function playAudioElement(reason = 'unknown') {
-      try {
-          return elements.audio.play()
-              .then(() => {
-                  connectionHealth.audio.status = 'connected';
-                  connectionHealth.audio.reconnectAttempts = 0;
-                  connectionHealth.audio.reconnectDelay = 2000;
-                  updateConnectionHealthUI();
-                  return true;
-              })
-              .catch(err => {
-                  console.error(`🎵 Play failed (${reason}):`, err);
-                  console.error('🎵 Audio state when play failed:', {
-                      error: elements.audio.error,
-                      networkState: elements.audio.networkState,
-                      readyState: elements.audio.readyState,
-                      src: elements.audio.src
-                  });
-                  connectionHealth.audio.status = 'error';
-                  updateConnectionHealthUI();
-                  if (!connectionHealth.currentEventSource) {
-                      connectSSE();
-                  }
-                  return false;
-              });
-      } catch (err) {
-          console.error(`🎵 Play threw (${reason}):`, err);
-          connectionHealth.audio.status = 'error';
-          updateConnectionHealthUI();
-          if (!connectionHealth.currentEventSource) {
-              connectSSE();
-          }
-          return Promise.resolve(false);
+      if (preloadContainer) {
+          return preloadContainer;
       }
-  }
-
-  function connectAudioStream(streamUrl, { forceFallback = false, reason = 'initial' } = {}) {
-      if (!streamUrl) {
-          console.warn('connectAudioStream called without streamUrl');
-          return false;
-      }
-
-      state.streamUrl = streamUrl;
-
-      if (!forceFallback && state.useMediaSource && state.streamController) {
-          try {
-              state.streamController.start(streamUrl);
-              return true;
-          } catch (err) {
-              console.warn(`🎧 MediaSource start failed (${reason}); falling back`, err);
-              return connectAudioStream(streamUrl, { forceFallback: true, reason: `${reason}_fallback` });
-          }
-      }
-
-      if (state.streamController) {
-          try {
-              state.streamController.stop();
-          } catch (err) {
-              console.warn('🎧 MediaSource stop failed during fallback:', err);
-          }
-      }
-
-      state.streamController = null;
-      state.useMediaSource = false;
-
-      elements.audio.src = streamUrl;
-      elements.audio.load();
-      return false;
-  }
-
-  function initializeMediaStreamController() {
-      if (!state.useMediaSource) {
-          return;
-      }
-      const ControllerCtor = window.MediaStreamController;
-      if (typeof ControllerCtor !== 'function') {
-          state.useMediaSource = false;
-          return;
-      }
-
-      const streamLogger = (event) => {
-          if (!event) return;
-          const level = event.level || 'info';
-          if (level === 'error') {
-              console.error('🎧 MSE error:', event.message, event.error || event);
-          } else if (level === 'warn') {
-              console.warn('🎧 MSE warn:', event.message, event.error || event);
+      const createContainer = () => {
+          if (preloadContainer) return;
+          const node = document.createElement('div');
+          node.style.position = 'absolute';
+          node.style.width = '1px';
+          node.style.height = '1px';
+          node.style.opacity = '0';
+          node.style.pointerEvents = 'none';
+          node.style.zIndex = '-1';
+          (document.body || document.documentElement).appendChild(node);
+          preloadContainer = node;
+          if (preloadQueue.length) {
+              const pending = preloadQueue.slice();
+              preloadQueue = [];
+              pending.forEach(src => preloadImage(src));
           }
       };
-
-      try {
-          state.streamController = new ControllerCtor(elements.audio, {
-              log: streamLogger,
-              onError: (err) => {
-                  console.warn('🎧 MediaSource streaming error; falling back to direct audio', err);
-                  connectionHealth.audio.status = 'connecting';
-                  updateConnectionHealthUI();
-                  audioHealth.isHealthy = false;
-                  audioHealth.lastTimeUpdate = null;
-                  audioHealth.bufferingStarted = Date.now();
-                  startAudioHealthMonitoring();
-                  state.awaitingSSE = true;
-                  connectAudioStream(state.streamUrl, { forceFallback: true, reason: 'mse-error' });
-                  playAudioElement('mse-fallback');
-              }
-          });
-      } catch (err) {
-          console.warn('🎧 Failed to initialize MediaSource controller; using direct audio element', err);
-          state.streamController = null;
-          state.useMediaSource = false;
+      if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', createContainer, { once: true });
+      } else {
+          createContainer();
       }
+      return preloadContainer;
   }
-
-  initializeMediaStreamController();
-
-  if (elements.nowPlayingCard && elements.beetsSegments) {
-      const showBeets = () => {
-          if (elements.beetsSegments.dataset.hasData === 'true') {
-              elements.beetsSegments.classList.remove('hidden');
+  
+  function preloadImage(url) {
+      const container = ensurePreloadContainer();
+      if (!url || typeof url !== 'string' || !albumCoverCache) {
+          return;
+      }
+  
+      if (!container) {
+          preloadQueue.push(url);
+          return;
+      }
+  
+      const cacheEntry = albumCoverCache.get(url);
+      if (cacheEntry && cacheEntry.success === true) {
+          return;
+      }
+  
+      const img = new Image();
+      img.onload = () => {
+          albumCoverCache.set(url, { success: true, timestamp: Date.now() });
+          if (img.parentElement) {
+              img.parentElement.removeChild(img);
           }
       };
-
-      const hideBeets = () => {
-          elements.beetsSegments.classList.add('hidden');
+      img.onerror = () => {
+          albumCoverCache.delete(url);
+          if (img.parentElement) {
+              img.parentElement.removeChild(img);
+          }
       };
-
-      elements.nowPlayingCard.addEventListener('mouseenter', showBeets);
-      elements.nowPlayingCard.addEventListener('mouseleave', hideBeets);
-      elements.nowPlayingCard.addEventListener('focus', showBeets, true);
-      elements.nowPlayingCard.addEventListener('blur', hideBeets, true);
-
-      elements.beetsSegments.addEventListener('mouseenter', showBeets);
-      elements.beetsSegments.addEventListener('mouseleave', hideBeets);
+      img.src = url;
+      img.style.position = 'absolute';
+      img.style.width = '1px';
+      img.style.height = '1px';
+      img.style.opacity = '0';
+      container.appendChild(img);
   }
-
-  if (elements.beetsSegments) {
-      elements.beetsSegments.dataset.hasData = elements.beetsSegments.dataset.hasData || 'false';
-  }
-
-  function handleDeadAudioSession() {
-    if (audioHealth.handlingRestart) {
-      return;
-    }
-
-    console.error('💀 Audio session is dead - restarting application');
-    audioHealth.handlingRestart = true;
-    audioHealth.isHealthy = false;
-    if (audioHealth.checkInterval) {
-      clearInterval(audioHealth.checkInterval);
-      audioHealth.checkInterval = null;
-    }
-    audioHealth.lastTimeUpdate = null;
-    audioHealth.bufferingStarted = null;
-
-    connectionHealth.audio.status = 'error';
-    updateConnectionHealthUI();
-
-    if (state.streamController) {
-      try {
-        state.streamController.stop();
-      } catch (err) {
-        console.warn('⚠️ Failed to stop media stream controller during restart:', err);
-      }
-    }
-
-    try {
-      elements.audio.pause();
-    } catch (err) {
-      console.warn('⚠️ Failed to pause audio during restart:', err);
-    }
-
-    state.sessionId = null;
-    clearFingerprint({ reason: 'audio_restart' });
-    state.awaitingSSE = false;
-
-    if (connectionHealth.currentEventSource) {
-      try {
-        connectionHealth.currentEventSource.close();
-      } catch (err) {
-        console.warn('⚠️ Failed to close SSE during restart:', err);
-      }
-      connectionHealth.currentEventSource = null;
-    }
-
-    setTimeout(() => {
-      window.location.reload();
-    }, 1000);
-  }
-
-  function startAudioHealthMonitoring() {
-    if (audioHealth.checkInterval) {
-      clearInterval(audioHealth.checkInterval);
-    }
-
-    audioHealth.lastTimeUpdate = null;
-    audioHealth.bufferingStarted = null;
-    audioHealth.isHealthy = false;
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || 0;
-
-    audioHealth.checkInterval = setInterval(() => {
-      if (audioHealth.handlingRestart) {
-        return;
-      }
-
-      const currentTime = Number(elements.audio.currentTime);
-      if (Number.isFinite(currentTime)) {
-        if (Math.abs(currentTime - audioHealth.lastObservedTime) > 0.05) {
-          audioHealth.lastObservedTime = currentTime;
-          audioHealth.lastTimeUpdate = Date.now();
-          audioHealth.bufferingStarted = null;
-          audioHealth.isHealthy = true;
-          connectionHealth.audio.status = 'connected';
-          updateConnectionHealthUI();
-        }
-      }
-
-      if (!audioHealth.lastTimeUpdate) {
-        return;
-      }
-
-      const now = Date.now();
-      const timeSinceUpdate = now - audioHealth.lastTimeUpdate;
-      const isBuffering = audioHealth.bufferingStarted !== null;
-      const bufferingDuration = isBuffering ? (now - audioHealth.bufferingStarted) : 0;
-
-      if (timeSinceUpdate > 12000) {
-        console.error(`❌ Audio session dead: no timeupdate for ${(timeSinceUpdate / 1000).toFixed(1)}s`);
-        handleDeadAudioSession();
-        return;
-      }
-
-      if (bufferingDuration > 8000) {
-        console.warn(`⚠️ Audio struggling: buffering for ${(bufferingDuration / 1000).toFixed(1)}s`);
-        connectionHealth.audio.status = 'degraded';
-        updateConnectionHealthUI();
-        return;
-      }
-
-      if (audioHealth.isHealthy && connectionHealth.audio.status !== 'connected') {
-        connectionHealth.audio.status = 'connected';
-        updateConnectionHealthUI();
-      }
-    }, 2000);
-  }
-
-  elements.audio.addEventListener('timeupdate', () => {
-    audioHealth.lastTimeUpdate = Date.now();
-    audioHealth.bufferingStarted = null;
-    audioHealth.isHealthy = true;
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-      audioHealth.stallTimer = null;
-    }
-    connectionHealth.audio.status = 'connected';
-    updateConnectionHealthUI();
-  });
-
-  elements.audio.addEventListener('waiting', () => {
-    console.log('⏳ Audio buffering...');
-    audioHealth.bufferingStarted = Date.now();
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-  });
-
-  elements.audio.addEventListener('playing', () => {
-    console.log('▶️ Audio playing');
-    audioHealth.bufferingStarted = null;
-    audioHealth.lastTimeUpdate = Date.now();
-    audioHealth.isHealthy = true;
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-      audioHealth.stallTimer = null;
-    }
-    connectionHealth.audio.status = 'connected';
-    updateConnectionHealthUI();
-    if (state.awaitingSSE && !connectionHealth.currentEventSource) {
-      state.awaitingSSE = false;
-      connectSSE();
-    }
-  });
-
-  elements.audio.addEventListener('error', (e) => {
-    console.error('❌ Audio error - session is dead', e);
-
-    const mediaError = elements.audio.error;
-    if (mediaError) {
-      console.error('🎵 Audio error details:', {
-        code: mediaError.code,
-        message: mediaError.message,
-        networkState: elements.audio.networkState,
-        readyState: elements.audio.readyState,
-        src: elements.audio.currentSrc,
-        currentTime: elements.audio.currentTime,
-        duration: elements.audio.duration
+  
+  function createDimensionCards(explorerData, options = {}) {
+      console.log('🔵 DIAG: createDimensionCards called', {
+          trackId: explorerData?.currentTrack?.identifier,
+          hasDirections: !!explorerData?.directions,
+          directionCount: Object.keys(explorerData?.directions || {}).length,
+          options
       });
-    }
-
-    audioHealth.isHealthy = false;
-    connectionHealth.audio.status = 'error';
-    updateConnectionHealthUI();
-
-    if (typeof checkStreamEndpoint === 'function') {
-      try {
-        checkStreamEndpoint();
-      } catch (err) {
-        console.warn('⚠️ Stream endpoint check failed:', err);
-      }
-    }
-
-    handleDeadAudioSession();
-  });
-
-  elements.audio.addEventListener('stalled', () => {
-    console.warn('⏳ Audio reported stalled; verifying...');
-
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-    }
-
-    const stallSnapshot = {
-      time: Number(elements.audio.currentTime) || 0,
-      readyState: elements.audio.readyState
-    };
-
-    audioHealth.stallTimer = setTimeout(() => {
-      audioHealth.stallTimer = null;
-
-      const now = Date.now();
-      const timeSinceUpdate = audioHealth.lastTimeUpdate ? now - audioHealth.lastTimeUpdate : Infinity;
-      const currentTime = Number(elements.audio.currentTime) || 0;
-      const advanced = Math.abs(currentTime - stallSnapshot.time) > 0.1;
-      const readyOk = elements.audio.readyState >= 3;
-
-      if (advanced || readyOk || timeSinceUpdate <= 1500) {
-        console.log('✅ Audio stall cleared without intervention');
-        return;
+      if (!explorerData || typeof explorerData !== 'object') {
+          console.warn('⚠️ Explorer render skipped: invalid explorer data payload');
+          return null;
       }
 
-      console.error('❌ Audio stalled - network failed (confirmed)');
-      audioHealth.isHealthy = false;
-      connectionHealth.audio.status = 'error';
-      updateConnectionHealthUI();
-    }, 1500);
-  });
+      const previousExplorerData = state.latestExplorerData;
+      let skipExitAnimationSeed = options.skipExitAnimation === true || state.skipNextExitAnimation === true;
+      if (!state.hasRenderedDeck) {
+          skipExitAnimationSeed = true;
+      }
 
-  elements.audio.addEventListener('loadstart', () => console.log('🎵 Load started'));
-  elements.audio.addEventListener('canplay', () => console.log('🎵 Can play'));
-  elements.audio.addEventListener('canplaythrough', () => console.log('🎵 Can play through'));
+      const beginFrame = (payload) => applyDeckRenderFrame(payload.explorerData || explorerData, options, {
+          previousExplorerData,
+          skipExitAnimationSeed,
+          frameMeta: payload.meta || null
+      });
 
-
-
-const albumCoverCache = typeof window !== 'undefined' ? new Map() : null;
-const preloadContainer = (() => {
-    if (typeof document === 'undefined') {
-        return null;
-    }
-    const node = document.createElement('div');
-    node.style.position = 'absolute';
-    node.style.width = '1px';
-    node.style.height = '1px';
-    node.style.opacity = '0';
-    node.style.pointerEvents = 'none';
-    node.style.zIndex = '-1';
-    document.body.appendChild(node);
-    return node;
-})();
-
-function preloadImage(url) {
-    if (!url || typeof url !== 'string' || !preloadContainer || !albumCoverCache) {
-        return;
-    }
-
-    if (albumCoverCache.has(url)) {
-        return;
-    }
-
-    const img = new Image();
-    img.onload = () => albumCoverCache.set(url, true);
-    img.onerror = () => albumCoverCache.set(url, false);
-    img.src = url;
-    img.style.position = 'absolute';
-    img.style.width = '1px';
-    img.style.height = '1px';
-    img.style.opacity = '0';
-    preloadContainer.appendChild(img);
+      state.isRenderingDeck = true;
+      state.pendingDeckHydration = true;
+      return requestDeckRenderFrame({ explorerData })
+          .then(beginFrame)
+          .catch((error) => {
+              console.warn('🛠️ Deck worker fallback triggered:', error);
+              const fallbackFrame = runDeckFrameBuild({ explorerData }) || { explorerData };
+              return beginFrame(fallbackFrame);
+          })
+          .finally(() => {
+              state.pendingDeckHydration = false;
+              state.isRenderingDeck = false;
+          });
+}
+// Export immediately after definition so exposeDeckHelpers can find it
+if (typeof window !== 'undefined') {
+    window.createDimensionCards = createDimensionCards;
+    window.__driftCreateDimensionCardsRef = createDimensionCards;
 }
 
-function createDimensionCards(explorerData, options = {}) {
-      const markDeckHydration = (pending) => {
-          if (pending) {
-              state.pendingDeckHydration = true;
-          } else {
-              state.pendingDeckHydration = false;
+function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
+      if (!explorerData || typeof explorerData !== 'object') {
+          console.warn('⚠️ Explorer render skipped: invalid explorer data payload');
+          return null;
+      }
+
+      const normalizeTracks = (direction) => {
+          if (!direction || !Array.isArray(direction.sampleTracks)) return;
+          direction.sampleTracks = direction.sampleTracks.map(entry => {
+              if (!entry) {
+                  return entry;
+              }
+              if (entry.track) {
+                  return entry;
+              }
+              return { track: entry };
+          });
+          if (direction.oppositeDirection) {
+              normalizeTracks(direction.oppositeDirection);
           }
       };
-      let skipExitAnimation = options.skipExitAnimation === true || state.skipNextExitAnimation === true;
-      if (state.skipNextExitAnimation) {
+
+      const previousExplorerData = renderContext.previousExplorerData || state.latestExplorerData;
+      let skipExitAnimation;
+      if (typeof renderContext.skipExitAnimationSeed === 'boolean') {
+          skipExitAnimation = renderContext.skipExitAnimationSeed;
+      } else {
+          skipExitAnimation = options.skipExitAnimation === true || state.skipNextExitAnimation === true;
+      }
+      if (renderContext.skipExitAnimationSeed === undefined && state.skipNextExitAnimation) {
           state.skipNextExitAnimation = false;
       }
       if (!state.hasRenderedDeck) {
           skipExitAnimation = true;
       }
-  const normalizeTracks = (direction) => {
-      if (!direction || !Array.isArray(direction.sampleTracks)) {
-          return;
-      }
-
-      direction.sampleTracks = direction.sampleTracks
-          .map(entry => {
-              if (!entry) return null;
-              if (entry.track && typeof entry.track === 'object') {
-                  return entry;
-              }
-              if (typeof entry === 'object') {
-                  return { track: entry };
-              }
-              return null;
-          })
-          .filter(Boolean);
-
-      if (direction.sampleTracks.length > 0) {
-          direction.isSynthetic = false;
-      }
-
-      if (direction.oppositeDirection) {
-          if (Array.isArray(direction.oppositeDirection.sampleTracks) && direction.oppositeDirection.sampleTracks.length > 0) {
-              direction.oppositeDirection.isSynthetic = false;
-          }
-          normalizeTracks(direction.oppositeDirection);
-      }
-  };
-
-      const ensureSyntheticOpposites = (data) => {
-          if (!data || !data.directions) {
-              return;
-          }
-
-          const directionsMap = data.directions;
-
-          Object.entries(directionsMap).forEach(([key, direction]) => {
-              if (!direction) {
-                  return;
-              }
-              if (direction.generatedOpposite) {
-                  return;
-              }
-              const oppositeKey = getOppositeDirection(key);
-              if (!oppositeKey) {
-                  return;
-              }
-
-              const hasExistingOpposite = directionsMap[oppositeKey]?.sampleTracks?.length;
-              const baseSamples = Array.isArray(direction.sampleTracks)
-                  ? direction.sampleTracks.map(entry => (
-                      entry && typeof entry === 'object' && entry.track
-                          ? { track: { ...entry.track } }
-                          : entry && typeof entry === 'object'
-                              ? { track: { ...entry } }
-                              : null
-                  )).filter(Boolean)
-                  : [];
-
-              if (!baseSamples.length) {
-                  return;
-              }
-
-              if (!hasExistingOpposite && directionsMap[oppositeKey]?.generatedOpposite) {
-                  delete directionsMap[oppositeKey];
-              }
-
-              if (!hasExistingOpposite) {
-                  direction.generatedOpposite = false;
-                  if (direction.oppositeDirection) {
-                      delete direction.oppositeDirection;
-                  }
-              }
-
-              if (hasExistingOpposite && !direction.oppositeDirection) {
-                  direction.oppositeDirection = {
-                      key: oppositeKey,
-                      sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } }))
-                  };
-              } else if (!hasExistingOpposite && direction.oppositeDirection) {
-                  delete direction.oppositeDirection;
-              }
-
-              direction.hasOpposite = Boolean(hasExistingOpposite);
-          });
-      };
-
-      const previousExplorerData = state.latestExplorerData;
       // Store for later redraw
       const previousNext = previousExplorerData?.nextTrack;
       const previousNextId = previousNext?.track?.identifier || previousNext?.identifier || null;
@@ -1866,27 +661,22 @@ function createDimensionCards(explorerData, options = {}) {
               };
           }
 
-          const previousTrackRecord = previousNext?.track
-              ? { ...previousNext.track }
-              : { ...previousNext };
-          const enrichedPrevious = {
-              ...previousTrackRecord,
-              identifier: previousTrackRecord?.identifier || previousNextId,
-              albumCover: previousTrackRecord?.albumCover || previousNext?.albumCover || null,
+          state.previousNextTrack = {
+	      identifier: previousNextId,
+	      albumCover: previousNext.albumCover,
               variant: assignment.variant,
               borderColor: assignment.border,
               glowColor: assignment.glow,
               directionKey: assignment.directionKey
           };
 
-          state.previousNextTrack = enrichedPrevious;
-
           cacheTrackColorAssignment(previousNextId, assignment);
       }
       state.remainingCounts = {};
+      const layoutEntries = {};
+      const layoutTimestamp = Date.now();
 
       Object.values(explorerData.directions || {}).forEach(normalizeTracks);
-      ensureSyntheticOpposites(explorerData);
 
       if (DEBUG_FLAGS.duplicates) {
           performDuplicateAnalysis(explorerData, "createDimensionCards");
@@ -1895,32 +685,24 @@ function createDimensionCards(explorerData, options = {}) {
       const container = document.getElementById('dimensionCards');
       deckLog('🎯 Container element:', container);
 
-      if (!container) {
-          console.error('❌ NO CONTAINER ELEMENT FOUND!');
+      if (state.dangerZoneVisualActive && options.forceDangerZoneRender !== true) {
+          console.log('🔴 DIAG: applyDeckRenderFrame BLOCKED by dangerZoneVisualActive');
+          deckLog('⏳ Danger Zone active; deferring deck render');
+          state.dangerZoneDeferredExplorer = explorerData;
+          state.lastDirectionSignature = null;
           return;
       }
 
-      safelyExitCardsDormantState({ immediate: true });
-
-      const existingCards = container.querySelectorAll('.dimension-card');
-      if (existingCards.length === 0) {
-          skipExitAnimation = true;
+      if (!container) {
+          console.error('❌ NO CONTAINER ELEMENT FOUND!');
+          return;
       }
 
       const nextTrackId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
       const currentTrackId = state.latestCurrentTrack?.identifier;
       const newCurrentTrackId = explorerData.currentTrack?.identifier || null;
       const currentTrackUnchanged = Boolean(currentTrackId && newCurrentTrackId && currentTrackId === newCurrentTrackId);
-      let manualOverrideActive = Boolean(state.manualNextTrackOverride && currentTrackUnchanged);
-      if (manualOverrideActive && state.selectedIdentifier && currentTrackId && state.selectedIdentifier === currentTrackId) {
-          manualOverrideActive = false;
-          state.manualNextTrackOverride = false;
-          state.skipTrayDemotionForTrack = null;
-          state.manualNextDirectionKey = null;
-          state.pendingManualTrackId = null;
-          state.selectedIdentifier = currentTrackId;
-          updateRadiusControlsUI();
-      }
+      const manualOverrideActive = Boolean(state.manualNextTrackOverride && currentTrackUnchanged);
 
       if (state.manualNextTrackOverride) {
           deckLog('🛰️ Manual selection state', {
@@ -1964,13 +746,13 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       if (manualOverrideActive) {
+      console.log('🔴 DIAG: applyDeckRenderFrame BLOCKED by manualOverrideActive');
       deckLog('🎯 Manual next track override active; preserving existing cards (selection still present)');
       if (state.nextTrackAnimationTimer) {
           clearTimeout(state.nextTrackAnimationTimer);
           state.nextTrackAnimationTimer = null;
       }
       state.usingOppositeDirection = false;
-      markDeckHydration(false);
       return;
   }
 
@@ -1980,83 +762,29 @@ function createDimensionCards(explorerData, options = {}) {
 
       state.lastDirectionSignature = incomingSignature;
 
-      if (!forceRedraw && previousSignature && incomingSignature && previousSignature === incomingSignature) {
+      if (!forceRedraw && !skipExitAnimation && previousSignature && incomingSignature && previousSignature === incomingSignature) {
           deckLog('🛑 No direction changes detected; skipping redraw');
           state.latestExplorerData = explorerData;
-
-          const container = elements.dimensionCards || document.getElementById('dimensionCards');
-          const hasCards = container && container.querySelector('.dimension-card');
-
-          if (!hasCards) {
-              if (state.cardsDormant) {
-                  deckLog('⏳ Deck dormant with no cards; waiting for next payload instead of forcing redraw');
-                  state.latestExplorerData = explorerData;
-                  markDeckHydration(false);
-                  return;
-              }
-              console.warn('🛠️ Deck empty despite unchanged signature; forcing redraw');
-              createDimensionCards(explorerData, { skipExitAnimation: true, forceRedraw: true });
-              markDeckHydration(false);
-              return;
-          }
-
           refreshCardsWithNewSelection();
-          state.hasRenderedDeck = true;
-          markDeckHydration(false);
           return;
       }
 
-      state.latestExplorerData = explorerData;
-      if (state.latestExplorerData?.nextTrack) {
-          normalizeNextTrackPayload(state.latestExplorerData.nextTrack, state.latestExplorerData.directions);
-      }
+  state.latestExplorerData = explorerData;
 
-      const preserveOppositeView = Boolean(
-          state.usingOppositeDirection && previousNextId && incomingNextId && previousNextId === incomingNextId
-      );
-
-      const currentNextTrackObj = (state.latestExplorerData?.nextTrack?.track)
-          || state.latestExplorerData?.nextTrack
-          || explorerData.nextTrack?.track
-          || explorerData.nextTrack
-          || null;
-      const currentNextId = currentNextTrackObj?.identifier || null;
-      const preferredOpposite = getPreferredOppositeState(currentNextId, state.lastSelectionGeneration);
-
-      if (preferredOpposite != null) {
-          state.usingOppositeDirection = preferredOpposite;
-          deckLog('🔁 Restoring opposite view from preference', state.reversePreference);
-      } else if (!preserveOppositeView) {
-          state.usingOppositeDirection = false;
-      } else {
-          deckLog('🔁 Preserving opposite-direction view during deck redraw');
-      }
-
-      const existingNextTrackCard = container.querySelector('.dimension-card.next-track');
+      // Reset reverse state when rendering fresh explorer data
+      state.usingOppositeDirection = false;
 
       if (!skipExitAnimation) {
-          const exitTargets = Array.from(container.querySelectorAll('.dimension-card')).filter(card => card !== existingNextTrackCard);
-          if (exitTargets.length > 0) {
-              markDeckHydration(true);
-              let remaining = exitTargets.length;
+          const exitingCards = container.querySelectorAll('.dimension-card');
+          if (exitingCards.length > 0) {
+              let remaining = exitingCards.length;
               let renderScheduled = false;
-
-              const finalizeRender = () => {
-                  container.innerHTML = '';
-                  createDimensionCards(explorerData, { skipExitAnimation: true });
-              };
-
               const scheduleRender = () => {
                   if (renderScheduled) return;
                   renderScheduled = true;
-                  if (existingNextTrackCard && document.body.contains(existingNextTrackCard)) {
-                      demoteNextTrackCardToTray(existingNextTrackCard, finalizeRender);
-                  } else {
-                      finalizeRender();
-                  }
+                  createDimensionCards(explorerData, { skipExitAnimation: true });
               };
-
-              const fallbackTimer = setTimeout(scheduleRender, 900);
+              const fallbackTimer = setTimeout(scheduleRender, 700);
 
               const tryComplete = () => {
                   remaining -= 1;
@@ -2066,7 +794,7 @@ function createDimensionCards(explorerData, options = {}) {
                   }
               };
 
-              exitTargets.forEach(card => {
+              exitingCards.forEach(card => {
                   let finished = false;
                   const handleDone = () => {
                       if (finished) return;
@@ -2082,29 +810,32 @@ function createDimensionCards(explorerData, options = {}) {
                   card.addEventListener('transitionend', onTransitionEnd);
                   card.addEventListener('animationend', onTransitionEnd);
 
+                  const computed = window.getComputedStyle(card);
+                  const baseTransform = card.style.transform || computed.transform || '';
+                  const exitTransform = baseTransform && baseTransform !== 'none'
+                      ? `${baseTransform} translateZ(-1200px) scale(0.2)`
+                      : 'translateZ(-1200px) scale(0.2)';
+
                   card.classList.add('card-exit');
                   card.style.pointerEvents = 'none';
                   card.style.willChange = 'transform, opacity';
-                  card.style.animation = 'dimensionCardExitCurve 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards';
-              });
-              return;
-          } else if (existingNextTrackCard && document.body.contains(existingNextTrackCard)) {
-              markDeckHydration(true);
-              demoteNextTrackCardToTray(existingNextTrackCard, () => {
-                  container.innerHTML = '';
-                  createDimensionCards(explorerData, { skipExitAnimation: true });
+                  card.style.transition = 'transform 0.6s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.45s ease';
+                  card.style.opacity = computed.opacity || '1';
+
+                  requestAnimationFrame(() => {
+                      card.style.opacity = '0';
+                      card.style.transform = exitTransform;
+                  });
               });
               return;
           }
       }
 
       // Clear existing cards
-      markDeckHydration(true);
       container.innerHTML = '';
 
       if (!explorerData) {
           console.error('❌ NO EXPLORER DATA AT ALL!', explorerData);
-          markDeckHydration(false);
           return;
       }
 
@@ -2114,7 +845,6 @@ function createDimensionCards(explorerData, options = {}) {
               explorerDataKeys: Object.keys(explorerData),
               directions: explorerData.directions
           });
-          markDeckHydration(false);
           return;
       }
 
@@ -2124,7 +854,6 @@ function createDimensionCards(explorerData, options = {}) {
               directions: explorerData.directions,
               explorerData: explorerData
           });
-          markDeckHydration(false);
           return;
       }
 
@@ -2179,6 +908,16 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       deckLog(`🎯 Using ${directions.length} total directions: ${directions.length - outlierDirections.length} regular + ${outlierDirections.length} outliers`);
+      const consolidationResult = consolidateDirectionsForDeck(directions);
+      if (consolidationResult) {
+          directions = consolidationResult.directions;
+          state.directionKeyAliases = consolidationResult.aliasMap || {};
+          if (Object.keys(state.directionKeyAliases).length > 0) {
+              deckLog(`♻️ Collapsed polarity duplicates`, state.directionKeyAliases);
+          }
+      } else {
+          state.directionKeyAliases = {};
+      }
 
       if (directions.length === 0) {
           console.error(`❌ NO DIRECTIONS TO DISPLAY!`);
@@ -2215,15 +954,7 @@ function createDimensionCards(explorerData, options = {}) {
       deckLog(`🔄 Directions with opposites:`, bidirectionalDirections.map(d => `${d.key} (${d.sampleTracks?.length || 0} tracks)`));
 
       // Find the next track direction from explorer data
-      const normalizedNextDirection = normalizeDirectionKey(
-          explorerData.nextTrack?.directionKey || explorerData.nextTrack?.direction || null,
-          explorerData.directions
-      );
-      if (explorerData.nextTrack && normalizedNextDirection) {
-          explorerData.nextTrack.directionKey = normalizedNextDirection;
-          explorerData.nextTrack.direction = normalizedNextDirection;
-      }
-      const nextTrackDirection = normalizedNextDirection;
+      const nextTrackDirection = explorerData.nextTrack ? explorerData.nextTrack.directionKey : null;
 
       deckLog(`🎯 About to create ${directions.length} cards - drawing order: bottom first, next track last`);
       let cardsCreated = 0;
@@ -2249,22 +980,21 @@ function createDimensionCards(explorerData, options = {}) {
           const hasReverse = direction.hasOpposite === true;
           const tracks = direction.sampleTracks || [];
           const trackCount = tracks.length;
-          for (t in tracks) preloadImage(t.albumCover);
+          for (const t of tracks) preloadImage(t.albumCover);
 
           deckLog(`🎯 Creating direction card ${index}: ${direction.key} (${trackCount} tracks)${hasReverse ? ' with reverse' : ''}`);
           if (hasReverse) {
               const oppositeTracks = direction.oppositeDirection?.sampleTracks || [];
               const oppositeCount = oppositeTracks.length;
-              for (t in oppositeTracks) preloadImage(t.albumCover);
+              for (const t of oppositeTracks) preloadImage(t.albumCover);
               deckLog(`🔄 Reverse available: ${oppositeCount} tracks in opposite direction`);
           }
 
           // All start as direction cards in clock positions (no special next-track handling yet)
           deckLog(`Create direction card ${index}`);
           let card;
-        try {
-            const currentTrackForCards = explorerData.currentTrack || state.latestCurrentTrack || null;
-            card = createDirectionCard(direction, index, directions.length, false, null, hasReverse, null, directions, currentTrackForCards);
+          try {
+              card = createDirectionCard(direction, index, directions.length, false, null, hasReverse, null, directions);
               deckLog(`✅ Created card for ${direction.key}, appending to container`);
               container.appendChild(card);
               if (typeof applyDirectionStackIndicator === 'function') {
@@ -2272,6 +1002,30 @@ function createDimensionCards(explorerData, options = {}) {
               }
               cardsCreated++;
               deckLog(`✅ Successfully added card ${index} (${direction.key}) to DOM, total cards: ${cardsCreated}`);
+
+              const directionType = card.dataset.directionType || getDirectionType(direction.key);
+              const colorVariant = card.dataset.colorVariant
+                  || (typeof variantFromDirectionType === 'function' ? variantFromDirectionType(directionType) : null);
+              layoutEntries[direction.key] = {
+                  key: direction.key,
+                  domain: direction.domain || null,
+                  directionType,
+                  colorVariant,
+                  directionValue: direction.direction || direction.key,
+                  sampleTracks: normalizeSamplesToTracks(direction.sampleTracks || []),
+                  oppositeTracks: normalizeSamplesToTracks(direction.oppositeDirection?.sampleTracks || []),
+                  hasOpposite: Boolean(hasReverse),
+                  oppositeKey: direction.oppositeDirection?.key || getOppositeDirection(direction.key) || null,
+                  isOutlier: Boolean(direction.isOutlier),
+                  clockPosition: card.dataset.clockPosition ? parseInt(card.dataset.clockPosition, 10) : null,
+                  originalClockPosition: card.dataset.originalClockPosition ? parseInt(card.dataset.originalClockPosition, 10) : null,
+                  borderColor: card.dataset.borderColor || card.style.getPropertyValue('--border-color') || null,
+                  glowColor: card.dataset.glowColor || card.style.getPropertyValue('--glow-color') || null,
+                  label: direction.isOutlier ? 'Outlier' : formatDirectionName(direction.key),
+                  stackSize: trackCount,
+                  lastUpdated: layoutTimestamp,
+                  isCenter: false
+              };
 
               // Stagger the animation
               // TODO setTimeout(() => {
@@ -2284,70 +1038,26 @@ function createDimensionCards(explorerData, options = {}) {
           }
       });
 
-      // Promote the recommended direction to center
+      // After all cards are visible, animate the selected next track to center
       if (state.nextTrackAnimationTimer) {
           clearTimeout(state.nextTrackAnimationTimer);
           state.nextTrackAnimationTimer = null;
       }
 
-      let promoteDirectionKey = nextTrackDirection;
-      if (!promoteDirectionKey && state.serverNextDirection) {
-          promoteDirectionKey = normalizeDirectionKey(state.serverNextDirection, explorerData.directions);
-      }
-
-      if (!promoteDirectionKey) {
-          const resolvedNext = resolveNextTrackData();
-          if (resolvedNext?.directionKey) {
-              promoteDirectionKey = resolvedNext.directionKey;
-              if (explorerData.nextTrack) {
-                  explorerData.nextTrack.directionKey = promoteDirectionKey;
-                  explorerData.nextTrack.direction = promoteDirectionKey;
-                  if (!explorerData.nextTrack.track && resolvedNext.track) {
-                      explorerData.nextTrack.track = resolvedNext.track;
-                  }
-              } else {
-                  explorerData.nextTrack = {
-                      directionKey: promoteDirectionKey,
-                      direction: promoteDirectionKey
-                  };
-                  if (resolvedNext.track) {
-                      explorerData.nextTrack.track = resolvedNext.track;
-                  }
-              }
+      state.nextTrackAnimationTimer = setTimeout(() => {
+          if (explorerData.nextTrack) {
+              deckLog(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
+              animateDirectionToCenter(explorerData.nextTrack.directionKey);
           }
-      }
-
-      if (!promoteDirectionKey) {
-          const fallbackDirection =
-              directions.find(direction => Array.isArray(direction.sampleTracks) && direction.sampleTracks.length > 0)
-              || directions[0];
-          if (fallbackDirection) {
-              promoteDirectionKey = fallbackDirection.key;
-              const firstEntry = fallbackDirection.sampleTracks?.[0] || null;
-              const firstTrack = firstEntry?.track || firstEntry || null;
-              if (!explorerData.nextTrack) {
-                  explorerData.nextTrack = {
-                      directionKey: promoteDirectionKey,
-                      direction: promoteDirectionKey,
-                      track: firstTrack || null
-                  };
-              } else if (!explorerData.nextTrack.track && firstTrack) {
-                  explorerData.nextTrack.track = firstTrack;
-              }
-          }
-      }
-
-      if (explorerData.nextTrack) {
-          normalizeNextTrackPayload(explorerData.nextTrack, explorerData.directions);
-          state.latestExplorerData.nextTrack = explorerData.nextTrack;
-      }
-
-      if (promoteDirectionKey) {
-          queueCenterPromotion(promoteDirectionKey, { notifyServer: false, origin: 'deck' });
-      }
+          state.nextTrackAnimationTimer = null;
+      }, directions.length * 150 + 1500); // Wait for all cards to appear
 
       deckLog(`🎯 FINISHED creating ${cardsCreated} cards in container`);
-      markDeckHydration(false);
+      state.hasRenderedDeck = cardsCreated > 0;
+      state.directionLayout = layoutEntries;
+      if (typeof window !== 'undefined') {
+          window.__lastDirectionLayout = layoutEntries;
+      }
 
       if (DEBUG_FLAGS.deck) {
         // Diagnostic counts
@@ -2379,11 +1089,9 @@ function createDimensionCards(explorerData, options = {}) {
       if (state.cardsDormant) {
           const info = resolveNextTrackData();
           if (info?.track) {
-              showNextTrackPreview(info.track, { directionKey: info.directionKey || info.track?.directionKey || null });
+              showNextTrackPreview(info.track);
           }
       }
-
-      state.hasRenderedDeck = true;
   }
 
 
@@ -2395,10 +1103,6 @@ function createDimensionCards(explorerData, options = {}) {
       }
 
       deckLog(`🔄 Swapping next track direction from ${state.latestExplorerData.nextTrack?.directionKey} to ${newNextDirectionKey}`);
-
-      if (typeof clearStackedPreviewLayer === 'function') {
-          clearStackedPreviewLayer();
-      }
 
       // Get the first track from the new direction
       const newDirection = state.latestExplorerData.directions[newNextDirectionKey];
@@ -2426,101 +1130,12 @@ function createDimensionCards(explorerData, options = {}) {
       };
 
       // Send the new next track selection to the server
-      sendNextTrack(firstTrack.identifier, newNextDirectionKey, {
-          source: 'user',
-          origin: 'deck',
-          explorerSignature: state.lastDirectionSignature
-      });
+      sendNextTrack(firstTrack.identifier, newNextDirectionKey, 'user');
 
       // Redraw all cards with the new next track assignment
       // This will maintain positions but swap the content and styling
       redrawDimensionCardsWithNewNext(newNextDirectionKey);
   }
-
-  function navigateDirectionToCenter(newDirectionKey) {
-      if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-          console.warn('Cannot navigate directions: explorer data missing');
-          return;
-      }
-
-      const direction = state.latestExplorerData.directions[newDirectionKey];
-      if (!direction) {
-          console.warn('Cannot navigate: direction not found', newDirectionKey);
-          return;
-      }
-
-      const sampleTracks = direction.sampleTracks || [];
-      const primaryEntry = sampleTracks[0];
-      const primaryTrack = primaryEntry ? (primaryEntry.track || primaryEntry) : null;
-      if (!primaryTrack || !primaryTrack.identifier) {
-          console.warn('Cannot navigate: direction has no primary track', newDirectionKey);
-          return;
-      }
-
-      const currentCenterKey = state.latestExplorerData?.nextTrack?.directionKey || null;
-      if (currentCenterKey && currentCenterKey === newDirectionKey) {
-          cycleStackContents(newDirectionKey, state.stackIndex);
-          return;
-      }
-      let promotionDelay = 0;
-
-      if (currentCenterKey && currentCenterKey !== newDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
-          const demoted = rotateCenterCardToNextPosition(currentCenterKey);
-          if (demoted) {
-              promotionDelay = 820;
-          }
-      }
-
-      const performPromotion = () => {
-          state.selectedIdentifier = primaryTrack.identifier;
-          state.stackIndex = 0;
-        state.pendingManualTrackId = primaryTrack.identifier;
-        state.manualNextTrackOverride = true;
-        state.skipTrayDemotionForTrack = null;
-        state.manualNextDirectionKey = newDirectionKey;
-          state.pendingSnapshotTrackId = primaryTrack.identifier;
-
-          if (!state.remainingCounts) {
-              state.remainingCounts = {};
-          }
-          state.remainingCounts[newDirectionKey] = Math.max(0, sampleTracks.length - 1);
-
-          state.latestExplorerData.nextTrack = {
-              directionKey: newDirectionKey,
-              direction: direction.direction,
-              track: primaryTrack
-          };
-
-          state.usingOppositeDirection = false;
-          const selectionOptions = {
-              origin: 'deck',
-              notifyServer: true,
-              explorerSignature: state.lastDirectionSignature
-          };
-
-          if (typeof animateDirectionToCenter === 'function') {
-              animateDirectionToCenter(newDirectionKey, selectionOptions);
-          } else {
-              convertToNextTrackStack(newDirectionKey, selectionOptions);
-          }
-
-          sendNextTrack(primaryTrack.identifier, newDirectionKey, {
-              source: 'user',
-              origin: 'deck',
-              explorerSignature: state.lastDirectionSignature
-          });
-      };
-
-      if (promotionDelay > 0) {
-          setTimeout(performPromotion, promotionDelay);
-      } else {
-          performPromotion();
-      }
-
-      tryFlushPendingCenterPromotion();
-  }
-
-  window.navigateDirectionToCenter = navigateDirectionToCenter;
 
   // Update the colors of stacked cards to preview other tracks in the direction
   function updateStackedCardColors(selectedCard, directionKey) {
@@ -2577,99 +1192,18 @@ function createDimensionCards(explorerData, options = {}) {
           return stored;
       };
 
-      const scheduleSelectionRetry = (reason, delayOverride) => {
-          const targetDelay = delayOverride ?? (state.cardsDormant ? 320 : 160);
-          state.pendingSelectionUpdate = {
-              trackId: state.selectedIdentifier,
-              directionKey: state.manualNextDirectionKey
-                  || state.latestExplorerData?.nextTrack?.directionKey
-                  || null,
-              reason,
-              attempts: state.selectionRetryCount
-          };
-          if (!state.selectionRetryTimer) {
-              state.selectionRetryTimer = setTimeout(() => {
-                  state.selectionRetryTimer = null;
-                  refreshCardsWithNewSelection();
-              }, targetDelay);
-          }
-      };
-
-      if (state.cardsDormant) {
-          state.selectionRetryCount = (state.selectionRetryCount || 0) + 1;
-          if (state.selectionRetryCount === 1) {
-              console.debug(`${ICON} ACTION selection-card-pending`, {
-                  selection: state.selectedIdentifier,
-                  reason: 'cards-dormant'
-              });
-          }
-          scheduleSelectionRetry('cards-dormant');
-          updateNextTrackMetadata(null);
-          return;
-      }
-
-      if (state.pendingDeckHydration) {
-          state.selectionRetryCount = (state.selectionRetryCount || 0) + 1;
-          if (state.selectionRetryCount === 1) {
-              console.debug(`${ICON} ACTION selection-card-pending`, {
-                  selection: state.selectedIdentifier,
-                  reason: 'deck-rebuild'
-              });
-          }
-          scheduleSelectionRetry('deck-rebuild', 140);
-          updateNextTrackMetadata(null);
-          return;
-      }
-
       // Find the selected card first
-  const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-  const allTrackCards = deckContainer ? deckContainer.querySelectorAll('.dimension-card.next-track') : [];
-  if (!allTrackCards.length) {
-      const targetDirectionKey =
-          state.manualNextDirectionKey ||
-          state.pendingSelectionUpdate?.directionKey ||
-          state.latestExplorerData?.nextTrack?.directionKey ||
-          state.baseDirectionKey ||
-          null;
-      const targetDirection = targetDirectionKey
-          ? state.latestExplorerData?.directions?.[targetDirectionKey]
-          : null;
-
-      const pendingBuildKey = state.pendingCenterCardKey;
-      const shouldAttemptBuild = Boolean(
-          targetDirection &&
-          state.selectedIdentifier &&
-          pendingBuildKey !== `${state.selectedIdentifier}:${targetDirectionKey}`
-      );
-
-      if (shouldAttemptBuild) {
-          console.warn(`${ICON} ACTION selection-center-synthesize`, {
-              selection: state.selectedIdentifier,
-              direction: targetDirectionKey
-          });
-          state.pendingCenterCardKey = `${state.selectedIdentifier}:${targetDirectionKey}`;
-          convertToNextTrackStack(targetDirectionKey, { notifyServer: false, origin: 'deck' });
-          scheduleSelectionRetry('synthesized-center', 40);
+      const allTrackCards = document.querySelectorAll('.dimension-card.next-track');
+      if (allTrackCards.length === 0) {
+          if (state.manualNextTrackOverride) {
+              console.warn(`${ICON} ACTION selection-cards-unavailable`, {
+                  selection: state.selectedIdentifier,
+                  reason: 'no next-track cards rendered'
+              });
+          }
+          updateNextTrackMetadata(null);
           return;
       }
-
-      const hasPendingBuild = Boolean(state.pendingCenterCardKey);
-
-      if (!hasPendingBuild) {
-          console.warn(`${ICON} ACTION selection-cards-unavailable`, {
-              selection: state.selectedIdentifier,
-              reason: 'no next-track cards rendered'
-          });
-      }
-
-      state.selectionRetryCount = (state.selectionRetryCount || 0) + 1;
-      scheduleSelectionRetry('no-cards');
-      updateNextTrackMetadata(null);
-      return;
-  } else if (state.pendingCenterCardKey) {
-      // Clear pending synthesis marker once cards exist
-      state.pendingCenterCardKey = null;
-  }
       let selectedCard = null;
       let selectedDimensionKey = null;
       let selectedTrackData = null;
@@ -2682,73 +1216,7 @@ function createDimensionCards(explorerData, options = {}) {
           }
       });
 
-      if (!selectedCard && allTrackCards.length === 1) {
-          const fallbackCard = allTrackCards[0];
-          const fallbackId = fallbackCard.dataset.trackMd5 || fallbackCard.dataset.trackIdentifier || null;
-          if (fallbackId) {
-              console.warn(`${ICON} ACTION selection-realign-center`, {
-                  selection: state.selectedIdentifier,
-                  fallback: fallbackId,
-                  direction: fallbackCard.dataset.directionKey || fallbackCard.dataset.baseDirectionKey || null
-              });
-              const storedTrack = extractStoredTrackFromCard(fallbackCard);
-              const fallbackDirectionKey = fallbackCard.dataset.directionKey || fallbackCard.dataset.baseDirectionKey || null;
-              if (storedTrack && fallbackDirectionKey) {
-                  state.latestExplorerData.nextTrack = {
-                      directionKey: fallbackDirectionKey,
-                      direction: fallbackDirectionKey,
-                      track: storedTrack
-                  };
-              }
-              state.selectedIdentifier = fallbackId;
-              state.manualNextTrackOverride = false;
-              state.pendingManualTrackId = null;
-              state.stackIndex = 0;
-              selectedCard = fallbackCard;
-              selectedDimensionKey = fallbackDirectionKey;
-          }
-      }
-
-      const desiredDirectionKey = state.manualNextDirectionKey
-          || state.pendingSelectionUpdate?.directionKey
-          || selectedDimensionKey
-          || state.latestExplorerData?.nextTrack?.directionKey
-          || null;
-
       if (!selectedCard) {
-          const animatingCenterCard = Array.from(allTrackCards).some(card => card.classList.contains('animating-to-center'));
-          const retryCap = animatingCenterCard ? 12 : 5;
-
-          state.selectionRetryCount = (state.selectionRetryCount || 0) + 1;
-
-          const missingDirectionData = desiredDirectionKey
-              && !(state.latestExplorerData?.directions?.[desiredDirectionKey]);
-          if (missingDirectionData && !state.awaitingDirectionRefresh && typeof requestSSERefresh === 'function') {
-              console.warn(`${ICON} ACTION selection-direction-missing`, {
-                  selection: state.selectedIdentifier,
-                  directionKey: desiredDirectionKey
-              });
-              state.awaitingDirectionRefresh = true;
-              requestSSERefresh({ escalate: false, stage: 'selection_direction_missing' })
-                  .finally(() => {
-                      state.awaitingDirectionRefresh = false;
-                  });
-          }
-
-          if (state.selectionRetryCount <= retryCap) {
-              if (state.selectionRetryCount === 1) {
-                  console.debug(`${ICON} ACTION selection-card-pending`, {
-                      selection: state.selectedIdentifier,
-                      reason: animatingCenterCard ? 'center animation in progress' : 'awaiting dataset sync'
-                  });
-              }
-              scheduleSelectionRetry(
-                  animatingCenterCard ? 'center-animation' : 'awaiting-dataset-sync',
-                  animatingCenterCard ? 180 : 140
-              );
-              return;
-          }
-
           console.error(`${ICON} ACTION selection-card-missing`, {
               selection: state.selectedIdentifier,
               availableCards: Array.from(allTrackCards).map(card => ({
@@ -2756,24 +1224,8 @@ function createDimensionCards(explorerData, options = {}) {
                   track: card.dataset.trackMd5
               }))
           });
-          state.selectionRetryCount = 0;
-          state.awaitingManualCard = false;
-          state.pendingSelectionUpdate = null;
-          if (state.selectionRetryTimer) {
-              clearTimeout(state.selectionRetryTimer);
-              state.selectionRetryTimer = null;
-          }
           return;
       }
-
-          state.selectionRetryCount = 0;
-          state.awaitingManualCard = false;
-          state.awaitingDirectionRefresh = false;
-          state.pendingSelectionUpdate = null;
-          if (state.selectionRetryTimer) {
-              clearTimeout(state.selectionRetryTimer);
-              state.selectionRetryTimer = null;
-          }
 
       // Second pass: update all cards based on selection
       allTrackCards.forEach(card => {
@@ -2834,7 +1286,6 @@ function createDimensionCards(explorerData, options = {}) {
                       cardDirection: directionKey,
                       cardTrack: cardTrackMd5
                   });
-                  state.awaitingManualCard = false;
                   return;
               }
 
@@ -2915,6 +1366,8 @@ function createDimensionCards(explorerData, options = {}) {
       }, 800);
 
       const streamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
+      state.streamUrl = streamUrl;
+      window.streamUrl = streamUrl;
       console.log(`🎵 Audio connecting to ${streamUrl}`);
 
       startAudioHealthMonitoring();
@@ -2925,10 +1378,31 @@ function createDimensionCards(explorerData, options = {}) {
       connectionHealth.audio.status = 'connecting';
       updateConnectionHealthUI();
 
-      connectAudioStream(streamUrl, { reason: 'initial-start' });
+      elements.audio.src = streamUrl;
+      elements.audio.load();
       state.awaitingSSE = true;
 
-      playAudioElement('initial-start');
+      elements.audio.play()
+        .then(() => {
+          connectionHealth.audio.status = 'connected';
+          connectionHealth.audio.reconnectAttempts = 0;
+          connectionHealth.audio.reconnectDelay = 2000;
+          updateConnectionHealthUI();
+        })
+        .catch(e => {
+          console.error('🎵 Play failed:', e);
+          console.error('🎵 Audio state when play failed:', {
+              error: elements.audio.error,
+              networkState: elements.audio.networkState,
+              readyState: elements.audio.readyState,
+              src: elements.audio.src
+          });
+          connectionHealth.audio.status = 'error';
+          updateConnectionHealthUI();
+          if (!connectionHealth.currentEventSource) {
+              window.connectSSE();
+          }
+        });
   }
 
   // Click to start
@@ -2967,10 +1441,7 @@ function createDimensionCards(explorerData, options = {}) {
       const directionKey = state.latestExplorerData?.nextTrack?.directionKey;
       if (!directionKey) return;
 
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (!deckContainer) return;
-
-      const clockCards = Array.from(deckContainer.querySelectorAll('[data-direction-key]:not(.next-track)'))
+      const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
           .map(c => ({
               element: c,
               key: c.dataset.directionKey,
@@ -2980,7 +1451,7 @@ function createDimensionCards(explorerData, options = {}) {
 
       const occupiedPositions = new Set(clockCards.map(c => c.position));
 
-      const nextTrackCard = deckContainer.querySelector(`.dimension-card.next-track[data-direction-key="${directionKey}"]`);
+      const nextTrackCard = document.querySelector(`.dimension-card.next-track[data-direction-key="${directionKey}"]`);
       if (!nextTrackCard) return;
 
       let nextPosition = nextTrackCard.dataset.originalClockPosition
@@ -3000,45 +1471,31 @@ function createDimensionCards(explorerData, options = {}) {
               e.preventDefault();
               break;
 
-          case 'ArrowRight': { // rotate the wheel clockwise
-              let targetCard = null;
-              for (let i = nextPosition + 1; i <= nextPosition + 12; i++) {
-                  const candidatePos = ((i + 11) % 12) + 1;
-                  targetCard = clockCards.find(c => c.position === candidatePos);
-                  if (targetCard) {
-                      nextPosition = candidatePos;
+          case 'ArrowRight': // rotate the wheel clockwise
+              for (i = nextPosition + 1; i <= nextPosition + 12; i++) {
+                  const posFromIndex = (i+11)%12+1;
+                  if (occupiedPositions.has(posFromIndex)) {
+                      nextPosition = posFromIndex;
+                      break;
+                  }
+	      }
+
+              swapNextTrackDirection(clockCards[nextPosition - 1].key);
+              e.preventDefault();
+              break;
+
+          case 'ArrowLeft': // rotate the wheel counter-clockwise
+              for (i = nextPosition-1; i >= nextPosition - 12; i--) {
+                  const posFromIndex = (i-1)%12 + 1;
+                  if (occupiedPositions.has(posFromIndex)) {
+                      nextPosition = posFromIndex;
                       break;
                   }
               }
 
-              if (targetCard) {
-                  navigateDirectionToCenter(targetCard.key);
-              } else {
-                  console.warn('⚠️ ArrowRight: no available direction card to rotate to');
-              }
+              swapNextTrackDirection(clockCards[nextPosition - 1].key);
               e.preventDefault();
               break;
-          }
-
-          case 'ArrowLeft': { // rotate the wheel counter-clockwise
-              let targetCard = null;
-              for (let i = nextPosition - 1; i >= nextPosition - 12; i--) {
-                  const candidatePos = ((i - 1) % 12 + 12) % 12 + 1;
-                  targetCard = clockCards.find(c => c.position === candidatePos);
-                  if (targetCard) {
-                      nextPosition = candidatePos;
-                      break;
-                  }
-              }
-
-              if (targetCard) {
-                  navigateDirectionToCenter(targetCard.key);
-              } else {
-                  console.warn('⚠️ ArrowLeft: no available direction card to rotate to');
-              }
-              e.preventDefault();
-              break;
-          }
 
           case 'ArrowDown':
               // deal another card from the pack
@@ -3047,97 +1504,28 @@ function createDimensionCards(explorerData, options = {}) {
               e.preventDefault();
               break;
 
-          case 'ArrowUp': {
+          case 'ArrowUp':
               // flip a reversable next track stack
-              const key = state.latestExplorerData.nextTrack.directionKey;
-              const directions = state.latestExplorerData?.directions || {};
-              const currentDirection = directions[key];
-              const normalizeSamples = (samples) => {
-                  if (!Array.isArray(samples)) return [];
-                  return samples
-                      .map(entry => {
-                          const track = entry?.track || entry;
-                          if (!track || !track.identifier) return null;
-                          return { track };
-                      })
-                      .filter(Boolean);
-              };
 
-              let oppositeKey = getOppositeDirection(key);
-              let oppositeDirection = currentDirection?.oppositeDirection || null;
+                  const key =  state.latestExplorerData.nextTrack.directionKey;
+                  const currentDirection = state.latestExplorerData.directions[key];
+                  if (currentDirection && currentDirection.oppositeDirection) {
+                      // Temporarily add the opposite direction to SSE data for swapping
+                      const oppositeKey = getOppositeDirection(key);
+                      if (oppositeKey) {
+                          state.latestExplorerData.directions[oppositeKey] = {
+                              ...currentDirection.oppositeDirection,
+                              key: oppositeKey
+                          };
 
-              const tryResolveFromMap = () => {
-                  if (!oppositeDirection && oppositeKey && directions[oppositeKey]) {
-                      oppositeDirection = directions[oppositeKey];
-                  }
-              };
-
-              tryResolveFromMap();
-
-              if (!oppositeDirection) {
-                  const embedded = Object.values(directions).find(dir => dir?.oppositeDirection && (dir.oppositeDirection.key === key || dir.oppositeDirection.direction === key));
-                  if (embedded?.oppositeDirection) {
-                      oppositeDirection = embedded.oppositeDirection;
-                      if (!oppositeKey) {
-                          oppositeKey = embedded.oppositeDirection.key || embedded.oppositeDirection.direction || null;
+                          // Swap stack contents immediately without animation
+                          swapStackContents(key, oppositeKey);
                       }
+                  } else {
+                      console.warn(`Opposite direction not available for ${direction.key}`);
                   }
-              }
-
-              tryResolveFromMap();
-
-              if (!oppositeDirection && !oppositeKey && currentDirection?.hasOpposite) {
-                  oppositeKey = getOppositeDirection(currentDirection.key || key);
-                  tryResolveFromMap();
-              }
-
-              if (currentDirection && oppositeDirection) {
-                  const normalizedCurrentSamples = normalizeSamples(currentDirection.sampleTracks);
-                  const normalizedOppositeSamples = normalizeSamples(oppositeDirection.sampleTracks);
-                  const resolvedOppositeKey = oppositeKey
-                      || oppositeDirection.key
-                      || oppositeDirection.direction
-                      || null;
-
-                  if (!resolvedOppositeKey) {
-                      console.warn(`Opposite direction key unresolved for ${key}`);
-                      e.preventDefault();
-                      break;
-                  }
-
-                  const oppositeDirectionEntry = {
-                      ...oppositeDirection,
-                      key: resolvedOppositeKey,
-                      sampleTracks: normalizedOppositeSamples
-                  };
-
-                  if (!oppositeDirectionEntry.oppositeDirection) {
-                      oppositeDirectionEntry.oppositeDirection = {
-                          key,
-                          sampleTracks: normalizedCurrentSamples
-                      };
-                  }
-
-                  if (!currentDirection.oppositeDirection) {
-                      currentDirection.oppositeDirection = {
-                          key: resolvedOppositeKey,
-                          sampleTracks: normalizedOppositeSamples
-                      };
-                  }
-
-                  state.latestExplorerData.directions[resolvedOppositeKey] = {
-                      ...(directions[resolvedOppositeKey] || {}),
-                      ...oppositeDirectionEntry
-                  };
-
-                  // Swap stack contents immediately without animation
-                  swapStackContents(key, resolvedOppositeKey);
-              } else {
-                  console.warn(`Opposite direction not available for ${key}`);
-              }
               e.preventDefault();
               break;
-          }
 
           case 'Escape':
               e.preventDefault();
@@ -3242,26 +1630,36 @@ function createDimensionCards(explorerData, options = {}) {
               e.preventDefault();
               break;
 
-      case '1':
-          // Microscope - ultra close examination
-          console.log('🔬 Key 1: Microscope mode');
-          triggerZoomMode('microscope');
-          e.preventDefault();
-          break;
+          case '1':
+              // Microscope - ultra close examination
+              console.log('🔬 Key 1: Microscope mode');
 
-      case '2':
-          // Magnifying glass - detailed examination
-          console.log('🔍 Key 2: Magnifying glass mode');
-          triggerZoomMode('magnifying');
-          e.preventDefault();
-          break;
+              fetch('/session/zoom/microscope', {
+                  method: 'POST'
+              }).catch(err => console.error('Microscope request failed:', err));
+              e.preventDefault();
+              rejig();
+              break;
 
-      case '3':
-          // Binoculars - wide exploration
-          console.log('🔭 Key 3: Binoculars mode');
-          triggerZoomMode('binoculars');
-          e.preventDefault();
-          break;
+          case '2':
+              // Magnifying glass - detailed examination
+              console.log('🔍 Key 2: Magnifying glass mode');
+              fetch('/session/zoom/magnifying', {
+                  method: 'POST'
+              }).catch(err => console.error('Magnifying request failed:', err));
+              e.preventDefault();
+              rejig();
+              break;
+
+          case '3':
+              // Binoculars - wide exploration
+              console.log('🔭 Key 3: Binoculars mode');
+              fetch('/session/zoom/binoculars', {
+                  method: 'POST'
+              }).catch(err => console.error('Binoculars request failed:', err));
+              e.preventDefault();
+              rejig();
+              break;
       }
   });
 
@@ -3274,7 +1672,6 @@ function createDimensionCards(explorerData, options = {}) {
           const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
         if (!hasTrack) {
             state.manualNextTrackOverride = false;
-            state.skipTrayDemotionForTrack = null;
             state.manualNextDirectionKey = null;
             state.pendingManualTrackId = null;
             state.selectedIdentifier = null;
@@ -3286,64 +1683,44 @@ function createDimensionCards(explorerData, options = {}) {
   });
 
 
-function getTrayPreviewElement() {
-    if (elements.nextTrackTrayPreview && elements.nextTrackTrayPreview.isConnected) {
-        return elements.nextTrackTrayPreview;
-    }
-    const resolved = document.querySelector('#nextTrackTray .next-track-tray-preview');
-    if (resolved) {
-        elements.nextTrackTrayPreview = resolved;
-    }
-    return resolved;
-}
+function showNextTrackPreview(track, options = {}) {
+      if (!elements.nextTrackPreview || !elements.nextTrackPreviewImage) {
+          return;
+      }
 
-function showNextTrackPreview(track, { directionKey = null } = {}) {
-    const preview = getTrayPreviewElement();
-    if (!preview) {
-        return;
-    }
+      const cover = track?.albumCover || track?.cover || null;
+      if (!cover) {
+          hideNextTrackPreview({ immediate: true });
+          return;
+      }
 
-    const cover = track?.albumCover || track?.cover || null;
-    if (!cover) {
-        hideNextTrackPreview({ immediate: true });
-        return;
-    }
+      const trackId = track?.identifier || null;
+      if (state.nextTrackPreviewTrackId === trackId && elements.nextTrackPreview.classList.contains('visible')) {
+          return;
+      }
 
-    if (state.suppressPreviewTrackId && track?.identifier === state.suppressPreviewTrackId) {
-        hideNextTrackPreview({ immediate: true });
-        return;
+      if (nextTrackPreviewFadeTimer) {
+          clearTimeout(nextTrackPreviewFadeTimer);
+          nextTrackPreviewFadeTimer = null;
+      }
+
+    if (elements.nextTrackPreviewImage.src !== cover) {
+        elements.nextTrackPreviewImage.src = cover;
     }
 
-    const trackId = track?.identifier || null;
-    if (
-        state.nextTrackPreviewTrackId === trackId &&
-        preview.classList.contains('visible') &&
-        preview.style.backgroundImage === `url("${cover}")`
-    ) {
-        return;
-    }
-
-    if (nextTrackPreviewFadeTimer) {
-        clearTimeout(nextTrackPreviewFadeTimer);
-        nextTrackPreviewFadeTimer = null;
-    }
-
-    preview.className = 'next-track-tray-preview';
-    preview.removeAttribute('style');
-    preview.style.backgroundImage = `url("${cover}")`;
-    preview.classList.add('visible');
+    elements.nextTrackPreview.classList.remove('fade-out');
+    elements.nextTrackPreview.classList.add('visible');
     state.nextTrackPreviewTrackId = trackId;
     state.trayPreviewState = {
         trackId,
-        directionKey,
+        directionKey: options.directionKey || track.directionKey || null,
         title: getDisplayTitle(track) || '',
         artist: track?.artist || ''
     };
 }
 
 function hideNextTrackPreview({ immediate = false } = {}) {
-    const preview = getTrayPreviewElement();
-    if (!preview) {
+    if (!elements.nextTrackPreview) {
         return;
     }
 
@@ -3352,315 +1729,114 @@ function hideNextTrackPreview({ immediate = false } = {}) {
         nextTrackPreviewFadeTimer = null;
     }
 
-    const clearPreview = () => {
-        preview.className = 'next-track-tray-preview';
-        preview.removeAttribute('style');
+    if (immediate) {
+        elements.nextTrackPreview.classList.remove('visible', 'fade-out');
+        if (elements.nextTrackPreviewImage) {
+            elements.nextTrackPreviewImage.src = '';
+        }
         state.nextTrackPreviewTrackId = null;
         state.trayPreviewState = null;
-    };
-
-    if (immediate || !preview.classList.contains('visible')) {
-        clearPreview();
         return;
     }
 
-    preview.classList.add('fade-out');
+    if (!elements.nextTrackPreview.classList.contains('visible')) {
+        state.nextTrackPreviewTrackId = null;
+        return;
+    }
+
+    elements.nextTrackPreview.classList.add('fade-out');
     nextTrackPreviewFadeTimer = setTimeout(() => {
-        clearPreview();
+        elements.nextTrackPreview.classList.remove('visible', 'fade-out');
+        if (elements.nextTrackPreviewImage) {
+            elements.nextTrackPreviewImage.src = '';
+        }
         nextTrackPreviewFadeTimer = null;
+        state.nextTrackPreviewTrackId = null;
+        state.trayPreviewState = null;
     }, 600);
 }
 
-function demoteNextTrackCardToTray(card, onComplete = () => {}) {
-    if (!card) {
-        onComplete();
-        return;
+function updatePlaylistTrayPreview({ immediate = false } = {}) {
+    const trayInfo = resolveNextTrackData();
+    const trayTrack = trayInfo?.track || null;
+    const trayRoot = elements.nextTrackTray || document.getElementById('nextTrackTray');
+    if (trayRoot) {
+        elements.nextTrackTray = trayRoot;
     }
 
-    state.skipNextExitAnimation = true;
-
-    if (typeof clearStackedPreviewLayer === 'function') {
-        clearStackedPreviewLayer();
-    }
-
-    const skipTargetId = state.skipTrayDemotionForTrack || null;
-    const datasetTrackId = card.dataset.trackMd5 || card.dataset.trackIdentifier || null;
-    if (skipTargetId && datasetTrackId && skipTargetId === datasetTrackId) {
-        state.skipTrayDemotionForTrack = null;
-        card.remove();
-        onComplete();
-        return;
-    }
-
-    card.classList.add('card-exit');
-    card.style.pointerEvents = 'none';
-    card.style.willChange = 'transform, opacity';
-    card.style.transition = 'transform 0.45s cubic-bezier(0.18, 0.8, 0.3, 1), opacity 0.4s ease';
-
-    requestAnimationFrame(() => {
-        card.style.transform = 'translate(-50%, -50%) translateZ(-900px) scale(0.45)';
-        card.style.opacity = '0';
-    });
-
-    const cleanup = () => {
-        card.removeEventListener('transitionend', handler);
-        if (card.parentElement) {
-            card.parentElement.removeChild(card);
-        }
-        onComplete();
-    };
-
-    const handler = (event) => {
-        if (event.target === card) {
-            cleanup();
-        }
-    };
-
-    card.addEventListener('transitionend', handler);
-    setTimeout(() => {
-        if (card.parentElement) {
-            cleanup();
-        }
-    }, 500);
-}
-
-function queueCenterPromotion(directionKey, options = {}) {
-    if (!directionKey) {
-        return;
-    }
-
-    state.pendingCenterPromotionKey = directionKey;
-    state.pendingCenterPromotionOptions = options;
-
-    tryFlushPendingCenterPromotion();
-}
-
-function tryFlushPendingCenterPromotion() {
-    if (!state.pendingCenterPromotionKey) {
-        return;
-    }
-
-    if (!state.nowPlayingInitialized || !state.latestCurrentTrack?.identifier) {
-        return;
-    }
-
-    const directionKey = state.pendingCenterPromotionKey;
-    const options = state.pendingCenterPromotionOptions || {};
-    state.pendingCenterPromotionKey = null;
-    state.pendingCenterPromotionOptions = null;
-
-    if (state.nextTrackAnimationTimer) {
-        clearTimeout(state.nextTrackAnimationTimer);
-        state.nextTrackAnimationTimer = null;
-    }
-
-    const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-
-    state.nextTrackAnimationTimer = setTimeout(() => {
-        const candidateCard = deckContainer
-            ? deckContainer.querySelector(`[data-direction-key="${directionKey}"]`)
-            : null;
-        if (candidateCard) {
-            deckLog(`🎯 Animating ${directionKey} to center as next track (queued)`);
-            animateDirectionToCenter(directionKey, options);
-        } else {
-            console.warn(`⚠️ Could not find card to promote for ${directionKey}; synthesizing center card`);
-            convertToNextTrackStack(directionKey, options);
-        }
-        state.nextTrackAnimationTimer = null;
-    }, 120);
-}
-
-if (typeof window !== 'undefined') {
-    window.tryFlushPendingCenterPromotion = tryFlushPendingCenterPromotion;
-}
-
-function enterCardsDormantState() {
-    if (state.cardsDormant) {
-        return;
-    }
-
-    const container = elements.dimensionCards || document.getElementById('dimensionCards');
-    if (container) {
-        container.classList.add('cards-dormant');
-        elements.dimensionCards = container;
-    }
-    state.cardsDormant = true;
-
-    const directionCards = container
-        ? Array.from(container.querySelectorAll('.dimension-card:not(.next-track)'))
-        : [];
-
-    directionCards.forEach(card => {
-        card.classList.remove('inactive-tilt', 'active');
-        if (!card.classList.contains('dormant-exit')) {
-            card.classList.add('dormant-exit');
-            const removeHandler = (event) => {
-                if (event.target !== card) return;
-                card.classList.remove('dormant-exit', 'midpoint-tilt');
-                card.removeEventListener('animationend', removeHandler);
-            };
-            card.addEventListener('animationend', removeHandler);
-        }
-    });
-
-    const centerCard = container?.querySelector('.dimension-card.next-track');
-    if (centerCard && centerCard.isConnected && !centerCard.dataset.dormantDemoted) {
-        centerCard.dataset.dormantDemoted = 'true';
-        demoteNextTrackCardToTray(centerCard, () => {
-            delete centerCard.dataset.dormantDemoted;
-        });
-    }
-
-    const nextInfo = resolveNextTrackData();
-    if (nextInfo && nextInfo.track) {
-        showNextTrackPreview(nextInfo.track, { directionKey: nextInfo.directionKey || nextInfo.track?.directionKey || null });
-    } else {
+    if (!trayTrack) {
         hideNextTrackPreview({ immediate: true });
-    }
-}
-
-function exitCardsDormantState({ immediate = false } = {}) {
-    if (state.cardsDormant) {
-        const container = elements.dimensionCards || document.getElementById('dimensionCards');
-        if (container) {
-            container.classList.remove('cards-dormant');
-            elements.dimensionCards = container;
-        }
-    }
-    state.cardsDormant = false;
-    hideNextTrackPreview({ immediate });
-    hideBeetsSegments();
-
-    if (state.pendingSelectionUpdate && state.selectedIdentifier) {
-        const pendingId = state.pendingSelectionUpdate.trackId;
-        if (!pendingId || pendingId === state.selectedIdentifier) {
-            if (state.selectionRetryTimer) {
-                clearTimeout(state.selectionRetryTimer);
-                state.selectionRetryTimer = null;
-            }
-            state.selectionRetryCount = 0;
-            state.pendingSelectionUpdate = null;
-            setTimeout(() => refreshCardsWithNewSelection(), immediate ? 0 : 40);
-        }
-    }
-}
-
-function sanitizeChipValue(value) {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'number') {
-        if (!Number.isFinite(value)) return '';
-        if (Math.abs(value) >= 10) {
-            return Math.round(value).toString();
-        }
-        return value.toFixed(2).replace(/\.00$/, '');
-    }
-    return String(value).trim();
-}
-
-function collectBeetsChips(meta) {
-    if (!meta || typeof meta !== 'object') {
-        return [];
-    }
-
-    const chips = [];
-    const seen = new Set();
-    const seenVals = new Set();
-
-    const pushChip = (segmentKey, slotKey, rawValue) => {
-        const segmentText = sanitizeChipValue(segmentKey) || 'segment';
-        const valueText = sanitizeChipValue(rawValue);
-
-        if (!segmentText || !valueText || valueText === '' || valueText === '0') return;
-
-        const normalizedValue = valueText.toLowerCase().split('/').join('\n');
-        if (seenVals.has(valueText)) return;
-        seenVals.add(valueText);
-
-        const normalizedSlot = sanitizeChipValue(slotKey) || '';
-        if (normalizedSlot.match(/path$/i)) return;
-
-        const id = `${segmentText.toLowerCase()}|${normalizedSlot}|${normalizedValue}`;
-        if (seen.has(id)) return;
-        seen.add(id);
-
-        const chipKey = normalizedSlot ? `${segmentText}:${normalizedSlot}` : segmentText;
-        chips.push({ key: chipKey, value: valueText, priority: 0 });
-    };
-
-    Object.entries(meta).forEach(([segmentKey, segmentValue]) => {
-        if (!segmentValue || typeof segmentValue !== 'object' || Array.isArray(segmentValue)) {
-            return;
-        }
-
-        Object.entries(segmentValue).forEach(([slotKey, rawValue]) => {
-            if (rawValue === null || rawValue === undefined) return;
-
-            if (Array.isArray(rawValue)) {
-                rawValue.forEach(entry => pushChip(segmentKey, slotKey, entry));
-            } else if (typeof rawValue === 'object') {
-                Object.entries(rawValue).forEach(([innerKey, innerValue]) => {
-                    if (innerValue === null || innerValue === undefined) return;
-                    const combinedKey = innerKey ? `${slotKey}.${innerKey}` : slotKey;
-                    if (Array.isArray(innerValue)) {
-                        innerValue.forEach(val => pushChip(segmentKey, combinedKey, val));
-                    } else {
-                        pushChip(segmentKey, combinedKey, innerValue);
-                    }
-                });
-            } else {
-                pushChip(segmentKey, slotKey, rawValue);
-            }
-        });
-    });
-
-    return chips;
-}
-
-function renderBeetsSegments(track) {
-    const container = elements.beetsSegments;
-    if (!container) return;
-
-    container.innerHTML = '';
-    container.classList.remove('visible');
-    container.classList.remove('hidden');
-
-    const meta = track?.beetsMeta || track?.beets || null;
-    const chips = collectBeetsChips(meta).slice(0, 21);
-
-    if (chips.length === 0) {
-        container.classList.add('hidden');
-        container.dataset.hasData = 'false';
+        trayRoot?.classList.remove('has-track');
         return;
     }
 
-    const fragment = document.createDocumentFragment();
-    chips.forEach(({ key, value }) => {
-        const chip = document.createElement('div');
-        chip.className = 'beets-chip';
-        chip.innerHTML = `
-            <span class="chip-bracket">[</span>
-            <span class="chip-value">${value}</span>
-            <span class="chip-separator">:</span>
-            <span class="chip-key">${key}</span>
-            <span class="chip-bracket">]</span>
-        `;
-        fragment.appendChild(chip);
+    showNextTrackPreview(trayTrack, { directionKey: trayInfo.directionKey || null });
+    trayRoot?.classList.add('has-track');
+}
+
+// Danger zone functions moved to danger-zone.js
+
+function resolveTrackIdentifier(trackLike) {
+    if (!trackLike || typeof trackLike !== 'object') {
+        return null;
+    }
+    return trackLike.identifier || trackLike.trackMd5 || trackLike.md5 || null;
+}
+
+function recordPendingLiveTrackCandidate(trackDetails, driftState, context = {}) {
+    if (!trackDetails || typeof trackDetails !== 'object') {
+        return;
+    }
+    const identifier = resolveTrackIdentifier(trackDetails);
+    if (!identifier) {
+        return;
+    }
+
+    const snapshot = { ...trackDetails };
+    state.pendingLiveTrackCandidate = {
+        track: snapshot,
+        driftState: driftState || null,
+        lockedAt: Date.now(),
+        context
+    };
+    if (typeof window !== 'undefined') {
+        window.state = window.state || {};
+        window.state.pendingLiveTrackCandidate = state.pendingLiveTrackCandidate;
+    }
+    console.log('📌 Pending now-playing candidate locked', {
+        trackId: identifier,
+        direction: driftState?.currentDirection || null,
+        context,
+        snapshotKeys: Object.keys(snapshot || {})
     });
-
-    container.appendChild(fragment);
-    container.classList.remove('hidden');
-    container.dataset.hasData = 'true';
 }
 
-function hideBeetsSegments() {
-    if (!elements.beetsSegments) return;
-    elements.beetsSegments.classList.remove('visible');
-    elements.beetsSegments.classList.add('hidden');
-}
+function adoptPendingLiveTrackCandidate(trackDetails, fallbackDriftState = null) {
+    const pending = state.pendingLiveTrackCandidate;
+    if (!trackDetails || !pending || !pending.track) {
+        return { driftState: fallbackDriftState || null, adopted: false };
+    }
+    const currentId = resolveTrackIdentifier(trackDetails);
+    const pendingId = resolveTrackIdentifier(pending.track);
+    if (!currentId || !pendingId || currentId !== pendingId) {
+        return { driftState: fallbackDriftState || null, adopted: false };
+    }
 
-window.renderBeetsSegments = renderBeetsSegments;
-window.collectBeetsChips = collectBeetsChips;
+    mergeTrackMetadata(trackDetails, pending.track);
+    const driftState = pending.driftState || fallbackDriftState || null;
+    console.log('📌 Pending now-playing candidate applied', {
+        trackId: currentId,
+        lockedForMs: pending.lockedAt ? Date.now() - pending.lockedAt : null,
+        context: pending.context || null
+    });
+    state.pendingLiveTrackCandidate = null;
+    if (typeof window !== 'undefined' && window.state) {
+        window.state.pendingLiveTrackCandidate = null;
+    }
+    updatePlaylistTrayPreview();
+    updatePlaylistTrayPreview();
+    return { driftState, adopted: true };
+}
 
 function updateNextTrackMetadata(track) {
     if (!elements.beetsSegments) {
@@ -3678,22 +1854,10 @@ function updateNextTrackMetadata(track) {
         return;
     }
 
-    const cache = getTrackMetadataCache();
-    const cachedEntry = cache[track.identifier] || (cache[track.identifier] = {
-        id: track.identifier,
-        meta: null,
-        details: null,
-        promise: null
-    });
+    const cache = state.trackMetadataCache || (state.trackMetadataCache = {});
+    const cachedEntry = cache[track.identifier];
 
-    if (cachedEntry.meta) {
-        track.beetsMeta = cachedEntry.meta;
-        renderBeetsSegments(track);
-        return;
-    }
-
-    if (cachedEntry.details?.beetsMeta) {
-        cachedEntry.meta = cachedEntry.details.beetsMeta;
+    if (cachedEntry?.meta) {
         track.beetsMeta = cachedEntry.meta;
         renderBeetsSegments(track);
         return;
@@ -3701,44 +1865,54 @@ function updateNextTrackMetadata(track) {
 
     hideBeetsSegments();
 
-    if (cachedEntry.promise) {
-        cachedEntry.promise.then(details => {
-            const meta = details?.beetsMeta || details?.beets || cachedEntry.meta;
+    if (cachedEntry?.promise) {
+        cachedEntry.promise.then(meta => {
             if (meta && track.identifier === cachedEntry.id) {
-                cachedEntry.meta = meta;
                 track.beetsMeta = meta;
                 renderBeetsSegments(track);
             }
-        }).catch(() => hideBeetsSegments());
+        }).catch(() => {});
         return;
     }
 
-    cachedEntry.promise = hydrateTrackDetails(track, { reason: 'beets-meta' })
-        .then(details => {
-            const meta = details?.beetsMeta || details?.beets || null;
+    const fetchPromise = fetch(`/track/${encodeURIComponent(track.identifier)}/meta`)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            return response.json();
+        })
+        .then(result => {
+            const meta = result?.track?.beetsMeta || result?.track?.beets || null;
             if (meta) {
-                cachedEntry.meta = meta;
+                cache[track.identifier] = { id: track.identifier, meta };
                 track.beetsMeta = meta;
+
                 if (state.selectedIdentifier === track.identifier) {
                     refreshCardsWithNewSelection();
                 } else {
                     renderBeetsSegments(track);
                 }
-            } else {
-                hideBeetsSegments();
             }
-            return details;
         })
-        .catch(() => {
+        .catch(error => {
+            console.warn('⚠️ Failed to load beets metadata:', error);
+            cache[track.identifier] = { id: track.identifier, meta: null };
             hideBeetsSegments();
-            return null;
-        })
-        .finally(() => {
-            cachedEntry.promise = null;
         });
+
+    cache[track.identifier] = { id: track.identifier, promise: fetchPromise, meta: null };
 }
 
 window.updateNextTrackMetadata = updateNextTrackMetadata;
+
+// Exports for sse-client.js
+if (typeof window !== 'undefined') {
+  window.updatePlaylistTrayPreview = updatePlaylistTrayPreview;
+  window.resolveTrackIdentifier = resolveTrackIdentifier;
+  window.recordPendingLiveTrackCandidate = recordPendingLiveTrackCandidate;
+  window.adoptPendingLiveTrackCandidate = adoptPendingLiveTrackCandidate;
+}
 
 // ====== Inactivity Management ======
   let inactivityTimer = null;
@@ -3746,7 +1920,18 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
   let cardsInactiveTilted = false; // Track if cards are already tilted from inactivity
   let midpointReached = false; // Track if we've hit the lockout threshold
   let cardsLocked = false; // Track if card interactions are locked
-  let lastProgressPhase = null; // Track progress bar phase for logging
+  let dangerZoneReached = false;
+
+  function publishInteractionState() {
+      if (typeof window === 'undefined') {
+          return;
+      }
+      window.__deckInteractionState = window.__deckInteractionState || {};
+      window.__deckInteractionState.cardsLocked = cardsLocked;
+      window.__deckInteractionState.dangerZoneReached = midpointReached;
+  }
+  window.publishInteractionState = publishInteractionState;
+  publishInteractionState();
 
   function markActivity() {
       lastActivityTime = Date.now();
@@ -3754,7 +1939,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       const canReactivate = !midpointReached && !cardsLocked;
 
       if (canReactivate) {
-          safelyExitCardsDormantState();
+          exitCardsDormantState();
       }
 
       // Only respond to activity if we're in the first half and cards aren't locked
@@ -3769,14 +1954,11 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       }
 
       // Immediately bring cards back to attention if they were inactive
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (deckContainer) {
-          const directionCards = deckContainer.querySelectorAll('.dimension-card:not(.track-detail-card)');
-          directionCards.forEach(card => {
-              card.classList.remove('inactive-tilt');
-              card.classList.add('active');
-          });
-      }
+      const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
+      directionCards.forEach(card => {
+          card.classList.remove('inactive-tilt');
+          card.classList.add('active');
+      });
       cardsInactiveTilted = false;
 
       // Set new timer for 10 seconds (only in first half)
@@ -3787,20 +1969,19 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
               performInactivityTilt();
           }
       }, 10000); // 10 seconds
+
+      publishInteractionState();
   }
 
   function performInactivityTilt() {
       if (cardsInactiveTilted) return; // Already tilted
 
-      console.log('📱 Performing inactivity tilt - rotating 45° on X axis');
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (deckContainer) {
-          const directionCards = deckContainer.querySelectorAll('.dimension-card:not(.track-detail-card)');
-          directionCards.forEach(card => {
-              card.classList.remove('active');
-              card.classList.add('inactive-tilt');
-          });
-      }
+      console.log('📱 Performing inactivity tilt - rotating 45° on X axis')
+      const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
+      directionCards.forEach(card => {
+          card.classList.remove('active');
+          card.classList.add('inactive-tilt');
+      });
       cardsInactiveTilted = true;
   }
 
@@ -3812,324 +1993,42 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
   // Initialize activity tracking
   markActivity();
 
-  // ====== Progress Bar Functions ======
+  // Progress bar functions moved to progress-ui.js
 
-  function startProgressAnimation(durationSeconds) {
-      startProgressAnimationFromPosition(durationSeconds, 0);
-  }
-
-  function renderProgressBar(progressFraction) {
-      const clamped = Math.min(Math.max(progressFraction, 0), 1);
-      const phase = clamped <= 0.5 ? 'fill' : 'drain';
-      if (phase !== lastProgressPhase) {
-          debugLog('progress', `Progress phase → ${phase}`, { progress: Number(clamped.toFixed(3)) });
-          lastProgressPhase = phase;
+  function resetProgressAndDeck(reason = 'manual') {
+      console.warn(`🧹 Forcing deck recovery (${reason})`);
+      if (typeof window.stopProgressAnimation === 'function') {
+          window.stopProgressAnimation();
       }
-      const background = document.getElementById('background');
-
-      updateMetadataFadeFromProgress(clamped);
-
-      if (clamped <= 0.5) {
-          const widthPercent = clamped * 2 * 100; // 0 → 100
-          elements.progressWipe.style.left = '0%';
-          elements.progressWipe.style.right = 'auto';
-          elements.progressWipe.style.width = `${widthPercent}%`;
-
-          if (background) {
-              let green = Math.floor(clamped * 10);
-              background.style.background = `linear-gradient(135deg, #235, #4${green}3)`;
-          }
-      } else {
-          const phase2Progress = (clamped - 0.5) * 2; // 0 → 1
-          elements.progressWipe.style.left = `${phase2Progress * 100}%`;
-          elements.progressWipe.style.right = 'auto';
-          elements.progressWipe.style.width = `${(1 - phase2Progress) * 100}%`;
-
-          if (background) {
-              let green = 10 - Math.floor(clamped * 10);
-              background.style.background = `linear-gradient(135deg, #235, #4${green}3)`;
-          }
+      if (typeof window.resetDangerZoneState === 'function') {
+          window.resetDangerZoneState();
       }
-  }
-
-  function formatTimecode(seconds) {
-      if (!Number.isFinite(seconds) || seconds < 0) {
-          return '--:--';
-      }
-      const wholeSeconds = Math.floor(seconds);
-      const minutes = Math.floor(wholeSeconds / 60);
-      const secs = wholeSeconds % 60;
-      return `${minutes}:${secs.toString().padStart(2, '0')}`;
-  }
-
-  function updatePlaybackClockDisplay(forceSeconds = null) {
-      if (!elements.playbackClock) return;
-
-      if (!state.playbackStartTimestamp || state.playbackDurationSeconds <= 0) {
-          elements.playbackClock.textContent = '';
-          elements.playbackClock.classList.add('is-hidden');
-          return;
-      }
-
-      const elapsedSeconds = forceSeconds !== null
-          ? forceSeconds
-          : Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
-      const clampedElapsed = Math.min(elapsedSeconds, state.playbackDurationSeconds);
-      const formatted = formatTimecode(clampedElapsed);
-      if (formatted === '--:--') {
-          elements.playbackClock.textContent = '';
-          elements.playbackClock.classList.add('is-hidden');
-          return;
-      }
-
-      elements.playbackClock.textContent = formatted;
-      elements.playbackClock.classList.remove('is-hidden');
-  }
-
-  function clearPlaybackClock() {
-      state.playbackStartTimestamp = null;
-      state.playbackDurationSeconds = 0;
-      updatePlaybackClockDisplay(null);
-  }
-
-  function shouldLockInteractions(elapsedSeconds, totalDuration) {
-      if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
-          return false;
-      }
-      const remaining = Math.max(totalDuration - elapsedSeconds, 0);
-      return remaining <= LOCKOUT_THRESHOLD_SECONDS;
-  }
-
-  const rootElement = typeof document !== 'undefined' ? document.documentElement : null;
-
-  function applyTailProgress(value = 0) {
-      if (!rootElement) {
-          state.tailProgress = 0;
-          return;
-      }
-      const normalized = Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
-      state.tailProgress = normalized;
-      rootElement.style.setProperty('--tail-progress', normalized.toFixed(3));
-      const isActive = normalized > 0;
-      rootElement.classList.toggle('tail-active', isActive);
-      rootElement.classList.toggle('tail-complete', normalized >= 0.999);
-  }
-
-  if (typeof window !== 'undefined') {
-      window.applyTailProgress = applyTailProgress;
-      window.updateTailProgress = updateTailProgress;
-  }
-
-  function updateTailProgress(elapsedSeconds, totalDuration) {
-      if (!Number.isFinite(totalDuration) || totalDuration <= 0 || !Number.isFinite(elapsedSeconds)) {
-          applyTailProgress(0);
-          return;
-      }
-      const remaining = Math.max(totalDuration - elapsedSeconds, 0);
-      if (remaining <= LOCKOUT_THRESHOLD_SECONDS) {
-          const windowSize = LOCKOUT_THRESHOLD_SECONDS || 1;
-          const fraction = 1 - (remaining / windowSize);
-          applyTailProgress(Math.max(0, Math.min(1, fraction)));
-      } else {
-          applyTailProgress(0);
-      }
-  }
-
-  function startProgressAnimationFromPosition(durationSeconds, startPositionSeconds = 0, options = {}) {
-      const resync = !!options.resync;
-      debugLog('progress', 'startProgressAnimationFromPosition()', {
-          durationSeconds,
-          startPositionSeconds,
-          resync,
-          stateDuration: state.playbackDurationSeconds,
-          stateStartTimestamp: state.playbackStartTimestamp
-      });
-
-      if (!resync) {
-          applyTailProgress(0);
-      }
-
-      if (resync && state.playbackStartTimestamp) {
-          const priorElapsed = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
-          const targetElapsed = Math.max(0, startPositionSeconds);
-          const priorDuration = state.playbackDurationSeconds || 0;
-          const targetDuration = Number.isFinite(durationSeconds) ? durationSeconds : priorDuration;
-
-          const elapsedDelta = Math.abs(priorElapsed - targetElapsed);
-          const durationDelta = Math.abs(priorDuration - targetDuration);
-          debugLog('progress', 'resync delta comparison', {
-              priorElapsed,
-              targetElapsed,
-              elapsedDelta,
-              priorDuration,
-              targetDuration,
-              durationDelta
-          });
-
-          if (elapsedDelta < 1 && durationDelta < 1 && priorDuration > 0) {
-              state.playbackDurationSeconds = targetDuration;
-              state.playbackStartTimestamp = Date.now() - targetElapsed * 1000;
-              const effectiveProgress = targetDuration > 0 ? targetElapsed / targetDuration : 0;
-              renderProgressBar(effectiveProgress);
-              updatePlaybackClockDisplay(targetElapsed);
-              updateTailProgress(targetElapsed, targetDuration);
-              debugLog('progress', 'resync fast-path applied', { effectiveProgress });
-              return;
-          }
-          debugLog('progress', 'resync delta exceeded tolerance – restarting animation');
-      }
-
-      // Clear any existing animation
-      if (state.progressAnimation) {
-          clearInterval(state.progressAnimation);
-          state.progressAnimation = null;
-          debugLog('progress', 'Cleared existing progress interval before restart');
-      }
-
-      if (!resync) {
-          midpointReached = false;
-          cardsLocked = false;
-          cardsInactiveTilted = false;
-          lastProgressPhase = null;
-
-          state.usingOppositeDirection = false;
-          clearReversePreference();
-
-          // Unlock cards at start of new track
-          unlockCardInteractions();
-
-          // Restart inactivity tracking for new track
-          markActivity();
-
-          // Reset visuals only when starting a fresh track
-          elements.progressWipe.style.width = '0%';
-          elements.progressWipe.style.left = '0%';
-          elements.progressWipe.style.right = 'auto';
-          elements.fullscreenProgress.classList.add('active');
-          debugLog('progress', 'Reset progress visuals for new track');
-      } else {
-          // Ensure progress container is visible on resync, but keep current fill
-          elements.fullscreenProgress.classList.add('active');
-          debugLog('progress', 'Resync requested; keeping existing wipe fill');
-      }
-
-      console.log(`🎬 Starting progress animation for ${durationSeconds}s from position ${startPositionSeconds}s – lockout begins with ${LOCKOUT_THRESHOLD_SECONDS}s remaining`);
-
-      const safeDuration = Math.max(durationSeconds, 0.001);
-      const clampedStartPosition = Math.min(Math.max(startPositionSeconds, 0), safeDuration);
-      const initialProgress = clampedStartPosition / safeDuration;
-      const remainingDuration = Math.max((safeDuration - clampedStartPosition) * 1000, 0); // ms
-
-      debugLog('progress', 'Computed progress parameters', {
-          safeDuration,
-          clampedStartPosition,
-          initialProgress,
-          remainingMs: remainingDuration
-      });
-
-      state.playbackDurationSeconds = safeDuration;
-      state.playbackStartTimestamp = Date.now() - clampedStartPosition * 1000;
-      updateTailProgress(clampedStartPosition, safeDuration);
-
-      renderProgressBar(initialProgress);
-      updatePlaybackClockDisplay(clampedStartPosition);
-
-      const initialShouldLock = shouldLockInteractions(clampedStartPosition, safeDuration);
-      debugLog('progress', 'Initial lock-state evaluation', {
-          initialShouldLock,
-          midpointReached,
-          cardsLocked
-      });
-
-      if (resync) {
-          if (initialShouldLock && state.tailProgress >= TAIL_LOCK_THRESHOLD) {
-              if (!midpointReached || !cardsLocked) {
-                  triggerMidpointActions();
-              }
-              midpointReached = true;
-              cardsLocked = true;
-              debugLog('progress', 'Resync landed inside lockout window → forcing lock state');
-          } else {
-              if (cardsLocked || midpointReached) {
-                  unlockCardInteractions();
-              }
-              midpointReached = false;
-              cardsLocked = false;
-              cardsInactiveTilted = false;
-              debugLog('progress', 'Resync outside lockout window → ensuring unlocked state');
-          }
-      } else if (!midpointReached && initialShouldLock && state.tailProgress >= TAIL_LOCK_THRESHOLD) {
-          triggerMidpointActions();
-          midpointReached = true;
-          cardsLocked = true;
-          debugLog('progress', 'New track immediately inside lockout window');
-      }
-
-      if (remainingDuration <= 0) {
-          debugLog('progress', 'Remaining duration <= 0; forcing completion');
-          renderProgressBar(1);
-          updatePlaybackClockDisplay(safeDuration);
-          applyTailProgress(1);
-          return;
-      }
-
-      const startTime = Date.now();
-
-      state.progressAnimation = setInterval(() => {
-          const elapsed = Date.now() - startTime;
-          const elapsedProgress = Math.min(elapsed / remainingDuration, 1);
-          const progress = Math.min(initialProgress + elapsedProgress * (1 - initialProgress), 1);
-
-          renderProgressBar(progress);
-          updatePlaybackClockDisplay();
-
-          const elapsedSeconds = progress * safeDuration;
-          if (!midpointReached && shouldLockInteractions(elapsedSeconds, safeDuration) && state.tailProgress >= TAIL_LOCK_THRESHOLD) {
-              triggerMidpointActions();
-              midpointReached = true;
-              cardsLocked = true;
-              debugLog('progress', 'Midpoint triggered during animation', { elapsedSeconds });
-          }
-          updateTailProgress(elapsedSeconds, safeDuration);
-
-          if (progress >= 1) {
-              clearInterval(state.progressAnimation);
-              state.progressAnimation = null;
-              updatePlaybackClockDisplay(safeDuration);
-              applyTailProgress(1);
-              debugLog('progress', 'Progress animation completed', { safeDuration });
-          }
-      }, 100); // Update every 100ms for smooth animation
-  }
-
-  if (typeof window !== 'undefined') {
-      window.__progressFns = window.__progressFns || {};
-      window.__progressFns.start = startProgressAnimationFromPosition;
-  }
-
-  function stopProgressAnimation() {
-      if (state.progressAnimation) {
-          clearInterval(state.progressAnimation);
-          state.progressAnimation = null;
-      }
-      elements.fullscreenProgress.classList.remove('active');
-      elements.progressWipe.style.width = '0%';
-      elements.progressWipe.style.left = '0%';
-      elements.progressWipe.style.right = 'auto';
+      cardsInactiveTilted = false;
       midpointReached = false;
+      window.exitDangerZoneVisualState({ reason: 'deck-reset' });
       cardsLocked = false;
-      console.log('🛑 Stopped progress animation');
-      clearPlaybackClock();
-      applyMetadataOpacity(0);
-      applyTailProgress(0);
-  }
-
-  if (typeof window !== 'undefined') {
-      window.__progressFns = window.__progressFns || {};
-      window.__progressFns.stop = stopProgressAnimation;
+      state.usingOppositeDirection = false;
+      state.lastProgressDesync = null;
+      state.progressEverStarted = false;
+      publishInteractionState();
+      clearReversePreference();
+      window.safelyExitCardsDormantState({ immediate: true });
+      unlockCardInteractions();
+      markActivity();
   }
 
   function triggerMidpointActions() {
+      // Defer danger zone entry if deck render is in progress to avoid blocking
+      if (state.isRenderingDeck || state.pendingDeckHydration) {
+          console.log('🎯 Deferring danger zone entry - deck render in progress');
+          setTimeout(() => {
+              if (!state.dangerZoneVisualActive && !state.isRenderingDeck && !state.pendingDeckHydration) {
+                  triggerMidpointActions();
+              }
+          }, 50);
+          return;
+      }
+
       console.log(`🎯 Locking in selection - ${LOCKOUT_THRESHOLD_SECONDS}s or less remaining`);
 
       // Clear inactivity timer - no longer needed in second half
@@ -4140,48 +2039,43 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
 
       enterCardsDormantState();
 
-      if (typeof clearStackedPreviewLayer === 'function') {
-          clearStackedPreviewLayer();
-      }
-
       // Tilt back all non-selected direction cards (if not already tilted from inactivity)
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (deckContainer) {
-          const directionCards = deckContainer.querySelectorAll('.dimension-card:not(.track-detail-card)');
-          directionCards.forEach(card => {
-              // Remove any inactivity classes and apply midpoint tilt
-              card.classList.remove('inactive-tilt', 'active');
-              card.classList.add('midpoint-tilt');
-          });
-      }
+      const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
+      directionCards.forEach(card => {
+          // Remove any inactivity classes and apply midpoint tilt
+          card.classList.remove('inactive-tilt', 'active');
+          card.classList.add('midpoint-tilt');
+      });
       cardsInactiveTilted = false; // Reset since we're now using midpoint tilt
 
       // Hide all reverse icons when entering second swipe
-      if (deckContainer) {
-          const reverseIcons = deckContainer.querySelectorAll('.uno-reverse');
-          reverseIcons.forEach(icon => {
-              console.log('🔄 Hiding reverse icon for second swipe');
-              icon.style.opacity = '0';
-              icon.style.pointerEvents = 'none';
-          });
-      }
+      const reverseIcons = document.querySelectorAll('.uno-reverse');
+      reverseIcons.forEach(icon => {
+          console.log('🔄 Hiding reverse icon for second swipe');
+          icon.style.opacity = '0';
+          icon.style.pointerEvents = 'none';
+      });
 
       // Lock card interactions
       lockCardInteractions();
+      enterDangerZoneVisualState();
+  }
+
+  function triggerDangerZoneActions() {
+      triggerMidpointActions();
   }
 
   function lockCardInteractions() {
       console.log('🔒 Locking card interactions until next track');
       cardsLocked = true;
 
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (deckContainer) {
-          const allCards = deckContainer.querySelectorAll('.dimension-card');
-          allCards.forEach(card => {
-              card.classList.add('interaction-locked');
-              card.style.pointerEvents = 'none';
-          });
-      }
+      const allCards = document.querySelectorAll('.dimension-card');
+      allCards.forEach(card => {
+          card.classList.add('interaction-locked');
+          card.style.pointerEvents = 'none';
+      });
+
+      publishInteractionState();
   }
 
   function unlockCardInteractions() {
@@ -4189,761 +2083,24 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       cardsLocked = false;
       cardsInactiveTilted = false;
 
-      safelyExitCardsDormantState({ immediate: true });
+      exitCardsDormantState({ immediate: true });
 
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (deckContainer) {
-          const allCards = deckContainer.querySelectorAll('.dimension-card');
-          allCards.forEach(card => {
-              card.classList.remove('interaction-locked', 'midpoint-tilt', 'inactive-tilt');
-              card.classList.add('active');
-              card.style.pointerEvents = 'auto';
-          });
-      }
+      const allCards = document.querySelectorAll('.dimension-card');
+      allCards.forEach(card => {
+          card.classList.remove('interaction-locked', 'midpoint-tilt', 'inactive-tilt');
+          card.classList.add('active');
+          card.style.pointerEvents = 'auto';
+      });
 
       // Restore reverse icons for new track (first swipe)
-      if (deckContainer) {
-          const reverseIcons = deckContainer.querySelectorAll('.uno-reverse');
-          reverseIcons.forEach(icon => {
-              console.log('🔄 Restoring reverse icon for new track');
-              icon.style.opacity = '';
-              icon.style.pointerEvents = '';
-          });
-      }
-  }
-
-  // ====== Session Management ======
-
-  // Smart SSE connection with health monitoring and reconnection
-  function connectSSE() {
-    const fingerprint = state.streamFingerprint;
-    const eventsUrl = composeEventsEndpoint(fingerprint);
-    syncEventsEndpoint(fingerprint);
-    state.awaitingSSE = false;
-
-    if (fingerprint) {
-      console.log(`🔌 Connecting SSE to fingerprint: ${fingerprint}`);
-    } else {
-      console.log('🔌 Connecting SSE (awaiting fingerprint from audio stream)');
-    }
-
-    connectionHealth.sse.status = 'connecting';
-    updateConnectionHealthUI();
-
-    // Close existing connection if any
-    if (connectionHealth.currentEventSource) {
-      connectionHealth.currentEventSource.close();
-    }
-
-    const eventSource = new EventSource(eventsUrl);
-    connectionHealth.currentEventSource = eventSource;
-
-    const handleSseStuck = async () => {
-      if (!state.streamFingerprint) {
-        console.warn('📡 SSE stuck but fingerprint not yet assigned; waiting for audio session');
-        return true;
-      }
-
-      const ok = await requestSSERefresh({ escalate: false });
-      return !ok;
-    };
-
-    const resetStuckTimer = () => {
-      if (connectionHealth.sse.stuckTimeout) {
-        clearTimeout(connectionHealth.sse.stuckTimeout);
-      }
-      connectionHealth.sse.stuckTimeout = setTimeout(async () => {
-        const shouldReconnect = await handleSseStuck();
-        if (shouldReconnect) {
-          console.warn('📡 SSE stuck check: forcing reconnect');
-          connectionHealth.sse.status = 'reconnecting';
-          updateConnectionHealthUI();
-          eventSource.close();
-          connectionHealth.sse.reconnectAttempts++;
-          const delay = getReconnectDelay(connectionHealth.sse.reconnectAttempts);
-          setTimeout(() => connectSSE(), delay);
-        } else {
-          resetStuckTimer();
-        }
-      }, 60000);
-    };
-
-    const simpleBody = state.streamFingerprint
-      ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
-      : null;
-
-    const handleHeartbeat = (heartbeat) => {
-      if (!heartbeat || !heartbeat.currentTrack) {
-        console.warn('⚠️ Heartbeat missing currentTrack payload');
-        return;
-      }
-
-      if (heartbeat.fingerprint && state.streamFingerprint !== heartbeat.fingerprint) {
-        applyFingerprint(heartbeat.fingerprint);
-      }
-
-      const currentTrack = heartbeat.currentTrack;
-      const currentTrackId = currentTrack.identifier || null;
-      const previousTrackId = state.latestCurrentTrack?.identifier || null;
-      const trackChanged = Boolean(currentTrackId && previousTrackId && currentTrackId !== previousTrackId);
-
-      if (Number.isFinite(currentTrack.durationMs)) {
-        state.playbackDurationSeconds = Math.max(currentTrack.durationMs / 1000, 0);
-      } else if (Number.isFinite(currentTrack.duration || currentTrack.length)) {
-        state.playbackDurationSeconds = currentTrack.duration || currentTrack.length || 0;
-      }
-
-      if (currentTrack.startTime) {
-        state.playbackStartTimestamp = currentTrack.startTime;
-      } else if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
-        state.playbackStartTimestamp = Date.now() - heartbeat.timing.elapsedMs;
-      }
-
-      state.latestCurrentTrack = {
-        ...state.latestCurrentTrack,
-        ...currentTrack,
-        duration: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null,
-        length: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null
-      };
-      window.state.latestCurrentTrack = state.latestCurrentTrack;
-      state.lastTrackUpdateTs = Date.now();
-
-      if ((trackChanged || (!previousTrackId && currentTrackId)) && currentTrackId) {
-        state.pendingSnapshotTrackId = currentTrackId;
-      }
-
-      const durationSeconds = state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || 0;
-      let elapsedSeconds = null;
-      if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
-        elapsedSeconds = Math.max(heartbeat.timing.elapsedMs / 1000, 0);
-      } else if (state.playbackStartTimestamp) {
-        elapsedSeconds = Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0);
-      }
-
-      if (durationSeconds > 0 && elapsedSeconds != null) {
-        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-        startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: !trackChanged });
-      }
-
-      const normalizedHeartbeatNext = normalizeNextTrackPayload(
-        heartbeat.nextTrack,
-        state.latestExplorerData?.directions
-      );
-
-      const nextTrackId = normalizedHeartbeatNext?.track?.identifier || normalizedHeartbeatNext?.identifier || null;
-      if (nextTrackId) {
-        state.serverNextTrack = nextTrackId;
-        const normalizedServerDirection = normalizedHeartbeatNext?.directionKey
-          || normalizeDirectionKey(normalizedHeartbeatNext?.direction || null, state.latestExplorerData?.directions)
-          || null;
-        state.serverNextDirection = normalizedServerDirection;
-        if (!state.manualNextTrackOverride) {
-          state.selectedIdentifier = nextTrackId;
-        }
-      }
-
-      const overrideInfo = heartbeat.override || null;
-      if (overrideInfo && overrideInfo.identifier) {
-        const overrideId = overrideInfo.identifier;
-        if (overrideInfo.status === 'pending' || overrideInfo.status === 'prepared' || overrideInfo.status === 'locked') {
-          state.manualNextTrackOverride = true;
-          state.skipTrayDemotionForTrack = null;
-          state.pendingManualTrackId = overrideId;
-          if (!state.selectedIdentifier || state.selectedIdentifier === state.serverNextTrack) {
-            state.selectedIdentifier = overrideId;
-          }
-        }
-      }
-
-  if (trackChanged && currentTrackId && state.manualNextTrackOverride) {
-    if (state.selectedIdentifier && currentTrackId === state.selectedIdentifier) {
-      console.log('🎯 Heartbeat: manual override track is now playing; clearing override after confirmation');
-      state.manualNextTrackOverride = false;
-      state.skipTrayDemotionForTrack = null;
-      state.manualNextDirectionKey = null;
-          state.pendingManualTrackId = null;
-          state.selectedIdentifier = currentTrackId;
-          clearReversePreference();
-          updateRadiusControlsUI();
-        }
-      }
-    };
-
-    const handleSelectionAck = (event) => {
-      const trackId = event.trackId || event.track?.identifier || null;
-      if (!trackId) {
-        return;
-      }
-
-      console.log('🛰️ selection_ack', event);
-
-      if (state.cardsDormant) {
-        safelyExitCardsDormantState({ immediate: true });
-      }
-
-      state.manualNextTrackOverride = true;
-      state.skipTrayDemotionForTrack = null;
-      state.pendingManualTrackId = trackId;
-      const acknowledgedDirection = event.direction || null;
-      const acknowledgeWouldOverrideOpposite =
-        acknowledgedDirection &&
-        state.usingOppositeDirection &&
-        acknowledgedDirection === (state.baseDirectionKey || null);
-
-      if (acknowledgedDirection && !acknowledgeWouldOverrideOpposite) {
-        state.manualNextDirectionKey = acknowledgedDirection;
-      }
-      state.selectedIdentifier = trackId;
-
-      if (Number.isFinite(event.generation)) {
-        state.lastSelectionGeneration = event.generation;
-        setReversePreference(trackId, { generation: event.generation });
-      } else if (state.reversePreference && state.reversePreference.trackId === trackId) {
-        setReversePreference(trackId);
-      }
-
-      const match = findTrackInExplorer(state.latestExplorerData, trackId);
-      if (match?.track) {
-        updateNextTrackMetadata(match.track);
-      } else {
-        updateNextTrackMetadata({ identifier: trackId });
-      }
-
-      const status = typeof event.status === 'string' ? event.status.toLowerCase() : '';
-      const promotedStatus = status === 'promoted' || status === 'playing';
-      const alreadyCurrent = state.latestCurrentTrack?.identifier === trackId;
-      const needsBootstrap = !state.nowPlayingInitialized || !state.latestCurrentTrack?.identifier;
-      const shouldUpdateNowPlaying =
-        (status === 'playing')
-        || (needsBootstrap && promotedStatus);
-
-      if (shouldUpdateNowPlaying && !alreadyCurrent) {
-        let trackDetails = event.track || null;
-        if (!trackDetails) {
-          if (match?.track) {
-            trackDetails = match.track;
-          } else {
-            const explorerNext = state.latestExplorerData?.nextTrack?.track
-              || state.latestExplorerData?.nextTrack
-              || null;
-            if (explorerNext?.identifier === trackId) {
-              trackDetails = explorerNext;
-            }
-          }
-        }
-
-        if (!trackDetails && state.previousNextTrack?.identifier === trackId) {
-          trackDetails = state.previousNextTrack;
-        }
-
-        if (!trackDetails) {
-          const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-          const centerCard = deckContainer ? deckContainer.querySelector('.dimension-card.next-track') : null;
-          const centerDetails = extractTrackFromCard(centerCard, trackId);
-          if (centerDetails) {
-            trackDetails = centerDetails;
-          } else if (state.latestExplorerData?.directions) {
-            const matchingCard = deckContainer
-              ? Array.from(deckContainer.querySelectorAll('.dimension-card')).find(card => {
-                  const candidateId = card.dataset.trackMd5 || card.dataset.trackIdentifier || null;
-                  return candidateId === trackId;
-                })
-              : null;
-            const cardDetails = extractTrackFromCard(matchingCard, trackId);
-            if (cardDetails) {
-              trackDetails = cardDetails;
-            }
-          }
-        }
-
-        if (trackDetails) {
-          const directionKeyCandidate =
-            acknowledgedDirection ||
-            match?.directionKey ||
-            state.manualNextDirectionKey ||
-            state.serverNextDirection ||
-            state.baseDirectionKey ||
-            null;
-          const driftState = directionKeyCandidate
-            ? { currentDirection: directionKeyCandidate }
-            : null;
-
-          updateNowPlayingCard(trackDetails, driftState);
-
-          const numericDuration = Number(trackDetails.duration ?? trackDetails.length);
-          if (Number.isFinite(numericDuration) && numericDuration > 0) {
-            startProgressAnimationFromPosition(numericDuration, 0, { resync: false });
-          }
-        } else {
-          console.warn('🎯 selection_ack: unable to resolve track details for promoted track', { trackId });
-        }
-      }
-
-      state.awaitingManualCard = true;
-      refreshCardsWithNewSelection();
-    };
-
-    const handleSelectionReady = (event) => {
-      const trackId = event.trackId || null;
-      console.log('🛰️ selection_ready', event);
-
-      if (trackId) {
-        const match = findTrackInExplorer(state.latestExplorerData, trackId);
-        if (match?.track) {
-          updateNextTrackMetadata(match.track);
-        } else {
-          updateNextTrackMetadata({ identifier: trackId });
-        }
-      }
-
-      if (trackId && state.pendingManualTrackId === trackId) {
-        state.manualNextTrackOverride = true;
-        state.skipTrayDemotionForTrack = null;
-      }
-
-      if (trackId && Number.isFinite(event.generation)) {
-        state.lastSelectionGeneration = event.generation;
-        setReversePreference(trackId, { generation: event.generation });
-      }
-    };
-
-    const handleSelectionFailed = (event) => {
-      console.warn('🛰️ selection_failed', event);
-      const failedTrack = event.trackId || null;
-
-    if (!failedTrack || state.pendingManualTrackId === failedTrack) {
-      state.manualNextTrackOverride = false;
-      state.skipTrayDemotionForTrack = null;
-      state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        clearReversePreference();
-      }
-
-      updateNextTrackMetadata(null);
-      requestSSERefresh({ escalate: false });
-    };
-
-    const handleExplorerSnapshot = (snapshot) => {
-      if (!snapshot) {
-        return;
-      }
-
-      if (snapshot.fingerprint && state.streamFingerprint !== snapshot.fingerprint) {
-        applyFingerprint(snapshot.fingerprint);
-      }
-
-      const previousExplorerData = state.latestExplorerData;
-      const manualOverrideActive = state.manualNextTrackOverride && (state.pendingManualTrackId || state.selectedIdentifier);
-      const manualOverrideTrackId = manualOverrideActive ? (state.pendingManualTrackId || state.selectedIdentifier) : null;
-      const manualOverrideDirectionKey = manualOverrideActive
-        ? (state.manualNextDirectionKey || previousExplorerData?.nextTrack?.directionKey || null)
-        : null;
-      const manualOverrideFallbackTrack = manualOverrideActive
-        ? (previousExplorerData?.nextTrack?.track || previousExplorerData?.nextTrack || null)
-        : null;
-
-      const previousTrackId = state.latestCurrentTrack?.identifier || null;
-      const currentTrackId = snapshot.currentTrack?.identifier || previousTrackId;
-      const pendingMatchesSnapshot = Boolean(
-        state.pendingSnapshotTrackId &&
-        currentTrackId &&
-        state.pendingSnapshotTrackId === currentTrackId
-      );
-      const trackActuallyAdvanced = Boolean(
-        currentTrackId &&
-        currentTrackId !== previousTrackId
-      );
-      const trackChanged = pendingMatchesSnapshot || trackActuallyAdvanced;
-
-      if (snapshot.currentTrack) {
-        state.latestCurrentTrack = snapshot.currentTrack;
-        window.state.latestCurrentTrack = snapshot.currentTrack;
-        state.lastTrackUpdateTs = Date.now();
-      }
-
-      if (trackActuallyAdvanced) {
-        removeTrayItemByTrackId(currentTrackId);
-      }
-
-      if (trackChanged) {
-        if (currentTrackId) {
-          state.pendingSnapshotTrackId = null;
-        }
-        applyTailProgress(0);
-        midpointReached = false;
-        cardsLocked = false;
-        state.cardsDormant = false;
-      }
-
-      if (trackChanged) {
-          safelyExitCardsDormantState({ immediate: true });
-          hideNextTrackPreview({ immediate: false });
-      } else if (state.cardsDormant) {
-          const info = resolveNextTrackData();
-          if (info?.track) {
-              showNextTrackPreview(info.track, { directionKey: info.directionKey || info.track?.directionKey || null });
-          }
-      }
-
-      const rawResolution = snapshot.explorer?.resolution;
-      const previousResolution = state.currentResolution;
-      const normalizedResolution = normalizeResolution(rawResolution);
-      const resolutionChanged = Boolean(normalizedResolution && normalizedResolution !== previousResolution);
-      if (resolutionChanged) {
-        state.currentResolution = normalizedResolution;
-        updateRadiusControlsUI();
-      }
-
-      const explorerDirections = snapshot.explorer?.directions || null;
-      const normalizedExplorerNext = snapshot.explorer?.nextTrack
-        ? normalizeNextTrackPayload(snapshot.explorer.nextTrack, explorerDirections)
-        : null;
-      const normalizedSnapshotNext = snapshot.nextTrack
-        ? normalizeNextTrackPayload(snapshot.nextTrack, explorerDirections)
-        : null;
-
-      const inferredTrack = normalizedExplorerNext?.track?.identifier
-        || normalizedExplorerNext?.identifier
-        || normalizedSnapshotNext?.track?.identifier
-        || normalizedSnapshotNext?.identifier
-        || null;
-      const inferredTrackObject =
-        (normalizedExplorerNext && typeof normalizedExplorerNext === 'object' && normalizedExplorerNext.track)
-          || (normalizedSnapshotNext && typeof normalizedSnapshotNext === 'object' && normalizedSnapshotNext.track)
-          || null;
-
-      if (inferredTrack) {
-        state.serverNextTrack = inferredTrack;
-        const normalizedServerDirection =
-          normalizedExplorerNext?.directionKey
-          || normalizedSnapshotNext?.directionKey
-          || normalizeDirectionKey(
-            (snapshot.explorer?.nextTrack && snapshot.explorer.nextTrack.direction) || snapshot.nextTrack?.direction || null,
-            explorerDirections
-          )
-          || null;
-        state.serverNextDirection = normalizedServerDirection;
-      }
-
-      if (inferredTrackObject && inferredTrackObject.identifier) {
-        hydrateTrackDetails(inferredTrackObject, { reason: 'next-track' }).catch(() => {});
-      }
-
-      const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
-      if (trackChanged && state.manualNextTrackOverride && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId) {
-        console.warn('🛰️ ACTION override-diverged', {
-          manualSelection: manualSelectionId,
-          playing: currentTrackId,
-          manualDirection: state.manualNextDirectionKey,
-          serverSuggestedNext: inferredTrack || null
-        });
-        scheduleHeartbeat(10000);
-      }
-      const deckSuspended = state.cardsDormant || Boolean(state.pendingSelectionUpdate);
-
-      if (trackChanged) {
-      if (state.manualNextTrackOverride) {
-        if (manualSelectionId && currentTrackId && manualSelectionId === currentTrackId) {
-          if (deckSuspended) {
-            state.awaitingManualCard = true;
-          } else {
-            console.log('🛰️ ACTION override-complete', {
-              selection: manualSelectionId,
-              playing: currentTrackId
-            });
-            state.manualNextTrackOverride = false;
-            state.skipTrayDemotionForTrack = null;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            state.selectedIdentifier = currentTrackId;
-            updateRadiusControlsUI();
-          }
-        }
-
-          const selectionVisible = manualSelectionId && snapshot.explorer && explorerContainsTrack(snapshot.explorer, manualSelectionId);
-          const canClearOverride = !deckSuspended
-              && !state.awaitingManualCard
-              && (!state.pendingSelectionUpdate || state.pendingSelectionUpdate.trackId === manualSelectionId);
-
-          if (canClearOverride && (!selectionVisible || manualSelectionId !== currentTrackId)) {
-            console.log('🛰️ ACTION override-cleared', {
-              previousSelection: manualSelectionId,
-              playing: currentTrackId
-            });
-            state.skipTrayDemotionForTrack = manualSelectionId || state.pendingManualTrackId || null;
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            state.selectedIdentifier = currentTrackId;
-            updateRadiusControlsUI();
-          }
-        } else if (currentTrackId) {
-          state.selectedIdentifier = currentTrackId;
-          updateRadiusControlsUI();
-        }
-      } else if (inferredTrack && !state.manualNextTrackOverride) {
-        state.selectedIdentifier = inferredTrack;
-        updateRadiusControlsUI();
-      }
-      if (!trackChanged) {
-        if (resolutionChanged) {
-          if (!deckSuspended && !state.awaitingManualCard) {
-            state.manualNextTrackOverride = false;
-            state.skipTrayDemotionForTrack = null;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            if (!state.manualNextTrackOverride && inferredTrack) {
-              state.selectedIdentifier = inferredTrack;
-            }
-            updateRadiusControlsUI();
-          }
-        } else if (!state.manualNextTrackOverride && inferredTrack) {
-          state.selectedIdentifier = inferredTrack;
-        }
-      }
-
-  if (state.manualNextTrackOverride && currentTrackId && state.pendingManualTrackId && currentTrackId === state.pendingManualTrackId) {
-    state.manualNextTrackOverride = false;
-    state.skipTrayDemotionForTrack = null;
-    state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = currentTrackId;
-        updateRadiusControlsUI();
-      }
-
-      if (snapshot.explorer) {
-        snapshot.explorer.currentTrack = snapshot.currentTrack || snapshot.explorer.currentTrack || null;
-        state.latestExplorerData = snapshot.explorer;
-        if (manualOverrideActive && manualOverrideTrackId) {
-          reapplyManualOverrideToExplorerData(
-            state.latestExplorerData,
-            manualOverrideTrackId,
-            manualOverrideDirectionKey,
-            previousExplorerData,
-            manualOverrideFallbackTrack
-          );
-          state.selectedIdentifier = manualOverrideTrackId;
-          state.serverNextTrack = manualOverrideTrackId;
-          const appliedDirection =
-            state.latestExplorerData.nextTrack?.directionKey ||
-            state.latestExplorerData.nextTrack?.direction ||
-            manualOverrideDirectionKey ||
-            state.serverNextDirection ||
-            null;
-          if (appliedDirection) {
-            state.serverNextDirection = appliedDirection;
-            state.manualNextDirectionKey = appliedDirection;
-          }
-        }
-        state.remainingCounts = {};
-        createDimensionCards(state.latestExplorerData);
-      }
-
-      if ((trackChanged || !previousTrackId) && (connectionHealth.audio.status === 'error' || connectionHealth.audio.status === 'failed')) {
-        console.log('🔄 Explorer snapshot received but audio unhealthy; restarting session');
-        handleDeadAudioSession();
-        return;
-      }
-
-      if (snapshot.currentTrack) {
-        console.log(`🎵 ${snapshot.currentTrack.title} by ${snapshot.currentTrack.artist}`);
-        if (snapshot.driftState) {
-          console.log(`🎯 Direction: ${snapshot.driftState.currentDirection}, Step: ${snapshot.driftState.stepCount}`);
-        }
-        updateNowPlayingCard(snapshot.currentTrack, snapshot.driftState);
-      }
-
-      const durationSeconds = snapshot.currentTrack?.duration || snapshot.currentTrack?.length || state.playbackDurationSeconds || 0;
-      const startTimeMs = snapshot.currentTrack?.startTime || state.playbackStartTimestamp || null;
-      if (durationSeconds > 0 && startTimeMs) {
-        const elapsedSeconds = Math.max((Date.now() - startTimeMs) / 1000, 0);
-        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-        const effectiveElapsed = trackChanged ? 0 : clampedElapsed;
-        debugLog('timing', 'Explorer snapshot timing payload', {
-            durationSeconds,
-            startTimeMs,
-            elapsedSeconds: effectiveElapsed,
-            trackChanged
-        });
-        startProgressAnimationFromPosition(durationSeconds, effectiveElapsed, { resync: !trackChanged });
-      }
-    };
-
-    if (simpleBody) {
-      fetch('/refresh-sse-simple', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(simpleBody)
-      }).catch(() => {});
-    }
-
-    eventSource.onopen = () => {
-      console.log('📡 SSE connected');
-      connectionHealth.sse.status = 'connected';
-      connectionHealth.sse.reconnectAttempts = 0;
-      connectionHealth.sse.reconnectDelay = 2000;
-      connectionHealth.sse.lastMessage = Date.now();
-      updateConnectionHealthUI();
-
-      resetStuckTimer();
-    };
-
-    eventSource.onmessage = (event) => {
-      connectionHealth.sse.lastMessage = Date.now();
-      resetStuckTimer();
-
-      state.lastSSEMessageTime = Date.now();  // Update in SSE onmessage
-      try {
-        const raw = JSON.parse(event.data);
-
-        // Normalize explorer sample tracks early (wrap { track } -> track)
-        if (raw.explorer && raw.explorer.directions) {
-          for (const directionKey of Object.keys(raw.explorer.directions)) {
-            const direction = raw.explorer.directions[directionKey];
-            if (Array.isArray(direction.sampleTracks)) {
-              direction.sampleTracks = direction.sampleTracks.map(entry => entry.track || entry);
-            }
-            if (direction.oppositeDirection && Array.isArray(direction.oppositeDirection.sampleTracks)) {
-              direction.oppositeDirection.sampleTracks = direction.oppositeDirection.sampleTracks.map(entry => entry.track || entry);
-            }
-          }
-        }
-
-        if (raw.explorer) {
-          normalizeNextTrackPayload(raw.explorer.nextTrack, raw.explorer.directions);
-        }
-        if (raw.nextTrack) {
-          normalizeNextTrackPayload(raw.nextTrack, raw.explorer?.directions);
-        }
-        if (raw.override && raw.override.nextTrack) {
-          normalizeNextTrackPayload(raw.override.nextTrack, raw.explorer?.directions);
-        }
-
-       const data = raw;
-       console.log('📡 Event:', data.type, data);
-
-        if (data.type === 'error') {
-          console.error('📡 SSE reported error payload:', data.message);
-          if (audioHealth.isHealthy) {
-            eventSource.close();
-            if (data.message === 'fingerprint_not_found') {
-              console.log('🔄 SSE fingerprint missing; requesting refresh');
-              requestSSERefresh({ escalate: false })
-                .then((ok) => {
-                  if (ok) {
-                    connectSSE();
-                  } else {
-                    console.warn('⚠️ Fingerprint refresh failed; bootstrapping new stream');
-                    createNewJourneySession('fingerprint_not_found');
-                  }
-                })
-                .catch((err) => {
-                  console.error('❌ Fingerprint refresh request failed:', err);
-                  connectionHealth.sse.reconnectAttempts++;
-                  const delay = getReconnectDelay(connectionHealth.sse.reconnectAttempts);
-                  setTimeout(() => connectSSE(), delay);
-                });
-            } else {
-              console.log('🔄 SSE error payload received while audio healthy; reconnecting SSE');
-              connectionHealth.sse.reconnectAttempts++;
-              const delay = getReconnectDelay(connectionHealth.sse.reconnectAttempts);
-              setTimeout(() => connectSSE(), delay);
-            }
-          } else {
-            console.log('🔄 SSE error payload and audio unhealthy; restarting session');
-            eventSource.close();
-            handleDeadAudioSession();
-          }
-          return;
-        }
-
-        if (data.type === 'connected') {
-          const previousSession = state.sessionId;
-          if (data.sessionId) {
-            state.sessionId = data.sessionId;
-            if (previousSession && previousSession !== data.sessionId) {
-              console.warn(`🆔 SSE reported session change ${previousSession} → ${data.sessionId}`);
-            } else if (!previousSession) {
-              console.log(`🆔 SSE assigned session: ${state.sessionId}`);
-            }
-          }
-
-          if (data.fingerprint) {
-            applyFingerprint(data.fingerprint);
-          }
-        }
-
-        // Ignore events from other sessions (legacy safety)
-        if (state.sessionId && data.session && data.session.sessionId && data.session.sessionId !== state.sessionId) {
-          console.log(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${state.sessionId})`);
-          return;
-        }
-
-        if (state.streamFingerprint && data.fingerprint && data.fingerprint !== state.streamFingerprint) {
-          console.log(`🔄 Updating fingerprint from ${state.streamFingerprint} → ${data.fingerprint}`);
-          applyFingerprint(data.fingerprint);
-        }
-
-       if (data.type === 'heartbeat') {
-          handleHeartbeat(data);
-          return;
-        }
-
-        if (data.type === 'explorer_snapshot') {
-          handleExplorerSnapshot(data);
-          return;
-        }
-
-        if (data.type === 'selection_ack') {
-          handleSelectionAck(data);
-          return;
-        }
-
-        if (data.type === 'selection_ready') {
-          handleSelectionReady(data);
-          return;
-        }
-
-        if (data.type === 'selection_failed') {
-          handleSelectionFailed(data);
-          return;
-        }
-
-        if (data.type === 'flow_options') {
-          console.log('🌟 Flow options available:', Object.keys(data.flowOptions));
-        }
-
-        if (data.type === 'direction_change') {
-          console.log(`🔄 Flow changed to: ${data.direction}`);
-        }
-
-      } catch (e) {
-        console.log('📡 Raw event:', event.data);
-      }
-    };
-
-    eventSource.onerror = (error) => {
-      console.error('❌ SSE error:', error);
-      connectionHealth.sse.status = 'reconnecting';
-      updateConnectionHealthUI();
-
-      if (audioHealth.handlingRestart) {
-        eventSource.close();
-        return;
-      }
-
-      if (audioHealth.isHealthy) {
-        console.log('🔄 SSE died but audio healthy - reconnecting SSE to same session');
-        eventSource.close();
-        connectionHealth.sse.reconnectAttempts++;
-        const delay = getReconnectDelay(connectionHealth.sse.reconnectAttempts);
-        setTimeout(() => connectSSE(), delay);
-      } else {
-        console.log('🔄 SSE died and audio unhealthy - full restart needed');
-        eventSource.close();
-        handleDeadAudioSession();
-      }
-    };
+      const reverseIcons = document.querySelectorAll('.uno-reverse');
+      reverseIcons.forEach(icon => {
+          console.log('🔄 Restoring reverse icon for new track');
+          icon.style.opacity = '';
+          icon.style.pointerEvents = '';
+      });
+
+      publishInteractionState();
   }
 
   console.log('🚢 Awaiting audio start to establish session.');
@@ -4953,7 +2110,6 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
   function swapStackContents(currentDimensionKey, oppositeDimensionKey) {
       console.log(`🔄 swapStackContents called with ${currentDimensionKey} → ${oppositeDimensionKey}`);
 
-      const previousOppositeState = state.usingOppositeDirection;
       // Toggle the simple opposite direction flag
       state.usingOppositeDirection = !state.usingOppositeDirection;
       console.log(`🔄 Toggled reverse mode: now using opposite direction = ${state.usingOppositeDirection}`);
@@ -4963,121 +2119,87 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       console.log(`🔄 Reset track index to 0 for opposite direction`);
 
       // Determine base/opposite keys from state and current card metadata
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      const centerCard = deckContainer ? deckContainer.querySelector('.dimension-card.next-track') : null;
+      const centerCard = document.querySelector('.dimension-card.next-track');
       const storedBaseKey = centerCard?.dataset?.baseDirectionKey || null;
       const storedOppositeKey = centerCard?.dataset?.oppositeDirectionKey || null;
 
       const baseKey = state.baseDirectionKey || storedBaseKey || currentDimensionKey;
-      const effectiveStoredOpposite = storedOppositeKey && storedOppositeKey !== baseKey ? storedOppositeKey : null;
-      const oppositeHint = effectiveStoredOpposite
+      const oppositeHint = storedOppositeKey
           || oppositeDimensionKey
           || state.currentOppositeDirectionKey
           || getOppositeDirection(baseKey);
 
       console.log(`🔄 About to call redrawNextTrackStack with baseDirectionKey: ${baseKey}, oppositeHint: ${oppositeHint}`);
-      const preferredTrackId = state.selectedIdentifier || state.pendingManualTrackId || state.serverNextTrack || null;
-      setReversePreference(preferredTrackId, {
-          generation: state.lastSelectionGeneration,
-          usingOpposite: state.usingOppositeDirection
-      });
-      const redrawOk = redrawNextTrackStack(baseKey, { oppositeKey: oppositeHint });
-      if (!redrawOk) {
-          state.usingOppositeDirection = previousOppositeState;
-          console.warn('🔄 Redraw failed; restored previous reverse state');
-      } else {
-          console.log(`🔄 Finished calling redrawNextTrackStack`);
-      }
+      redrawNextTrackStack(baseKey, { oppositeKey: oppositeHint });
+      console.log(`🔄 Finished calling redrawNextTrackStack`);
   }
 
   window.swapStackContents = swapStackContents;
 
+  function prioritizeAlternateTrack(samples, excludeTrackId) {
+      if (!Array.isArray(samples) || samples.length < 2 || !excludeTrackId) {
+          return samples;
+      }
+      const normalized = samples.map((entry, index) => ({
+          index,
+          track: entry?.track || entry || null
+      }));
+      const alternate = normalized.find(item => item.track && item.track.identifier && item.track.identifier !== excludeTrackId);
+      if (!alternate || alternate.index === 0) {
+          return samples;
+      }
+      const [entry] = samples.splice(alternate.index, 1);
+      samples.unshift(entry);
+      return samples;
+  }
+
+  if (typeof window !== 'undefined') {
+      window.prioritizeAlternateTrack = prioritizeAlternateTrack;
+  }
+
   // Redraw the next track stack respecting the reverse flag
   function redrawNextTrackStack(specifiedDimensionKey = null, options = {}) {
-      if (!state.latestExplorerData?.nextTrack) return false;
+      if (!state.latestExplorerData?.nextTrack) return;
 
-      const rawForcedOppositeKey = options?.oppositeKey || null;
-      const selectionOrigin = options?.origin || 'deck';
+      const forcedOppositeKey = options?.oppositeKey || null;
 
       const baseDimensionKey = specifiedDimensionKey
           || state.baseDirectionKey
           || state.latestExplorerData.nextTrack.directionKey;
       state.baseDirectionKey = baseDimensionKey;
-      let baseDirection = state.latestExplorerData.directions[baseDimensionKey];
+      const baseDirection = state.latestExplorerData.directions[baseDimensionKey];
 
       const embeddedOppositeKey = baseDirection?.oppositeDirection?.key
           || baseDirection?.oppositeDirection?.direction
           || null;
-      const forcedOppositeKey = rawForcedOppositeKey && rawForcedOppositeKey !== baseDimensionKey
-          ? rawForcedOppositeKey
-          : null;
-      const trackedOpposite = state.currentOppositeDirectionKey && state.currentOppositeDirectionKey !== baseDimensionKey
-          ? state.currentOppositeDirectionKey
-          : null;
-      const preferOppositeKey = (...candidates) => {
-          for (const candidate of candidates) {
-              if (candidate && candidate !== baseDimensionKey) {
-                  return candidate;
-              }
-          }
-          return null;
-      };
-      let resolvedOppositeKey = preferOppositeKey(
-          forcedOppositeKey,
-          trackedOpposite,
-          embeddedOppositeKey,
-          getOppositeDirection(baseDimensionKey)
-      );
-
-      const normalizeSampleEntries = (samples) => {
-          if (!Array.isArray(samples)) return [];
-          return samples
-              .map(entry => {
-                  if (!entry) return null;
-                  if (entry.track && typeof entry.track === 'object') {
-                      return normalizeSampleTrack(entry.track);
-                  }
-                  return normalizeSampleTrack(entry);
-              })
-              .filter(Boolean);
-      };
-
-      const wrapTracksAsSamples = (tracks) => {
-          if (!Array.isArray(tracks)) return [];
-          return tracks
-              .map(entry => {
-                  if (!entry) return null;
-                  if (entry.track && typeof entry.track === 'object') {
-                      const normalized = normalizeSampleTrack(entry.track);
-                      return normalized ? { ...entry, track: normalized } : null;
-                  }
-                  const normalized = normalizeSampleTrack(entry);
-                  return normalized ? { track: normalized } : null;
-              })
-              .filter(Boolean);
-      };
+      const fallbackOppositeKey =
+          state.currentOppositeDirectionKey
+          || embeddedOppositeKey
+          || getOppositeDirection(baseDimensionKey)
+          || null;
+      let resolvedOppositeKey = fallbackOppositeKey;
 
       let displayDimensionKey;
       let displayDirection;
 
-  if (state.usingOppositeDirection) {
-      displayDimensionKey = resolvedOppositeKey;
-      displayDirection = displayDimensionKey ? state.latestExplorerData.directions[displayDimensionKey] : null;
+      if (state.usingOppositeDirection) {
+          displayDimensionKey = forcedOppositeKey || fallbackOppositeKey;
+          displayDirection = displayDimensionKey ? state.latestExplorerData.directions[displayDimensionKey] : null;
 
-      console.log(`🔄 Current direction data:`, baseDirection);
+          console.log(`🔄 Current direction data:`, baseDirection);
           console.log(`🔄 Has oppositeDirection:`, !!baseDirection?.oppositeDirection);
           console.log(`🔄 Opposite key target:`, displayDimensionKey);
           console.log(`🔄 Opposite exists in directions:`, !!displayDirection);
 
-      if (baseDirection?.oppositeDirection) {
-          displayDirection = baseDirection.oppositeDirection;
-          displayDirection.hasOpposite = true;
-          displayDimensionKey = baseDirection.oppositeDirection.key
-              || baseDirection.oppositeDirection.direction
-              || displayDimensionKey
-              || resolvedOppositeKey
-              || getOppositeDirection(baseDimensionKey);
-          console.log(`🔄 Using embedded opposite direction data: ${displayDimensionKey}`);
+          if (baseDirection?.oppositeDirection) {
+              displayDirection = baseDirection.oppositeDirection;
+              displayDirection.hasOpposite = true;
+              displayDimensionKey = baseDirection.oppositeDirection.key
+                  || baseDirection.oppositeDirection.direction
+                  || displayDimensionKey
+                  || resolvedOppositeKey
+                  || getOppositeDirection(baseDimensionKey);
+              console.log(`🔄 Using embedded opposite direction data: ${displayDimensionKey}`);
           } else if (!displayDirection) {
               const searchKey = displayDimensionKey || resolvedOppositeKey || getOppositeDirection(baseDimensionKey);
               console.warn(`🔄 Opposite direction ${searchKey} missing in top-level list; searching embedded data`);
@@ -5092,56 +2214,8 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
               }
 
               if (!displayDirection) {
-                  const syntheticKey = displayDimensionKey || resolvedOppositeKey || getOppositeDirection(baseDimensionKey);
-                  const baseOppositeTracks = normalizeSampleEntries(baseDirection?.oppositeDirection?.sampleTracks);
-                  const fallbackBaseTracks = baseOppositeTracks.length ? baseOppositeTracks : normalizeSampleEntries(baseDirection?.sampleTracks);
-
-                  if (syntheticKey && fallbackBaseTracks.length) {
-                      console.warn(`🔄 No opposite direction data available for ${baseDimensionKey}; synthesizing ${syntheticKey}`);
-
-                      const syntheticSamples = wrapTracksAsSamples(fallbackBaseTracks);
-                      const polarity = baseDirection?.polarity === 'positive'
-                          ? 'negative'
-                          : baseDirection?.polarity === 'negative'
-                              ? 'positive'
-                              : 'negative';
-
-                      const syntheticDirection = {
-                          ...baseDirection,
-                          key: syntheticKey,
-                          direction: baseDirection?.direction || syntheticKey,
-                          sampleTracks: syntheticSamples,
-                          trackCount: syntheticSamples.length,
-                          hasOpposite: true,
-                          polarity,
-                          skipConsistencyCheck: true,
-                          isSynthetic: true
-                      };
-
-                      syntheticDirection.oppositeDirection = {
-                          key: baseDimensionKey,
-                          sampleTracks: wrapTracksAsSamples(normalizeSampleEntries(baseDirection?.sampleTracks)),
-                          skipConsistencyCheck: true,
-                          isSynthetic: true
-                      };
-
-                      state.latestExplorerData.directions[syntheticKey] = syntheticDirection;
-                      state.latestExplorerData.directions[baseDimensionKey] = {
-                          ...state.latestExplorerData.directions[baseDimensionKey],
-                          hasOpposite: true,
-                          oppositeDirection: syntheticDirection.oppositeDirection
-                      };
-
-                      baseDirection = state.latestExplorerData.directions[baseDimensionKey];
-                      displayDirection = state.latestExplorerData.directions[syntheticKey];
-
-                      displayDimensionKey = syntheticKey;
-                      resolvedOppositeKey = syntheticKey;
-                      state.skipNextExitAnimation = true;
-                  } else {
-                      console.error(`🔄 No opposite direction data available for ${baseDimensionKey}`);
-                      return false;
-                  }
+                  console.error(`🔄 No opposite direction data available for ${baseDimensionKey}`);
+                  return;
               }
           }
 
@@ -5166,13 +2240,10 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
 
           if (!displayDirection) {
               console.error(`🔄 No direction data found for ${baseDimensionKey}`);
-              return false;
+              return;
           }
 
-          resolvedOppositeKey = resolvedOppositeKey
-              || embeddedOppositeKey
-              || getOppositeDirection(baseDimensionKey)
-              || null;
+          resolvedOppositeKey = fallbackOppositeKey;
       }
 
       if (!displayDirection) {
@@ -5181,239 +2252,35 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
               resolvedOppositeKey,
               available: Object.keys(state.latestExplorerData.directions || {})
           });
-          return false;
+          return;
       }
+
+      state.currentOppositeDirectionKey = resolvedOppositeKey;
 
       console.log(`🔄 Redrawing next track stack: base=${baseDimensionKey}, display=${displayDimensionKey}, reversed=${state.usingOppositeDirection}`);
       console.log(`🔄 Direction sample tracks count:`, displayDirection?.sampleTracks?.length || 0);
       console.log(`🔄 First track in direction:`, displayDirection?.sampleTracks?.[0]?.title || 'None');
 
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      const currentCard = deckContainer ? deckContainer.querySelector('.dimension-card.next-track') : null;
+      const currentCard = document.querySelector('.dimension-card.next-track');
       if (!currentCard) {
           console.error('🔄 Could not find current next-track card');
-          return false;
+          return;
       }
 
       currentCard.dataset.baseDirectionKey = baseDimensionKey;
-
-      let displayTracks = normalizeSampleEntries(displayDirection.sampleTracks);
-      if (displayDirection) {
-          if (Array.isArray(displayDirection.sampleTracks) && displayDirection.sampleTracks.length > 0) {
-              displayDirection.isSynthetic = false;
-          }
-          if (displayDirection.oppositeDirection?.sampleTracks?.length) {
-              displayDirection.oppositeDirection.isSynthetic = false;
-          }
-      }
-
-      if (!displayTracks.length && resolvedOppositeKey) {
-          const topLevelOpposite = state.latestExplorerData.directions?.[resolvedOppositeKey];
-          const topLevelTracks = normalizeSampleEntries(topLevelOpposite?.sampleTracks);
-          if (topLevelTracks.length) {
-              displayTracks = topLevelTracks;
-              displayDirection.sampleTracks = wrapTracksAsSamples(topLevelTracks);
-          }
-      }
-
-      if (!displayTracks.length && baseDirection?.oppositeDirection) {
-          const embeddedTracks = normalizeSampleEntries(baseDirection.oppositeDirection.sampleTracks);
-          if (embeddedTracks.length) {
-              displayTracks = embeddedTracks;
-              displayDirection.sampleTracks = wrapTracksAsSamples(embeddedTracks);
-          }
-      }
-
-      if (!displayTracks.length) {
-          const fallbackTrack = state.latestExplorerData?.nextTrack?.track
-              || state.latestExplorerData?.nextTrack
-              || state.previousNextTrack
-              || null;
-          const normalizedFallback = fallbackTrack && fallbackTrack.track ? fallbackTrack.track : fallbackTrack;
-          if (normalizedFallback) {
-              displayTracks = [normalizedFallback];
-              displayDirection.sampleTracks = wrapTracksAsSamples(displayTracks);
-          }
-      }
-
-      if (!displayTracks.length) {
-          console.error(`🔄 No tracks found for direction ${displayDimensionKey}`);
-          return false;
-      }
-
-      if (!state.latestExplorerData.directions) {
-          state.latestExplorerData.directions = {};
-      }
-
-      const collectNormalizedTracks = (...sources) => {
-          for (const source of sources) {
-              const normalized = normalizeSampleEntries(source);
-              if (normalized.length) {
-                  return normalized;
-              }
-          }
-          return [];
-      };
-
-      if (displayDirection && displayDimensionKey) {
-          displayDirection = {
-              ...displayDirection,
-              key: displayDimensionKey
-          };
-      }
-
-      const baseEntry = {
-          ...(state.latestExplorerData.directions[baseDimensionKey] || {}),
-          ...baseDirection,
-          key: baseDimensionKey
-      };
-      if (!baseEntry.direction) {
-          baseEntry.direction = baseEntry.key;
-      }
-
-      const oppositeKey = (resolvedOppositeKey && resolvedOppositeKey !== baseEntry.key) ? resolvedOppositeKey : null;
-      let oppositeEntry = null;
-      if (oppositeKey) {
-          const existingOpposite = state.latestExplorerData.directions[oppositeKey]
-              || (baseEntry.oppositeDirection && (baseEntry.oppositeDirection.key === oppositeKey || baseEntry.oppositeDirection.direction === oppositeKey) ? baseEntry.oppositeDirection : null)
-              || (displayDimensionKey === oppositeKey ? displayDirection : null);
-          oppositeEntry = {
-              ...(existingOpposite || {}),
-              key: oppositeKey
-          };
-          if (!oppositeEntry.direction) {
-              oppositeEntry.direction = oppositeEntry.key;
-          }
-      }
-
-      const baseTrackList = collectNormalizedTracks(
-          baseEntry.sampleTracks,
-          baseDirection?.sampleTracks,
-          displayTracks
-      );
-      const oppositeTrackList = oppositeEntry
-          ? collectNormalizedTracks(
-              oppositeEntry.sampleTracks,
-              baseDirection?.oppositeDirection?.sampleTracks,
-              displayDimensionKey === (oppositeEntry?.key || null) ? displayTracks : []
-          )
-          : [];
-
-      const normalizedBaseSamples = wrapTracksAsSamples(baseTrackList.length ? baseTrackList : displayTracks);
-      const normalizedOppositeSamples = wrapTracksAsSamples(oppositeTrackList);
-      const hasBaseSamples = normalizedBaseSamples.length > 0;
-      const hasOppositeSamples = normalizedOppositeSamples.length > 0;
-
-      if (state.usingOppositeDirection && !hasOppositeSamples) {
-          console.warn(`🔄 Opposite stack unavailable for ${baseDimensionKey}; reverting reverse toggle`);
-          return false;
-      }
-
-      baseEntry.sampleTracks = hasBaseSamples ? normalizedBaseSamples : baseEntry.sampleTracks || [];
-      baseEntry.hasOpposite = hasOppositeSamples;
-      if (hasBaseSamples) {
-          baseEntry.isSynthetic = false;
-      }
-
-      if (hasOppositeSamples && oppositeEntry) {
-          baseEntry.oppositeDirection = {
-              ...(baseEntry.oppositeDirection || {}),
-              key: oppositeEntry.key,
-              direction: oppositeEntry.direction || oppositeEntry.key,
-              sampleTracks: normalizedOppositeSamples
-          };
-          baseEntry.oppositeDirection.isSynthetic = false;
-      } else if (hasOppositeSamples && !oppositeEntry && oppositeKey) {
-          baseEntry.oppositeDirection = {
-              ...(baseEntry.oppositeDirection || {}),
-              key: oppositeKey,
-              direction: baseEntry.oppositeDirection?.direction || oppositeKey,
-              sampleTracks: normalizedOppositeSamples
-          };
-          baseEntry.oppositeDirection.isSynthetic = false;
-      } else if (!hasOppositeSamples && baseEntry.oppositeDirection) {
-          baseEntry.oppositeDirection = {
-              ...(baseEntry.oppositeDirection || {}),
-              key: baseEntry.oppositeDirection.key || oppositeKey,
-              direction: baseEntry.oppositeDirection.direction || baseEntry.key,
-              sampleTracks: []
-          };
-      }
-
-      if (oppositeEntry) {
-          oppositeEntry.sampleTracks = hasOppositeSamples ? normalizedOppositeSamples : [];
-          oppositeEntry.hasOpposite = hasBaseSamples;
-          if (hasOppositeSamples) {
-              oppositeEntry.isSynthetic = false;
-          }
-          if (hasBaseSamples) {
-              oppositeEntry.oppositeDirection = {
-                  ...(oppositeEntry.oppositeDirection || {}),
-                  key: baseEntry.key,
-                  direction: baseEntry.direction || baseEntry.key,
-                  sampleTracks: normalizedBaseSamples
-              };
-              oppositeEntry.oppositeDirection.isSynthetic = false;
-          } else if (oppositeEntry.oppositeDirection) {
-              oppositeEntry.oppositeDirection = {
-                  ...(oppositeEntry.oppositeDirection || {}),
-                  key: baseEntry.key,
-                  direction: baseEntry.direction || baseEntry.key,
-                  sampleTracks: []
-              };
-          }
-      }
-
-      state.latestExplorerData.directions[baseEntry.key] = baseEntry;
-      if (oppositeEntry) {
-          state.latestExplorerData.directions[oppositeEntry.key] = oppositeEntry;
-      }
-
-      if (displayDimensionKey === baseEntry.key) {
-          displayDirection = baseEntry;
-      } else if (oppositeEntry && displayDimensionKey === oppositeEntry.key) {
-          displayDirection = oppositeEntry;
-      } else if (displayDirection && displayDimensionKey) {
-          state.latestExplorerData.directions[displayDimensionKey] = {
-              ...(state.latestExplorerData.directions[displayDimensionKey] || {}),
-              ...displayDirection
-          };
-      } else {
-          displayDirection = baseEntry;
-      }
-
-      baseDirection = baseEntry;
-
-      if (displayDirection) {
-          const displayHasOpposite = displayDimensionKey === baseEntry.key
-              ? hasOppositeSamples
-              : hasBaseSamples;
-          displayDirection.hasOpposite = displayHasOpposite;
-      }
-
-      const storedOppositeKey = hasOppositeSamples
-          ? (oppositeEntry?.key || baseEntry.oppositeDirection?.key || resolvedOppositeKey || null)
-          : null;
-      const flipTargetKey = state.usingOppositeDirection
-          ? baseEntry.key
-          : storedOppositeKey;
-
-      if (storedOppositeKey && storedOppositeKey !== baseEntry.key) {
-          state.currentOppositeDirectionKey = storedOppositeKey;
-      } else if (!hasOppositeSamples) {
-          state.currentOppositeDirectionKey = null;
-      }
-
-      currentCard.dataset.baseDirectionKey = baseDimensionKey;
-      if (flipTargetKey && flipTargetKey !== displayDimensionKey) {
-          currentCard.dataset.oppositeDirectionKey = flipTargetKey;
+      if (resolvedOppositeKey) {
+          currentCard.dataset.oppositeDirectionKey = resolvedOppositeKey;
       } else {
           delete currentCard.dataset.oppositeDirectionKey;
       }
 
+      const displayTracks = (displayDirection.sampleTracks || []).map(entry => entry.track || entry);
+      if (displayTracks.length === 0) {
+          console.error(`🔄 No tracks found for direction ${displayDimensionKey}`);
+          return;
+      }
+
       const trackToShow = displayTracks[0];
-      const trackForCard = trackToShow?.track ? trackToShow.track : trackToShow;
-      const nextTrackRecord = trackForCard ? { ...trackForCard } : null;
 
       console.log(`🔄 TRACK SELECTION DEBUG:`, {
           usingOppositeDirection: state.usingOppositeDirection,
@@ -5425,28 +2292,10 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       });
 
       state.stackIndex = 0;
-      state.selectedIdentifier = trackForCard?.identifier || null;
-      if (state.selectedIdentifier) {
-          setReversePreference(state.selectedIdentifier, { generation: state.lastSelectionGeneration, usingOpposite: state.usingOppositeDirection });
-      }
-      console.log(`🔄 Updated selection to first track of ${state.usingOppositeDirection ? 'OPPOSITE' : 'ORIGINAL'} stack (${displayDimensionKey}): ${trackForCard?.title || trackToShow?.title} (${state.selectedIdentifier})`);
+      state.selectedIdentifier = trackToShow.identifier;
+      console.log(`🔄 Updated selection to first track of ${state.usingOppositeDirection ? 'OPPOSITE' : 'ORIGINAL'} stack (${displayDimensionKey}): ${trackToShow.title} (${trackToShow.identifier})`);
 
-      if (!state.latestExplorerData) {
-          state.latestExplorerData = {};
-      }
-      state.latestExplorerData.nextTrack = {
-          directionKey: displayDimensionKey,
-          direction: displayDirection?.direction || displayDimensionKey,
-          track: nextTrackRecord
-      };
-
-      if (trackForCard?.identifier) {
-          sendNextTrack(trackForCard.identifier, displayDimensionKey, {
-              source: 'user',
-              origin: selectionOrigin,
-              explorerSignature: state.lastDirectionSignature
-          });
-      }
+      sendNextTrack(trackToShow.identifier, displayDimensionKey, 'user');
 
       delete currentCard.dataset.originalBorderColor;
       delete currentCard.dataset.originalGlowColor;
@@ -5469,11 +2318,10 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       currentCard.dataset.directionType = getDirectionType(displayDimensionKey);
 
       updateCardWithTrackDetails(currentCard, trackToShow, displayDirection, false, swapStackContents);
-      return true;
   }
 
   // Animate a direction card from its clock position to center (becoming next track stack)
-  function animateDirectionToCenter(directionKey, options = {}) {
+  function animateDirectionToCenter(directionKey) {
       console.log(`🎬 animateDirectionToCenter called for: ${directionKey}`);
 
       if (!directionKey) {
@@ -5500,7 +2348,7 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
                       const retryKey = state.latestExplorerData?.nextTrack?.directionKey
                           || (state.selectedIdentifier ? findDirectionKeyContainingTrack(state.latestExplorerData, state.selectedIdentifier) : null);
                       if (retryKey) {
-                          animateDirectionToCenter(retryKey, options);
+                          animateDirectionToCenter(retryKey);
                       }
                   }, 120);
               }
@@ -5510,48 +2358,34 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
 
       // Reset track index for the new dimension
       state.stackIndex = 0;
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      const findCardByDirection = (key) => {
-          if (!key || !deckContainer) return null;
-          return deckContainer.querySelector(`.dimension-card[data-direction-key="${key}"]`);
-      };
-      let card = findCardByDirection(directionKey);
+      let card = document.querySelector(`[data-direction-key="${directionKey}"]`);
       if (!card) {
           console.error(`🎬 Could not find card for direction: ${directionKey}`);
-          if (deckContainer) {
-              console.error(`🎬 Available cards:`, Array.from(deckContainer.querySelectorAll('[data-direction-key]')).map(c => c.dataset.directionKey));
-          }
+          console.error(`🎬 Available cards:`, Array.from(document.querySelectorAll('[data-direction-key]')).map(c => c.dataset.directionKey));
 
           // FALLBACK: Try to find the opposite direction if this direction doesn't exist
           const oppositeKey = getOppositeDirection(directionKey);
           console.log(`🎬 Trying fallback to opposite direction: ${oppositeKey}`);
 
-          let fallbackCard = null;
-          if (oppositeKey) {
-              fallbackCard = findCardByDirection(oppositeKey);
-              if (!fallbackCard) {
-                  const candidates = deckContainer ? Array.from(deckContainer.querySelectorAll('[data-direction-key]')) : [];
-                  fallbackCard = candidates.find(node => node.dataset.directionKey === oppositeKey) || null;
-              }
-          }
-
+          const fallbackCard = oppositeKey ? document.querySelector(`[data-direction-key="${oppositeKey}"]`) : null;
           if (fallbackCard) {
               console.log(`🎬 Found fallback card for ${oppositeKey}, using it instead`);
-              return animateDirectionToCenter(oppositeKey, options);
+              return animateDirectionToCenter(oppositeKey);
           }
 
           // As a last resort, create a temporary card in the center
-          if (deckContainer) {
+          const container = elements.dimensionCards || document.getElementById('dimensionCards');
+          if (container) {
               console.warn(`🎬 Creating temporary next track card for ${directionKey}`);
               card = document.createElement('div');
               card.className = 'dimension-card next-track track-detail-card visible';
               card.dataset.directionKey = directionKey;
               card.style.left = '50%';
               card.style.top = '45%';
-              card.style.transform = 'translate(-50%, -42%) translateZ(-300px) scale(1.06)';
-              card.style.zIndex = '200';
-              deckContainer.appendChild(card);
-              convertToNextTrackStack(directionKey, options);
+              card.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
+              card.style.zIndex = '120';
+              container.appendChild(card);
+              convertToNextTrackStack(directionKey);
               return;
           }
 
@@ -5567,10 +2401,6 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       if (!card.dataset.originalDirectionKey) {
           card.dataset.originalDirectionKey = directionKey;
       }
-      if (typeof clearStackedPreviewLayer === 'function') {
-          clearStackedPreviewLayer();
-      }
-
       if (typeof hideStackSizeIndicator === 'function') {
           hideStackSizeIndicator(card);
       }
@@ -5579,20 +2409,20 @@ window.updateNextTrackMetadata = updateNextTrackMetadata;
       card.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
       card.style.left = '50%';
       card.style.top = '45%';
-      card.style.transform = 'translate(-51%, -44%) translateZ(-420px) scale(1.02)';
+      card.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
       card.style.zIndex = '100';
 
       // After animation completes, create stack indicators and update content
       setTimeout(() => {
           console.log(`🎬 Animation complete for ${directionKey}, converting to next track stack...`);
-          convertToNextTrackStack(directionKey, options);
+          convertToNextTrackStack(directionKey);
           card.classList.remove('animating-to-center');
           card.style.transition = ''; // Remove transition for normal interactions
       }, 800);
   }
 
 
-function createDirectionCard(direction, index, total, isNextTrack, nextTrackData, hasReverse = false, counterpart = null, directions, currentTrackOverride = null) {
+  function createDirectionCard(direction, index, total, isNextTrack, nextTrackData, hasReverse = false, counterpart = null, directions) {
       console.log(`🕐 Card ${direction.key} (index ${index}): clockPosition=TBD`);
       const card = document.createElement('div');
       let cardClasses = 'dimension-card';
@@ -5628,15 +2458,25 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
 
       // Calculate clock-based position - simple sequential assignment
       // Use the creation index directly to assign positions around the clock
-      const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-      const totalDirections = Math.max(1, directions.length);
-      const slotIndex = Math.min(
-          availablePositions.length - 1,
-          Math.floor(index * availablePositions.length / totalDirections)
-      );
-      let clockPosition = availablePositions[slotIndex];
-      if (directions.length > availablePositions.length) {
-          clockPosition = availablePositions[index % availablePositions.length];
+      let clockPosition;
+      if (direction.isOutlier) {
+          // Outliers go to 11 o'clock
+          clockPosition = 11;
+      } else {
+          // Even distribution around clock face (skip 12 for outliers)
+          const totalRegularCards = directions.filter(d => !d.isOutlier).length;
+          const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]; // Skip 11 for outliers
+          const regularCardIndex = directions.filter((d, i) => i <= index && !d.isOutlier).length - 1;
+
+          if (totalRegularCards <= availablePositions.length) {
+              // Evenly distribute cards around the clock
+              const step = availablePositions.length / totalRegularCards;
+              const positionIndex = Math.round(regularCardIndex * step) % availablePositions.length;
+              clockPosition = availablePositions[positionIndex];
+          } else {
+              // Fallback if somehow we have too many cards
+              clockPosition = availablePositions[regularCardIndex % availablePositions.length];
+          }
       }
       console.log(`🕐 Card ${direction.key} (index ${index}): clockPosition=${clockPosition}`);
 
@@ -5655,8 +2495,6 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       // Store direction type and colors for consistent coloring
       card.dataset.directionType = directionType;
       card.dataset.borderColor = colors.border;
-      card.style.setProperty('--card-border-color', colors.border);
-      card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
       card.dataset.glowColor = colors.glow;
       card.style.setProperty('--card-border-color', colors.border);
       card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
@@ -5776,8 +2614,6 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
       card.style.setProperty('--card-border-color', colors.border);
       card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
-      card.style.setProperty('--card-border-color', colors.border);
-      card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
       console.log(`🎨 Colors set. Card glow-color property:`, card.style.getPropertyValue('--glow-color'));
 
       // Double-check that the properties are actually set
@@ -5810,14 +2646,13 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
               console.log(`🎬 Valid card click, triggering animation: ${direction.key} to center`);
 
               // Find any existing next track card (more reliable than using latestExplorerData)
-              const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-              const existingNextTrackCard = deckContainer ? deckContainer.querySelector('.dimension-card.next-track') : null;
+              const existingNextTrackCard = document.querySelector('.dimension-card.next-track');
 
               if (!existingNextTrackCard) {
                   // No existing next track, animate directly to center
                   console.log(`🎬 No existing next track found, animating ${direction.key} directly to center`);
                   state.usingOppositeDirection = false; // Reset reverse flag when selecting new direction
-                  animateDirectionToCenter(direction.key, { origin: 'deck', notifyServer: true });
+                  animateDirectionToCenter(direction.key);
               } else {
                   // Check if this card represents the same base dimension (ignoring polarity)
                   const currentCardDirection = existingNextTrackCard.dataset.directionKey;
@@ -5837,127 +2672,71 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
                          console.log(`🔄 Cycling stack for ${direction.key}, current card shows ${currentCardDirection}, usingOppositeDirection = ${state.usingOppositeDirection}`);
 
                          // Determine which tracks to cycle through based on reverse flag
-                        let tracksToUse, dimensionToShow;
-                        if (state.usingOppositeDirection && Array.isArray(direction.oppositeDirection?.sampleTracks) && direction.oppositeDirection.sampleTracks.length) {
-                            tracksToUse = direction.oppositeDirection.sampleTracks;
-                            dimensionToShow = direction.oppositeDirection;
-                            console.log(`🔄 Cycling through opposite direction tracks`);
-                        } else {
-                            tracksToUse = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
-                            dimensionToShow = direction;
-                            console.log(`🔄 Cycling through original direction tracks`);
-                        }
+                         let tracksToUse, dimensionToShow;
+                         if (state.usingOppositeDirection && direction.oppositeDirection?.sampleTracks) {
+                             tracksToUse = direction.oppositeDirection.sampleTracks;
+                             dimensionToShow = direction.oppositeDirection;
+                             console.log(`🔄 Cycling through opposite direction tracks`);
+                         } else {
+                             tracksToUse = direction.sampleTracks;
+                             dimensionToShow = direction;
+                             console.log(`🔄 Cycling through original direction tracks`);
+                         }
 
-                        if (!tracksToUse.length) {
-                            console.warn(`⚠️ No sample tracks available to cycle for ${direction.key}`);
-                            return;
-                        }
-
-                        // Cycle the appropriate tracks
-                        if (tracksToUse.length > 1) {
-                            const previousHead = tracksToUse.shift();
-                            tracksToUse.push(previousHead);
-                        }
-
-                        const nextSample = tracksToUse[0];
-
-                        const track = nextSample && (nextSample.track || nextSample);
-                        if (!track) {
-                            console.warn(`⚠️ Sample entry missing track data for ${direction.key}`);
-                            return;
-                        }
-                        updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
-
-                        if (track.identifier) {
-                            sendNextTrack(track.identifier, dimensionToShow?.key || direction.key, {
-                                source: 'user',
-                                origin: 'deck',
-                                explorerSignature: state.lastDirectionSignature
-                            });
-                        }
+                         // Cycle the appropriate tracks
+                         tracksToUse.push(tracksToUse.shift());
+                         const track = tracksToUse[0].track || tracksToUse[0];
+                         updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           console.log(`🎬 Found existing next track: ${existingNextTrackCard.dataset.directionKey}, rotating to next clock position`);
                           rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
                           // Wait for the rotation animation to complete before starting the new one
                           setTimeout(() => {
                               state.usingOppositeDirection = false; // Reset reverse flag when selecting new direction
-                              animateDirectionToCenter(direction.key, { origin: 'deck', notifyServer: true });
+                              animateDirectionToCenter(direction.key);
                           }, 400); // Half the animation time for smoother transition
                       }
                   }
 
+                  // Update server with the new selection
+                  const track = direction.sampleTracks[0].track || direction.sampleTracks[0];
+                  sendNextTrack(track.identifier, direction.key, 'user');
           });
       }
 
-    if (typeof evaluateDirectionConsistency === 'function') {
-        const samplesForCheck = Array.isArray(directionTracks) && directionTracks.length
-            ? directionTracks
-            : (Array.isArray(direction.sampleTracks) ? direction.sampleTracks : []);
-        const consistencyTrack = currentTrackOverride || state.latestCurrentTrack;
-        evaluateDirectionConsistency(direction, {
-            card,
-            sampleTracks: samplesForCheck,
-            currentTrack: consistencyTrack
-        });
-    }
+      if (typeof evaluateDirectionConsistency === 'function') {
+          const samplesForCheck = Array.isArray(directionTracks) && directionTracks.length
+              ? directionTracks
+              : (Array.isArray(direction.sampleTracks) ? direction.sampleTracks : []);
+          evaluateDirectionConsistency(direction, {
+              card,
+              sampleTracks: samplesForCheck,
+              currentTrack: state.latestCurrentTrack
+          });
+      }
 
       return card;
   }
 
   // Rotate center card to next available clock position (circular rotation system)
   function rotateCenterCardToNextPosition(directionKey) {
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      let card = deckContainer
-          ? deckContainer.querySelector(`.dimension-card.next-track[data-direction-key="${directionKey}"]`)
-          : null;
-      if (!card && deckContainer) {
-          card = deckContainer.querySelector(`.dimension-card.next-track[data-base-direction-key="${directionKey}"]`)
-              || deckContainer.querySelector(`.dimension-card.next-track[data-original-direction-key="${directionKey}"]`);
-      }
-      if (!card) {
-          console.warn(`🔄 rotateCenterCardToNextPosition: no center card found for ${directionKey}`);
-          return false;
-      }
+      const card = document.querySelector(`[data-direction-key="${directionKey}"].next-track`);
+      if (!card) return;
 
-      const cardDirectionKey = card.dataset.directionKey
-          || card.dataset.baseDirectionKey
-          || card.dataset.originalDirectionKey
-          || directionKey;
-
-      const stackedFollowers = deckContainer
-          ? Array.from(deckContainer.querySelectorAll('.dimension-card.next-track'))
-          : []
-          .filter(node => node !== card);
-      if (stackedFollowers.length) {
-          stackedFollowers.forEach(node => {
-              node.style.opacity = '0';
-              node.style.pointerEvents = 'none';
-          });
-          setTimeout(() => {
-              stackedFollowers.forEach(node => {
-                  if (node.parentElement) {
-                      node.parentElement.removeChild(node);
-                  }
-              });
-          }, 420);
-      }
-
-      console.log(`🔄 Rotating center card ${cardDirectionKey} to next clock position`);
+      console.log(`🔄 Rotating center card ${directionKey} to next clock position`);
 
       if (typeof hideStackSizeIndicator === 'function') {
           hideStackSizeIndicator(card);
       }
 
       // Get all cards on the clock face (not center)
-      const clockCards = deckContainer
-          ? Array.from(deckContainer.querySelectorAll('[data-direction-key]:not(.next-track)'))
-              .map(c => ({
-                  element: c,
-                  key: c.dataset.directionKey,
-                  position: parseInt(c.dataset.clockPosition) || 12
-              }))
-              .sort((a, b) => a.position - b.position)
-          : [];
+      const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
+          .map(c => ({
+              element: c,
+              key: c.dataset.directionKey,
+              position: parseInt(c.dataset.clockPosition) || 12
+          }))
+          .sort((a, b) => a.position - b.position);
 
       console.log(`🔄 Current clock positions:`, clockCards.map(c => `${c.key}@${c.position}`));
 
@@ -5967,13 +2746,13 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
 
       // Check if we should try to return to the original position first
       const originalPosition = card.dataset.originalClockPosition ? parseInt(card.dataset.originalClockPosition) : null;
-      console.log(`🔄 Card ${cardDirectionKey} original position was: ${originalPosition}`);
+      console.log(`🔄 Card ${directionKey} original position was: ${originalPosition}`);
 
       let nextPosition = 1;
       if (originalPosition && !occupiedPositions.has(originalPosition)) {
           // Return to original position if it's available
           nextPosition = originalPosition;
-          console.log(`🔄 Returning ${cardDirectionKey} to original position ${nextPosition}`);
+          console.log(`🔄 Returning ${directionKey} to original position ${nextPosition}`);
       } else {
           // Find first available gap in positions 1-12 (preferring non-outlier positions)
           const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 11]; // Check 11 (outlier) last
@@ -5986,7 +2765,7 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
           console.log(`🔄 Found first available position: ${nextPosition}`);
       }
 
-      console.log(`🔄 Moving ${cardDirectionKey} to position ${nextPosition}`);
+      console.log(`🔄 Moving ${directionKey} to position ${nextPosition}`);
 
       // Calculate position coordinates
       const angle = ((nextPosition - 1) / 12) * Math.PI * 2 - Math.PI / 2;
@@ -5997,67 +2776,29 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       const x = centerX + radiusX * Math.cos(angle);
       const y = centerY + radiusY * Math.sin(angle);
 
-      // Determine which direction the card should represent once it returns to the clock
-      const resetKey = card.dataset.originalDirectionKey
-          || card.dataset.baseDirectionKey
-          || card.dataset.directionKey
-          || cardDirectionKey;
-      card.dataset.pendingClockResetKey = resetKey;
-
       // Update card's stored position
       card.dataset.clockPosition = nextPosition;
 
-      // Animate to the new clock position with direction styling active
+      // Animate to the new clock position
       card.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
       card.style.left = `${x}%`;
       card.style.top = `${y}%`;
       card.style.transform = 'translate(-50%, -50%) translateZ(-800px) scale(0.5)';
       card.style.zIndex = '20';
 
-      const handleTransitionEnd = (event) => {
-          if (event.target !== card) return;
-          card.removeEventListener('transitionend', handleTransitionEnd);
-          finalizeClockReturn(card);
-      };
-      card.addEventListener('transitionend', handleTransitionEnd);
-
-      // Fallback to clear transition if the event doesn't fire (e.g., display: none)
+      // After animation, remove next-track styling and reset to normal card
       setTimeout(() => {
-          card.removeEventListener('transitionend', handleTransitionEnd);
-          finalizeClockReturn(card);
-      }, 820);
+          card.classList.remove('next-track', 'track-detail-card');
+          // Stack indication is now handled by CSS pseudo-elements
 
-      return true;
+          // Reset card content to simple direction display
+          resetCardToDirectionDisplay(card, card.dataset.originalDirectionKey || directionKey);
+
+          card.style.transition = '';
+      }, 800);
   }
-
-  function finalizeClockReturn(card) {
-      card.style.transition = '';
-
-      const resetKey = card.dataset.pendingClockResetKey
-          || card.dataset.originalDirectionKey
-          || card.dataset.baseDirectionKey
-          || card.dataset.directionKey;
-      const clockPosition = card.dataset.clockPosition || null;
-      const originalClockPosition = card.dataset.originalClockPosition || null;
-
-      delete card.dataset.pendingClockResetKey;
-
-      if (!resetKey) {
-          console.warn('🔄 finalizeClockReturn missing reset key', {
-              clockPosition,
-              originalClockPosition
-          });
-          return;
-      }
-
-      console.debug('🔄 finalizeClockReturn', {
-          directionKey: resetKey,
-          clockPosition,
-          originalClockPosition,
-          hasTrackData: Boolean(card.dataset.trackMd5)
-      });
-
-      resetCardToDirectionDisplay(card, resetKey);
+  if (typeof window !== 'undefined') {
+      window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
   }
 
   // Reset a card back to simple direction display (when moving from center to clock position)
@@ -6066,7 +2807,7 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
 
       // IMPORTANT: Reset reverse state and restore original face
       console.log(`🔄 Restoring original face for ${directionKey} (removing any reversed state)`);
-      card.classList.remove('track-detail-card', 'next-track');
+      card.classList.remove('track-detail-card');
 
       const lingeringStackVisual = card.querySelector('.stack-line-visual');
       if (lingeringStackVisual) {
@@ -6094,36 +2835,6 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
                   console.log(`🔄 Found embedded direction data for ${baseDirectionKey} inside ${baseKey}.oppositeDirection`);
                   break;
               }
-          }
-      }
-
-      if (!direction) {
-          const datasetTrackId = card.dataset.trackMd5 || card.dataset.trackIdentifier || null;
-          if (datasetTrackId) {
-              const syntheticTrack = {
-                  identifier: datasetTrackId,
-                  title: card.dataset.trackTitle || 'Unknown Track',
-                  artist: card.dataset.trackArtist || '',
-                  album: card.dataset.trackAlbum || '',
-                  duration: card.dataset.trackDurationSeconds ? Number(card.dataset.trackDurationSeconds) : null,
-                  albumCover: card.dataset.trackAlbumCover || ''
-              };
-
-              const syntheticDirection = {
-                  key: baseDirectionKey,
-                  sampleTracks: [{ track: syntheticTrack }],
-                  trackCount: 1,
-                  hasOpposite: !!getOppositeDirection(baseDirectionKey),
-                  skipConsistencyCheck: true,
-                  isSynthetic: true
-              };
-
-              state.latestExplorerData = state.latestExplorerData || {};
-              state.latestExplorerData.directions = state.latestExplorerData.directions || {};
-              state.latestExplorerData.directions[baseDirectionKey] = syntheticDirection;
-
-              direction = syntheticDirection;
-              console.warn(`🔄 Synthesized direction data for ${baseDirectionKey} from card dataset`);
           }
       }
 
@@ -6166,7 +2877,9 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       const sample = Array.isArray(direction.sampleTracks) ? direction.sampleTracks[0] : null;
       const sampleTrack = sample?.track || sample || {};
       const albumCover = sampleTrack.albumCover || sample?.albumCover || '';
-      const labelContent = `<div class="dimension-label">${directionName}</div>`;
+      const labelContent = sampleTrack?.title
+          ? `<div class="dimension-label"><div class="track-title">${sampleTrack.title}</div><div class="direction-name">${directionName}</div></div>`
+          : `<div class="dimension-label">${directionName}</div>`;
 
       card.innerHTML = `
           <div class="panel ${colorVariant}">
@@ -6206,20 +2919,9 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       if (state.baseDirectionKey === directionKey || state.baseDirectionKey === resolvedKey) {
           state.baseDirectionKey = null;
       }
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (!(deckContainer && deckContainer.querySelector('.dimension-card.next-track'))) {
+      if (!document.querySelector('.dimension-card.next-track')) {
           state.currentOppositeDirectionKey = null;
       }
-
-      // Clear out track-specific datasets so the card behaves like a pure direction entry
-      delete card.dataset.trackMd5;
-      delete card.dataset.trackIdentifier;
-      delete card.dataset.trackTitle;
-      delete card.dataset.trackArtist;
-      delete card.dataset.trackAlbum;
-      delete card.dataset.trackAlbumCover;
-      delete card.dataset.trackDurationSeconds;
-      delete card.dataset.trackDurationDisplay;
 
       if (typeof evaluateDirectionConsistency === 'function') {
           evaluateDirectionConsistency(direction, {
@@ -6248,16 +2950,15 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
   function resolveNextTrackData() {
       const explorer = state.latestExplorerData;
       if (explorer) {
-          const explorerNext = explorer.nextTrack ? normalizeNextTrackPayload(explorer.nextTrack, explorer.directions) : null;
+          const explorerNext = explorer.nextTrack;
           if (explorerNext) {
               const track = explorerNext.track || explorerNext;
               if (track) {
                   return {
                       track,
-                      directionKey: normalizeDirectionKey(
-                        explorerNext.directionKey || explorerNext.direction || null,
-                        explorer.directions
-                      ) || findDirectionKeyContainingTrack(explorer, track.identifier)
+                      directionKey: explorerNext.directionKey
+                        || explorerNext.direction
+                        || findDirectionKeyContainingTrack(explorer, track.identifier)
                   };
               }
           }
@@ -6265,20 +2966,14 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
           if (state.selectedIdentifier) {
               const match = findTrackInExplorer(explorer, state.selectedIdentifier);
               if (match?.track) {
-                  return {
-                      track: match.track,
-                      directionKey: normalizeDirectionKey(match.directionKey || null, explorer.directions) || match.directionKey || null
-                  };
+                  return { track: match.track, directionKey: match.directionKey || null };
               }
           }
 
           if (state.serverNextTrack) {
               const match = findTrackInExplorer(explorer, state.serverNextTrack);
               if (match?.track) {
-                  return {
-                      track: match.track,
-                      directionKey: normalizeDirectionKey(match.directionKey || null, explorer.directions) || match.directionKey || null
-                  };
+                  return { track: match.track, directionKey: match.directionKey || null };
               }
           }
       }
@@ -6290,32 +2985,16 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
       return null;
   }
 
-  // Convert a direction card into a next track stack (add track details and indicators)
-  function convertToNextTrackStack(directionKey, options = {}) {
-      const notifyServer = options?.notifyServer === true;
-      const selectionOrigin = options?.origin || 'system';
-      const explorerSig = options?.explorerSignature ?? state.lastDirectionSignature;
+  if (typeof window !== 'undefined') {
+    window.resolveNextTrackData = resolveNextTrackData;
+  }
 
+  // Convert a direction card into a next track stack (add track details and indicators)
+  function convertToNextTrackStack(directionKey) {
       console.log(`🔄 Converting ${directionKey} to next track stack...`);
       console.log(`🔄 Latest explorer data:`, state.latestExplorerData);
       console.log(`🔄 Direction data:`, state.latestExplorerData?.directions[directionKey]);
 
-      let deckHydrationLocked = false;
-      const ensureDeckHydrationLock = () => {
-          if (!deckHydrationLocked) {
-              state.pendingDeckHydration = true;
-              deckHydrationLocked = true;
-          }
-      };
-      const releaseDeckHydrationLock = () => {
-          if (!deckHydrationLocked) return;
-          deckHydrationLocked = false;
-          requestAnimationFrame(() => {
-              state.pendingDeckHydration = false;
-          });
-      };
-
-      const requestedDirectionKey = directionKey;
       let directionData = state.latestExplorerData?.directions[directionKey];
       let actualDirectionKey = directionKey;
 
@@ -6369,7 +3048,7 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
           };
       }
 
-      const direction = { ...directionData };
+      const direction = directionData;
       direction.key = actualDirectionKey;
       directionKey = actualDirectionKey;
 
@@ -6401,107 +3080,19 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
           return;
       }
 
-      const normalizeSample = (sample) => {
-          if (!sample) return null;
-          const normalizedTrack = normalizeSampleTrack(sample);
-          if (!normalizedTrack) return null;
-          if (sample && typeof sample === 'object' && 'track' in sample) {
-              return { ...sample, track: normalizedTrack };
-          }
-          return { track: normalizedTrack };
-      };
-
-      const normalizedSamples = sampleTracks.map(normalizeSample).filter(Boolean);
-      if (!normalizedSamples.length) {
-          console.error(`🔄 Unable to normalize sample tracks for ${directionKey}`);
-          return;
-      }
-
-      direction.sampleTracks = normalizedSamples;
-      if (normalizedSamples.length > 0) {
-          direction.isSynthetic = false;
-      }
-      const resolveValidSamples = (samples) => {
-          if (!Array.isArray(samples)) {
-              return [];
-          }
-          return samples
-              .map(normalizeSample)
-              .filter(Boolean);
-      };
-      const inlineOppositeSamples = resolveValidSamples(direction.oppositeDirection?.sampleTracks);
-      const finalSamples = normalizedSamples;
-
-      direction.hasOpposite = inlineOppositeSamples.length > 0;
-      if (inlineOppositeSamples.length > 0 && direction.oppositeDirection) {
-          direction.oppositeDirection.isSynthetic = false;
-      }
-
-      if (!state.latestExplorerData.directions) {
-          state.latestExplorerData.directions = {};
-      }
-
-      state.latestExplorerData.directions[actualDirectionKey] = {
-          ...(state.latestExplorerData.directions[actualDirectionKey] || {}),
-          ...direction,
-          key: actualDirectionKey,
-          sampleTracks: finalSamples
-      };
-
-      if (requestedDirectionKey && requestedDirectionKey !== actualDirectionKey) {
-          state.latestExplorerData.directions[requestedDirectionKey] = {
-              ...(state.latestExplorerData.directions[requestedDirectionKey] || {}),
-              ...direction,
-              key: requestedDirectionKey,
-              sampleTracks: finalSamples
-          };
-      }
-
       state.baseDirectionKey = actualDirectionKey;
       const computedOppositeKey = direction.oppositeDirection?.key
           || direction.oppositeDirection?.direction
           || getOppositeDirection(actualDirectionKey)
           || null;
-      const existingOppositeSamples = resolveValidSamples(
-          computedOppositeKey
-              ? state.latestExplorerData.directions?.[computedOppositeKey]?.sampleTracks
-              : null
-      );
-      const hasOppositeSamples = inlineOppositeSamples.length > 0 || existingOppositeSamples.length > 0;
-      direction.hasOpposite = hasOppositeSamples;
-      if (!hasOppositeSamples && direction.oppositeDirection) {
-          direction.oppositeDirection = {
-              ...(direction.oppositeDirection || {}),
-              key: computedOppositeKey || direction.oppositeDirection?.key || getOppositeDirection(actualDirectionKey),
-              sampleTracks: []
-          };
-      }
-      if (hasOppositeSamples && direction.oppositeDirection) {
-          direction.oppositeDirection.isSynthetic = false;
-      }
-      state.currentOppositeDirectionKey = hasOppositeSamples ? computedOppositeKey : null;
+      state.currentOppositeDirectionKey = computedOppositeKey;
 
-      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-      if (!deckContainer) {
-          ensureDeckHydrationLock();
-          queueCenterPromotion(directionKey, options);
-          releaseDeckHydrationLock();
-          return;
-      }
-
-      ensureDeckHydrationLock();
-
-      const findCardForDirection = (key) => {
-          if (!key || !deckContainer) return null;
-          return deckContainer.querySelector(`.dimension-card[data-direction-key="${key}"]`);
-      };
-
-      let card = findCardForDirection(actualDirectionKey);
+      let card = document.querySelector(`[data-direction-key="${actualDirectionKey}"]`);
       if (!card) {
-          const fallbackKey = findDirectionKeyContainingTrack(state.latestExplorerData, (finalSamples[0]?.track || finalSamples[0])?.identifier);
+          const fallbackKey = findDirectionKeyContainingTrack(state.latestExplorerData, (sampleTracks[0]?.track || sampleTracks[0])?.identifier);
           if (fallbackKey) {
               console.warn(`🔄 Could not find card for ${actualDirectionKey}; attempting fallback card ${fallbackKey}`);
-              card = findCardForDirection(fallbackKey);
+              card = document.querySelector(`[data-direction-key="${fallbackKey}"]`);
               if (card) {
                   state.baseDirectionKey = fallbackKey;
                   actualDirectionKey = fallbackKey;
@@ -6511,133 +3102,55 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
 
       if (!card) {
           console.warn(`🔄 Could not find card element for ${actualDirectionKey}; creating temporary next-track card`);
-          if (deckContainer) {
+          const container = elements.dimensionCards || document.getElementById('dimensionCards');
+          if (container) {
               card = document.createElement('div');
               card.className = 'dimension-card next-track track-detail-card visible';
               card.dataset.directionKey = actualDirectionKey;
               card.style.left = '50%';
               card.style.top = '45%';
-              card.style.transform = 'translate(-51%, -44%) translateZ(-420px) scale(1.02)';
-              card.style.zIndex = '0';
-              deckContainer.appendChild(card);
-
-              const assignSyntheticClockPosition = (node) => {
-                  if (!deckContainer) return;
-                  const occupiedPositions = new Set(
-                      Array.from(deckContainer.querySelectorAll('[data-clock-position]'))
-                          .filter(existing => existing !== node)
-                          .map(existing => parseInt(existing.dataset.clockPosition, 10))
-                          .filter(pos => Number.isInteger(pos) && pos >= 1 && pos <= 12)
-                  );
-                  const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-                  let chosen = availablePositions.find(pos => !occupiedPositions.has(pos));
-                  if (!chosen) {
-                      chosen = ((availablePositions.length % 12) || 12);
-                  }
-                  node.dataset.clockPosition = String(chosen);
-                  if (!node.dataset.originalClockPosition) {
-                      node.dataset.originalClockPosition = String(chosen);
-                  }
-              };
-
-              assignSyntheticClockPosition(card);
+              card.style.transform = 'translate(-50%, -40%) translateZ(-400px) scale(1.0)';
+              card.style.zIndex = '120';
+              container.appendChild(card);
           }
       }
 
       if (!card) {
           console.error(`🔄 Could not find or create card element for ${actualDirectionKey}`);
-          if (deckContainer) {
-              console.error('🎬 Available deck cards: ', Array.from(deckContainer.querySelectorAll('.dimension-card')).map(el => el.getAttribute('data-direction-key')));
-          }
-          releaseDeckHydrationLock();
+          console.error('🎬 Available cards: ', Array.from(document.querySelectorAll('.dimension-card')).map(el => el.getAttribute('data-direction-key')));
           return;
       }
-      if (!card.dataset.clockPosition) {
-          const syntheticPosition = () => {
-              const occupied = new Set(
-                  Array.from(deckContainer.querySelectorAll('[data-clock-position]'))
-                      .filter(existing => existing !== card)
-                      .map(existing => parseInt(existing.dataset.clockPosition, 10))
-                      .filter(pos => Number.isInteger(pos) && pos >= 1 && pos <= 12)
-              );
-              const slots = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-              let chosen = slots.find(pos => !occupied.has(pos));
-              if (!chosen) {
-                  chosen = slots[0];
-              }
-              card.dataset.clockPosition = String(chosen);
-              if (!card.dataset.originalClockPosition) {
-                  card.dataset.originalClockPosition = String(chosen);
-              }
-          };
-          syntheticPosition();
-      }
       card.dataset.baseDirectionKey = actualDirectionKey;
-      if (hasOppositeSamples && computedOppositeKey && computedOppositeKey !== actualDirectionKey) {
+      if (computedOppositeKey) {
           card.dataset.oppositeDirectionKey = computedOppositeKey;
       } else {
           delete card.dataset.oppositeDirectionKey;
       }
-
-      const wasNextTrack = card.classList.contains('next-track');
-      card.classList.add('track-detail-card', 'next-track');
-      card.classList.remove('animating-to-center');
-      card.style.left = '50%';
-      card.style.top = '45%';
-      card.style.transform = 'translate(-50%, -42%) translateZ(-300px) scale(1.06)';
-      card.style.zIndex = '200';
-
-      if (!wasNextTrack) {
-          card.classList.add('visible');
-      }
+      card.classList.add('track-detail-card');
       console.log(`🔄 Found card for ${actualDirectionKey}, updating with track details...`);
       console.log(`🔄 Card element:`, card);
-      console.log(`🔄 Sample tracks:`, finalSamples);
+      console.log(`🔄 Sample tracks:`, sampleTracks);
 
-      const primarySample = finalSamples[0] || {};
-      const trackForCard = primarySample.track || primarySample;
-      const preferredRecord = trackForCard ? { ...trackForCard } : null;
+      const primarySample = sampleTracks[0] || {};
+      const selectedTrack = primarySample.track || primarySample;
 
-      console.log(`🔄 Selected track:`, trackForCard);
+      console.log(`🔄 Selected track:`, selectedTrack);
       console.log(`🔄 About to call updateCardWithTrackDetails with preserveColors=true...`);
-      updateCardWithTrackDetails(card, trackForCard, direction, true, swapStackContents);
+      updateCardWithTrackDetails(card, selectedTrack, direction, true, swapStackContents);
       console.log(`🔄 Finished calling updateCardWithTrackDetails`);
 
-      state.skipNextExitAnimation = true;
-
-      const previewDirectionKey = direction?.key
-          || actualDirectionKey
-          || requestedDirectionKey
-          || directionKey;
-
-      state.latestExplorerData.nextTrack = {
-          directionKey: previewDirectionKey,
-          direction: direction?.direction || previewDirectionKey,
-          track: preferredRecord
-      };
-
-      const suppressPreview = state.suppressPreviewTrackId && trackForCard?.identifier === state.suppressPreviewTrackId;
-      if (state.cardsDormant && !suppressPreview) {
-          showNextTrackPreview(trackForCard, { directionKey: previewDirectionKey });
-      } else {
-          hideNextTrackPreview({ immediate: true });
+      if (state.cardsDormant) {
+          showNextTrackPreview(selectedTrack);
       }
 
       if (typeof updateNextTrackMetadata === 'function') {
-          updateNextTrackMetadata(trackForCard);
+          updateNextTrackMetadata(selectedTrack);
       }
 
-      if (notifyServer && trackForCard?.identifier) {
-          if (selectionOrigin === 'deck') {
-              sendNextTrack(trackForCard.identifier, previewDirectionKey, {
-                  source: 'user',
-                  origin: selectionOrigin,
-                  explorerSignature: explorerSig
-              });
-          }
-      }
-
-      releaseDeckHydrationLock();
+      // Stack depth indication is now handled via CSS pseudo-elements on the main card
+  }
+  if (typeof window !== 'undefined') {
+      window.convertToNextTrackStack = convertToNextTrackStack;
   }
 
   // Periodic status check (optional, for monitoring)
@@ -6645,962 +3158,203 @@ function createDirectionCard(direction, index, total, isNextTrack, nextTrackData
     fetch('/status').catch(() => {});
   }, 30000);
 
+  function navigateDirectionToCenter(newDirectionKey) {
+      const canonicalDirectionKey = resolveCanonicalDirectionKey(newDirectionKey);
+      if (!state.latestExplorerData || !state.latestExplorerData.directions) {
+          console.warn('Cannot navigate directions: explorer data missing');
+          return;
+      }
 
-// ====== Heartbeat & Sync System ======
+      const direction = state.latestExplorerData.directions[canonicalDirectionKey];
+      if (!direction) {
+          console.warn('Cannot navigate: direction not found', canonicalDirectionKey);
+          return;
+      }
 
-// Unified next-track communication (handles user selection, heartbeat, and manual refresh)
-async function sendNextTrack(trackMd5 = null, direction = null, options = 'user') {
-    let requestSource = 'user';
-    let origin = null;
-    let explorerSignature = null;
+      const sampleTracks = direction.sampleTracks || [];
+      const primaryEntry = sampleTracks[0];
+      const primaryTrack = primaryEntry ? (primaryEntry.track || primaryEntry) : null;
+      if (!primaryTrack || !primaryTrack.identifier) {
+          console.warn('Cannot navigate: direction has no primary track', canonicalDirectionKey);
+          return;
+      }
 
-    if (typeof options === 'string') {
-        requestSource = options;
-    } else if (options && typeof options === 'object') {
-        requestSource = options.source || 'user';
-        origin = options.origin || null;
-        explorerSignature = options.explorerSignature || null;
-    }
-    // requestSource: 'user' | 'heartbeat' | 'manual_refresh'
+      const currentCenterKey = resolveCanonicalDirectionKey(state.latestExplorerData?.nextTrack?.directionKey || null);
+      if (currentCenterKey && currentCenterKey === canonicalDirectionKey) {
+          cycleStackContents(canonicalDirectionKey, state.stackIndex);
+          return;
+      }
+      let promotionDelay = 0;
 
-    // Clear existing heartbeat
-    if (state.heartbeatTimeout) {
-        clearTimeout(state.heartbeatTimeout);
-        state.heartbeatTimeout = null;
-    }
+      if (currentCenterKey && currentCenterKey !== canonicalDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
+          const demoted = rotateCenterCardToNextPosition(currentCenterKey);
+          if (demoted) {
+              promotionDelay = 820;
+          }
+      }
 
-    if (!state.streamFingerprint) {
-        console.warn('⚠️ sendNextTrack: No fingerprint yet; waiting for SSE to bind');
-        const ready = await waitForFingerprint(5000);
+      const performPromotion = () => {
+          state.selectedIdentifier = primaryTrack.identifier;
+          state.stackIndex = 0;
+          state.pendingManualTrackId = primaryTrack.identifier;
+          state.manualSelectionPending = true;
+          state.manualNextTrackOverride = false;
+          state.skipTrayDemotionForTrack = null;
+          state.manualNextDirectionKey = canonicalDirectionKey;
+          state.pendingSnapshotTrackId = primaryTrack.identifier;
 
-        if (!ready || !state.streamFingerprint) {
-            console.warn('⚠️ sendNextTrack: Fingerprint still missing after wait; restarting session');
-            await createNewJourneySession('missing_fingerprint');
+          if (!state.remainingCounts) {
+              state.remainingCounts = {};
+          }
+          state.remainingCounts[canonicalDirectionKey] = Math.max(0, sampleTracks.length - 1);
 
-            const fallbackReady = await waitForFingerprint(5000);
-            if (!fallbackReady || !state.streamFingerprint) {
-                console.error('❌ sendNextTrack: Aborting call - fingerprint unavailable');
-                scheduleHeartbeat(10000);
-                return;
-            }
-        }
-    }
+          state.latestExplorerData.nextTrack = {
+              directionKey: canonicalDirectionKey,
+              direction: direction.direction,
+              track: primaryTrack
+          };
 
-    // Use existing data if not provided (heartbeat/refresh case)
-    const manualOverrideActive = state.manualNextTrackOverride && state.selectedIdentifier;
+          state.usingOppositeDirection = false;
+          const selectionOptions = {
+              origin: 'deck',
+              notifyServer: true,
+              explorerSignature: state.lastDirectionSignature
+          };
 
-    const allowFallback = requestSource !== 'manual_refresh';
+          if (typeof animateDirectionToCenter === 'function') {
+              animateDirectionToCenter(canonicalDirectionKey, selectionOptions);
+          } else {
+              convertToNextTrackStack(canonicalDirectionKey, selectionOptions);
+          }
 
-    let md5ToSend = trackMd5;
-    let dirToSend = direction;
+          sendNextTrack(primaryTrack.identifier, canonicalDirectionKey, {
+              source: 'user',
+              origin: 'deck',
+              explorerSignature: state.lastDirectionSignature
+          });
+      };
 
-    if (!md5ToSend && allowFallback) {
-        if (manualOverrideActive && state.selectedIdentifier) {
-            md5ToSend = state.selectedIdentifier;
-            dirToSend = dirToSend || state.manualNextDirectionKey || null;
-        }
+      if (promotionDelay > 0) {
+          setTimeout(performPromotion, promotionDelay);
+      } else {
+          performPromotion();
+      }
 
-        if (!md5ToSend) {
-            if (state.serverNextTrack) {
-                md5ToSend = state.serverNextTrack;
-                dirToSend = dirToSend || state.serverNextDirection || null;
-            }
-        }
+      tryFlushPendingCenterPromotion();
+  }
 
-        if (!md5ToSend) {
-            md5ToSend = state.latestExplorerData?.nextTrack?.track?.identifier || null;
-            dirToSend = dirToSend || state.latestExplorerData?.nextTrack?.directionKey || null;
-        }
+  if (typeof window !== 'undefined') {
+      window.navigateDirectionToCenter = navigateDirectionToCenter;
+  }
 
-        if (!md5ToSend && state.lastRefreshSummary?.nextTrack) {
-            const refreshNextId = extractNextTrackIdentifier(state.lastRefreshSummary.nextTrack);
-            if (refreshNextId) {
-                md5ToSend = refreshNextId;
-                if (!dirToSend) {
-                    dirToSend = extractNextTrackDirection(state.lastRefreshSummary.nextTrack, state.latestExplorerData?.directions);
-                }
-            }
-        }
+  function queueCenterPromotion(directionKey, options = {}) {
+      const canonicalKey = resolveCanonicalDirectionKey(directionKey);
+      if (!canonicalKey) {
+          return;
+      }
 
-        if (!md5ToSend) {
-            md5ToSend = state.selectedIdentifier || null;
-        }
+      state.pendingCenterPromotionKey = canonicalKey;
+      state.pendingCenterPromotionOptions = { ...options };
 
-        if (!md5ToSend && state.previousNextTrack?.identifier) {
-            md5ToSend = state.previousNextTrack.identifier;
-            dirToSend = dirToSend || state.previousNextTrack.directionKey || null;
-        }
+      tryFlushPendingCenterPromotion();
+  }
 
-        if (!md5ToSend) {
-            const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
-            const activeCard = deckContainer ? deckContainer.querySelector('.dimension-card.next-track') : null;
-            if (activeCard) {
-                const datasetMd5 = activeCard.dataset.trackMd5 || activeCard.dataset.trackIdentifier || null;
-                if (datasetMd5) {
-                    md5ToSend = datasetMd5;
-                }
-                if (!dirToSend) {
-                    dirToSend = activeCard.dataset.directionKey || activeCard.dataset.baseDirectionKey || null;
-                }
-            }
-        }
+  function tryFlushPendingCenterPromotion() {
+      if (!state.pendingCenterPromotionKey) {
+          return;
+      }
 
-        if (!md5ToSend && state.baseDirectionKey) {
-            const direction = state.latestExplorerData?.directions?.[state.baseDirectionKey] || null;
-            const candidate = direction?.sampleTracks?.[0];
-            if (candidate) {
-                const track = candidate.track || candidate;
-                if (track?.identifier) {
-                    md5ToSend = track.identifier;
-                    dirToSend = dirToSend || state.baseDirectionKey;
-                }
-            }
-        }
-    }
+      if (!state.nowPlayingInitialized || !state.latestCurrentTrack?.identifier) {
+          return;
+      }
 
-    if (manualOverrideActive && !dirToSend) {
-        dirToSend = state.manualNextDirectionKey;
-    }
+      const directionKey = resolveCanonicalDirectionKey(state.pendingCenterPromotionKey);
+      const options = state.pendingCenterPromotionOptions || {};
+      state.pendingCenterPromotionKey = null;
+      state.pendingCenterPromotionOptions = null;
 
-    if (!md5ToSend) {
-        console.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
-        state.manualNextTrackOverride = false;
-        state.skipTrayDemotionForTrack = null;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = null;
-        state.stackIndex = 0;
+      if (state.nextTrackAnimationTimer) {
+          clearTimeout(state.nextTrackAnimationTimer);
+          state.nextTrackAnimationTimer = null;
+      }
 
-        if (requestSource === 'heartbeat') {
-            if (typeof requestSSERefresh === 'function') { await requestSSERefresh(); }
-            // TODO(lean-comms): remove fallback auto-heartbeat once E2E verified
-            scheduleHeartbeat(30000);
-        } else {
-            if (typeof requestSSERefresh === 'function') { await requestSSERefresh(); }
-        }
-        return;
-    }
+      const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
 
-    console.log(`📤 sendNextTrack (${requestSource}${origin ? `/${origin}` : ''}): ${md5ToSend.substring(0,8)}... via ${dirToSend || 'unknown'}`);
+      state.nextTrackAnimationTimer = setTimeout(() => {
+          const candidateCard = deckContainer
+              ? deckContainer.querySelector(`[data-direction-key="${directionKey}"]`)
+              : null;
+          if (candidateCard) {
+              deckLog(`🎯 Animating ${directionKey} to center as next track (queued)`);
+              animateDirectionToCenter(directionKey, options);
+          } else {
+              console.warn(`⚠️ Could not find card to promote for ${directionKey}; synthesizing center card`);
+              convertToNextTrackStack(directionKey, options);
+          }
+          state.nextTrackAnimationTimer = null;
+      }, 120);
+  }
 
-    if (requestSource === 'user') {
-        state.manualNextTrackOverride = true;
-        state.skipTrayDemotionForTrack = null;
-        state.manualNextDirectionKey = dirToSend;
-        state.pendingManualTrackId = md5ToSend;
-        if (state.nextTrackAnimationTimer) {
-            clearTimeout(state.nextTrackAnimationTimer);
-            state.nextTrackAnimationTimer = null;
-        }
-        if (state.cardsDormant) {
-            const nextInfo = resolveNextTrackData();
-            if (nextInfo?.track) {
-                showNextTrackPreview(nextInfo.track, { directionKey: nextInfo.directionKey || nextInfo.track?.directionKey || null });
-            }
-        }
-    }
+  if (typeof window !== 'undefined') {
+      window.tryFlushPendingCenterPromotion = tryFlushPendingCenterPromotion;
+  }
 
-    try {
-        const response = await fetch('/next-track', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                trackMd5: md5ToSend,
-                direction: dirToSend,
-                source: requestSource,
-                origin,
-                explorerSignature,
-                fingerprint: state.streamFingerprint,
-                sessionId: state.sessionId
-            })
-        });
+// Heartbeat & Sync System moved to sync-manager.js
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-        window.state = window.state || {};
-        window.state.lastHeartbeatResponse = data;
-
-        if (data.fingerprint) {
-            if (state.streamFingerprint !== data.fingerprint) {
-                console.log(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
-            }
-            applyFingerprint(data.fingerprint);
-        }
-
-        if (requestSource === 'user' && md5ToSend) {
-            state.selectedIdentifier = md5ToSend;
-        }
-
-        const serverTrack = data.currentTrack;
-        const localTrack = state.latestCurrentTrack?.identifier || null;
-        if (requestSource === 'heartbeat' && serverTrack && localTrack && serverTrack !== localTrack) {
-            console.error('🛰️ ACTION heartbeat-track-mismatch (immediate)', { serverTrack, localTrack });
-            fullResync();
-            return;
-        }
-
-
-        // data = { nextTrack, currentTrack, duration, remaining }
-
-        if (DEBUG_FLAGS.deck) {
-            console.log(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
-        }
-
-        // Analyze response and take appropriate action
-        analyzeAndAct(data, requestSource, md5ToSend);
-
-    } catch (error) {
-        console.error('❌ sendNextTrack failed:', error);
-
-        const statusMatch = typeof error?.message === 'string' ? error.message.match(/HTTP\s+(\d+)/) : null;
-        const statusCode = statusMatch ? Number(statusMatch[1]) : null;
-
-        if (statusCode === 404) {
-            console.warn('⚠️ next-track endpoint returned 404; requesting SSE refresh and backing off');
-
-            // Clear any pending manual override so we can recover cleanly once data arrives
-            state.pendingManualTrackId = null;
-
-            if (typeof requestSSERefresh === 'function') {
-                try {
-                    await requestSSERefresh({ escalate: false, stage: 'next-track-404' });
-                } catch (refreshError) {
-                    console.warn('⚠️ SSE refresh after 404 failed', refreshError);
-                }
-            }
-
-            // Reduce heartbeat pressure so we do not re-trigger the failure loop immediately
-            scheduleHeartbeat(45000);
-            return;
-        }
-
-        // Set shorter retry timeout for transient issues
-        scheduleHeartbeat(10000); // Retry in 10s
-    }
-}
 
 if (typeof window !== 'undefined') {
-  window.sendNextTrack = sendNextTrack;
-}
-
-function analyzeAndAct(data, source, sentMd5) {
-    const { nextTrack, currentTrack, duration, remaining } = data;
-
-    if (data.fingerprint && state.streamFingerprint !== data.fingerprint) {
-        if (!DEBUG_FLAGS.deck) {
-            console.log(`🔄 Server response rotated fingerprint to ${data.fingerprint.substring(0, 6)}…`);
-        }
-        applyFingerprint(data.fingerprint);
-    }
-
-    if (!data || !currentTrack) {
-        console.warn('⚠️ Invalid server response');
-        // TODO(lean-comms): remove long auto heartbeat once SSE flow confirmed stable
-        scheduleHeartbeat(60000);
-        return;
-    }
-
-    const ICON = '🛰️';
-    const serverDurationSeconds = (typeof duration === 'number' && duration > 0) ? (duration / 1000) : null;
-    const serverElapsedSeconds = (typeof duration === 'number' && typeof remaining === 'number' && duration > 0)
-        ? Math.max((duration - remaining) / 1000, 0)
-        : null;
-    const clientDurationSeconds = state.playbackDurationSeconds || null;
-    const clientElapsedSeconds = (state.playbackStartTimestamp && state.playbackDurationSeconds)
-        ? Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0)
-        : null;
-
-    const clientNextTrack = state.latestExplorerData?.nextTrack?.track?.identifier
-        || state.latestExplorerData?.nextTrack?.identifier
-        || state.selectedIdentifier
-        || null;
-
-    if (DEBUG_FLAGS.deck) {
-        console.log(`${ICON} Sync snapshot (${source})`, {
-            server: {
-                currentTrack: currentTrack || null,
-                elapsedSeconds: serverElapsedSeconds,
-                durationSeconds: serverDurationSeconds,
-                nextTrack: nextTrack || null
-            },
-            client: {
-                currentTrack: state.latestCurrentTrack?.identifier || null,
-                elapsedSeconds: clientElapsedSeconds,
-                durationSeconds: clientDurationSeconds,
-                nextTrack: clientNextTrack || null,
-                pendingSelection: state.selectedIdentifier || null
-            },
-            sentOverride: sentMd5 || null
-        });
-    }
-
-    // Check 1: Current track MD5 mismatch
-    const currentMd5 = state.latestCurrentTrack?.identifier;
-    const currentTrackMismatch = currentMd5 && currentTrack !== currentMd5;
-
-    if (currentTrackMismatch) {
-        console.log(`${ICON} ACTION current-track-mismatch`, {
-            expected: currentMd5,
-            received: currentTrack,
-            source
-        });
-        fullResync();
-        return;
-    }
-
-    if (state.suppressPreviewTrackId && currentTrack === state.suppressPreviewTrackId) {
-        state.suppressPreviewTrackId = null;
-    }
-
-    // Check 2: Next track MD5 mismatch
-    const expectedNextMd5 = state.latestExplorerData?.nextTrack?.track?.identifier || state.selectedIdentifier;
-    const hasServerNext = Boolean(nextTrack);
-    const nextTrackMismatch = Boolean(expectedNextMd5 && hasServerNext && nextTrack !== expectedNextMd5);
-
-    if (expectedNextMd5 && !hasServerNext) {
-        console.log(`${ICON} ACTION awaiting-server-next`, {
-            expected: expectedNextMd5,
-            source,
-            sentMd5
-        });
-        if (state.manualNextTrackOverride) {
-            // TODO(lean-comms): reassess auto heartbeat after override once staged refresh covers this case
-            scheduleHeartbeat(10000);
-        }
-    }
-
-    if (nextTrackMismatch) {
-        if (state.manualNextTrackOverride || state.pendingManualTrackId) {
-            console.log(`${ICON} ACTION server-next-ignored`, {
-                expected: expectedNextMd5,
-                received: nextTrack,
-                source,
-                overrideActive: state.manualNextTrackOverride,
-                pendingManualTrackId: state.pendingManualTrackId,
-                sentMd5
-            });
-            // TODO(lean-comms): reassess auto heartbeat after override mismatch once staged refresh covers this case
-            scheduleHeartbeat(20000);
-            return;
-        }
-
-        console.log(`${ICON} ACTION next-track-mismatch`, {
-            expected: expectedNextMd5,
-            received: nextTrack,
-            source,
-            sentMd5
-        });
-
-        // If this is what we just sent, it's a confirmation not a mismatch - just update our state
-        if (sentMd5 && nextTrack === sentMd5) {
-            console.log(`${ICON} ACTION confirmation`, {
-                acknowledged: sentMd5,
-                source
-            });
-            selectedNextTrackSha = nextTrack;
-            // TODO(lean-comms): drop long heartbeat once confirmation flow is stable
-            scheduleHeartbeat(60000);
-            return;
-        }
-
-        // Otherwise, server picked something different (only happens on heartbeat/auto-transition)
-        // Check if the server's next track is in our current neighborhood
-        if (isTrackInNeighborhood(nextTrack)) {
-            console.log(`${ICON} ACTION promote-neighborhood`, {
-                track: nextTrack,
-                source
-            });
-            promoteTrackToNextStack(nextTrack);
-            // TODO(lean-comms): drop long heartbeat once confirmation flow is stable
-            scheduleHeartbeat(60000);
-        } else {
-            console.log(`${ICON} ACTION full-resync-needed`, {
-                track: nextTrack,
-                reason: 'not_in_neighborhood',
-                source
-            });
-            fullResync();
-            return;
-        }
-    }
-
-    // Check 3: Timing drift (just update, don't panic)
-    if (typeof duration === 'number' && typeof remaining === 'number' && duration > 0) {
-        const durationSeconds = Math.max(duration / 1000, 0);
-        const elapsedSeconds = Math.max((duration - remaining) / 1000, 0);
-        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-        debugLog('timing', `${ICON} ACTION timing-update`, {
-            durationSeconds,
-            elapsedSeconds: clampedElapsed,
-            source
-        });
-        startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: true });
-    }
-
-    // All checks passed
-    console.log(`${ICON} ACTION sync-ok`, { source });
-
-    if (state.cardsDormant) {
-        const info = resolveNextTrackData();
-        if (info?.track) {
-            showNextTrackPreview(info.track, { directionKey: info.directionKey || info.track?.directionKey || null });
-        }
-    }
-
-    // TODO(lean-comms): consider removing steady-state heartbeat once confidence high
-    scheduleHeartbeat(60000);
-}
-
-function isTrackInNeighborhood(trackMd5) {
-    if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-        return false;
-    }
-
-    // Search through all directions' sample tracks
-    for (const [dirKey, direction] of Object.entries(state.latestExplorerData.directions)) {
-        if (direction.sampleTracks) {
-            const found = direction.sampleTracks.some(sample => {
-                const track = sample.track || sample;
-                return track.identifier === trackMd5;
-            });
-            if (found) {
-                console.log(`🔍 Track ${trackMd5.substring(0,8)} found in direction: ${dirKey}`);
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-function promoteTrackToNextStack(trackMd5) {
-    if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-        console.warn('⚠️ No explorer data to promote track from');
-        return;
-    }
-
-    // Find which direction contains this track
-    let foundDirection = null;
-    let foundTrack = null;
-
-    for (const [dirKey, direction] of Object.entries(state.latestExplorerData.directions)) {
-        if (direction.sampleTracks) {
-            const trackData = direction.sampleTracks.find(sample => {
-                const track = sample.track || sample;
-                return track.identifier === trackMd5;
-            });
-
-            if (trackData) {
-                foundDirection = dirKey;
-                foundTrack = trackData.track || trackData;
-                break;
-            }
-        }
-    }
-
-    if (!foundDirection || !foundTrack) {
-        console.error('❌ Track not found in any direction, cannot promote');
-        return;
-    }
-
-    console.log(`🎯 Promoting track from ${foundDirection} to next track stack`);
-
-    // Use existing function to swap next track direction
-    navigateDirectionToCenter(foundDirection);
-
-    // Update selected track state
-    state.selectedIdentifier = trackMd5;
-}
-
-function scheduleHeartbeat(delayMs = 60000) {
-    const MIN_HEARTBEAT_INTERVAL = 1000;
-    delayMs = Math.max(delayMs, MIN_HEARTBEAT_INTERVAL);
-    if (state.heartbeatTimeout) {
-        clearTimeout(state.heartbeatTimeout);
-    }
-
-    state.heartbeatTimeout = setTimeout(() => {
-        console.log('💓 Heartbeat triggered');
-        sendNextTrack(null, null, 'heartbeat');
-        window.state = window.state || {};
-        const serverTrack = window.state?.lastHeartbeatResponse?.currentTrack;
-        const localTrack = window.state?.latestCurrentTrack?.identifier || null;
-        if (serverTrack && localTrack && serverTrack !== localTrack) {
-            console.error('🛰️ ACTION heartbeat-track-mismatch', { serverTrack, localTrack });
-            fullResync();
-            return;
-        }
-
-    }, delayMs);
-
-    console.log(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
-}
-
-async function fullResync() {
-    console.log('🔄 Full resync triggered - calling /refresh-sse');
-
-    try {
-        const payload = {};
-        if (state.streamFingerprint) {
-            payload.fingerprint = state.streamFingerprint;
-        }
-        if (state.sessionId) {
-            payload.sessionId = state.sessionId;
-        }
-
-        const response = await fetch('/refresh-sse', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-
-        // Check for 404 - session no longer exists (server restart)
-        if (response.status === 404) {
-            console.error('🚨 Session not found on server - session was destroyed (likely server restart)');
-            console.log('🔄 Reloading page to get new session...');
-            window.location.reload();
-            return;
-        }
-
-        const result = await response.json();
-
-        if (result.fingerprint) {
-            if (state.streamFingerprint !== result.fingerprint) {
-                console.log(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
-            }
-            applyFingerprint(result.fingerprint);
-        }
-
-        if (result.ok) {
-            console.log('✅ Resync broadcast triggered, waiting for SSE update...');
-            // SSE event will update UI
-            // TODO(lean-comms): revisit steady-state heartbeat once SSE proves reliable
-            scheduleHeartbeat(60000);
-
-            if (state.pendingResyncCheckTimer) {
-              clearTimeout(state.pendingResyncCheckTimer);
-            }
-
-            state.pendingResyncCheckTimer = setTimeout(() => {
-              const lastUpdate = state.lastTrackUpdateTs || 0;
-              const age = Date.now() - lastUpdate;
-              const hasCurrent = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
-
-              if (!hasCurrent || age > 5000) {
-                console.warn('🛰️ ACTION resync-followup: no track update after broadcast, requesting SSE refresh');
-                if (typeof requestSSERefresh === 'function') { requestSSERefresh(); }
-              }
-            }, 5000);
-        } else {
-            console.warn('⚠️ Resync failed:', result.reason);
-
-            // If session doesn't exist, reload
-            if (result.error === 'Session not found' || result.error === 'Master session not found') {
-                console.log('🔄 Session lost, reloading page...');
-                window.location.reload();
-                return;
-            }
-
-            // TODO(lean-comms): drop auto retry once staged refresh covers this path
-            scheduleHeartbeat(10000); // Retry sooner
-        }
-    } catch (error) {
-        console.error('❌ Resync error:', error);
-        // TODO(lean-comms): drop auto retry once staged refresh covers this path
-        scheduleHeartbeat(10000); // Retry sooner
-    }
-}
-
-// Request SSE refresh from the backend
-async function createNewJourneySession(reason = 'unknown') {
-    if (state.creatingNewSession) {
-        console.log(`🛰️ ACTION new-session-skip: already creating (${reason})`);
-        return;
-    }
-
-    state.creatingNewSession = true;
-    try {
-        console.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
-
-        const streamElement = state.isStarted ? elements.audio : null;
-        if (streamElement) {
-            try {
-                streamElement.pause();
-            } catch (err) {
-                console.warn('🎵 Pause before new session failed:', err);
-            }
-        }
-
-        clearFingerprint({ reason: `new_session_${reason}` });
-        state.sessionId = null;
-
-        const newStreamUrl = composeStreamEndpoint(null, Date.now());
-        state.streamUrl = newStreamUrl;
-
-        if (streamElement) {
-            audioHealth.isHealthy = false;
-            audioHealth.lastTimeUpdate = null;
-            audioHealth.bufferingStarted = Date.now();
-            connectAudioStream(newStreamUrl, { reason: `new-session-${reason}` });
-            state.awaitingSSE = true;
-        }
-
-        state.manualNextTrackOverride = false;
-        state.skipTrayDemotionForTrack = null;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = null;
-        state.stackIndex = 0;
-        state.latestExplorerData = null;
-        state.remainingCounts = {};
-
-        if (state.pendingInitialTrackTimer) {
-            clearTimeout(state.pendingInitialTrackTimer);
-            state.pendingInitialTrackTimer = null;
-        }
-        if (state.pendingResyncCheckTimer) {
-            clearTimeout(state.pendingResyncCheckTimer);
-            state.pendingResyncCheckTimer = null;
-        }
-
-        if (connectionHealth.currentEventSource) {
-            connectionHealth.currentEventSource.close();
-            connectionHealth.currentEventSource = null;
-        }
-        connectionHealth.sse.status = 'reconnecting';
-        updateConnectionHealthUI();
-
-        setTimeout(() => connectSSE(), 200);
-
-        if (streamElement && state.isStarted) {
-            startAudioHealthMonitoring();
-            playAudioElement('new-session');
-        }
-
-        // TODO(lean-comms): revisit auto heartbeat after new session once staged recovery validated
-        scheduleHeartbeat(5000);
-    } catch (error) {
-        console.error('❌ Failed to create new journey session:', error);
-        // TODO(lean-comms): revisit auto heartbeat after new session failure once staged recovery validated
-        scheduleHeartbeat(10000);
-    } finally {
-        state.creatingNewSession = false;
-    }
-}
-
-async function verifyExistingSessionOrRestart(reason = 'unknown', options = {}) {
-    const { escalate = true } = options;
-    if (!state.streamFingerprint) {
-        const ready = await waitForFingerprint(3000);
-        if (!ready || !state.streamFingerprint) {
-            if (escalate) {
-                await createNewJourneySession(reason);
-            }
-            return false;
-        }
-    }
-
-    try {
-        const ok = await requestSSERefresh({ escalate: false });
-        if (ok) {
-            console.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting');
-
-            if (connectionHealth.currentEventSource) {
-                connectionHealth.currentEventSource.close();
-                connectionHealth.currentEventSource = null;
-            }
-
-            connectionHealth.sse.status = 'reconnecting';
-            updateConnectionHealthUI();
-            connectSSE();
-
-            // TODO(lean-comms): evaluate removing auto heartbeat after session rebind once proven stable
-            scheduleHeartbeat(10000);
-            return true;
-        }
-    } catch (error) {
-        console.error('❌ verifyExistingSessionOrRestart failed:', error);
-    }
-
-    if (escalate) {
-        await createNewJourneySession(reason);
-    }
-    return false;
-}
-
-async function requestSSERefresh(options = {}) {
-    const { escalate = true, stage = 'rebroadcast' } = options;
-    if (!state.streamFingerprint) {
-        console.warn('⚠️ requestSSERefresh: No fingerprint yet; waiting for SSE handshake');
-        const ready = await waitForFingerprint(4000);
-        if (!ready || !state.streamFingerprint) {
-            console.warn('⚠️ requestSSERefresh: Aborting refresh - fingerprint unavailable');
-            return false;
-        }
-    }
-
-    try {
-        console.log('🔄 Sending SSE refresh request to backend...');
-        const requestBody = {
-            reason: 'zombie_session_recovery',
-            clientTime: Date.now(),
-            lastTrackStart: state.latestCurrentTrack?.startTime || null,
-            fingerprint: state.streamFingerprint,
-            sessionId: state.sessionId,
-            stage
+    // Expose deck helpers immediately so exposeDeckHelpers() can find them at module level
+    window.createDimensionCards = createDimensionCards;
+    window.swapStackContents = swapStackContents;
+    window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
+    window.convertToNextTrackStack = convertToNextTrackStack;
+    window.__driftCreateDimensionCardsRef = createDimensionCards;
+    window.__driftSwapStackContentsRef = swapStackContents;
+
+    window.__deckTestHooks = window.__deckTestHooks || {};
+    window.__deckTestHooks.getDeckApi = function getDeckApi() {
+        return {
+            createDimensionCards,
+            navigateDirectionToCenter,
+            rotateCenterCardToNextPosition,
+            convertToNextTrackStack,
+            resetCardToDirectionDisplay,
+            elements,
+            state
         };
-
-        // Add session ID if we have one
-        if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-            requestBody.requestExplorerData = true;
-        }
-
-        const response = await fetch('/refresh-sse', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(requestBody)
-        });
-
-        if (response.ok) {
-            const result = await response.json();
-            console.log('✅ SSE refresh request successful:', result);
-
-            state.lastRefreshSummary = result;
-
-            if (result.fingerprint) {
-                if (state.streamFingerprint !== result.fingerprint) {
-                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
-                }
-                applyFingerprint(result.fingerprint);
-            }
-
-            if (result.ok === false) {
-                const reason = result.reason || 'unknown';
-                console.warn(`🔄 SSE refresh reported issue: ${reason}`);
-
-                if (reason === 'inactive') {
-                    console.warn('🔄 SSE refresh indicates inactive session; verifying stream state');
-                    if (!escalate) {
-                        return false;
-                    }
-                    if (result.streamAlive === false) {
-                        await createNewJourneySession('refresh_inactive');
-                    } else {
-                        await verifyExistingSessionOrRestart('refresh_inactive');
-                    }
-                } else if (reason === 'no_track') {
-                    console.warn('🔄 SSE refresh returned no track; scheduling quick heartbeat');
-                    // TODO(lean-comms): drop quick heartbeat once staged refresh proves sufficient
-                    scheduleHeartbeat(5000);
-                }
-                return false;
-            }
-
-            if (result.currentTrack) {
-                const previousTrackId = state.latestCurrentTrack?.identifier || null;
-                console.log(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
-                console.log(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
-
-                if (result.fingerprint && state.streamFingerprint !== result.fingerprint) {
-                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
-                    applyFingerprint(result.fingerprint);
-                }
-
-                // Update the now playing card with current track data
-                updateNowPlayingCard(result.currentTrack, null);
-                const incomingTrackId = result.currentTrack?.identifier || null;
-
-                // Update fallback next-track info so heartbeats have a baseline even without explorer data
-                if (result.nextTrack) {
-                    const nextTrackId = extractNextTrackIdentifier(result.nextTrack);
-                    if (nextTrackId) {
-                        state.serverNextTrack = nextTrackId;
-                        const nextDirection = extractNextTrackDirection(result.nextTrack, state.latestExplorerData?.directions);
-                        if (nextDirection) {
-                            state.serverNextDirection = nextDirection;
-                        }
-                        if (!state.manualNextTrackOverride) {
-                            state.selectedIdentifier = state.selectedIdentifier || nextTrackId;
-                        }
-                    } else {
-                        console.warn('⚠️ SSE refresh nextTrack present but missing identifier', result.nextTrack);
-                    }
-                }
-
-                // If the backend provides exploration data, update the cards
-                if (result.explorerData) {
-                    console.log(`🔄 Backend provided exploration data, updating direction cards`);
-                    createDimensionCards(result.explorerData);
-                } else {
-                    console.log(`🔄 No exploration data from backend - keeping existing cards`);
-                }
-
-                if (!result.explorerData && (!state.latestExplorerData || !state.latestExplorerData.directions)) {
-                    console.warn('⚠️ Explorer data still missing after refresh; forcing follow-up request');
-                    fullResync();
-                }
-
-                // Start progress animation if duration is available
-                const timingElapsedMs = Number.isFinite(result.currentTrack?.elapsedMs)
-                    ? result.currentTrack.elapsedMs
-                    : Number.isFinite(result.timing?.elapsedMs)
-                        ? result.timing.elapsedMs
-                        : null;
-
-                const reportedDuration = Number.isFinite(result.currentTrack?.duration)
-                    ? result.currentTrack.duration
-                    : Number.isFinite(result.currentTrack?.length)
-                        ? result.currentTrack.length
-                        : null;
-
-                if (Number.isFinite(reportedDuration) && reportedDuration > 0) {
-                    state.playbackDurationSeconds = reportedDuration;
-                }
-
-                const audioElapsed = elements.audio && Number.isFinite(elements.audio.currentTime)
-                    ? elements.audio.currentTime
-                    : null;
-
-                const elapsedSeconds = timingElapsedMs !== null
-                    ? Math.max(timingElapsedMs / 1000, 0)
-                    : audioElapsed;
-
-                if (elapsedSeconds !== null) {
-                    state.playbackStartTimestamp = Date.now() - elapsedSeconds * 1000;
-                }
-
-                const sameTrack = Boolean(incomingTrackId && previousTrackId && incomingTrackId === previousTrackId);
-                const effectiveDuration = state.playbackDurationSeconds || reportedDuration || 0;
-
-                if (effectiveDuration > 0) {
-                    debugLog('timing', 'Manual refresh timing payload', {
-                        effectiveDuration,
-                        elapsedSeconds,
-                        inferredFromAudio: elapsedSeconds === audioElapsed,
-                        sameTrack
-                    });
-                    if (sameTrack) {
-                        if (elapsedSeconds !== null) {
-                            startProgressAnimationFromPosition(effectiveDuration, elapsedSeconds, { resync: true });
-                        } else if (state.playbackStartTimestamp) {
-                            const inferredElapsed = Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0);
-                            startProgressAnimationFromPosition(effectiveDuration, inferredElapsed, { resync: true });
-                        }
-                    } else {
-                        const startOffset = elapsedSeconds !== null ? Math.min(elapsedSeconds, effectiveDuration) : 0;
-                        startProgressAnimationFromPosition(effectiveDuration, startOffset, { resync: true });
-                        if (elapsedSeconds === null) {
-                            state.playbackStartTimestamp = Date.now() - startOffset * 1000;
-                        }
-                    }
-                }
-
-            } else {
-                console.warn('🔄 SSE refresh completed but no current track reported');
-            }
-
-            return true;
-
-        } else {
-            console.error('❌ SSE refresh request failed:', response.status, response.statusText);
-            const errorText = await response.text();
-            console.error('❌ Error details:', errorText);
-        }
-
-    } catch (error) {
-        console.error('❌ SSE refresh request error:', error);
+    };
+    const reverseHelper =
+        (typeof prioritizeAlternateTrack === 'function' && prioritizeAlternateTrack)
+        || window.prioritizeAlternateTrack
+        || null;
+    if (reverseHelper) {
+        window.__deckTestHooks.prioritizeAlternateTrack = reverseHelper;
     }
-
-    return false;
-}
-
-async function manualRefresh() {
-    console.log('🔄 Manual refresh requested');
-
-    if (!state.streamFingerprint) {
-        console.warn('🛰️ Manual refresh: no fingerprint yet; waiting before attempting rebroadcast');
-        const ready = await waitForFingerprint(4000);
-        if (!ready || !state.streamFingerprint) {
-            console.warn('🛰️ Manual refresh: fingerprint still missing; escalating to new session');
-            await createNewJourneySession('manual_refresh_stage3_no_fingerprint');
-            return 'new_session';
-        }
-    }
-
-    const rebroadcastOk = await requestSSERefresh({ escalate: false, stage: 'rebroadcast' });
-    if (rebroadcastOk) {
-        console.log('🔄 Manual refresh: heartbeat rebroadcast succeeded');
-        return 'rebroadcast';
-    }
-
-        console.warn('🛰️ Manual refresh: rebroadcast did not recover; attempting session rebind');
-    const rebindOk = await verifyExistingSessionOrRestart('manual_refresh_stage2', { escalate: false });
-    if (rebindOk) {
-        console.log('🔄 Manual refresh: session rebind succeeded');
-        return 'session_rebind';
-    }
-
-    console.warn('🛰️ Manual refresh: session rebind failed; creating new journey session');
-    await createNewJourneySession('manual_refresh_stage3');
-    return 'new_session';
-}
-
-
-// Manual refresh button functionality
-function setupManualRefreshButton() {
-    const refreshButton = document.getElementById('refreshButton');
-
-    if (refreshButton) {
-        refreshButton.addEventListener('click', async () => {
-            console.log('🔄 Manual refresh button clicked');
-
-            // Add visual feedback
-            refreshButton.classList.add('refreshing');
-
-            try {
-                const outcome = await manualRefresh();
-                console.log(`🔄 Manual refresh completed via ${outcome}`);
-
-                // Keep spinning animation for a bit longer to show it worked
-                setTimeout(() => {
-                    refreshButton.classList.remove('refreshing');
-                }, 1500);
-
-            } catch (error) {
-                console.error('❌ Manual refresh failed:', error);
-                refreshButton.classList.remove('refreshing');
-            }
-        });
-
-        console.log('🔄 Manual refresh button set up');
-    } else {
-        console.warn('🔄 Manual refresh button not found in DOM');
-    }
+    window.__deckTestHooks.setDeckStaleFlag = setDeckStaleFlag;
+    window.__deckTestHooks.armExplorerSnapshotTimer = armExplorerSnapshotTimer;
+    window.__deckTestHooks.clearExplorerSnapshotTimer = clearExplorerSnapshotTimer;
 }
 
 // Initialize manual refresh button when page loads
 document.addEventListener('DOMContentLoaded', function () {
-  setupManualRefreshButton();
-  setupRadiusControls();
-  setupFzfSearch(function () { state.journeyMode = true; });
-
-  // reconnection: Visibility API
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      const sseStale = Date.now() - state.lastSSEMessageTime > 30000;
-      if (sseStale) connectSSE();
+    if (typeof window.setupManualRefreshButton === 'function') {
+        window.setupManualRefreshButton();
     }
-  });
+    setupRadiusControls();
+    setupFzfSearch(function () { state.journeyMode = true; });
 
-  // reconnection: Network change
-  window.addEventListener('online', () => {
-    setTimeout(() => {
-      if (connectionHealth.sse.status !== 'connected') connectSSE();
-    }, 1000);
-  });
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            const sseStale = Date.now() - state.lastSSEMessageTime > 30000;
+            if (sseStale) {
+                window.connectSSE();
+            }
+        }
+    });
+
+    window.addEventListener('online', () => {
+        setTimeout(() => connectSSE(), 1000);
+    });
 });
 
 }
@@ -7633,79 +3387,72 @@ async function checkStreamEndpoint() {
         // Try refresh button as recovery
         console.log('🔄 Attempting SSE refresh as recovery...');
         if (typeof requestSSERefresh === 'function') {
-            await requestSSERefresh();
+            requestSSERefresh().catch(err => {
+                console.warn('⚠️ SSE refresh recovery attempt failed', err);
+            });
         }
     }
 }
 
+const MAX_DECK_HELPER_EXPOSURE_ATTEMPTS = 48;
+let deckHelperExposureLogged = false;
+function exposeDeckHelpers(attempt = 0) {
+    if (typeof window === 'undefined') {
+        return;
+    }
+    const createRef = (typeof createDimensionCards === 'function' && createDimensionCards)
+        || (window && typeof window.__driftCreateDimensionCardsRef === 'function' && window.__driftCreateDimensionCardsRef)
+        || null;
+    const swapRef = (typeof swapStackContents === 'function' && swapStackContents)
+        || (window && typeof window.__driftSwapStackContentsRef === 'function' && window.__driftSwapStackContentsRef)
+        || null;
+    const missingCreate = !createRef;
+    const missingSwap = !swapRef;
+    if (missingCreate || missingSwap) {
+        if (attempt >= MAX_DECK_HELPER_EXPOSURE_ATTEMPTS && !deckHelperExposureLogged) {
+            console.error('⛔ Deck helpers still unavailable; continuing to retry in background');
+            deckHelperExposureLogged = true;
+        }
+        const delay = Math.min(250, 25 * (attempt + 1));
+        setTimeout(() => exposeDeckHelpers(attempt + 1), delay);
+        return;
+    }
 
+    if (deckHelperExposureLogged) {
+        console.log('✅ Deck helpers bound after extended retry');
+        deckHelperExposureLogged = false;
+    }
 
+    window.__driftCreateDimensionCardsRef = createRef;
+    window.__driftSwapStackContentsRef = swapRef;
+    window.createDimensionCards = createRef;
+    window.rotateCenterCardToNextPosition = typeof rotateCenterCardToNextPosition === 'function'
+        ? rotateCenterCardToNextPosition
+        : undefined;
+    window.convertToNextTrackStack = typeof convertToNextTrackStack === 'function'
+        ? convertToNextTrackStack
+        : undefined;
+    window.swapStackContents = swapRef;
+    window.showNextTrackPreview = typeof showNextTrackPreview === 'function'
+        ? showNextTrackPreview
+        : undefined;
+    window.hideNextTrackPreview = typeof hideNextTrackPreview === 'function'
+        ? hideNextTrackPreview
+        : undefined;
+
+    window.__deckTestHooks = Object.assign({}, window.__deckTestHooks, {
+        createDimensionCards,
+        rotateCenterCardToNextPosition: window.rotateCenterCardToNextPosition,
+        convertToNextTrackStack: window.convertToNextTrackStack,
+        swapStackContents: window.swapStackContents,
+        showNextTrackPreview: window.showNextTrackPreview,
+        hideNextTrackPreview: window.hideNextTrackPreview,
+        prioritizeAlternateTrack: (typeof prioritizeAlternateTrack === 'function' && prioritizeAlternateTrack)
+            || window.prioritizeAlternateTrack
+            || undefined
+    });
+}
 
 if (typeof window !== 'undefined') {
-  window.state = state;
-  window.setCardVariant = setCardVariant;
-  window.getCardBackgroundColor = getCardBackgroundColor;
-
-  const requestSSERefreshForWindow = typeof requestSSERefresh === 'function'
-    ? requestSSERefresh
-    : async function requestSSERefreshStub() {
-        console.warn('⚠️ window.requestSSERefresh invoked before the real refresher was registered');
-        return false;
-      };
-
-  window.requestSSERefresh = requestSSERefreshForWindow;
-  setTimeout(() => {
-    window.createDimensionCards = createDimensionCards;
-    window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
-    window.convertToNextTrackStack = convertToNextTrackStack;
-    window.showNextTrackPreview = showNextTrackPreview;
-    window.hideNextTrackPreview = hideNextTrackPreview;
-    window.__deckTestHooks = Object.assign({}, window.__deckTestHooks, {
-      createDimensionCards,
-      rotateCenterCardToNextPosition,
-      convertToNextTrackStack,
-      showNextTrackPreview,
-      hideNextTrackPreview
-    });
-  }, 0);
-
-  window.__uiTestHooks = window.__uiTestHooks || {};
-  const progressHooks = {
-    get state() {
-      return state;
-    },
-    get elements() {
-      return elements;
-    }
-  };
-
-  if (typeof startProgressAnimationFromPosition === 'function') {
-    progressHooks.startProgressAnimationFromPosition = startProgressAnimationFromPosition;
-  }
-  if (typeof stopProgressAnimation === 'function') {
-    progressHooks.stopProgressAnimation = stopProgressAnimation;
-  }
-  if (typeof updatePlaybackClockDisplay === 'function') {
-    progressHooks.updatePlaybackClockDisplay = updatePlaybackClockDisplay;
-  }
-  if (typeof renderProgressBar === 'function') {
-    progressHooks.renderProgressBar = renderProgressBar;
-  }
-
-  if (typeof startProgressAnimationFromPosition === 'function') {
-    window.startProgressAnimationFromPosition = startProgressAnimationFromPosition;
-  }
-  if (typeof stopProgressAnimation === 'function') {
-    window.stopProgressAnimation = stopProgressAnimation;
-  }
-
-  window.__progressFns = window.__progressFns || {};
-  if (typeof startProgressAnimationFromPosition === 'function') {
-    window.__progressFns.start = startProgressAnimationFromPosition;
-  }
-  if (typeof stopProgressAnimation === 'function') {
-    window.__progressFns.stop = stopProgressAnimation;
-  }
-
-  window.__uiTestHooks.progress = progressHooks;
+    exposeDeckHelpers();
 }

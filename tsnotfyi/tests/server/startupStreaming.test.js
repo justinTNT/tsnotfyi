@@ -36,7 +36,7 @@ function createDirectionSet() {
 
   const corePairs = [
     { base: 'bpm', description: 'Tempo' },
-    { base: 'danceability', description: 'Danceability' },
+    { base: 'danceability', description: 'Jiggy' },
     { base: 'spectral_centroid', description: 'Brightness' },
     { base: 'tonal_clarity', description: 'Tonality' }
   ];

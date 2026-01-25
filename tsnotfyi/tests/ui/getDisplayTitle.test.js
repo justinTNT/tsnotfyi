@@ -26,6 +26,21 @@ describe('getDisplayTitle', () => {
     expect(getDisplayTitle(track)).toBe('Secret Jam');
   });
 
+  test('prefers cached details title when meta is missing', () => {
+    const track = {
+      identifier: 'track-4'
+    };
+
+    window.state.trackMetadataCache['track-4'] = {
+      details: {
+        title: 'Encoded Echoes',
+        path: '/vault/encoded_echoes.flac'
+      }
+    };
+
+    expect(getDisplayTitle(track)).toBe('Encoded Echoes');
+  });
+
   test('falls back to local file stem when no metadata is available', () => {
     const track = {
       identifier: 'track-3',

@@ -8,9 +8,15 @@
   const NUM_LAT = 80;
   const NUM_LAT_OTHER = 69;
   const PATH_RES = 123;
-  const RADIAL_SEG = 53;
-  const BASE_PULSE_HZ = 0.23;
-  const SEL_PULSE_HZ = 1.23;
+const RADIAL_SEG = 53;
+const BASE_PULSE_HZ = 0.23;
+const SEL_PULSE_HZ = 1.23;
+
+function hsl(h, s, l) {
+    const color = new THREE.Color();
+    color.setHSL(((h % 360) + 360) % 360 / 360, s, l);
+    return color;
+}
 
 
   // ====== Sparkle Systems ======

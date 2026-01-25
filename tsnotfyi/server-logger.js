@@ -1,3 +1,7 @@
+const fs = require('fs');
+const path = require('path');
+const internalMetrics = require('./metrics/internalMetrics');
+
 const AVAILABLE_CHANNELS = [
   'all',
   'general',
@@ -27,6 +31,116 @@ const nativeConsole = {
   warn: console.warn.bind(console),
   error: console.error.bind(console)
 };
+
+const DEFAULT_LOG_ROOT = process.env.LOG_DIR || path.join(__dirname, 'logs');
+const LOG_DIRECTORIES = {
+  server: path.join(DEFAULT_LOG_ROOT, 'server'),
+  client: path.join(DEFAULT_LOG_ROOT, 'client')
+};
+const logStreams = new Map();
+
+function ensureDirectory(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function getLogStream(type) {
+  const dirPath = LOG_DIRECTORIES[type];
+  if (!dirPath) {
+    throw new Error(`Unknown log type: ${type}`);
+  }
+  ensureDirectory(dirPath);
+  const dateKey = new Date().toISOString().slice(0, 10);
+  const streamKey = `${type}:${dateKey}`;
+  if (logStreams.has(streamKey)) {
+    return logStreams.get(streamKey);
+  }
+  const filePath = path.join(dirPath, `${dateKey}.log`);
+  const stream = fs.createWriteStream(filePath, { flags: 'a' });
+  logStreams.set(streamKey, stream);
+  return stream;
+}
+
+function safeSerialize(value) {
+  if (value === null || value === undefined) {
+    return String(value);
+  }
+  const type = typeof value;
+  if (type === 'string') {
+    return value;
+  }
+  if (type === 'number' || type === 'boolean' || type === 'bigint') {
+    return String(value);
+  }
+  if (type === 'function') {
+    return `[Function ${value.name || 'anonymous'}]`;
+  }
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message}`;
+  }
+  const seen = new WeakSet();
+  try {
+    return JSON.stringify(value, (key, val) => {
+      if (typeof val === 'bigint') {
+        return `${val.toString()}n`;
+      }
+      if (typeof val === 'function') {
+        return `[Function ${val.name || 'anonymous'}]`;
+      }
+      if (typeof val === 'object' && val !== null) {
+        if (seen.has(val)) {
+          return '[Circular]';
+        }
+        seen.add(val);
+      }
+      return val;
+    });
+  } catch (error) {
+    return `<<unserializable: ${error?.message || error}>>`;
+  }
+}
+
+function writeServerLogEntry(level, channel, args) {
+  try {
+    const stream = getLogStream('server');
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level: level.toUpperCase(),
+      channel: channel || 'general',
+      message: (args || []).map(arg => safeSerialize(arg)).join(' ')
+    };
+    stream.write(`${JSON.stringify(entry)}\n`);
+    internalMetrics.recordLogEntry(entry);
+  } catch (error) {
+    nativeConsole.error('[logger:error]', error);
+  }
+}
+
+function writeClientLogBatch(sessionId, entries = [], extra = {}) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
+  try {
+    const stream = getLogStream('client');
+    entries.forEach((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return;
+      }
+      const line = {
+        timestamp: entry.timestamp || new Date().toISOString(),
+        level: (entry.level || 'log').toUpperCase(),
+        sessionId: sessionId || null,
+        message: entry.message || '',
+        fragments: entry.fragments || [],
+        reason: extra.reason || 'unspecified',
+        clientTimestamp: extra.clientTimestamp || null
+      };
+      stream.write(`${JSON.stringify(line)}\n`);
+    });
+  } catch (error) {
+    nativeConsole.error('[client-log:error]', error);
+    throw error;
+  }
+}
 
 function cloneFlags() {
   return { ...activeFlags };
@@ -108,6 +222,7 @@ function formatPrefix(channel, level) {
 
 function logChannel(level, channel, ...args) {
   const prefix = formatPrefix(channel, level);
+  writeServerLogEntry(level, channel, args);
   if (level === 'error') {
     nativeConsole.error(prefix, ...args);
     return;
@@ -136,7 +251,8 @@ module.exports = {
   shouldLog,
   getLogFlags: cloneFlags,
   configureLogFlags,
-  configureFromSpec
+  configureFromSpec,
+  writeClientLogBatch
 };
 
 // Override default console to route through general channel

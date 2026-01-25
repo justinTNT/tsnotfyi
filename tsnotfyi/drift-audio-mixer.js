@@ -5,6 +5,7 @@ const { setImmediate: setImmediatePromise } = require('timers/promises');
 const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
 const fingerprintRegistry = require('./fingerprint-registry');
+const { getTrackTitle } = require('./schemas/track-definitions');
 
 const VERBOSE_EXPLORER = process.env.LOG_EXPLORER === '1';
 const VERBOSE_CACHE = process.env.LOG_CACHE === '1';
@@ -26,6 +27,95 @@ const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
 const CROSSFADE_GUARD_MS = 6000;
+const LIVE_PROMOTION_WINDOW_MS = 2000;
+const MIN_LIVE_PROMOTION_DELAY_MS = 250;
+const STREAM_IDLE_GRACE_MS = 5000;
+const STREAM_OVERRIDE_GRACE_MS = 20000;
+const HEARTBEAT_DIVERGENCE_THRESHOLD_MS = 2000;
+const HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS = 4000;
+const VAE_LATENT_LABELS = [
+  'Hidden Doorway',
+  'Clandestine Passage',
+  'Secret Path',
+  'Whispered Corridor',
+  'Shrouded Walkway',
+  'Candlelit Arcade',
+  'Phantom Stairwell',
+  'Midnight Causeway'
+];
+
+const NEGATIVE_DIRECTION_KEYS = new Set([
+  'slower',
+  'less_danceable',
+  'more_atonal',
+  'simpler',
+  'smoother',
+  'sparser_onsets',
+  'looser_tuning',
+  'weaker_fifths',
+  'weaker_chords',
+  'slower_changes',
+  'less_bass',
+  'less_air',
+  'calmer',
+  'darker'
+]);
+
+function isNegativeDirectionKey(directionKey) {
+  if (!directionKey || typeof directionKey !== 'string') {
+    return false;
+  }
+  if (directionKey.includes('_negative')) {
+    return true;
+  }
+  return NEGATIVE_DIRECTION_KEYS.has(directionKey);
+}
+
+function pruneEmptyStrings(value) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === '' ? undefined : trimmed;
+  }
+  if (Array.isArray(value)) {
+    const cleaned = value
+      .map(item => pruneEmptyStrings(item))
+      .filter(item => item !== undefined);
+    return cleaned;
+  }
+  if (typeof value === 'object') {
+    const result = {};
+    let hasValue = false;
+    Object.entries(value).forEach(([key, val]) => {
+      const sanitized = pruneEmptyStrings(val);
+      if (sanitized !== undefined) {
+        result[key] = sanitized;
+        hasValue = true;
+      }
+    });
+    return hasValue ? result : undefined;
+  }
+  return value;
+}
+
+function cloneAndSanitizeBeetsMeta(meta) {
+  if (!meta || typeof meta !== 'object') {
+    return null;
+  }
+  let clone;
+  try {
+    clone = JSON.parse(JSON.stringify(meta));
+  } catch (error) {
+    clone = { ...meta };
+  }
+  const cleaned = pruneEmptyStrings(clone);
+  if (!cleaned || (typeof cleaned === 'object' && Object.keys(cleaned).length === 0)) {
+    return null;
+  }
+  return cleaned;
+}
 
 class DriftAudioMixer {
   constructor(sessionId, radialSearch) {
@@ -38,6 +128,7 @@ class DriftAudioMixer {
     this.driftPlayer = new DirectionalDriftPlayer(radialSearch);
     this.currentTrack = null;
     this.pendingCurrentTrack = null;
+    this.pendingLivePromotion = null;
     this.nextTrack = null;
     this.trackStartTime = null;
     this.isTransitioning = false;
@@ -47,6 +138,8 @@ class DriftAudioMixer {
 
     // Session history and exploration data
     this.sessionHistory = []; // Array of previous tracks with timestamps and metadata
+    this.explorerEventHistory = [];
+    this.maxExplorerEventHistory = 200;
     this.maxHistorySize = 50; // Keep last 50 tracks in history
 
     // Stack-based journey state (Named Sessions)
@@ -83,13 +176,34 @@ class DriftAudioMixer {
     this.lastExplorerSnapshotPayload = null;
     this.lastExplorerSnapshotSerialized = null;
     this.lastExplorerSnapshotTimestamp = 0;
+    this.currentExplorerSummary = null;
+    this.explorerHistory = [];
+    this.maxExplorerHistory = 5;
+    this.sessionEvents = [];
+    this.maxSessionEvents = 200;
 
     // Cleanup callback supplied by session manager
     this.onIdle = null;
     this.cleanupTimer = null;
+    this.streamingStopTimer = null;
+    this.persistedOverrideState = null;
 
     // Explorer configuration
-    this.explorerResolution = 'magnifying_glass';
+    this.explorerResolution = 'adaptive';
+    this.adaptiveRadiusCache = new Map();
+    this.currentAdaptiveRadius = null;
+    this.currentNeighborhoodSnapshot = null;
+    this.pendingExplorerPromise = null;
+    this.lastExplorerSnapshotSummary = null;
+    this.pendingCrossfadePrepTimer = null;
+    this.dynamicRadiusState = {
+      currentRadius: null,
+      minRadius: 0.05,
+      maxRadius: 2.0,
+      starvationStreak: 0,
+      abundanceStreak: 0,
+      lastAdjustment: null
+    };
 
     // Track loading state to prevent concurrent playCurrentTrack calls
     this.currentTrackLoadingPromise = null; // Seeding vs seeded distinction
@@ -102,6 +216,16 @@ class DriftAudioMixer {
     this.sampleRate = config.audio.sampleRate;
     this.channels = config.audio.channels;
     this.bitRate = config.audio.bitRate;
+
+    this.pendingTrackReadyResolvers = new Set();
+    this.liveStreamState = {
+      trackId: null,
+      title: null,
+      artist: null,
+      startedAt: null,
+      lastChunkAt: null,
+      chunkBytes: 0
+    };
 
     // Initialize advanced audio mixer
     this.audioMixer = new AdvancedAudioMixer({
@@ -120,6 +244,7 @@ class DriftAudioMixer {
 
     // Set up mixer callbacks
     this.audioMixer.onData = (chunk) => {
+      this.recordLivePlaybackChunk(chunk);
       this.broadcastToClients(chunk);
     };
 
@@ -175,14 +300,31 @@ class DriftAudioMixer {
       const engineStartTime = this.audioMixer?.engine?.streamingStartTime;
       this.trackStartTime = engineStartTime || Date.now();
       const visualStartTime = this.pendingVisualTrackStartTime || this.trackStartTime;
-      this.setDisplayCurrentTrack(this.currentTrack, { startTime: visualStartTime });
-      this.pendingVisualCurrentTrack = null;
-      this.pendingVisualTrackStartTime = null;
+      this.pendingVisualCurrentTrack = this.currentTrack;
+      this.pendingVisualTrackStartTime = visualStartTime;
+      const playbackMetadataSeconds = Number.isFinite(this.currentTrack?.length)
+        ? this.currentTrack.length
+        : Number.isFinite(this.currentTrack?.duration)
+          ? this.currentTrack.duration
+          : null;
+      const playbackTrimmedSeconds = this.audioMixer?.engine?.currentTrack?.estimatedDuration || null;
+      console.log('🕒 [timing] Track playback started', {
+        trackId: this.currentTrack?.identifier || null,
+        title: this.currentTrack?.title || null,
+        metadataSeconds: playbackMetadataSeconds,
+        trimmedSeconds: playbackTrimmedSeconds,
+        startTimestamp: this.trackStartTime
+      });
+      if (this.clients.size === 0) {
+        this.commitPendingVisualTrack('no-active-stream', this.currentTrack?.identifier || null);
+      }
 
       if (!this.currentTrack) {
         console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
         return;
       }
+
+      this.broadcastHeartbeat('track-start', { force: true }).catch(() => {});
 
       const identifier = this.currentTrack.identifier || null;
       if (identifier) {
@@ -200,11 +342,16 @@ class DriftAudioMixer {
       this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
         console.error('📡 Failed to broadcast track event:', err);
       });
-
-      // Kick off next-track preparation immediately so UI has a recommendation
-      this.prepareNextTrackForCrossfade({ reason: 'auto-initial' }).catch(err => {
-        console.warn('⚠️ Initial auto prepare failed:', err?.message || err);
+      this.resolvePendingTrackReady(true);
+      this.recordSessionEvent('track_started', {
+        trackId: this.currentTrack.identifier || null,
+        title: this.currentTrack.title || '',
+        reason: reason || 'auto',
+        startTime: this.trackStartTime
       });
+
+      // Kick off next-track preparation after a short delay so audio can stabilize
+      this.scheduleAutoCrossfadePrep(reason || 'auto-initial');
     };
 
     this.audioMixer.onTrackEnd = () => {
@@ -217,10 +364,12 @@ class DriftAudioMixer {
     this.audioMixer.onCrossfadeStart = (info) => {
       console.log(`🔄 Advanced mixer: Crossfade started (${info.currentBPM} → ${info.nextBPM} BPM)`);
       this.crossfadeStartedAt = Date.now();
-      this.pendingVisualCurrentTrack = this.nextTrack
-        ? this.hydrateTrackRecord(this.nextTrack) || this.nextTrack
-        : null;
-      this.pendingVisualTrackStartTime = this.crossfadeStartedAt;
+      // Defer visual/state promotion until the new audio buffer actually begins streaming.
+      // Previously we pre-populated the visual track using the crossfade start timestamp,
+      // which made the UI jump ~leadTime seconds ahead of the real audio hand-off.
+      this.pendingVisualCurrentTrack = null;
+      this.pendingVisualTrackStartTime = null;
+      this.broadcastHeartbeat('crossfade-start', { force: true }).catch(() => {});
     };
 
     this.audioMixer.onError = (error) => {
@@ -242,6 +391,8 @@ class DriftAudioMixer {
     this.userSelectionDeferredForCrossfade = false;
     this.nextTrackLoadPromise = null;
     this.crossfadeStartedAt = null;
+    this.heartbeatInterval = null;
+    this.heartbeatIntervalMs = 10000;
 
     console.log(`Created drift audio mixer for session: ${sessionId}`);
   }
@@ -314,6 +465,205 @@ class DriftAudioMixer {
     return this.visualTrackStartTime || this.trackStartTime || null;
   }
 
+  getDisplayTrackTiming() {
+    const track = this.getDisplayCurrentTrack();
+    const startTime = this.getDisplayTrackStartTime();
+    if (!track || !Number.isFinite(startTime)) {
+      return null;
+    }
+
+    const durationSeconds = this.getAdjustedTrackDuration(
+      track.identifier && this.currentTrack?.identifier === track.identifier ? this.currentTrack : track,
+      { logging: false }
+    ) || track.length || track.duration || null;
+
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      return null;
+    }
+
+    const durationMs = Math.max(Math.round(durationSeconds * 1000), 0);
+    const now = Date.now();
+    const elapsedMs = Math.max(now - startTime, 0);
+    const remainingMs = Math.max(durationMs - Math.min(elapsedMs, durationMs), 0);
+
+    return {
+      track,
+      startTime,
+      durationMs,
+      elapsedMs,
+      remainingMs
+    };
+  }
+
+  hasManualOverrideConflict(candidateId) {
+    if (this.pendingUserOverrideTrackId && this.pendingUserOverrideTrackId !== candidateId) {
+      return true;
+    }
+    if (
+      this.lockedNextTrackIdentifier &&
+      this.lockedNextTrackIdentifier !== candidateId &&
+      (!this.currentTrack || this.currentTrack.identifier !== this.lockedNextTrackIdentifier)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  hasActiveManualOverride() {
+    return Boolean(
+      this.pendingUserOverrideTrackId ||
+      (
+        this.lockedNextTrackIdentifier &&
+        (!this.currentTrack || this.currentTrack.identifier !== this.lockedNextTrackIdentifier)
+      )
+    );
+  }
+
+  commitPendingVisualTrack(reason = 'auto', expectedTrackId = null) {
+    const pending = this.pendingVisualCurrentTrack;
+    if (!pending) {
+      return;
+    }
+    if (expectedTrackId && pending.identifier && pending.identifier !== expectedTrackId) {
+      return;
+    }
+    const startTime = this.pendingVisualTrackStartTime || Date.now();
+    this.setDisplayCurrentTrack(pending, { startTime });
+    console.log('🕒 [timing] Visual track committed', {
+      reason,
+      trackId: pending.identifier,
+      startTimestamp: startTime
+    });
+    this.pendingVisualCurrentTrack = null;
+    this.pendingVisualTrackStartTime = null;
+  }
+
+  cancelPendingLivePromotion() {
+    if (this.pendingLivePromotion?.timer) {
+      clearTimeout(this.pendingLivePromotion.timer);
+    }
+    this.pendingLivePromotion = null;
+  }
+
+  scheduleLivePromotion(trackId, delayMs) {
+    this.cancelPendingLivePromotion();
+    const delay = Math.max(delayMs, MIN_LIVE_PROMOTION_DELAY_MS);
+    console.log('⏱️ [timing] Delaying live promotion', {
+      sessionId: this.sessionId,
+      trackId,
+      delayMs: delay
+    });
+    const timer = setTimeout(() => {
+      if (!this.liveStreamState || this.liveStreamState.trackId !== trackId) {
+        console.warn('⏱️ [timing] Skipping delayed promotion; live stream moved on', {
+          sessionId: this.sessionId,
+          trackId,
+          liveTrackId: this.liveStreamState?.trackId || null
+        });
+        this.pendingLivePromotion = null;
+        return;
+      }
+      this.pendingLivePromotion = null;
+      this.flushLivePromotion('delayed-live-chunk', trackId);
+    }, delay);
+    this.pendingLivePromotion = { trackId, timer };
+  }
+
+  flushLivePromotion(reason = 'live-chunk', trackId = null) {
+    this.cancelPendingLivePromotion();
+    this.commitPendingVisualTrack(reason, trackId);
+    setTimeout(() => {
+      (async () => {
+        try {
+          await this.broadcastHeartbeat(reason, { force: true });
+        } catch (err) {
+          console.warn(`⚠️ Failed to broadcast ${reason} heartbeat:`, err?.message || err);
+        }
+        try {
+          await this.broadcastExplorerSnapshot(true, reason);
+        } catch (err) {
+          console.warn(`⚠️ Failed to broadcast ${reason} explorer snapshot:`, err?.message || err);
+        }
+      })();
+    }, 0);
+  }
+
+  resolvePendingTrackReady(success) {
+    if (!this.pendingTrackReadyResolvers || this.pendingTrackReadyResolvers.size === 0) {
+      return;
+    }
+    const resolvers = Array.from(this.pendingTrackReadyResolvers);
+    this.pendingTrackReadyResolvers.clear();
+    resolvers.forEach(({ resolve, timer }) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      try {
+        resolve(Boolean(success));
+      } catch (err) {
+        console.warn('⚠️ Track-ready resolver failed:', err?.message || err);
+      }
+    });
+  }
+
+  scheduleAutoCrossfadePrep(reason = 'auto-initial') {
+    if (this.pendingCrossfadePrepTimer) {
+      clearTimeout(this.pendingCrossfadePrepTimer);
+      this.pendingCrossfadePrepTimer = null;
+    }
+
+    const delayMs = reason === 'crossfade_complete' ? 0 : 8000;
+    const deferredReason = delayMs === 0 ? reason : `${reason}-deferred`;
+
+    const execute = () => {
+      this.pendingCrossfadePrepTimer = null;
+      if (!this.isActive) {
+        return;
+      }
+      this.prepareNextTrackForCrossfade({ reason: deferredReason }).catch(err => {
+        console.warn('⚠️ Auto crossfade prep failed:', err?.message || err);
+      });
+    };
+
+    if (delayMs === 0) {
+      execute();
+    } else {
+      this.pendingCrossfadePrepTimer = setTimeout(execute, delayMs);
+    }
+  }
+
+  awaitCurrentTrackReady(timeoutMs = 15000) {
+    if (this.currentTrack && this.trackStartTime) {
+      return Promise.resolve(true);
+    }
+
+    return new Promise((resolve) => {
+      const entry = {
+        resolve: (value) => {
+          if (!entry.settled) {
+            entry.settled = true;
+            resolve(Boolean(value));
+          }
+        },
+        settled: false,
+        timer: null
+      };
+
+      entry.timer = setTimeout(() => {
+        if (this.pendingTrackReadyResolvers) {
+          this.pendingTrackReadyResolvers.delete(entry);
+        }
+        entry.resolve(false);
+      }, Math.max(1000, timeoutMs));
+
+      if (!this.pendingTrackReadyResolvers) {
+        this.pendingTrackReadyResolvers = new Set();
+      }
+
+      this.pendingTrackReadyResolvers.add(entry);
+    });
+  }
+
   // Start the drift playback
   async startDriftPlayback() {
     if (this.currentProcess) {
@@ -329,10 +679,24 @@ class DriftAudioMixer {
     } catch (error) {
       console.error('Failed to start drift playback:', error);
       this.fallbackToNoise();
+      this.resolvePendingTrackReady(false);
     }
   }
 
   // Play the current track using advanced mixer
+  buildTrackMetadata(track) {
+    if (!track) {
+      return null;
+    }
+    return {
+      identifier: track.identifier || track.md5 || null,
+      title: track.title || null,
+      artist: track.artist || null,
+      album: track.album || null,
+      path: track.path || null
+    };
+  }
+
   async playCurrentTrack() {
     const trackToPlay = this.pendingCurrentTrack || this.currentTrack;
 
@@ -386,12 +750,25 @@ class DriftAudioMixer {
       console.log(`🔧 DEBUG: About to load track into advanced mixer: ${trackPath}`);
       console.log(`🔧 DEBUG: Current mixer state - isActive: ${this.isActive}, clients: ${this.clients.size}`);
 
-      const trackInfo = await this.audioMixer.loadTrack(trackPath, 'current');
+      const trackInfo = await this.audioMixer.loadTrack(trackPath, 'current', this.buildTrackMetadata(trackToPlay));
 
+      const metadataSeconds = Number.isFinite(trackToPlay.length)
+        ? trackToPlay.length
+        : Number.isFinite(trackToPlay.duration)
+          ? trackToPlay.duration
+          : null;
+      const trimmedSeconds = Number.isFinite(trackInfo?.duration) ? trackInfo.duration : null;
       console.log(`📊 Track analysis: BPM=${trackInfo.bpm}, Key=${trackInfo.key}, Duration=${trackInfo.duration?.toFixed(1)}s`);
+      console.log('🕒 [timing] Track load summary', {
+        trackId: trackToPlay.identifier,
+        title: trackToPlay.title,
+        metadataSeconds,
+        trimmedSeconds,
+        pendingLengthSeconds: this.audioMixer?.engine?.currentTrack?.estimatedDuration || null
+      });
       console.log(`🔧 DEBUG: Track loaded successfully, about to start streaming`);
 
-      // Start streaming with crossfade support
+    // Start streaming with crossfade support
       const streamingResult = this.audioMixer.startStreaming();
       console.log(`🔧 DEBUG: audioMixer.startStreaming() returned: ${streamingResult}`);
 
@@ -457,6 +834,10 @@ class DriftAudioMixer {
     const { direction = null, debounceMs = this.userSelectionDebounceMs } = options;
 
     console.log(`🎯 [override] handleUserSelectedNextTrack requested ${trackMd5} (direction=${direction || 'none'})`);
+    this.recordSessionEvent('manual_override_requested', {
+      trackId: trackMd5,
+      direction
+    });
 
     this.manualSelectionGeneration += 1;
     const selectionGeneration = this.manualSelectionGeneration;
@@ -470,14 +851,24 @@ class DriftAudioMixer {
     this.lockedNextTrackIdentifier = trackMd5;
     this.pendingUserOverrideGeneration = selectionGeneration;
 
-    // Clear any preloaded auto-selection so mixer won't consume it while debounce runs
-    if (typeof this.audioMixer?.clearNextTrackSlot === 'function') {
-      this.audioMixer.clearNextTrackSlot();
+    const mixerStatus = (this.audioMixer && typeof this.audioMixer.getStatus === 'function')
+      ? this.audioMixer.getStatus()
+      : null;
+    const crossfadeActive = mixerStatus?.isCrossfading === true;
+
+    // Only clear the preloaded slot immediately if we are not mid-crossfade; otherwise the mixer
+    // still needs that buffer to finish the fade before we can swap in the manual pick.
+    if (!crossfadeActive) {
+      if (typeof this.audioMixer?.clearNextTrackSlot === 'function') {
+        this.audioMixer.clearNextTrackSlot();
+      }
+      if (this.nextTrack) {
+        console.log('🧹 [override] Clearing previously prepared next track to honor manual selection');
+      }
+      this.nextTrack = null;
+    } else {
+      console.log('🧹 [override] Preserving crossfade buffer until fade completes; will refresh once idle');
     }
-    if (this.nextTrack) {
-      console.log('🧹 [override] Clearing previously prepared next track to honor manual selection');
-    }
-    this.nextTrack = null;
 
     this.broadcastHeartbeat('user-selection-pending', { force: true }).catch(() => {});
 
@@ -782,6 +1173,18 @@ class DriftAudioMixer {
           }
         }
 
+        const manualConflict = !overrideTrackId && this.hasManualOverrideConflict(hydratedNextTrack.identifier);
+        if (manualConflict) {
+          console.warn('🛑 [override] Auto preparation skipped while manual override locked', {
+            sessionId: this.sessionId,
+            candidateId: hydratedNextTrack.identifier,
+            lockedId: this.lockedNextTrackIdentifier || null,
+            pendingOverrideId: this.pendingUserOverrideTrackId || null,
+            preparationReason
+          });
+          return;
+        }
+
         if (!hydratedNextTrack.transitionReason) {
           hydratedNextTrack.transitionReason = preparationReason;
         }
@@ -800,7 +1203,7 @@ class DriftAudioMixer {
         this.nextTrackLoadPromise = (async () => {
           try {
             console.log(`🎯 [prepare] Loading track into mixer (${hydratedNextTrack.path})`);
-            return await this.audioMixer.loadTrack(hydratedNextTrack.path, 'next');
+            return await this.audioMixer.loadTrack(hydratedNextTrack.path, 'next', this.buildTrackMetadata(hydratedNextTrack));
           } catch (loadErr) {
             this.nextTrack = previousNext || null;
             if (overrideTrackId) {
@@ -838,10 +1241,11 @@ class DriftAudioMixer {
             currentTrackId: this.currentTrack?.identifier || null
           });
           await this.broadcastHeartbeat('user-next-prepared', { force: true });
-        } else if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== hydratedNextTrack.identifier) {
-          // Lock no longer applies if a different track is queued
-          this.lockedNextTrackIdentifier = null;
-          await this.broadcastHeartbeat('auto-next-prepared', { force: false });
+          this.recordSessionEvent('manual_override_prepared', {
+            trackId: hydratedNextTrack.identifier,
+            direction: this.pendingUserOverrideDirection || hydratedNextTrack.nextTrackDirection || null,
+            generation: manualGenerationAtStart
+          });
         } else {
           await this.broadcastHeartbeat('auto-next-prepared', { force: false });
         }
@@ -1086,7 +1490,7 @@ class DriftAudioMixer {
         this.pushToStack(
           this.pendingCurrentTrack.identifier,
           direction,
-          this.explorerResolution || 'magnify'
+          this.explorerResolution || 'adaptive'
         );
         
         // Advance stack index to new track
@@ -1138,6 +1542,7 @@ class DriftAudioMixer {
     const now = Date.now();
 
     this.pendingCurrentTrack = null;
+    this.resolvePendingTrackReady(false);
 
     // Initialize rate limiting variables on first call
     if (!this.lastNoiseTime) {
@@ -1250,6 +1655,7 @@ class DriftAudioMixer {
 
     this.clients.add(response);
     this.pendingClientBootstrap = false;
+    this.cancelScheduledStreamingStop('audio-client-connected');
 
     if (this.cleanupTimer) {
       clearTimeout(this.cleanupTimer);
@@ -1258,7 +1664,11 @@ class DriftAudioMixer {
 
     // Start drift if this is the first client
     if (this.clients.size === 1 && !this.isActive) {
-      this.startStreaming();
+      this.startStreaming().catch((err) => {
+        console.error('❌ Failed to start streaming for new client:', err);
+      });
+    } else {
+      this.restorePersistedOverrideState('client-connect');
     }
 
     // Handle client disconnect
@@ -1268,13 +1678,16 @@ class DriftAudioMixer {
 
       // Stop streaming if no clients
       if (this.clients.size === 0) {
-        this.stopStreaming();
+        this.scheduleStreamingStop('no-audio-clients');
       }
     });
 
     response.on('error', (err) => {
       console.error('Client response error:', err);
       this.clients.delete(response);
+      if (this.clients.size === 0) {
+        this.scheduleStreamingStop('no-audio-clients');
+      }
     });
   }
 
@@ -1284,10 +1697,13 @@ class DriftAudioMixer {
 
     console.log(`🎵 Starting drift streaming for session: ${this.sessionId}`);
     this.isActive = true;
+    this.ensureHeartbeatLoop();
+    const tryRestore = () => this.restorePersistedOverrideState('stream-start');
 
     // If the mixer is already streaming (preload) just start serving clients
     if (this.audioMixer?.engine?.isStreaming) {
       console.log('🎵 Mixer already streaming from preload; keeping current track');
+      tryRestore();
       return;
     }
 
@@ -1296,6 +1712,7 @@ class DriftAudioMixer {
       console.log(`🌱 Track is seeding, waiting for it to become seeded...`);
       await this.currentTrackLoadingPromise;
       console.log(`🌳 Track seeded and ready`);
+      tryRestore();
       return;
     }
 
@@ -1306,15 +1723,141 @@ class DriftAudioMixer {
     } else {
       await this.startDriftPlayback();
     }
+
+    tryRestore();
   }
 
   // Set up stream piping for current process
+  shouldExtendIdleGrace() {
+    return Boolean(
+      this.audioMixer?.engine?.isCrossfading ||
+      this.pendingUserSelectionTimer ||
+      this.hasPersistableOverrideState()
+    );
+  }
+
+  hasPersistableOverrideState() {
+    return Boolean(
+      this.lockedNextTrackIdentifier ||
+      this.pendingUserOverrideTrackId ||
+      (this.nextTrack && this.nextTrack.identifier)
+    );
+  }
+
+  scheduleStreamingStop(reason = 'idle') {
+    const delay = this.shouldExtendIdleGrace() ? STREAM_OVERRIDE_GRACE_MS : STREAM_IDLE_GRACE_MS;
+
+    if (this.streamingStopTimer) {
+      clearTimeout(this.streamingStopTimer);
+      this.streamingStopTimer = null;
+    }
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+
+    console.log(`🕓 Scheduling drift shutdown for session ${this.sessionId} in ${delay}ms (${reason})`);
+
+    this.streamingStopTimer = setTimeout(() => {
+      this.streamingStopTimer = null;
+      const preserveOverride = this.hasPersistableOverrideState();
+      this.stopStreaming({
+        reason,
+        preserveLockedOverride: preserveOverride
+      });
+    }, delay);
+  }
+
+  cancelScheduledStreamingStop(reason = 'client-returned') {
+    if (!this.streamingStopTimer) {
+      return;
+    }
+    clearTimeout(this.streamingStopTimer);
+    this.streamingStopTimer = null;
+    console.log(`🕓 Cancelled scheduled drift shutdown for session ${this.sessionId} (${reason})`);
+  }
+
+  captureOverridePersistence(reason = 'idle-stop') {
+    if (!this.hasPersistableOverrideState()) {
+      this.persistedOverrideState = null;
+      return null;
+    }
+
+    const snapshot = {
+      trackId: this.pendingUserOverrideTrackId
+        || this.lockedNextTrackIdentifier
+        || this.nextTrack?.identifier
+        || null,
+      direction: this.pendingUserOverrideDirection
+        || this.nextTrack?.nextTrackDirection
+        || this.driftPlayer?.currentDirection
+        || null,
+      pendingGeneration: this.pendingUserOverrideGeneration,
+      manualGeneration: this.manualSelectionGeneration,
+      timestamp: Date.now(),
+      reason
+    };
+
+    if (!snapshot.trackId) {
+      this.persistedOverrideState = null;
+      return null;
+    }
+
+    this.persistedOverrideState = snapshot;
+    console.log(`📦 [override] Persisting selection ${snapshot.trackId} during ${reason}`);
+    return snapshot;
+  }
+
+  restorePersistedOverrideState(trigger = 'resume') {
+    const snapshot = this.persistedOverrideState;
+    if (!snapshot || !snapshot.trackId) {
+      return;
+    }
+
+    if (this.pendingUserOverrideTrackId || this.lockedNextTrackIdentifier) {
+      this.persistedOverrideState = null;
+      return;
+    }
+
+    this.manualSelectionGeneration = Math.max(
+      this.manualSelectionGeneration || 0,
+      snapshot.manualGeneration || 0
+    );
+
+    this.lockedNextTrackIdentifier = snapshot.trackId;
+    this.pendingUserOverrideTrackId = snapshot.trackId;
+    this.pendingUserOverrideDirection = snapshot.direction || null;
+    this.pendingUserOverrideGeneration = snapshot.pendingGeneration || null;
+
+    console.log(`📦 [override] Restoring persisted selection ${snapshot.trackId} (${trigger})`);
+
+    setTimeout(() => {
+      this.applyUserSelectedTrackOverride(snapshot.trackId).catch((err) => {
+        console.warn('⚠️ Failed to restore persisted override:', err?.message || err);
+      });
+    }, 0);
+
+    this.persistedOverrideState = null;
+  }
 
   // Stop streaming
-  stopStreaming() {
+  stopStreaming(options = {}) {
     if (!this.isActive) return;
 
-    console.log(`🛑 Stopping drift streaming for session: ${this.sessionId}`);
+    const { reason = 'manual', preserveLockedOverride = false } = options || {};
+    console.log(`🛑 Stopping drift streaming for session: ${this.sessionId} (${reason})`);
+
+    if (this.streamingStopTimer) {
+      clearTimeout(this.streamingStopTimer);
+      this.streamingStopTimer = null;
+    }
+
+    if (preserveLockedOverride) {
+      this.captureOverridePersistence(reason);
+    } else {
+      this.persistedOverrideState = null;
+    }
+
     this.isActive = false;
 
     // Stop advanced mixer
@@ -1331,9 +1874,23 @@ class DriftAudioMixer {
     this.currentTrack = null;
     this.nextTrack = null;
     this.pendingCurrentTrack = null;
+    this.lastExplorerSnapshotPayload = null;
+    this.lastExplorerSnapshotSummary = null;
+    if (this.pendingCrossfadePrepTimer) {
+      clearTimeout(this.pendingCrossfadePrepTimer);
+      this.pendingCrossfadePrepTimer = null;
+    }
     this._lastBroadcastTrackId = null;
     this.lastTrackEventPayload = null;
     this.lastTrackEventTimestamp = 0;
+    this.resolvePendingTrackReady(false);
+
+    if (preserveLockedOverride) {
+      this.clearPendingUserSelection();
+      this.lockedNextTrackIdentifier = null;
+    } else {
+      this.resetManualOverrideLock();
+    }
 
     if (!this.pendingClientBootstrap && typeof this.onIdle === 'function' && this.clients.size === 0 && this.eventClients.size === 0) {
       this.onIdle();
@@ -1352,6 +1909,63 @@ class DriftAudioMixer {
         this.clients.delete(client);
       }
     }
+  }
+
+  recordLivePlaybackChunk(chunk) {
+    if (!chunk || !chunk.length) {
+      return;
+    }
+
+    const metadata = typeof this.audioMixer?.getCurrentPlaybackMetadata === 'function'
+      ? this.audioMixer.getCurrentPlaybackMetadata()
+      : null;
+    const fallbackTrack = this.currentTrack || this.pendingCurrentTrack || null;
+    const trackId = metadata?.identifier || fallbackTrack?.identifier || null;
+
+    if (!trackId) {
+      return;
+    }
+
+    const now = Date.now();
+    const changed = trackId !== this.liveStreamState.trackId;
+
+    if (changed) {
+      const humanLabel = metadata?.title || fallbackTrack?.title || trackId;
+      console.log(`📡 Live stream chunk now sourced from ${humanLabel}`);
+      const timing = this.getDisplayTrackTiming();
+      const remainingMs = timing?.remainingMs ?? null;
+      const needsDelay = Number.isFinite(remainingMs) && remainingMs > LIVE_PROMOTION_WINDOW_MS;
+      if (needsDelay) {
+        const delayMs = Math.max(remainingMs - LIVE_PROMOTION_WINDOW_MS, MIN_LIVE_PROMOTION_DELAY_MS);
+        this.scheduleLivePromotion(trackId, delayMs);
+      } else {
+        this.flushLivePromotion('live-chunk', trackId);
+      }
+    }
+
+    if (metadata?.identifier && fallbackTrack?.identifier && metadata.identifier !== fallbackTrack.identifier) {
+      console.warn('⚠️ Live playback identifier differs from session current track', {
+        sessionId: this.sessionId,
+        liveTrackId: metadata.identifier,
+        sessionTrackId: fallbackTrack.identifier
+      });
+    }
+
+    this.liveStreamState = {
+      trackId,
+      title: metadata?.title || fallbackTrack?.title || null,
+      artist: metadata?.artist || fallbackTrack?.artist || null,
+      startedAt: changed ? now : (this.liveStreamState.startedAt || now),
+      lastChunkAt: now,
+      chunkBytes: chunk.length
+    };
+  }
+
+  getLiveStreamState() {
+    if (!this.liveStreamState || !this.liveStreamState.trackId) {
+      return null;
+    }
+    return { ...this.liveStreamState };
   }
 
   async restartStream(reason = 'manual-restart') {
@@ -1561,6 +2175,229 @@ class DriftAudioMixer {
     }
   }
 
+  computeNeighborhoodStats(neighborhoodEntries) {
+    if (!Array.isArray(neighborhoodEntries) || neighborhoodEntries.length === 0) {
+      return {
+        count: 0,
+        distanceCount: 0,
+        min: null,
+        max: null,
+        median: null,
+        average: null,
+        p95: null
+      };
+    }
+
+    const distances = neighborhoodEntries
+      .map(entry => {
+        if (!entry) return null;
+        const dist = Number(entry.distance);
+        if (Number.isFinite(dist)) {
+          return dist;
+        }
+        const similarity = Number(entry.similarity);
+        return Number.isFinite(similarity) ? similarity : null;
+      })
+      .filter(value => Number.isFinite(value))
+      .sort((a, b) => a - b);
+
+    const stats = {
+      count: neighborhoodEntries.length,
+      distanceCount: distances.length,
+      min: null,
+      max: null,
+      median: null,
+      average: null,
+      p95: null
+    };
+
+    if (distances.length > 0) {
+      const sum = distances.reduce((acc, value) => acc + value, 0);
+      stats.average = sum / distances.length;
+      stats.min = distances[0];
+      stats.max = distances[distances.length - 1];
+
+      if (distances.length === 1) {
+        stats.median = distances[0];
+        stats.p95 = distances[0];
+      } else {
+        const mid = Math.floor(distances.length / 2);
+        if (distances.length % 2 === 0) {
+          stats.median = (distances[mid - 1] + distances[mid]) / 2;
+        } else {
+          stats.median = distances[mid];
+        }
+        const p95Index = Math.min(distances.length - 1, Math.floor(distances.length * 0.95));
+        stats.p95 = distances[p95Index];
+      }
+    }
+
+    return stats;
+  }
+
+  evaluateRadiusAdjustment(directionStats, retryDepth = 0) {
+    const MAX_RETRIES = 2;
+    if (!directionStats) {
+      return { action: null, retry: false };
+    }
+
+    const radiusState = this.dynamicRadiusState || {
+      currentRadius: null,
+      minRadius: 0.05,
+      maxRadius: 2.0,
+      starvationStreak: 0,
+      abundanceStreak: 0
+    };
+
+    const totalDirections = directionStats.finalCount ?? 0;
+    const trimmedSamples = directionStats.trimmedSamples ?? 0;
+    const starvationThreshold = 2;
+    const abundanceThreshold = 2;
+    const desiredDirections = Math.min(this.stackTotalCount || 12, 12);
+
+    if (totalDirections === 0) {
+      radiusState.starvationStreak = (radiusState.starvationStreak || 0) + 1;
+    } else {
+      radiusState.starvationStreak = 0;
+    }
+
+    if (trimmedSamples > desiredDirections && totalDirections >= desiredDirections) {
+      radiusState.abundanceStreak = (radiusState.abundanceStreak || 0) + 1;
+    } else {
+      radiusState.abundanceStreak = 0;
+    }
+
+    const now = Date.now();
+    const safeRadius = Number.isFinite(radiusState.currentRadius) ? radiusState.currentRadius : 0.25;
+    const minRadius = radiusState.minRadius ?? 0.05;
+    const maxRadius = radiusState.maxRadius ?? 2.0;
+
+    if (radiusState.starvationStreak >= starvationThreshold) {
+      const current = safeRadius;
+      const expanded = Math.min((current || 0.25) * 1.3 + 0.02, maxRadius);
+      if (expanded > current + 0.0001) {
+        radiusState.currentRadius = expanded;
+        radiusState.starvationStreak = 0;
+        radiusState.lastAdjustment = now;
+        this.recordSessionEvent('radius_adjustment', {
+          action: 'expand',
+          reason: 'starvation',
+          from: current,
+          to: expanded,
+          retryEligible: retryDepth < MAX_RETRIES
+        });
+        return {
+          action: {
+            action: 'expand',
+            reason: 'starvation',
+            from: current,
+            to: expanded,
+            timestamp: now,
+            retry: retryDepth < MAX_RETRIES
+          },
+          retry: retryDepth < MAX_RETRIES
+        };
+      }
+    }
+
+    if (radiusState.abundanceStreak >= abundanceThreshold && Number.isFinite(safeRadius)) {
+      const current = safeRadius;
+      const shrunk = Math.max(current * 0.85, minRadius);
+      if (shrunk < current - 0.0001) {
+        radiusState.currentRadius = shrunk;
+        radiusState.abundanceStreak = 0;
+        radiusState.lastAdjustment = now;
+        this.recordSessionEvent('radius_adjustment', {
+          action: 'shrink',
+          reason: 'abundance',
+          from: current,
+          to: shrunk,
+          retryEligible: retryDepth < MAX_RETRIES
+        });
+        return {
+          action: {
+            action: 'shrink',
+            reason: 'abundance',
+            from: current,
+            to: shrunk,
+            timestamp: now,
+            retry: retryDepth < MAX_RETRIES
+          },
+          retry: retryDepth < MAX_RETRIES
+        };
+      }
+    }
+
+    return { action: null, retry: false };
+  }
+
+  summarizeExplorerSnapshot(explorerData, currentTrackId = null) {
+    if (!explorerData) {
+      return null;
+    }
+    const currentId = currentTrackId
+      || explorerData.currentTrack?.identifier
+      || explorerData.currentTrack?.track?.identifier
+      || '';
+    const nextId = explorerData.nextTrack?.track?.identifier
+      || explorerData.nextTrack?.identifier
+      || '';
+    const directions = explorerData.directions || {};
+    const entries = Object.keys(directions).sort().map((key) => {
+      const direction = directions[key] || {};
+      const primaryCount = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.length : 0;
+      const oppositeCount = Array.isArray(direction.oppositeDirection?.sampleTracks)
+        ? direction.oppositeDirection.sampleTracks.length
+        : 0;
+      return `${key}:${primaryCount}:${oppositeCount}`;
+    });
+    return `${currentId}::${nextId}::${entries.join('|')}`;
+  }
+
+  recordExplorerEvent({ reason, explorerData, nextTrack }) {
+    const diagnostics = explorerData?.diagnostics || null;
+    const entry = {
+      timestamp: Date.now(),
+      reason: reason || 'snapshot',
+      trackId: diagnostics?.currentTrackId || this.currentTrack?.identifier || null,
+      radius: diagnostics?.radius || null,
+      neighborhood: diagnostics?.neighborhood || null,
+      directionStats: diagnostics?.directionStats || null,
+      retryCount: diagnostics?.retryCount ?? 0,
+      nextTrack: null
+    };
+
+    if (nextTrack?.track) {
+      entry.nextTrack = {
+        identifier: nextTrack.track.identifier,
+        title: nextTrack.track.title,
+        artist: nextTrack.track.artist,
+        directionKey: nextTrack.track.directionKey || nextTrack.directionKey || null
+      };
+    }
+
+    this.explorerEventHistory.push(entry);
+    if (this.explorerEventHistory.length > this.maxExplorerEventHistory) {
+      this.explorerEventHistory.shift();
+    }
+    this.recordSessionEvent('explorer_event', entry);
+  }
+
+  recordSessionEvent(type, data = {}) {
+    if (!type) {
+      return;
+    }
+    const entry = {
+      timestamp: Date.now(),
+      type,
+      data
+    };
+    this.sessionEvents.push(entry);
+    if (this.sessionEvents.length > this.maxSessionEvents) {
+      this.sessionEvents.shift();
+    }
+  }
+
   selectStrategicSamples(candidates, currentTrack) {
     if (!candidates || candidates.length === 0) return [];
     if (candidates.length === 1) return candidates;
@@ -1655,6 +2492,21 @@ class DriftAudioMixer {
       const randomB = b._priority * (0.95 + Math.random() * 0.1);
       return randomB - randomA;
     });
+  }
+
+  ensureHeartbeatLoop() {
+    if (this.heartbeatInterval) {
+      return;
+    }
+    this.heartbeatInterval = setInterval(() => {
+      if (!this.isActive) {
+        return;
+      }
+      this.broadcastHeartbeat('steady-state').catch(() => {});
+    }, this.heartbeatIntervalMs);
+    if (typeof this.heartbeatInterval.unref === 'function') {
+      this.heartbeatInterval.unref();
+    }
   }
 
   // Filter tracks based on session-level noArtist/noAlbum flags
@@ -1769,6 +2621,9 @@ class DriftAudioMixer {
 
     const now = Date.now();
     const displayStartTime = this.getDisplayTrackStartTime();
+    const liveState = this.getLiveStreamState();
+    const liveTrackId = liveState?.trackId || null;
+    const liveStartTime = Number.isFinite(liveState?.startedAt) ? liveState.startedAt : null;
 
     let durationSeconds = null;
     if (displayTrack.identifier && this.currentTrack?.identifier === displayTrack.identifier) {
@@ -1779,10 +2634,77 @@ class DriftAudioMixer {
     }
 
     const durationMs = Number.isFinite(durationSeconds) ? Math.max(Math.round(durationSeconds * 1000), 0) : null;
-    const elapsedMs = displayStartTime ? Math.max(now - displayStartTime, 0) : null;
+    const visualElapsedMs = Number.isFinite(displayStartTime) ? Math.max(now - displayStartTime, 0) : null;
+    const liveElapsedMs = liveStartTime != null ? Math.max(now - liveStartTime, 0) : null;
+
+    let elapsedMs = visualElapsedMs;
+    let rebasedVisualStart = false;
+
+    if (liveElapsedMs != null) {
+      const trackMismatch = Boolean(displayTrack.identifier && liveTrackId && displayTrack.identifier !== liveTrackId);
+      const divergenceMs = visualElapsedMs != null ? Math.abs(liveElapsedMs - visualElapsedMs) : null;
+      const shouldUseLiveElapsed =
+        trackMismatch ||
+        visualElapsedMs == null ||
+        (divergenceMs != null && divergenceMs > HEARTBEAT_DIVERGENCE_THRESHOLD_MS);
+
+      if (shouldUseLiveElapsed) {
+        elapsedMs = liveElapsedMs;
+        if (!trackMismatch && liveStartTime != null && displayTrack.identifier === liveTrackId) {
+          if (!Number.isFinite(this.visualTrackStartTime) || this.visualTrackStartTime !== liveStartTime) {
+            this.visualTrackStartTime = liveStartTime;
+            rebasedVisualStart = true;
+          }
+        }
+        const shouldLogRebase = trackMismatch || rebasedVisualStart || visualElapsedMs == null;
+        if (shouldLogRebase) {
+          console.warn('⏱️ [timing] Rebased heartbeat elapsed using live stream state', {
+            sessionId: this.sessionId,
+            trackId: displayTrack.identifier,
+            liveTrackId,
+            visualElapsedMs,
+            liveElapsedMs,
+            divergenceMs,
+            reason: trackMismatch ? 'track-mismatch' : (visualElapsedMs == null ? 'visual-missing' : 'divergence')
+          });
+        }
+      }
+    }
+
     const remainingMs = durationMs != null && elapsedMs != null
-      ? Math.max(durationMs - elapsedMs, 0)
+      ? Math.max(durationMs - Math.min(elapsedMs, durationMs), 0)
       : null;
+
+    if (
+      Number.isFinite(durationMs) &&
+      Number.isFinite(elapsedMs) &&
+      elapsedMs > durationMs + HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS
+    ) {
+      console.warn('⏱️ [timing] Heartbeat elapsed exceeds duration', {
+        sessionId: this.sessionId,
+        trackId: displayTrack.identifier,
+        elapsedMs,
+        durationMs,
+        overshootMs: Math.round(elapsedMs - durationMs),
+        liveTrackId,
+        displayTrackId: displayTrack.identifier,
+        reason
+      });
+    }
+
+    if (
+      Number.isFinite(durationMs) &&
+      Number.isFinite(elapsedMs) &&
+      elapsedMs > durationMs
+    ) {
+      console.warn('⏱️ [timing] Clamping heartbeat elapsed to track duration', {
+        sessionId: this.sessionId,
+        trackId: displayTrack.identifier,
+        durationMs,
+        originalElapsedMs: elapsedMs
+      });
+      elapsedMs = durationMs;
+    }
 
     const nextSummary = this.buildNextTrackSummary();
     const overrideId = this.pendingUserOverrideTrackId || this.lockedNextTrackIdentifier || null;
@@ -1799,20 +2721,18 @@ class DriftAudioMixer {
 
     const beetsMeta = displayTrack.beetsMeta || this.lookupTrackBeetsMeta(displayTrack.identifier) || null;
 
+    const canonicalStartTime = liveStartTime ?? displayStartTime ?? null;
     const currentTrackPayload = {
       identifier: displayTrack.identifier,
       title: displayTrack.title,
       artist: displayTrack.artist,
-      startTime: displayStartTime,
+      startTime: canonicalStartTime,
       durationMs
     };
 
-    if (beetsMeta) {
-      try {
-        currentTrackPayload.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
-      } catch (err) {
-        currentTrackPayload.beetsMeta = beetsMeta;
-      }
+    const sanitizedBeetsMeta = cloneAndSanitizeBeetsMeta(beetsMeta);
+    if (sanitizedBeetsMeta) {
+      currentTrackPayload.beetsMeta = sanitizedBeetsMeta;
     }
 
     return {
@@ -1903,6 +2823,7 @@ class DriftAudioMixer {
     }
 
     let snapshotEvent = null;
+    let snapshotSummary = null;
 
     try {
       console.log(`📡 Building explorer snapshot for: ${displayTrack.title} by ${displayTrack.artist}`);
@@ -1950,7 +2871,10 @@ class DriftAudioMixer {
         }
 
         try {
-          explorerData = await this.getComprehensiveExplorerData();
+          explorerData = await this.getComprehensiveExplorerData({
+            forceFresh: true,
+            retryDepth: explorerRetryAttempts
+          });
           console.log(`📊 Explorer retry #${explorerRetryAttempts}: ${Object.keys(explorerData.directions || {}).length} directions`);
         } catch (retryError) {
           console.warn('⚠️ Explorer retry failed:', retryError?.message || retryError);
@@ -1984,6 +2908,16 @@ class DriftAudioMixer {
         explorerData.nextTrack = nextTrackSummary;
       }
 
+      snapshotSummary = this.summarizeExplorerSnapshot(explorerData, currentTrackId);
+      if (!force && snapshotSummary && this.lastExplorerSnapshotSummary === snapshotSummary) {
+        console.log(`📡 Skipping explorer snapshot for ${currentTrackId} (unchanged summary)`);
+        return;
+      }
+
+      if (explorerData?.diagnostics) {
+        explorerData.diagnostics.retryCount = explorerRetryAttempts;
+      }
+
       const featuresFallback = this.lookupTrackFeatures(currentTrackId);
       const pcaFallback = this.lookupTrackPca(currentTrackId);
       const artFallback = this.lookupTrackAlbumCover(currentTrackId);
@@ -2009,12 +2943,9 @@ class DriftAudioMixer {
       }) || {};
 
       const beetsMeta = displayTrack.beetsMeta || activeTrack?.beetsMeta || beetsFallback || null;
-      if (beetsMeta) {
-        try {
-          hydratedCurrent.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
-        } catch (err) {
-          hydratedCurrent.beetsMeta = beetsMeta;
-        }
+      const sanitizedMeta = cloneAndSanitizeBeetsMeta(beetsMeta);
+      if (sanitizedMeta) {
+        hydratedCurrent.beetsMeta = sanitizedMeta;
       }
 
       const currentTrackPayload = this.sanitizeTrackForClient(hydratedCurrent, {
@@ -2040,6 +2971,12 @@ class DriftAudioMixer {
       const sanitizedNextTrack = this.serializeNextTrackForClient(nextTrackSummary || explorerData.nextTrack || null, {
         includeFeatures: true,
         includePca: true
+      });
+
+      this.recordExplorerEvent({
+        reason,
+        explorerData,
+        nextTrack: sanitizedNextTrack
       });
 
       snapshotEvent = {
@@ -2074,7 +3011,9 @@ class DriftAudioMixer {
             seenArtistsCount: this.seenArtists.size,
             seenAlbumsCount: this.seenAlbums.size
           }
-        }
+        },
+        explorerDiagnostics: explorerData.diagnostics || null,
+        explorerEvents: this.explorerEventHistory.slice(-10)
       };
 
       console.log(`📡 Broadcasting explorer snapshot: ${displayTrack.title} by ${displayTrack.artist}`);
@@ -2135,6 +3074,7 @@ class DriftAudioMixer {
     this.lastExplorerSnapshotPayload = snapshotEvent;
     this.lastExplorerSnapshotSerialized = serialized;
     this.lastExplorerSnapshotTimestamp = snapshotEvent.timestamp;
+    this.lastExplorerSnapshotSummary = snapshotSummary;
 
     if (this.eventClients.size === 0) {
       console.log('📡 No event clients, caching explorer snapshot for future subscribers');
@@ -2175,13 +3115,14 @@ class DriftAudioMixer {
   }
 
   // Get comprehensive explorer data with PCA-enhanced directions and diversity scoring
-  async getComprehensiveExplorerData() {
+  async runComprehensiveExplorerData(options = {}) {
     if (!this.currentTrack) {
       throw new Error('No current track for explorer data');
     }
+    const retryDepth = Number.isFinite(options.retryDepth) ? options.retryDepth : 0;
 
     // Check session-level cache first
-    const resolution = this.explorerResolution || 'magnifying_glass';
+    const resolution = this.explorerResolution || 'adaptive';
     const cacheKey = `${this.currentTrack.identifier}_${resolution}`;
 
     if (this.explorerDataCache.has(cacheKey)) {
@@ -2193,6 +3134,7 @@ class DriftAudioMixer {
 
     const currentTrackData = this.radialSearch.kdTree.getTrack(this.currentTrack.identifier);
     if (!currentTrackData || !currentTrackData.pca) {
+      this.currentNeighborhoodSnapshot = null;
       // Fallback to legacy exploration if no PCA data
       return await this.getLegacyExplorerData();
     }
@@ -2208,29 +3150,122 @@ class DriftAudioMixer {
     console.log(`📊 Getting neighborhood for track: ${currentTrackData.identifier}`);
     console.log(`📊 Track has PCA data:`, !!currentTrackData.pca);
 
-    let totalNeighborhood;
+    const cachedAdaptive = this.adaptiveRadiusCache.get(this.currentTrack.identifier) || null;
+    const dynamicRadius = Number.isFinite(this.dynamicRadiusState.currentRadius)
+      ? this.dynamicRadiusState.currentRadius
+      : null;
+    let totalNeighborhood = [];
+    let totalNeighborhoodSize = 0;
+    this.currentNeighborhoodSnapshot = null;
 
     try {
-      totalNeighborhood = this.radialSearch.kdTree.pcaRadiusSearch(
-        currentTrackData, resolution, 'primary_d', 1000
-      );
-      console.log(`📊 PCA radius search returned: ${totalNeighborhood.length} tracks`);
-    } catch (pcaError) {
-      console.error('📊 PCA radius search failed:', pcaError);
-      // Fallback to legacy radius search
-      console.log('📊 Falling back to legacy radius search');
-      const radiusFallback = {
-        microscope: 0.03,
-        magnifying_glass: 0.07,
-        binoculars: 0.11
-      };
-      const legacyRadius = radiusFallback[resolution] || 0.25;
-      totalNeighborhood = this.radialSearch.kdTree.radiusSearch(currentTrackData, legacyRadius, null, 1000);
-      console.log(`📊 Legacy radius search returned: ${totalNeighborhood.length} tracks`);
+      const adaptiveResult = await this.radialSearch.getAdaptiveNeighborhood(this.currentTrack.identifier, {
+        targetMin: 350,
+        targetMax: 450,
+        initialRadius: dynamicRadius
+          ?? (cachedAdaptive && Number.isFinite(cachedAdaptive.radius) ? cachedAdaptive.radius : null),
+        limit: 1500
+      });
+
+      if (adaptiveResult && Array.isArray(adaptiveResult.neighbors) && adaptiveResult.neighbors.length > 0) {
+        totalNeighborhood = adaptiveResult.neighbors;
+        totalNeighborhoodSize = totalNeighborhood.length;
+        this.currentAdaptiveRadius = {
+          radius: adaptiveResult.radius,
+          count: adaptiveResult.count,
+          iterations: adaptiveResult.iterations,
+          withinTarget: adaptiveResult.withinTarget,
+          scale: adaptiveResult.scale,
+          targetMin: 350,
+          targetMax: 450,
+          cachedRadiusReused: Boolean(cachedAdaptive)
+        };
+        this.adaptiveRadiusCache.set(this.currentTrack.identifier, {
+          radius: adaptiveResult.radius,
+          count: adaptiveResult.count,
+          scale: adaptiveResult.scale,
+          updatedAt: Date.now()
+        });
+        const tunedRadius = Number.isFinite(adaptiveResult.radius) ? adaptiveResult.radius.toFixed(4) : 'n/a';
+        console.log(`📊 Adaptive PCA radius tuned to ${tunedRadius}, neighbors=${totalNeighborhoodSize} (iterations=${adaptiveResult.iterations}${adaptiveResult.withinTarget ? ', within target' : ', outside target'})`);
+        this.currentNeighborhoodSnapshot = Array.isArray(totalNeighborhood) ? totalNeighborhood.slice() : null;
+        if (Number.isFinite(adaptiveResult.radius)) {
+          this.dynamicRadiusState.currentRadius = adaptiveResult.radius;
+        }
+      } else {
+        throw new Error('Adaptive PCA neighborhood empty');
+      }
+    } catch (adaptiveError) {
+      console.warn('⚠️ Adaptive PCA search failed, falling back to calibrated settings:', adaptiveError.message || adaptiveError);
+      this.currentAdaptiveRadius = null;
+      try {
+        totalNeighborhood = this.radialSearch.kdTree.pcaRadiusSearch(
+          currentTrackData,
+          'magnifying_glass',
+          'primary_d',
+          1000
+        );
+        totalNeighborhoodSize = totalNeighborhood.length;
+        console.log(`📊 Calibrated PCA fallback returned: ${totalNeighborhoodSize} tracks`);
+        this.currentNeighborhoodSnapshot = Array.isArray(totalNeighborhood) ? totalNeighborhood.slice() : null;
+        if (totalNeighborhoodSize > 0) {
+          const fallbackRadius = cachedAdaptive && Number.isFinite(cachedAdaptive.radius)
+            ? cachedAdaptive.radius
+            : this.dynamicRadiusState.currentRadius;
+          if (Number.isFinite(fallbackRadius)) {
+            this.dynamicRadiusState.currentRadius = fallbackRadius;
+          }
+        }
+      } catch (pcaError) {
+        console.error('📊 PCA radius search failed:', pcaError);
+        console.log('📊 Falling back to legacy radius search');
+        const fallbackRadius = (cachedAdaptive && Number.isFinite(cachedAdaptive.radius) && cachedAdaptive.radius > 0)
+          ? cachedAdaptive.radius
+          : 0.25;
+        totalNeighborhood = this.radialSearch.kdTree.radiusSearch(currentTrackData, fallbackRadius, null, 1000);
+        totalNeighborhoodSize = totalNeighborhood.length;
+        console.log(`📊 Legacy radius search returned: ${totalNeighborhoodSize} tracks`);
+        this.currentNeighborhoodSnapshot = Array.isArray(totalNeighborhood) ? totalNeighborhood.slice() : null;
+        if (totalNeighborhoodSize > 0) {
+          this.dynamicRadiusState.currentRadius = fallbackRadius;
+        }
+      }
     }
 
-    const totalNeighborhoodSize = totalNeighborhood.length;
-    console.log(`📊 Final neighborhood size: ${totalNeighborhoodSize} tracks`);
+    const neighborhoodStats = this.computeNeighborhoodStats(totalNeighborhood);
+
+    if (totalNeighborhoodSize === 0) {
+      console.warn('⚠️ Explorer neighborhood empty after all attempts; downstream stacks may be sparse');
+      this.currentNeighborhoodSnapshot = [];
+    } else {
+      console.log(`📊 Final neighborhood size: ${totalNeighborhoodSize} tracks`);
+    }
+
+    explorerData.neighborhood = {
+      size: totalNeighborhoodSize,
+      radius: this.currentAdaptiveRadius ? this.currentAdaptiveRadius.radius : null,
+      iterations: this.currentAdaptiveRadius ? this.currentAdaptiveRadius.iterations : 0,
+      targetMin: 350,
+      targetMax: 450,
+      cachedRadiusReused: Boolean(cachedAdaptive),
+      distanceStats: neighborhoodStats
+    };
+
+    const directionDiagnostics = {
+      initialCount: 0,
+      sanitizedCount: 0,
+      finalCount: 0,
+      duplicatesRemoved: 0,
+      missingIdentifiers: 0,
+      uniqueTracks: 0,
+      removedDirections: 0,
+      promotedOpposites: 0,
+      droppedOpposites: 0,
+      trimmedSamples: 0,
+      randomInjections: 0,
+      totalSamples: 0,
+      finalSamples: 0
+    };
 
     // Get PCA directions with enhanced data
     const pcaDirections = this.radialSearch.getPCADirections();
@@ -2256,7 +3291,7 @@ class DriftAudioMixer {
     const originalFeatures = [
       // Rhythmic
       { name: 'bpm', positive: 'faster', negative: 'slower', description: 'Tempo' },
-      { name: 'danceability', positive: 'more_danceable', negative: 'less_danceable', description: 'Danceability' },
+      { name: 'danceability', positive: 'more_danceable', negative: 'less_danceable', description: 'Jiggy' },
       { name: 'onset_rate', positive: 'busier_onsets', negative: 'sparser_onsets', description: 'Rhythmic density' },
       { name: 'beat_punch', positive: 'punchier_beats', negative: 'smoother_beats', description: 'Beat character' },
 
@@ -2328,11 +3363,16 @@ class DriftAudioMixer {
 
     summarizeDirectionsByDomain('post-limit', explorerData.directions);
 
-    // Strategic deduplication: PCA directions take precedence over similar core directions
-    // TODO explorerData.directions = this.deduplicateTracksStrategically(explorerData.directions);
+    // Strategic deduplication: PCA/VAE directions get first pass, then core features
+    explorerData.directions = this.deduplicateTracksStrategically(explorerData.directions, {
+      maxCardsPerStack: 12,
+      totalNeighborhoodSize
+    });
 
-    // 🃏 DEBUG: Verify no duplicate cards across stacks
-    // TODO this.debugDuplicateCards(explorerData.directions);
+    // 🃏 DEBUG: Verify no duplicate cards across stacks when verbose logging enabled
+    if (VERBOSE_EXPLORER) {
+      this.debugDuplicateCards(explorerData.directions);
+    }
 
     // 🃏 FINAL DEDUPLICATION: Each card appears in exactly one stack (highest position wins)
     explorerData.directions = this.finalDeduplication(explorerData.directions);
@@ -2382,10 +3422,30 @@ class DriftAudioMixer {
     explorerData.directions = this.prioritizeBidirectionalDirections(explorerData.directions);
 
     // 🧼 SAFETY NET: Remove any residual duplicates introduced by prioritization embedding
-    explorerData.directions = this.sanitizeDirectionalStacks(explorerData.directions);
-    explorerData.directions = this.removeEmptyDirections(explorerData.directions);
-    explorerData.directions = this.applyStackBudget(explorerData.directions);
+    const initialDirectionCount = Object.keys(explorerData.directions || {}).length;
+    directionDiagnostics.initialCount = initialDirectionCount;
+
+    const sanitizeResult = this.sanitizeDirectionalStacks(explorerData.directions);
+    explorerData.directions = sanitizeResult.directions;
+    directionDiagnostics.sanitizedCount = Object.keys(explorerData.directions || {}).length;
+    directionDiagnostics.duplicatesRemoved = sanitizeResult.stats.duplicatesRemoved;
+    directionDiagnostics.missingIdentifiers = sanitizeResult.stats.missingIdentifiers;
+    directionDiagnostics.uniqueTracks = sanitizeResult.stats.uniqueTracks;
+    directionDiagnostics.totalSamples = sanitizeResult.stats.totalSamples;
+
+    const removalResult = this.removeEmptyDirections(explorerData.directions);
+    explorerData.directions = removalResult.directions;
+    directionDiagnostics.removedDirections = removalResult.stats.removedDirections;
+    directionDiagnostics.promotedOpposites = removalResult.stats.promotedOpposites;
+    directionDiagnostics.droppedOpposites = removalResult.stats.droppedOpposites;
+
+    const stackBudgetResult = this.applyStackBudget(explorerData.directions);
+    explorerData.directions = stackBudgetResult.directions;
+    directionDiagnostics.trimmedSamples = stackBudgetResult.stats.trimmedSamples;
+    directionDiagnostics.randomInjections = stackBudgetResult.stats.randomInjections;
+    directionDiagnostics.finalSamples = stackBudgetResult.stats.finalSamples;
     explorerData.directions = this.selectTopTrack(explorerData.directions);
+    directionDiagnostics.finalCount = Object.keys(explorerData.directions || {}).length;
 
     if (VERBOSE_EXPLORER) {
       Object.entries(explorerData.directions).forEach(([key, data]) => {
@@ -2398,10 +3458,61 @@ class DriftAudioMixer {
       });
     }
 
+    const radiusDiagnostics = this.currentAdaptiveRadius
+      ? {
+          mode: 'adaptive',
+          radius: this.currentAdaptiveRadius.radius,
+          count: this.currentAdaptiveRadius.count,
+          iterations: this.currentAdaptiveRadius.iterations,
+          withinTarget: this.currentAdaptiveRadius.withinTarget,
+          cachedRadiusReused: this.currentAdaptiveRadius.cachedRadiusReused
+        }
+      : {
+          mode: 'fallback',
+          radius: cachedAdaptive?.radius ?? null,
+          cachedRadiusReused: Boolean(cachedAdaptive)
+        };
+
+    const radiusFeedback = this.evaluateRadiusAdjustment(directionDiagnostics, retryDepth);
+    if (radiusFeedback.action) {
+      radiusDiagnostics.adjustment = radiusFeedback.action;
+    }
+    if (radiusFeedback.retry) {
+      this.recordSessionEvent('radius_retry', {
+        reason: radiusFeedback.action?.reason || 'unknown',
+        action: radiusFeedback.action?.action || null,
+        retryDepth,
+        nextRadius: this.dynamicRadiusState.currentRadius || null
+      });
+    }
+
+    explorerData.diagnostics = {
+      timestamp: Date.now(),
+      currentTrackId: this.currentTrack.identifier,
+      radius: radiusDiagnostics,
+      neighborhood: {
+        total: totalNeighborhoodSize,
+        distanceStats: neighborhoodStats
+      },
+      directionStats: directionDiagnostics,
+      radiusRetryDepth: retryDepth
+    };
+
+    if (radiusFeedback.retry) {
+      console.warn(`🔁 Explorer starvation detected (depth ${retryDepth}); expanding radius to ${this.dynamicRadiusState.currentRadius?.toFixed(4) || 'n/a'} and retrying`);
+      return await this.getComprehensiveExplorerData({
+        ...options,
+        forceFresh: true,
+        retryDepth: retryDepth + 1
+      });
+    }
+
     // Calculate diversity scores and select next track
     explorerData.diversityMetrics = this.calculateExplorerDiversityMetrics(explorerData.directions, totalNeighborhoodSize);
     explorerData.nextTrack = await this.selectNextTrackFromExplorer(explorerData);
     explorerData.resolution = this.explorerResolution;
+
+    this.recordExplorerSummary(explorerData, radiusDiagnostics, totalNeighborhoodSize);
 
     // Cache the computed explorer data for this session
     this.explorerDataCache.set(cacheKey, explorerData);
@@ -2410,20 +3521,83 @@ class DriftAudioMixer {
     return explorerData;
   }
 
+  recordExplorerSummary(explorerData, radiusDiagnostics, totalNeighborhoodSize) {
+    if (!explorerData) {
+      return;
+    }
+    const directionEntries = Object.entries(explorerData.directions || {});
+    const topDirections = directionEntries
+      .map(([key, dir]) => ({
+        key,
+        score: Number((dir.diversityScore ?? 0).toFixed(2)),
+        trackCount: dir.trackCount ?? 0,
+        domain: dir.domain || null,
+        isOutlier: Boolean(dir.isOutlier)
+      }))
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, 5);
+
+    const summary = {
+      timestamp: Date.now(),
+      trackId: this.currentTrack?.identifier || null,
+      resolution: this.explorerResolution || 'adaptive',
+      neighborhoodSize: totalNeighborhoodSize,
+      nextDirection: explorerData.nextTrack?.nextTrackDirection || explorerData.nextTrack?.direction || null,
+      diversity: explorerData.diversityMetrics || null,
+      topDirections,
+      radius: radiusDiagnostics || null,
+      directionStats: {
+        total: directionEntries.length,
+        valid: explorerData.diversityMetrics?.validDirections ?? null
+      }
+    };
+
+    this.currentExplorerSummary = summary;
+    this.explorerHistory.push(summary);
+    if (this.explorerHistory.length > this.maxExplorerHistory) {
+      this.explorerHistory.shift();
+    }
+    this.recordSessionEvent('explorer_snapshot', {
+      trackId: summary.trackId,
+      nextDirection: summary.nextDirection,
+      neighborhoodSize: summary.neighborhoodSize,
+      diversity: summary.diversity,
+      topDirections: summary.topDirections,
+      radius: summary.radius
+    });
+  }
+
+  async getComprehensiveExplorerData(options = {}) {
+    if (!options.forceFresh && this.pendingExplorerPromise) {
+      return this.pendingExplorerPromise;
+    }
+
+    const basePromise = this.runComprehensiveExplorerData(options);
+
+    if (options.forceFresh) {
+      return basePromise;
+    }
+
+    const wrappedPromise = basePromise.finally(() => {
+      if (this.pendingExplorerPromise === wrappedPromise) {
+        this.pendingExplorerPromise = null;
+      }
+    });
+
+    this.pendingExplorerPromise = wrappedPromise;
+    return wrappedPromise;
+  }
+
   setExplorerResolution(resolution) {
-    const validResolutions = ['microscope', 'magnifying_glass', 'binoculars'];
-    if (!validResolutions.includes(resolution)) {
-      throw new Error(`Invalid explorer resolution: ${resolution}`);
+    const previous = this.explorerResolution || 'adaptive';
+    const normalized = (resolution || 'adaptive').toString().toLowerCase();
+
+    if (normalized !== 'adaptive') {
+      console.log(`🔍 Ignoring legacy explorer resolution request (${resolution}); adaptive tuning is always enabled.`);
     }
 
-    if (this.explorerResolution === resolution) {
-      console.log(`🔍 Explorer resolution already ${resolution}, no change`);
-      return false;
-    }
-
-    console.log(`🔍 Updating explorer resolution: ${this.explorerResolution} → ${resolution}`);
-    this.explorerResolution = resolution;
-    return true;
+    this.explorerResolution = 'adaptive';
+    return previous !== this.explorerResolution;
   }
 
   // Explore a specific PCA direction
@@ -2432,8 +3606,14 @@ class DriftAudioMixer {
 
     try {
       const searchConfig = {
-        resolution: this.explorerResolution || 'magnifying_glass',
-        limit: 40
+        resolution: this.explorerResolution || 'adaptive',
+        limit: 40,
+        adaptiveRadius: this.currentAdaptiveRadius && Number.isFinite(this.currentAdaptiveRadius.radius)
+          ? this.currentAdaptiveRadius.radius
+          : null,
+        precomputedNeighbors: Array.isArray(this.currentNeighborhoodSnapshot) && this.currentNeighborhoodSnapshot.length > 0
+          ? this.currentNeighborhoodSnapshot
+          : null
       };
 
       const candidates = await this.radialSearch.getPCADirectionalCandidates(
@@ -2670,22 +3850,54 @@ class DriftAudioMixer {
 
   async exploreVaeDirection(explorerData, latentIndex, polarity, options = {}) {
     const directionKey = `vae_latent_${latentIndex}_${polarity}`;
-    const description = `Latent axis ${latentIndex + 1} (${polarity === 'positive' ? '+' : '-'})`;
+    const baseLabel = VAE_LATENT_LABELS[latentIndex] || `Latent Axis ${latentIndex + 1}`;
+    const directionName = baseLabel;
+    const orientationDescriptor = polarity === 'positive' ? 'forward flow' : 'mirrored flow';
+    const description = `${baseLabel} (${orientationDescriptor})`;
 
     try {
-      const result = await this.radialSearch.getVAEDirectionalCandidates(
-        this.currentTrack.identifier,
-        latentIndex,
-        polarity,
-        {
-          resolution: this.explorerResolution || 'magnifying_glass',
-          limit: options.limit || 24
+      const scope = this.explorerResolution || 'adaptive';
+      const resolutionPriority = (() => {
+        switch (scope) {
+          case 'microscope':
+            return ['microscope', 'magnifying_glass', 'binoculars', 'adaptive'];
+          case 'binoculars':
+            return ['binoculars', 'magnifying_glass', 'adaptive'];
+          case 'adaptive':
+            return ['magnifying_glass', 'binoculars', 'adaptive'];
+          default:
+            return ['magnifying_glass', 'binoculars', scope];
         }
-      );
+      })();
 
-      const candidates = result?.candidates || [];
+      const limit = options.limit || 24;
+      let result = null;
+      let candidates = [];
+      const attemptedResolutions = [];
+
+      for (const resolutionCandidate of resolutionPriority) {
+        attemptedResolutions.push(resolutionCandidate);
+        try {
+          result = await this.radialSearch.getVAEDirectionalCandidates(
+            this.currentTrack.identifier,
+            latentIndex,
+            polarity,
+            {
+              resolution: resolutionCandidate,
+              limit
+            }
+          );
+          candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+          if (candidates.length > 0) {
+            break;
+          }
+        } catch (innerError) {
+          console.warn(`⚠️ VAE search failed for resolution ${resolutionCandidate}:`, innerError.message || innerError);
+        }
+      }
+
       if (candidates.length === 0) {
-        console.log(`🚫 VAE direction ${directionKey} returned no candidates`);
+        console.log(`🚫 VAE direction ${directionKey} returned no candidates (tried ${attemptedResolutions.join(', ')})`);
         return;
       }
 
@@ -2709,9 +3921,7 @@ class DriftAudioMixer {
       const neighborhoodSize = totalAvailable > 0 ? totalAvailable : formattedTracks.length;
 
       explorerData.directions[directionKey] = {
-        direction: polarity === 'positive'
-          ? `increase latent ${latentIndex + 1}`
-          : `decrease latent ${latentIndex + 1}`,
+        direction: directionName,
         description,
         domain: 'vae',
         component: `latent_${latentIndex}`,
@@ -2782,79 +3992,129 @@ class DriftAudioMixer {
     return values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
   }
 
-  // Strategic deduplication using "teaching value" - which direction benefits most from each track
-  deduplicateTracksStrategically(directions) {
-    // Phase 1: Collect all tracks from all directions and build priority-ordered stack list
-    const allTracks = new Map(); // trackId -> track
-    const stacks = []; // Array of {directionKey, direction, isPCA}
+  // Strategic deduplication using breadth-first dealing with domain-aware priority
+  deduplicateTracksStrategically(directions, options = {}) {
+    if (!directions || typeof directions !== 'object') {
+      return directions;
+    }
 
-    // Gather all unique tracks
-    Object.entries(directions).forEach(([directionKey, direction]) => {
-      if (!direction.sampleTracks) return;
+    const entries = Object.entries(directions);
+    if (entries.length === 0) {
+      return directions;
+    }
 
-      // Classify direction type
-      const isPCA = directionKey.includes('_pc') || directionKey.includes('primary_d');
-      stacks.push({ directionKey, direction, isPCA });
+    const maxCardsPerStack = Math.max(1, Number.isFinite(options.maxCardsPerStack) ? options.maxCardsPerStack : 12);
+    const totalNeighborhoodSize = Number.isFinite(options.totalNeighborhoodSize) ? options.totalNeighborhoodSize : null;
 
-      direction.sampleTracks.forEach(track => {
-        const trackId = track.identifier || track.track?.identifier;
-        if (trackId && !allTracks.has(trackId)) {
-          allTracks.set(trackId, track.track || track);
-        }
-      });
-    });
-
-    // Sort stacks by priority: PCA first, then core
-    stacks.sort((a, b) => {
-      if (a.isPCA !== b.isPCA) {
-        return a.isPCA ? -1 : 1; // PCA comes first
+    const cloneSampleEntry = (entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
       }
-      return 0; // Maintain order within same type
-    });
 
-    // Phase 2: Initialize empty stacks
-    const finalDirections = {};
-    stacks.forEach(stack => {
-      finalDirections[stack.directionKey] = {
-        ...stack.direction,
-        sampleTracks: []
+      if (entry.track && typeof entry.track === 'object') {
+        return {
+          ...entry,
+          track: { ...entry.track }
+        };
+      }
+
+      const clonedTrack = { ...entry };
+      return { track: clonedTrack };
+    };
+
+    const stacks = entries.map(([directionKey, direction], index) => {
+      const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.slice() : [];
+      const domain = direction?.domain || '';
+      const priority = (() => {
+        if (domain === 'vae' || directionKey.startsWith('vae_')) return 0;
+        if (domain.includes('pca') || directionKey.includes('_pc') || directionKey.includes('primary_d')) return 1;
+        return 2;
+      })();
+      return {
+        directionKey,
+        direction,
+        sampleTracks,
+        pointer: 0,
+        priority,
+        originalIndex: index
       };
     });
 
-    // Phase 3: Breadth-first dealing - deal cards round-robin to stacks
-    const maxCardsPerStack = 8;
-    let dealtCount = 0;
+    const finalDirections = {};
+    stacks.forEach(stack => {
+      const originalSamples = Array.isArray(stack.direction.originalSampleTracks)
+        ? stack.direction.originalSampleTracks.map(cloneSampleEntry).filter(Boolean)
+        : (Array.isArray(stack.direction.sampleTracks)
+            ? stack.direction.sampleTracks.map(cloneSampleEntry).filter(Boolean)
+            : []);
 
-    // Deal cards level by level (breadth-first)
-    for (let level = 0; level < maxCardsPerStack; level++) {
-      // For each stack at this level, try to deal one card
-      for (let stackIndex = 0; stackIndex < stacks.length; stackIndex++) {
-        const stack = stacks[stackIndex];
+      finalDirections[stack.directionKey] = {
+        ...stack.direction,
+        key: stack.direction?.key || stack.directionKey,
+        sampleTracks: [],
+        originalSampleTracks: originalSamples
+      };
+    });
 
-        // Skip if this stack is already full
-        if (finalDirections[stack.directionKey].sampleTracks.length >= maxCardsPerStack) {
-          continue;
+    const sortedStacks = stacks.slice().sort((a, b) => {
+      if (a.priority !== b.priority) {
+        return a.priority - b.priority;
+      }
+      return a.originalIndex - b.originalIndex;
+    });
+
+    const usedTrackIds = new Set();
+    let totalDealt = 0;
+
+    for (let level = 0; level < maxCardsPerStack; level += 1) {
+      let dealtAtLevel = false;
+
+      for (const stack of sortedStacks) {
+        while (stack.pointer < stack.sampleTracks.length) {
+          const candidate = stack.sampleTracks[stack.pointer++];
+          if (!candidate) {
+            continue;
+          }
+
+          const trackId = candidate.identifier || candidate.track?.identifier;
+          if (!trackId || usedTrackIds.has(trackId)) {
+            continue;
+          }
+
+          const clonedEntry = cloneSampleEntry(candidate);
+          if (clonedEntry) {
+            finalDirections[stack.directionKey].sampleTracks.push(clonedEntry);
+            usedTrackIds.add(trackId);
+            totalDealt += 1;
+            dealtAtLevel = true;
+            break;
+          }
         }
+      }
 
-        // Find the next available track from this direction's original pool
-        const availableTrack = stack.direction.sampleTracks.find(t => {
-          const trackId = t.identifier || t.track?.identifier;
-          // Check if this track hasn't been dealt yet
-          return !Object.values(finalDirections).some(dir =>
-            dir.sampleTracks.some(dealt =>
-              (dealt.identifier || dealt.track?.identifier) === trackId
-            )
-          );
-        });
-
-        if (availableTrack) {
-          finalDirections[stack.directionKey].sampleTracks.push(availableTrack.track || availableTrack);
-          dealtCount++;
-        }
+      if (!dealtAtLevel) {
+        break;
       }
     }
 
-    console.log(`🃏 Breadth-first dealing: ${dealtCount} cards dealt to ${stacks.length} stacks (PCA first, then core)`);
+    Object.entries(finalDirections).forEach(([directionKey, direction]) => {
+      const sampleCount = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.length : 0;
+      direction.trackCount = sampleCount;
+      direction.actualTrackCount = sampleCount;
+      if (Number.isFinite(totalNeighborhoodSize) && totalNeighborhoodSize > 0) {
+        direction.totalNeighborhoodSize = totalNeighborhoodSize;
+        direction.splitRatio = sampleCount / totalNeighborhoodSize;
+        direction.diversityScore = this.calculateDirectionDiversity(sampleCount, totalNeighborhoodSize);
+      }
+    });
+
+    console.log(`🃏 Breadth-first dealing: ${totalDealt} cards dealt across ${sortedStacks.length} stacks (max ${maxCardsPerStack} per stack)`);
+
+    entries.forEach(([directionKey]) => {
+      if (!finalDirections[directionKey]) {
+        finalDirections[directionKey] = directions[directionKey];
+      }
+    });
 
     return finalDirections;
   }
@@ -2965,7 +4225,7 @@ class DriftAudioMixer {
             const pos2 = positions.find(p => p.direction === opposite);
 
             if (pos2 && pos1.dimValue !== null && pos2.dimValue !== null) {
-              const isNegativeDir = isNegativeDirection(pos1.direction);
+              const isNegativeDir = isNegativeDirectionKey(pos1.direction);
               const expectedDifference = isNegativeDir ?
                 pos2.dimValue - pos1.dimValue : // negative direction should have lower value
                 pos1.dimValue - pos2.dimValue;  // positive direction should have higher value
@@ -3119,13 +4379,33 @@ class DriftAudioMixer {
 
   applyStackBudget(directions) {
     if (!directions || typeof directions !== 'object') {
-      return directions;
+      return {
+        directions,
+        stats: {
+          trimmedSamples: 0,
+          randomInjections: 0,
+          finalSamples: 0
+        }
+      };
     }
 
     const total = this.stackTotalCount || 0;
     if (!Number.isFinite(total) || total <= 0) {
-      return directions;
+      return {
+        directions,
+        stats: {
+          trimmedSamples: 0,
+          randomInjections: 0,
+          finalSamples: 0
+        }
+      };
     }
+
+    const stats = {
+      trimmedSamples: 0,
+      randomInjections: 0,
+      finalSamples: 0
+    };
 
     const randomCount = Math.min(this.stackRandomCount || 0, total);
     const deterministicLimit = Math.max(total - randomCount, 0);
@@ -3134,11 +4414,16 @@ class DriftAudioMixer {
     Object.entries(directions).forEach(([directionKey, direction]) => {
       const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
       let trimmed;
+      const originalLength = samples.length;
 
       if (deterministicLimit === 0) {
         trimmed = [];
       } else {
         trimmed = samples.slice(0, Math.min(samples.length, deterministicLimit));
+      }
+
+      if (originalLength > trimmed.length) {
+        stats.trimmedSamples += (originalLength - trimmed.length);
       }
 
       direction.sampleTracks = trimmed;
@@ -3193,15 +4478,17 @@ class DriftAudioMixer {
         }
         currentTracks.push(clone);
       });
+      stats.randomInjections += picks.length;
 
       direction.sampleTracks = currentTracks;
       const finalCount = currentTracks.length;
       direction.displayTrackCount = finalCount;
       direction.actualTrackCount = finalCount;
       direction.trackCount = finalCount;
+      stats.finalSamples += finalCount;
     });
 
-    return directions;
+    return { directions, stats };
   }
 
   getRandomSubset(array, size) {
@@ -3322,10 +4609,9 @@ class DriftAudioMixer {
       clone.vae = this.cloneVaeData(track.vae);
     }
     if (track.beetsMeta) {
-      try {
-        clone.beetsMeta = JSON.parse(JSON.stringify(track.beetsMeta));
-      } catch (err) {
-        clone.beetsMeta = track.beetsMeta;
+      const sanitized = cloneAndSanitizeBeetsMeta(track.beetsMeta);
+      if (sanitized) {
+        clone.beetsMeta = sanitized;
       }
     }
     if (track.analysis) {
@@ -3333,6 +4619,13 @@ class DriftAudioMixer {
         clone.analysis = JSON.parse(JSON.stringify(track.analysis));
       } catch (err) {
         // Non-serializable analysis structures can be ignored for hydration purposes
+      }
+    }
+
+    if (!clone.title || (typeof clone.title === 'string' && clone.title.trim() === '')) {
+      const fallbackTitle = getTrackTitle(track);
+      if (fallbackTitle) {
+        clone.title = fallbackTitle;
       }
     }
 
@@ -3642,10 +4935,11 @@ class DriftAudioMixer {
     const beetsSources = [baseClone?.beetsMeta, overlay?.beetsMeta, annotations?.beetsMeta, nestedCandidate?.beetsMeta];
     const beetsMeta = beetsSources.find(meta => meta && Object.keys(meta).length > 0) || null;
     if (beetsMeta) {
-      try {
-        result.beetsMeta = JSON.parse(JSON.stringify(beetsMeta));
-      } catch (err) {
-        result.beetsMeta = beetsMeta;
+      const sanitizedMeta = cloneAndSanitizeBeetsMeta(beetsMeta);
+      if (sanitizedMeta) {
+        result.beetsMeta = sanitizedMeta;
+      } else {
+        delete result.beetsMeta;
       }
     } else {
       delete result.beetsMeta;
@@ -3724,12 +5018,27 @@ class DriftAudioMixer {
   // Ensure each stack reports unique tracks (within the stack and across all stacks)
   sanitizeDirectionalStacks(directions) {
     if (!directions || typeof directions !== 'object') {
-      return directions;
+      return {
+        directions,
+        stats: {
+          initialDirections: 0,
+          totalSamples: 0,
+          uniqueTracks: 0,
+          duplicatesRemoved: 0,
+          missingIdentifiers: 0
+        }
+      };
     }
 
+    const stats = {
+      initialDirections: Object.keys(directions).length,
+      totalSamples: 0,
+      uniqueTracks: 0,
+      duplicatesRemoved: 0,
+      missingIdentifiers: 0
+    };
+
     const globalAssignments = new Map(); // trackId -> { directionKey, location }
-    let duplicatesRemoved = 0;
-    let missingIdentifiers = 0;
 
     const normalizeStack = (directionKey, direction, location = 'primary') => {
       if (!direction || !Array.isArray(direction.sampleTracks)) {
@@ -3740,23 +5049,24 @@ class DriftAudioMixer {
       const sanitized = [];
 
       direction.sampleTracks.forEach((entry, index) => {
+        stats.totalSamples += 1;
         const trackId = entry?.identifier || entry?.track?.identifier;
 
         if (!trackId) {
-          missingIdentifiers += 1;
+          stats.missingIdentifiers += 1;
           console.warn(`🧼 STACK SANITIZE: Dropping track without identifier from ${directionKey}/${location} (index ${index})`);
           return;
         }
 
         if (localSeen.has(trackId)) {
-          duplicatesRemoved += 1;
+          stats.duplicatesRemoved += 1;
           console.warn(`🧼 STACK SANITIZE: Removed local duplicate ${trackId} from ${directionKey}/${location} (index ${index})`);
           return;
         }
 
         const existing = globalAssignments.get(trackId);
         if (existing) {
-          duplicatesRemoved += 1;
+          stats.duplicatesRemoved += 1;
           const title = entry?.title || entry?.track?.title || trackId;
           console.warn(`🧼 STACK SANITIZE: Removed ${title} (${trackId}) from ${directionKey}/${location}; already assigned to ${existing.directionKey}/${existing.location}`);
           return;
@@ -3779,25 +5089,42 @@ class DriftAudioMixer {
       normalizeStack(directionKey, direction, 'primary');
     });
 
-    const summaryParts = [`${globalAssignments.size} unique tracks retained`];
-    if (duplicatesRemoved > 0) {
-      summaryParts.push(`removed ${duplicatesRemoved} duplicates`);
+    stats.uniqueTracks = globalAssignments.size;
+
+    const summaryParts = [
+      `${stats.uniqueTracks} unique tracks retained`,
+      `processed ${stats.totalSamples} samples`
+    ];
+    if (stats.duplicatesRemoved > 0) {
+      summaryParts.push(`removed ${stats.duplicatesRemoved} duplicates`);
     }
-    if (missingIdentifiers > 0) {
-      summaryParts.push(`dropped ${missingIdentifiers} missing-id entries`);
+    if (stats.missingIdentifiers > 0) {
+      summaryParts.push(`dropped ${stats.missingIdentifiers} missing-id entries`);
     }
     console.log(`🧼 STACK SANITIZE: ${summaryParts.join(', ')}`);
 
-    return directions;
+    return { directions, stats };
   }
 
   // Remove directions that lost all candidates after sanitization
   removeEmptyDirections(directions) {
     if (!directions || typeof directions !== 'object') {
-      return directions;
+      return {
+        directions,
+        stats: {
+          removedDirections: 0,
+          promotedOpposites: 0,
+          droppedOpposites: 0
+        }
+      };
     }
 
     const cleaned = {};
+    const stats = {
+      removedDirections: 0,
+      promotedOpposites: 0,
+      droppedOpposites: 0
+    };
 
     Object.entries(directions).forEach(([directionKey, direction]) => {
       const primaryTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
@@ -3812,6 +5139,7 @@ class DriftAudioMixer {
           console.warn(`🧼 STACK SANITIZE: Dropping empty opposite stack for ${directionKey}`);
           direction.hasOpposite = false;
           delete direction.oppositeDirection;
+          stats.droppedOpposites += 1;
         }
         cleaned[directionKey] = direction;
         return;
@@ -3824,13 +5152,15 @@ class DriftAudioMixer {
           ...opposite,
           hasOpposite: false
         };
+        stats.promotedOpposites += 1;
         return;
       }
 
       console.warn(`🧼 STACK SANITIZE: Removing ${directionKey} entirely (no candidates remain)`);
+      stats.removedDirections += 1;
     });
 
-    return cleaned;
+    return { directions: cleaned, stats };
   }
 
   // ⚖️ Prioritize bidirectional directions: larger stack becomes primary, smaller becomes opposite
@@ -4049,6 +5379,29 @@ class DriftAudioMixer {
     ];
     console.log(`📊 Defined core indices: [${coreIndices.join(', ')}]`);
 
+    const categorizeDomain = (domainValue) => {
+      if (!domainValue) return null;
+      if (domainValue === 'vae') return 'vae';
+      if (domainValue.startsWith('tonal')) return 'tonal';
+      if (domainValue.startsWith('rhythmic')) return 'rhythmic';
+      if (domainValue.startsWith('spectral')) return 'spectral';
+      return null;
+    };
+
+    const getCategoryCounts = (dimensions) => {
+      const counts = { vae: 0, tonal: 0, rhythmic: 0, spectral: 0 };
+      dimensions.forEach(dim => {
+        const primary = Array.isArray(dim?.bestDirections) ? dim.bestDirections[0] : null;
+        const category = primary ? categorizeDomain(primary.domain) : null;
+        if (category) {
+          counts[category] += 1;
+        }
+      });
+      return counts;
+    };
+
+    const requiredCategories = ['vae', 'tonal', 'rhythmic', 'spectral'];
+
     const logVaeSummary = (tag, map) => {
       const vaeDimensions = Array.from(map.entries())
         .filter(([_, dirs]) => Array.isArray(dirs) && dirs.some(dir => dir?.domain === 'vae'))
@@ -4069,6 +5422,7 @@ class DriftAudioMixer {
     const coreMap = new Map();
     const pcaMap = new Map();
     const vaeMap = new Map();
+    const availableCategories = new Set();
 
     // Group directions by their base dimension and classify as core or PCA
     const directionEntries = Object.entries(directions);
@@ -4089,6 +5443,10 @@ class DriftAudioMixer {
       }
 
       const directionObj = { key, ...directionInfo };
+      const trackCount = directionObj.trackCount ?? (
+        Array.isArray(directionObj.sampleTracks) ? directionObj.sampleTracks.length : 0
+      );
+      directionObj.trackCount = trackCount;
       if (directionObj.vae && !directionObj.domain) {
         directionObj.domain = 'vae';
       }
@@ -4100,7 +5458,7 @@ class DriftAudioMixer {
         console.log('🧠 VAE direction candidate detected', {
           key,
           dimensionName,
-          trackCount: directionObj.sampleTracks?.length || 0,
+          trackCount,
           diversityScore: directionObj.diversityScore,
           isOutlier: directionObj.isOutlier
         });
@@ -4132,6 +5490,11 @@ class DriftAudioMixer {
         dimensionMap.set(dimensionName, []);
       }
       dimensionMap.get(dimensionName).push(directionObj);
+
+      const categoryKey = categorizeDomain(domain);
+      if (categoryKey && trackCount > 0 && directionObj.isOutlier !== true) {
+        availableCategories.add(categoryKey);
+      }
       // Yield to the event loop periodically so audio streaming keeps flowing
       if ((idx + 1) % 5 === 0) {
         await setImmediatePromise();
@@ -4304,6 +5667,104 @@ class DriftAudioMixer {
       finalDimensions.push(...remainingDimensions);
     }
 
+    const availableCategoryList = requiredCategories.filter(cat => availableCategories.has(cat));
+    const usedDimensions = new Set(finalDimensions.map(d => d.dimName));
+
+    const findAdditionalDimension = (category) => {
+      const pool = category === 'vae' ? vaeCandidates : pcaCandidates;
+      const ranked = pool
+        .filter(candidate => !usedDimensions.has(candidate.dimName)
+          && candidate.bestDirections.length > 0
+          && (category === 'vae'
+            ? true
+            : categorizeDomain(candidate.bestDirections[0]?.domain) === category))
+        .sort((a, b) => (
+          (b.bestDirections[0]?.diversityScore ?? 0) - (a.bestDirections[0]?.diversityScore ?? 0)
+        ));
+      return ranked[0] || null;
+    };
+
+    const enforceDomainDiversity = () => {
+      if (availableCategoryList.length < 2) {
+        console.warn('⚠️ Domain diversity requirement skipped (insufficient categories available)', {
+          availableCategories: availableCategoryList
+        });
+        return;
+      }
+
+      let categoryCounts = getCategoryCounts(finalDimensions);
+      let presentCategories = requiredCategories.filter(cat => categoryCounts[cat] > 0);
+
+      while (presentCategories.length < 2) {
+        const missingOptions = availableCategoryList.filter(cat => !presentCategories.includes(cat));
+        if (missingOptions.length === 0) {
+          break;
+        }
+        const targetCategory = missingOptions[0];
+        const additionalDimension = findAdditionalDimension(targetCategory);
+        if (!additionalDimension) {
+          console.warn(`⚠️ No candidates available to cover '${targetCategory}' domain for explorer diversity`);
+          const index = availableCategoryList.indexOf(targetCategory);
+          if (index !== -1) {
+            availableCategoryList.splice(index, 1);
+          }
+          if (availableCategoryList.length < 2) {
+            break;
+          }
+          continue;
+        }
+        console.log(`🎯 Domain diversity: injecting '${additionalDimension.dimName}' (${targetCategory})`);
+        finalDimensions.push(additionalDimension);
+        usedDimensions.add(additionalDimension.dimName);
+        categoryCounts = getCategoryCounts(finalDimensions);
+        presentCategories = requiredCategories.filter(cat => categoryCounts[cat] > 0);
+      }
+
+      while (finalDimensions.length > maxDimensions) {
+        const removalOptions = finalDimensions
+          .map((dim, idx) => {
+            const remaining = finalDimensions.filter((_, i) => i !== idx);
+            const countsAfterRemoval = getCategoryCounts(remaining);
+            const categoriesAfterRemoval = requiredCategories.filter(cat => countsAfterRemoval[cat] > 0);
+            const canRemove = categoriesAfterRemoval.length >= 2 || categoriesAfterRemoval.length === 0;
+            return {
+              idx,
+              canRemove,
+              diversity: dim.bestDirections?.[0]?.diversityScore ?? 0
+            };
+          })
+          .filter(option => option.canRemove)
+          .sort((a, b) => a.diversity - b.diversity);
+
+        if (removalOptions.length === 0) {
+          console.warn('⚠️ Unable to trim explorer dimensions without violating diversity requirement');
+          break;
+        }
+
+        const removed = finalDimensions.splice(removalOptions[0].idx, 1)[0];
+        usedDimensions.delete(removed.dimName);
+        categoryCounts = getCategoryCounts(finalDimensions);
+        presentCategories = requiredCategories.filter(cat => categoryCounts[cat] > 0);
+      }
+
+      categoryCounts = getCategoryCounts(finalDimensions);
+      presentCategories = requiredCategories.filter(cat => categoryCounts[cat] > 0);
+      if (presentCategories.length < 2) {
+        console.warn('⚠️ Domain diversity still below target after adjustments', {
+          available: availableCategoryList,
+          finalCategories: presentCategories,
+          counts: categoryCounts
+        });
+      } else {
+        console.log('✅ Domain diversity satisfied for explorer selection', {
+          categories: presentCategories,
+          counts: categoryCounts
+        });
+      }
+    };
+
+    enforceDomainDiversity();
+
     // Build final directions object - only send primary direction but store opposite info
     finalDimensions.forEach(({ bestDirections }) => {
       const primaryDirection = bestDirections[0]; // Most populous direction
@@ -4324,6 +5785,22 @@ class DriftAudioMixer {
         hasOpposite: hasOpposite, // Flag for frontend Uno Reverse
         oppositeDirection: hasOpposite ? bestDirections[1] : null // Store opposite for Uno Reverse
       };
+    });
+
+    Object.entries(selectedDirections).forEach(([key, dir]) => {
+      const samples = Array.isArray(dir.sampleTracks) ? dir.sampleTracks : [];
+      const hasValidSample = samples.some(sample => {
+        const track = sample?.track || sample;
+        return track && track.identifier;
+      });
+      if (!hasValidSample) {
+        explorerLog(`⚠️ Removing direction '${key}' from explorer set (no valid sample tracks)`, {
+          trackCount: dir.trackCount,
+          domain: dir.domain,
+          hasOpposite: dir.hasOpposite
+        });
+        delete selectedDirections[key];
+      }
     });
 
     console.log(`🎯 Selected ${finalDimensions.length} dimensions producing ${Object.keys(selectedDirections).length} total directions`);
@@ -4475,6 +5952,17 @@ class DriftAudioMixer {
         });
       console.log(`🧭 Contribution breakdown (reference=${referenceLabel}, refDist=${referenceDist.toFixed(4)}): ${topSlices.join(' | ')}`);
     }
+
+    this.recordSessionEvent('next_track_selected', {
+      trackId: selectedTrackId,
+      directionKey: selectedDirectionKey,
+      directionLabel,
+      domain: selectedDirection.domain || null,
+      diversityScore: selectedDirection.diversityScore,
+      weightedScore: weightedScore,
+      skippedCandidates,
+      transitionReason: 'explorer'
+    });
 
     return {
       ...selectedTrack,
@@ -4689,7 +6177,7 @@ class DriftAudioMixer {
       this.stack.push({
         identifier: this.currentTrack.identifier,
         direction: null, // First track has no incoming direction
-        scope: this.explorerResolution || 'magnify'
+        scope: this.explorerResolution || 'adaptive'
       });
     }
     
@@ -4697,7 +6185,7 @@ class DriftAudioMixer {
       this.stack.push({
         identifier: this.nextTrack.identifier,
         direction: this.driftPlayer.getDriftState().currentDirection || null,
-        scope: this.explorerResolution || 'magnify'
+        scope: this.explorerResolution || 'adaptive'
       });
       this.stackIndex = 0; // Currently on first track
     } else {
@@ -4706,7 +6194,7 @@ class DriftAudioMixer {
   }
 
   // Add track to stack (organic exploration)
-  pushToStack(identifier, direction = null, scope = 'magnify') {
+  pushToStack(identifier, direction = null, scope = 'adaptive') {
     if (this.ephemeral) {
       console.log('📚 Session is ephemeral, not adding to stack');
       return;
@@ -4863,7 +6351,7 @@ class DriftAudioMixer {
     // Check if stack is empty or track is not at current position
     if (this.stack.length === 0) {
       // First track - add as seed with no direction
-      this.pushToStack(identifier, null, this.explorerResolution || 'magnify');
+      this.pushToStack(identifier, null, this.explorerResolution || 'adaptive');
       this.stackIndex = 0;
       this.positionSeconds = 0;
       console.log(`📚 Added seed track to stack: ${identifier}`);

@@ -109,31 +109,6 @@ body {
     visibility: hidden;
 }
 
-.radius-button {
-    width: 32px;
-    height: 32px;
-    border-radius: 16px;
-    border: 0px solid #050;
-    color: #0a0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    font-size: 16px;
-    transition: background 0.2s ease, color 0.2s ease, transform 0.1s ease;
-}
-
-.radius-button:hover {
-    color: #9f9;
-    transform: translateY(-1px);
-}
-
-.radius-button.active {
-    background: #050;
-    color: #020;
-    box-shadow: 0 0 10px rgba(0, 60, 0, 0.6);
-}
-
 /* Stack line visualization for remaining tracks */
 .stack-line-visual {
     position: absolute;
@@ -657,7 +632,7 @@ body {
     width: 100%;
     height: 100%;
     pointer-events: none;
-    z-index: 2; /* Behind UI elements but above background */
+    z-index: 10; /* Beneath deck so cards sit on top */
     opacity: 0;
     transition: opacity 0.5s ease;
 }
@@ -676,6 +651,7 @@ body {
         rgba(255, 255, 255, 0.08) 0%,
         rgba(255, 255, 255, 0.12) 50%,
         rgba(255, 255, 255, 0.08) 100%);
+    mix-blend-mode: screen;
     transition: none; /* Animation will be handled by JavaScript */
 }
 
@@ -908,35 +884,40 @@ audio {
 
 
 
-/* Midpoint tilt state for direction cards when track reaches halfway point */
-.dimension-card:not(.track-detail-card).midpoint-tilt {
+/* Danger Zone tilt state for direction cards inside the final lockout window */
+.dimension-card:not(.track-detail-card).danger-zone-tilt {
     transform: translate(-50%, -50%) translateZ(-1200px) scale(0.5) rotateX(45deg);
     transition: transform 1s ease-out;
 }
 
 #nextTrackTray {
     position: fixed;
-    bottom: 20px;
-    left: 0;
-    width: 260px;
+    top: calc(50% + 220px);
+    left: 50%;
+    transform: translate(-50%, 0);
+    width: 220px;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 16px;
-    z-index: 40;
+    gap: 12px;
+    z-index: 120;
+    pointer-events: none;
+}
+
+#nextTrackTray.has-track {
     pointer-events: auto;
 }
 
 .next-track-tray-preview {
-    width: 180px;
-    height: 180px;
-    border-radius: 16px;
+    width: 200px;
+    height: 200px;
+    border-radius: 20px;
     background-size: cover;
     background-position: center;
-    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 30px 60px rgba(0, 0, 0, 0.55);
     opacity: 0;
-    transform: translateY(24px) scale(0.85);
-    transition: transform 0.6s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.6s ease;
+    transform: translateY(35px) scale(0.8);
+    transition: transform 0.55s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.55s ease;
 }
 
 .next-track-tray-preview.visible {
@@ -946,7 +927,7 @@ audio {
 
 .next-track-tray-preview.fade-out {
     opacity: 0;
-    transform: translateY(-20px) scale(0.75);
+    transform: translateY(15px) scale(0.85);
 }
 
 @keyframes dimensionCardExitCurve {
@@ -967,6 +948,72 @@ audio {
 .dimension-card.dormant-exit {
     pointer-events: none;
     animation: dimensionCardExitCurve 0.85s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+#dimensionCards.dormant-tray-mode {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.45s ease;
+}
+
+#dimensionCards.cards-dormant {
+    pointer-events: none;
+}
+
+#dimensionCards.cards-dormant .dimension-card {
+    opacity: 1;
+    filter: none;
+    transition: opacity 0.3s ease;
+}
+
+#dimensionCards.cards-dormant::after {
+    content: '';
+    display: none;
+    position: absolute;
+    top: 12%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 6px 14px;
+    font-size: 0.82rem;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: #ffd66b;
+    background: rgba(7, 9, 13, 0.75);
+    border-radius: 999px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+}
+
+:root.deck-stale #dimensionCards .dimension-card {
+    opacity: 0.55;
+    filter: saturate(0.55);
+    transition: opacity 0.3s ease;
+}
+
+:root.deck-stale #dimensionCards::before {
+    content: 'Waiting for explorer data…';
+    position: absolute;
+    top: 8%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 6px 14px;
+    font-size: 0.78rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #9dd4ff;
+    background: rgba(8, 12, 20, 0.78);
+    border-radius: 999px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    pointer-events: none;
+    z-index: 5;
+}
+
+:root.deck-stale #dimensionCards .dimension-card .label {
+    opacity: 0.85;
+}
+
+.dimension-card.danger-zone-locked {
+    pointer-events: none;
 }
 
 .stacked-preview-layer {
@@ -1272,11 +1319,19 @@ audio {
 
 .dimension-card .dimension-label {
     margin: 0;
-    font-size: 1.6rem;
-    font-weight: 240;
+    font-size: 1.35rem;
+    font-weight: 300;
     text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
-    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
-    text-transform: uppercase;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    text-transform: none;
+    letter-spacing: 0.015em;
+}
+
+.dimension-card .dimension-label.track-only {
+    font-size: 1.4rem;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0.01em;
 }
 
 /* Uno Reverse Card Indicator */
@@ -1561,4 +1616,43 @@ audio {
     transform-origin: center;
     z-index: 1;
     transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)
+}
+#hardResetButton {
+    position: fixed;
+    top: 20px;
+    right: 70px;
+    width: 36px;
+    height: 36px;
+    background: rgba(17, 17, 17, 0.75);
+    border: 1px solid rgba(255, 0, 0, 0.5);
+    border-radius: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.35;
+    transition: all 0.3s ease;
+    z-index: 1995;
+    user-select: none;
+    backdrop-filter: blur(4px);
+}
+
+#hardResetButton:hover {
+    opacity: 0.8;
+    background: rgba(17, 17, 17, 0.95);
+    border-color: #f44;
+    transform: scale(1.05);
+}
+
+#hardResetButton.refreshing {
+    opacity: 1;
+    border-color: #ff8080;
+    background: rgba(255, 0, 0, 0.2);
+    animation: spin 1.5s linear infinite;
+}
+
+#hardResetButton .refresh-icon {
+    font-size: 16px;
+    font-weight: bold;
+    color: #f55;
 }

@@ -5,6 +5,12 @@
 //  *) updateCardWithTrackDetails
 //  *) createDirectionCard
 
+import { state, DEBUG_FLAGS, getCardBackgroundColor } from './globals.js';
+import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, getDirectionColor, variantFromDirectionType } from './tools.js';
+import { findTrackInExplorer, hydrateTrackDetails } from './explorer-utils.js';
+import { setCardVariant } from './deck-render.js';
+import { collectBeetsChips } from './beets-ui.js';
+
 const HELPERS_DEBUG = {
   colors: false,
   duplicates: false
@@ -29,10 +35,40 @@ function helpersDuplicateLog(...args) {
   const photoStyle = (albumCover) =>
     `background: ${albumCoverBackground(albumCover)}; background-size: 120%; background-position-x: 45%`
 
+  function decodeHexEncodedPath(candidate) {
+      if (!candidate || typeof candidate !== 'string') {
+          return candidate;
+      }
+      if (!candidate.startsWith('\\x') || candidate.length <= 2) {
+          return candidate;
+      }
+      const hexPart = candidate.slice(2);
+      if (hexPart.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hexPart)) {
+          return candidate;
+      }
+      try {
+          const byteLength = hexPart.length / 2;
+          const bytes = new Uint8Array(byteLength);
+          for (let i = 0; i < byteLength; i += 1) {
+              const byte = parseInt(hexPart.substr(i * 2, 2), 16);
+              if (Number.isNaN(byte)) {
+                  return candidate;
+              }
+              bytes[i] = byte;
+          }
+          const decoder = new TextDecoder('utf-8');
+          return decoder.decode(bytes);
+      } catch (error) {
+          return candidate;
+      }
+  }
+
   function extractFileStem(candidate) {
       if (!candidate || typeof candidate !== 'string') return null;
 
-      const trimmed = candidate.trim();
+      const normalized = decodeHexEncodedPath(candidate);
+
+      const trimmed = normalized.trim();
       if (!trimmed) return null;
 
       const segments = trimmed.split(/[/\\]/);
@@ -83,20 +119,32 @@ function helpersDuplicateLog(...args) {
       ];
 
       if (typeof window !== 'undefined' && track.identifier) {
-          const cachedMeta = window.state?.trackMetadataCache?.[track.identifier]?.meta;
-          if (cachedMeta) {
-              const cachedTitle = typeof cachedMeta.title === 'string' ? cachedMeta.title.trim() : '';
-              if (cachedTitle) {
-                  return cachedTitle;
+          const cacheEntry = state?.trackMetadataCache?.[track.identifier];
+          if (cacheEntry && typeof cacheEntry === 'object') {
+              const candidatePayloads = [];
+              if (cacheEntry.details && typeof cacheEntry.details === 'object') {
+                  candidatePayloads.push(cacheEntry.details);
+              }
+              if (cacheEntry.meta && typeof cacheEntry.meta === 'object') {
+                  candidatePayloads.push(cacheEntry.meta);
               }
 
-              fallbackPaths.push(
-                  cachedMeta.path,
-                  cachedMeta.file,
-                  cachedMeta.filename,
-                  cachedMeta.item?.path,
-                  cachedMeta.item?.file
-              );
+              for (const payload of candidatePayloads) {
+                  const payloadTitle = typeof payload.title === 'string' ? payload.title.trim() : '';
+                  if (payloadTitle) {
+                      return payloadTitle;
+                  }
+
+                  fallbackPaths.push(
+                      payload.path,
+                      payload.file,
+                      payload.filename,
+                      payload.item?.path,
+                      payload.item?.file,
+                      payload.libraryItem?.path,
+                      payload.libraryItem?.file
+                  );
+              }
           }
       }
 
@@ -112,43 +160,13 @@ function helpersDuplicateLog(...args) {
       return 'Unknown Track';
   }
 
-  function findTrackInExplorer(directionKey, explorerData, identifier) {
-      if (!explorerData || !explorerData.directions || !identifier) return null;
-      const directions = explorerData.directions;
-      const inspect = (direction) => {
-          if (!direction) return null;
-          const primary = direction.sampleTracks || [];
-          for (const sample of primary) {
-              const track = sample.track || sample;
-              if (track?.identifier === identifier) return track;
-          }
-          if (direction.oppositeDirection) {
-              const oppositeSamples = direction.oppositeDirection.sampleTracks || [];
-              for (const sample of oppositeSamples) {
-                  const track = sample.track || sample;
-                  if (track?.identifier === identifier) return track;
-              }
-          }
-          return null;
-      };
-
-      if (directionKey && directions[directionKey]) {
-          const directHit = inspect(directions[directionKey]);
-          if (directHit) return directHit;
-      }
-
-      for (const direction of Object.values(directions)) {
-          const hit = inspect(direction);
-          if (hit) return hit;
-      }
-      return null;
-  }
+  // findTrackInExplorer imported from explorer-utils.js
 
 
   function resolveOppositeDirectionKey(direction) {
       if (!direction) return null;
 
-      const stateRef = window.state || {};
+      const stateRef = state;
       const directions = stateRef.latestExplorerData?.directions || {};
 
       const directOpposite = direction.oppositeDirection;
@@ -251,11 +269,6 @@ function helpersDuplicateLog(...args) {
       return `<${tag} class="${classes.join(' ')}" ${attr}${styleAttr}><div class="symbol">${UNO_REVERSE_SVG}</div></${tag}>`;
   }
 
-  window.resolveOppositeDirectionKey = resolveOppositeDirectionKey;
-  window.resolveOppositeBorderColor = resolveOppositeBorderColor;
-  window.renderReverseIcon = renderReverseIcon;
-
-
   function resolveDirectionKeyForCard(direction, card, track = null, fallbackKey = null) {
       const candidates = [];
       if (direction?.key) candidates.push(direction.key);
@@ -300,8 +313,23 @@ function helpersDuplicateLog(...args) {
       );
   }
 
+  function extractSampleIdentifiers(sampleList) {
+      if (!Array.isArray(sampleList)) {
+          return [];
+      }
+      return sampleList
+          .map(sample => {
+              const track = sample && typeof sample === 'object' && sample.track ? sample.track : sample;
+              if (!track || typeof track !== 'object') {
+                  return null;
+              }
+              return track.identifier || track.trackMd5 || track.md5 || null;
+          })
+          .filter(Boolean);
+  }
+
   function hasActualOpposite(direction, resolvedKey) {
-      const stateRef = window.state || {};
+      const stateRef = state;
       const directionsMap = stateRef.latestExplorerData?.directions || {};
       const inlineOpposite = direction?.oppositeDirection;
       const inlineSamples = Array.isArray(inlineOpposite?.sampleTracks)
@@ -313,9 +341,24 @@ function helpersDuplicateLog(...args) {
           ? externalDirection.sampleTracks
           : [];
 
-      const inlineValid = inlineSamples.length > 0 && inlineOpposite?.isSynthetic !== true;
-      const externalValid = externalSamples.length > 0 && externalDirection?.isSynthetic !== true;
-      return inlineValid || externalValid;
+      const inlineIds = extractSampleIdentifiers(inlineSamples);
+      const externalIds = extractSampleIdentifiers(externalSamples);
+      const oppositeIds = [...new Set([...inlineIds, ...externalIds])];
+      if (oppositeIds.length === 0) {
+          return false;
+      }
+
+      const primaryIds = new Set(extractSampleIdentifiers(direction?.sampleTracks || []));
+      let hasDistinctOpposite = false;
+      if (primaryIds.size === 0) {
+          hasDistinctOpposite = true;
+      } else {
+          hasDistinctOpposite = oppositeIds.some(id => !primaryIds.has(id));
+      }
+
+      const inlineValid = inlineIds.length > 0 && inlineOpposite?.isSynthetic !== true;
+      const externalValid = externalIds.length > 0 && externalDirection?.isSynthetic !== true;
+      return hasDistinctOpposite && (inlineValid || externalValid);
   }
 
   function applyReverseBadge(card, direction, context, { interactive = false, extraClasses = '', highlightOverride = null } = {}) {
@@ -495,8 +538,8 @@ function helpersDuplicateLog(...args) {
 
       let value = extractMetricValue(descriptor, track);
 
-      if (value === undefined && track.identifier && window.state?.latestExplorerData) {
-          const explorerData = window.state.latestExplorerData;
+      if (value === undefined && track.identifier && state?.latestExplorerData) {
+          const explorerData = state.latestExplorerData;
           let fallback = null;
           if (direction?.key) {
               fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
@@ -525,8 +568,8 @@ function helpersDuplicateLog(...args) {
 
       let value = track?.pca?.primary_d;
 
-      if (!Number.isFinite(Number(value)) && track?.identifier && window.state?.latestExplorerData) {
-          const explorerData = window.state.latestExplorerData;
+      if (!Number.isFinite(Number(value)) && track?.identifier && state?.latestExplorerData) {
+          const explorerData = state.latestExplorerData;
           let fallback = null;
           if (direction?.key) {
               fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
@@ -554,7 +597,7 @@ function helpersDuplicateLog(...args) {
           return;
       }
 
-      const stateRef = window.state || {};
+      const stateRef = state;
       const activeCurrentTrack = currentTrack || stateRef.latestCurrentTrack;
       const descriptor = getDirectionMetricDescriptor(direction.key, direction);
 
@@ -698,7 +741,7 @@ function helpersDuplicateLog(...args) {
                   metricDiffs: diffEntries,
                   primaryDeltas
               });
-          } else if (window.DEBUG_FLAGS?.consistency && (diffEntries.length || primaryDeltas.length)) {
+          } else if (DEBUG_FLAGS?.consistency && (diffEntries.length || primaryDeltas.length)) {
               console.debug(`✅ Consistency check passed for ${direction.key}`, {
                   descriptor: descriptorKey,
                   sampleCount: samples.length,
@@ -708,8 +751,6 @@ function helpersDuplicateLog(...args) {
           }
       }
   }
-
-  window.evaluateDirectionConsistency = evaluateDirectionConsistency;
 
   // Update the stack visualization with remaining track count
   function updateStackSizeIndicator(direction, cardForContext, overrideIndex) {
@@ -733,9 +774,9 @@ function helpersDuplicateLog(...args) {
       const md5 = nextTrackCard.dataset.trackMd5;
       const directionKey = nextTrackCard.dataset.directionKey;
       const totalTracksFromDataset = Number(nextTrackCard.dataset.totalTracks);
-      const currentTrack = window.state?.latestCurrentTrack;
+      const currentTrack = state?.latestCurrentTrack;
       const sampleTracks = direction.sampleTracks || [];
-      const activeIdentifier = window.state?.selectedIdentifier || md5;
+      const activeIdentifier = state?.selectedIdentifier || md5;
       const matchedTrack = sampleTracks.find(sample => {
           const track = sample.track || sample;
           return track.identifier === activeIdentifier;
@@ -743,7 +784,7 @@ function helpersDuplicateLog(...args) {
           const track = sample.track || sample;
           return track.identifier === md5;
       }) || sampleTracks[0];
-      const nextTrackPayload = window.state?.latestExplorerData?.nextTrack?.track || window.state?.latestExplorerData?.nextTrack || {};
+      const nextTrackPayload = state?.latestExplorerData?.nextTrack?.track || state?.latestExplorerData?.nextTrack || {};
       const candidateTrack = matchedTrack || nextTrackPayload;
 
       const getIndexFromTracks = (identifier) => {
@@ -770,8 +811,8 @@ function helpersDuplicateLog(...args) {
               ? Number(nextTrackCard.dataset.trackIndex)
               : -1;
       }
-      if (matchedIndex < 0 && typeof window.state?.stackIndex === 'number') {
-          matchedIndex = window.state.stackIndex;
+      if (matchedIndex < 0 && typeof state?.stackIndex === 'number') {
+          matchedIndex = state.stackIndex;
       }
       if (matchedIndex < 0) {
           matchedIndex = 0;
@@ -781,35 +822,35 @@ function helpersDuplicateLog(...args) {
           ? totalTracksFromDataset
           : (sampleTracks.length || tracksToCount.length || 0);
 
-      if (!window.state.remainingCounts) {
-          window.state.remainingCounts = {};
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
       }
 
       let remainingCount;
       if (Number.isFinite(matchedIndex)) {
           remainingCount = Math.max(0, totalTracks - matchedIndex - 1);
-      } else if (window.state.remainingCounts.hasOwnProperty(directionKey)) {
-          remainingCount = Math.max(0, Number(window.state.remainingCounts[directionKey]));
-      } else if (window.state.stackIndex && directionKey === window.state.latestExplorerData?.nextTrack?.directionKey) {
-          const idx = Number(window.state.stackIndex);
+      } else if (state.remainingCounts.hasOwnProperty(directionKey)) {
+          remainingCount = Math.max(0, Number(state.remainingCounts[directionKey]));
+      } else if (state.stackIndex && directionKey === state.latestExplorerData?.nextTrack?.directionKey) {
+          const idx = Number(state.stackIndex);
           remainingCount = Math.max(0, totalTracks - idx - 1);
       } else {
           remainingCount = Math.max(0, totalTracks - 1);
       }
 
-      window.state.remainingCounts[directionKey] = remainingCount;
+      state.remainingCounts[directionKey] = remainingCount;
 
       if (!Number.isFinite(matchedIndex)) {
-          const stored = window.state?.remainingCounts ? window.state.remainingCounts[directionKey] : undefined;
+          const stored = state?.remainingCounts ? state.remainingCounts[directionKey] : undefined;
           if (stored !== undefined && stored !== null) {
               remainingCount = Math.max(0, Number(stored));
           }
       }
 
-      if (!window.state.remainingCounts) {
-          window.state.remainingCounts = {};
+      if (!state.remainingCounts) {
+          state.remainingCounts = {};
       }
-      window.state.remainingCounts[directionKey] = remainingCount;
+      state.remainingCounts[directionKey] = remainingCount;
       const fallbackIndex = Math.max(0, totalTracks - remainingCount - 1);
       nextTrackCard.dataset.trackIndex = String(Number.isFinite(matchedIndex) ? matchedIndex : fallbackIndex);
       nextTrackCard.dataset.totalTracks = String(totalTracks);
@@ -927,8 +968,8 @@ function helpersDuplicateLog(...args) {
       };
 
       const findFeaturesLookup = (identifier) => {
-          if (!identifier || !window.state?.latestExplorerData) return null;
-          const directions = window.state.latestExplorerData.directions || {};
+          if (!identifier || !state?.latestExplorerData) return null;
+          const directions = state.latestExplorerData.directions || {};
           for (const direction of Object.values(directions)) {
               const samples = direction.sampleTracks || [];
               for (const sample of samples) {
@@ -942,8 +983,8 @@ function helpersDuplicateLog(...args) {
       };
 
       const findPcaLookup = (identifier) => {
-          if (!identifier || !window.state?.latestExplorerData) return null;
-          const directions = window.state.latestExplorerData.directions || {};
+          if (!identifier || !state?.latestExplorerData) return null;
+          const directions = state.latestExplorerData.directions || {};
           for (const direction of Object.values(directions)) {
               const samples = direction.sampleTracks || [];
               for (const sample of samples) {
@@ -1106,17 +1147,13 @@ function helpersDuplicateLog(...args) {
       nextTrackCard.appendChild(metricsContainer);
       revealTargets.push(metricsContainer);
 
-      const collectChips = typeof window.collectBeetsChips === 'function'
-          ? window.collectBeetsChips
-          : null;
-
-      if (collectChips) {
+      if (collectBeetsChips) {
           const trackData = candidateTrack && (candidateTrack.track || candidateTrack);
           if (trackData) {
               const beetsMeta = trackData.beetsMeta || trackData.beets || null;
               const beetsChips = Array.isArray(beetsMeta)
                   ? beetsMeta
-                  : (beetsMeta ? collectChips(beetsMeta) : []);
+                  : (beetsMeta ? collectBeetsChips(beetsMeta) : []);
 
               const chipsArray = Array.isArray(beetsChips) ? beetsChips.slice(0, 12) : [];
 
@@ -1267,9 +1304,6 @@ function helpersDuplicateLog(...args) {
       card.appendChild(stackLineContainer);
   }
 
-  window.applyDirectionStackIndicator = applyDirectionStackIndicator;
-
-
   // Comprehensive duplicate detection system
 
   function performDuplicateAnalysis(explorerData, context = "unknown") {
@@ -1413,7 +1447,7 @@ function helpersDuplicateLog(...args) {
                   sampleTracks: directionData.sampleTracks || sampleTracks
               };
 
-              updateCardWithTrackDetails(centerCard, nextTrack, directionForUpdate, true, window.swapStackContents);
+              updateCardWithTrackDetails(centerCard, nextTrack, directionForUpdate, true, swapStackContents);
 
               if (typeof updateStackSizeIndicator === 'function') {
                   updateStackSizeIndicator(directionData, centerCard, nextIndex);
@@ -1558,6 +1592,11 @@ function helpersDuplicateLog(...args) {
       if (reverseButton) {
           reverseButton.addEventListener('click', (e) => {
               e.stopPropagation();
+              const interactionState = typeof window !== 'undefined' ? (window.__deckInteractionState || {}) : {};
+              if (interactionState.cardsLocked) {
+                  console.warn('🔒 Reverse toggle ignored while cards are locked');
+                  return;
+              }
               console.log(`🔄 Swapping stack contents from ${resolvedKey} to opposite`);
 
               const currentDirection = state.latestExplorerData.directions[resolvedKey];
@@ -1786,7 +1825,7 @@ function helpersDuplicateLog(...args) {
                   ...targetDimension,
                   key: newNextDirectionKey,
                   sampleTracks: sampleTracks.map(track => ({ track }))
-              }, true, window.swapStackContents);
+              }, true, swapStackContents);
               targetCard.classList.add('next-track', 'track-detail-card');
           }
       };
@@ -1819,7 +1858,7 @@ function helpersDuplicateLog(...args) {
 
       // Create selected card (front, fully visible)
       const selectedTrack = sampleTracks[finalSelectedTrackIndex];
-      const swapFn = typeof window.swapStackContents === 'function' ? window.swapStackContents : () => {};
+      const swapFn = typeof swapStackContents === 'function' ? swapStackContents : () => {};
       const selectedCard = createTrackDetailCard(direction, selectedTrack.track || selectedTrack, index, total, true, 0, sampleTracks.length, swapFn);
       container.appendChild(selectedCard);
       selectedCard.dataset.trackIndex = String(finalSelectedTrackIndex);
@@ -1877,9 +1916,11 @@ function helpersDuplicateLog(...args) {
 
       // Format as readable JSON with proper indentation
       helpersColorLog(`🎨 JSON 3`);
-      text1.textContent = JSON.stringify(trackPayload, null, 2);
+      const sanitizedTrackPayload = sanitizeMetadataValue(trackPayload) ?? null;
+      text1.textContent = JSON.stringify(sanitizedTrackPayload, null, 2);
       console.dir({got: text1.textContent, from: trackPayload});
-      text2.textContent = JSON.stringify(metadata2, null, 2);
+      const sanitizedMetadata = sanitizeMetadataValue(metadata2) ?? null;
+      text2.textContent = JSON.stringify(sanitizedMetadata, null, 2);
       console.dir({got: text2.textContent, from: metadata2});
 
       helpersColorLog(`🎨 JSON metadata overlay updated for: ${direction.key}`);
@@ -1893,9 +1934,9 @@ function helpersDuplicateLog(...args) {
           `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
           '??:??';
 
-      if (track && typeof window !== 'undefined' && typeof window.hydrateTrackDetails === 'function') {
+      if (track && typeof window !== 'undefined' && typeof hydrateTrackDetails === 'function') {
           try {
-              window.hydrateTrackDetails(track, { reason: 'card-update' }).catch(() => {});
+              hydrateTrackDetails(track, { reason: 'card-update' }).catch(() => {});
           } catch (err) {
               // Swallow hydration errors - cards can render with partial metadata
           }
@@ -1922,8 +1963,8 @@ function helpersDuplicateLog(...args) {
 
       const variantClass = variantFromDirectionType(directionType);
 
-      if (typeof window !== 'undefined' && typeof window.setCardVariant === 'function') {
-          window.setCardVariant(card, variantFromDirectionType(directionType));
+      if (typeof window !== 'undefined' && typeof setCardVariant === 'function') {
+          setCardVariant(card, variantFromDirectionType(directionType));
       }
 
       const baseDirectionKeyForCard = card.dataset.baseDirectionKey
@@ -2049,8 +2090,8 @@ function helpersDuplicateLog(...args) {
       card.style.setProperty('--border-color', borderColor);
       card.style.setProperty('--glow-color', glowColor);
       card.style.setProperty('--card-border-color', borderColor);
-      if (typeof window !== 'undefined' && typeof window.getCardBackgroundColor === 'function') {
-          card.style.setProperty('--card-background-color', window.getCardBackgroundColor(directionType));
+      if (typeof window !== 'undefined' && typeof getCardBackgroundColor === 'function') {
+          card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
       }
 
       // ALSO update the data attributes to match
@@ -2174,7 +2215,7 @@ function helpersDuplicateLog(...args) {
           evaluateDirectionConsistency(direction, {
               card,
               sampleTracks: samplesForCheck,
-              currentTrack: window.state?.latestCurrentTrack
+              currentTrack: state?.latestCurrentTrack
           });
       }
   }
@@ -2183,3 +2224,60 @@ function helpersDuplicateLog(...args) {
       const relativeComponent = magnitude * CONSISTENCY_DYNAMIC_RELATIVE;
       return Math.max(CONSISTENCY_CHECK_TOLERANCE, CONSISTENCY_DYNAMIC_MIN_TOLERANCE, relativeComponent);
   }
+  function sanitizeMetadataValue(value) {
+      if (value === null || value === undefined) {
+          return value;
+      }
+      if (typeof value === 'string') {
+          return value.trim() === '' ? undefined : value;
+      }
+      if (Array.isArray(value)) {
+          const mapped = value
+              .map(item => sanitizeMetadataValue(item))
+              .filter(item => item !== undefined);
+          return mapped;
+      }
+      if (typeof value === 'object') {
+          const result = {};
+          let hasValue = false;
+          Object.entries(value).forEach(([key, val]) => {
+              const sanitized = sanitizeMetadataValue(val);
+              if (sanitized !== undefined) {
+                  result[key] = sanitized;
+                  hasValue = true;
+              }
+          });
+          return hasValue ? result : undefined;
+      }
+      return value;
+  }
+
+// ES module exports
+export {
+    getDisplayTitle,
+    photoStyle,
+    albumCoverBackground,
+    renderReverseIcon,
+    updateCardWithTrackDetails,
+    cycleStackContents,
+    applyDirectionStackIndicator,
+    resolveOppositeBorderColor,
+    createNextTrackCardStack,
+    hideStackSizeIndicator,
+    applyReverseBadge,
+    ensureStackedPreviewLayer,
+    clearStackedPreviewLayer,
+    renderStackedPreviews,
+    redrawDimensionCardsWithNewNext,
+    hideDirectionKeyOverlay,
+    updateDirectionKeyOverlay,
+    decodeHexEncodedPath,
+    extractFileStem
+};
+
+// Keep window.* for console debugging
+if (typeof window !== 'undefined') {
+    window.getDisplayTitle = getDisplayTitle;
+    window.photoStyle = photoStyle;
+    window.updateCardWithTrackDetails = updateCardWithTrackDetails;
+}

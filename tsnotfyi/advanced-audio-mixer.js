@@ -69,6 +69,11 @@ class AdvancedAudioMixer {
     this.onCrossfadeStart = null;
     this.onError = null;
 
+    this.trackMetadata = {
+      current: null,
+      next: null
+    };
+
     console.log('🎛️ Advanced Audio Mixer initialized');
   }
 
@@ -81,7 +86,7 @@ class AdvancedAudioMixer {
   }
 
   // Load and process a track into the buffer with aggressive caching
-  async loadTrack(trackPath, slot = 'current') {
+  async loadTrack(trackPath, slot = 'current', metadata = null) {
     console.log(`🎵 Loading track: ${trackPath} into ${slot} slot`);
 
     try {
@@ -104,6 +109,8 @@ class AdvancedAudioMixer {
           track.crossfadeLeadTime = cached.analysis.crossfadeLeadTime || 8; // Default if not cached
           console.log(`🎯 Next track (cached) crossfade lead time: ${track.crossfadeLeadTime}s`);
         }
+
+        this.setSlotMetadata(slot, metadata);
 
         return {
           bpm: cached.bpm,
@@ -155,12 +162,15 @@ class AdvancedAudioMixer {
 
       console.log(`✅ Track processed and cached: BPM=${analysis.bpm}, Key=${analysis.key}, Size=${streamBuffer.length} bytes`);
 
-      return {
+      const trackDetails = {
         bpm: analysis.bpm,
         key: analysis.key,
         duration: trimmedResult.actualDuration, // Return the recalculated duration
         size: streamBuffer.length
       };
+      this.setSlotMetadata(slot, metadata);
+
+      return trackDetails;
 
     } catch (error) {
       console.error(`❌ Failed to load track: ${error.message}`);
@@ -1002,6 +1012,8 @@ class AdvancedAudioMixer {
     this.engine.isCrossfading = false;
     this.engine.crossfadePosition = 0;
     this.engine.tempoAdjustment = 1.0;
+    this.trackMetadata.current = this.trackMetadata.next || null;
+    this.trackMetadata.next = null;
 
     if (this.onTrackStart) {
       this.onTrackStart('crossfade_complete');
@@ -1091,6 +1103,36 @@ class AdvancedAudioMixer {
       estimatedDuration: null,
       crossfadeLeadTime: null
     };
+
+    this.trackMetadata.next = null;
+  }
+
+  setSlotMetadata(slot, metadata) {
+    if (slot !== 'current' && slot !== 'next') {
+      return;
+    }
+    if (!metadata) {
+      this.trackMetadata[slot] = null;
+      return;
+    }
+    this.trackMetadata[slot] = {
+      identifier: metadata.identifier || null,
+      title: metadata.title || null,
+      artist: metadata.artist || null,
+      album: metadata.album || null,
+      path: metadata.path || null
+    };
+  }
+
+  getSlotMetadata(slot) {
+    if (slot !== 'current' && slot !== 'next') {
+      return null;
+    }
+    return this.trackMetadata[slot] || null;
+  }
+
+  getCurrentPlaybackMetadata() {
+    return this.trackMetadata.current || null;
   }
 
   // Get cache efficiency stats
@@ -1285,6 +1327,23 @@ class AdvancedAudioMixer {
     }
 
     return maxRMS;
+  }
+
+  logPlaybackSummary(event = 'playback') {
+    const metadata = this.trackMetadata.current || null;
+    const startTime = this.engine.streamingStartTime;
+    if (!metadata || !metadata.identifier || !startTime) {
+      return;
+    }
+    const elapsedSeconds = (Date.now() - startTime) / 1000;
+    const estimatedDuration = this.engine.currentTrack?.estimatedDuration || null;
+    console.log('🕒 [timing] Track playback summary', {
+      event,
+      trackId: metadata.identifier,
+      title: metadata.title,
+      elapsedSeconds: Number(elapsedSeconds.toFixed(3)),
+      estimatedDuration
+    });
   }
 
   // Clean up resources

@@ -1,3 +1,4 @@
+require('./utils/logTimestamps');
 const express = require('express');
 const session = require('express-session');
 const path = require('path');
@@ -9,6 +10,7 @@ const VAEService = require('./services/vaeService');
 const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
 const serverLogger = require('./server-logger');
+const internalMetrics = require('./metrics/internalMetrics');
 
 const startupLog = serverLogger.createLogger('startup');
 const serverLog = serverLogger.createLogger('server');
@@ -234,7 +236,7 @@ function checkoutPrimedSession(resolution = 'request') {
 
   session.isPrimed = false;
   sessionLog.info(`🔥 Primed session ${sessionId} assigned (${resolution})`);
-  schedulePrimedSessions('replenish');
+  setTimeout(() => schedulePrimedSessions('replenish'), 45000);
   return session;
 }
 
@@ -397,7 +399,31 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // Serve static files and middleware
-app.use(express.json());
+const defaultJsonParser = express.json({ limit: '8mb' });
+const clientLogJsonParser = express.json({ limit: '32mb' });
+
+app.post('/client-logs', clientLogJsonParser, (req, res) => {
+  const { sessionId = null, entries = [], reason = 'unspecified', clientTimestamp = Date.now() } = req.body || {};
+  if (!Array.isArray(entries) || entries.length === 0) {
+    res.status(204).end();
+    return;
+  }
+
+  try {
+    serverLogger.writeClientLogBatch(sessionId, entries, { reason, clientTimestamp });
+    res.json({ ok: true, accepted: entries.length });
+  } catch (error) {
+    console.error('❌ Failed to persist client log batch', {
+      sessionId: sessionId || null,
+      reason,
+      entries: entries.length,
+      error: error?.message || error
+    });
+    res.status(500).json({ ok: false, error: 'client-log-write-failed' });
+  }
+});
+
+app.use(defaultJsonParser);
 
 // Session middleware (infrastructure only - not changing behavior yet)
 app.use(session({
@@ -412,9 +438,39 @@ app.use(session({
   name: config.session.cookieName
 }));
 
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const elapsed = Number(process.hrtime.bigint() - start) / 1e6;
+    const routePath = req.route?.path
+      ? `${req.baseUrl || ''}${req.route.path}`
+      : req.path || (req.originalUrl ? req.originalUrl.split('?')[0] : 'unknown');
+    internalMetrics.recordHttpRequest({
+      method: req.method,
+      path: routePath,
+      statusCode: res.statusCode,
+      durationMs: elapsed
+    });
+  });
+  next();
+});
+
 app.use(express.static('public'));
 app.use( '/images', express.static('images') );
 app.use( '/Volumes', express.static('/Volumes', { fallthrough: false }) );
+
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') {
+    console.error('🚫 Request payload exceeded limit', {
+      path: req.path,
+      limit: err.limit,
+      length: err.length
+    });
+    res.status(413).json({ ok: false, error: 'payload-too-large' });
+    return;
+  }
+  next(err);
+});
 
 // Create a new session on demand
 app.post('/create-session', async (req, res) => {
@@ -428,6 +484,37 @@ app.post('/create-session', async (req, res) => {
   } catch (error) {
     sessionLog.error('Failed to create session:', error);
     res.status(500).json({ error: 'Failed to create session' });
+  }
+});
+
+app.post('/session/bootstrap', async (req, res) => {
+  try {
+    const session = await getSessionForRequest(req, { createIfMissing: true });
+
+    if (!session) {
+      logSessionEvent('session_bootstrap_failed', {
+        reason: 'session_unavailable',
+        ip: extractRequestIp(req)
+      }, { level: 'warn' });
+      return res.status(503).json({ error: 'Session unavailable' });
+    }
+
+    const fingerprint = fingerprintRegistry.getFingerprintForSession(session.sessionId);
+    logSessionEvent('session_bootstrap', {
+      sessionId: session.sessionId,
+      fingerprint: fingerprint || null,
+      ip: extractRequestIp(req)
+    });
+
+    res.json({
+      sessionId: session.sessionId,
+      fingerprint: fingerprint || null,
+      mixerReady: Boolean(session.mixer && !session.mixer.pendingClientBootstrap),
+      createdAt: session.created ? session.created.toISOString() : null
+    });
+  } catch (error) {
+    sessionLog.error('Failed to bootstrap session:', error);
+    res.status(500).json({ error: 'Failed to bootstrap session' });
   }
 });
 
@@ -805,7 +892,23 @@ app.get('/events', async (req, res) => {
         sseLog.error('📡 Failed to broadcast explorer snapshot on connect:', err);
       });
     } else {
-      sseLog.info('📡 No valid current track to broadcast, skipping initial snapshot');
+      sseLog.info('📡 No valid current track yet; awaiting bootstrap before first snapshot');
+      try {
+        const ready = await session.mixer.awaitCurrentTrackReady?.(15000);
+        if (ready && session.mixer.currentTrack && session.mixer.isActive) {
+          sseLog.info('📡 Bootstrap complete; dispatching initial snapshot after wait');
+          await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
+          session.mixer.broadcastExplorerSnapshot(true, 'sse-connected').catch(err => {
+            sseLog.error('📡 Failed to broadcast explorer snapshot on delayed connect:', err);
+          });
+        } else {
+          sseLog.warn('📡 Bootstrap wait timed out; current track still unavailable');
+          res.write('data: {"type":"bootstrap_pending","message":"awaiting_current_track"}\n\n');
+        }
+      } catch (bootstrapError) {
+        sseLog.error('📡 Bootstrap wait failed:', bootstrapError);
+        res.write('data: {"type":"bootstrap_pending","message":"awaiting_current_track"}\n\n');
+      }
     }
 
     req.on('close', () => {
@@ -930,10 +1033,12 @@ app.post('/refresh-sse', async (req, res) => {
       return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
     }
 
+    const forceExplorerUpdate = req.body.forceExplorerUpdate === true;
+
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
       console.log(`🔄 Triggering heartbeat + snapshot for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       await session.mixer.broadcastHeartbeat('manual-refresh', { force: true });
-      session.mixer.broadcastExplorerSnapshot(true, 'manual-refresh').catch(err => {
+      session.mixer.broadcastExplorerSnapshot(forceExplorerUpdate, 'manual-refresh').catch(err => {
         console.error('🔄 Failed to broadcast explorer snapshot during refresh:', err);
       });
 
@@ -1976,9 +2081,22 @@ app.get('/search', async (req, res) => {
     }
     const rows = result.rows;
 
+    const decodeBtPath = (btPath) => {
+      if (btPath && btPath.startsWith('\\x')) {
+        try {
+          const hexString = btPath.slice(2);
+          const buffer = Buffer.from(hexString, 'hex');
+          return buffer.toString('utf8');
+        } catch (error) {
+          return btPath;
+        }
+      }
+      return btPath;
+    };
+
     const results = rows.map(row => {
       try {
-        const decodedPath = row.bt_path;
+        const decodedPath = decodeBtPath(row.bt_path);
         const filename = path.basename(decodedPath);
         const directory = path.dirname(decodedPath).replace('/Volumes/', '');
 
@@ -2597,10 +2715,20 @@ app.get('/api/dimensions/track/:id', async (req, res) => {
         }
       });
 
+      const hasReportableMetadataValue = (value) => {
+        if (value === null || value === undefined) {
+          return false;
+        }
+        if (typeof value === 'string' && value.trim() === '') {
+          return false;
+        }
+        return true;
+      };
+
       if (vaeMetadataFields.length > 0) {
         response.metadata.vae = {};
         vaeMetadataFields.forEach(field => {
-          if (track[field] !== null && track[field] !== undefined) {
+          if (hasReportableMetadataValue(track[field])) {
             response.metadata.vae[field] = track[field];
           }
         });
@@ -2611,7 +2739,7 @@ app.get('/api/dimensions/track/:id', async (req, res) => {
       
       // Add metadata (subset for API)
       ['bt_artist', 'bt_title', 'bt_album', 'bt_year', 'bt_length'].forEach(field => {
-        if (track[field] !== null && track[field] !== undefined) {
+        if (hasReportableMetadataValue(track[field])) {
           response.metadata[field] = track[field];
         }
       });
@@ -3305,7 +3433,7 @@ app.post('/session/:sessionId/force-next', (req, res) => {
   res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/force-next instead.' });
 });
 
-// Zoom mode commands (microscope, magnifying glass, binoculars)
+// Zoom mode command (legacy aliases now converge on adaptive tuning)
 app.post('/session/zoom/:mode', async (req, res) => {
   const mode = req.params.mode;
   const session = await getSessionForRequest(req, { createIfMissing: false });
@@ -3314,20 +3442,22 @@ app.post('/session/zoom/:mode', async (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  const validModes = ['microscope', 'magnifying', 'binoculars'];
-  if (!validModes.includes(mode)) {
+  const supportedModes = ['adaptive', 'auto', 'microscope', 'magnifying', 'binoculars'];
+  if (!supportedModes.includes(mode)) {
     return res.status(400).json({ error: 'Invalid zoom mode' });
   }
 
   try {
-    console.log(`🔍 Zoom mode ${mode} for session ${session.sessionId}`);
+    console.log(`🔍 Zoom mode request '${mode}' for session ${session.sessionId}`);
 
     if (!session.mixer.setExplorerResolution) {
       return res.status(400).json({ error: 'Session does not support zoom controls' });
     }
 
-    const normalizedMode = mode === 'magnifying' ? 'magnifying_glass' : mode;
+    const normalizedMode = mode === 'auto' ? 'adaptive' : mode;
     const changed = session.mixer.setExplorerResolution(normalizedMode);
+
+    const deprecated = ['microscope', 'magnifying', 'binoculars'].includes(mode);
 
     if (changed) {
       await session.mixer.broadcastHeartbeat('zoom-change', { force: false });
@@ -3337,20 +3467,25 @@ app.post('/session/zoom/:mode', async (req, res) => {
     }
 
     const modeEmoji = {
+      'adaptive': '🧭',
+      'auto': '🧭',
       'microscope': '🔬',
       'magnifying': '🔍',
-      'magnifying_glass': '🔍',
       'binoculars': '🔭'
     };
 
-    const emoji = modeEmoji[mode] || modeEmoji[normalizedMode] || '';
+    const emoji = modeEmoji[normalizedMode] || modeEmoji[mode] || '';
 
     res.json({
-      message: `${emoji} ${mode} mode activated`,
-      mode,
+      message: deprecated
+        ? `${emoji} Adaptive explorer tuning is now automatic`
+        : `${emoji} Adaptive explorer tuning confirmed`,
+      mode: 'adaptive',
+      requestedMode: mode,
       sessionId: session.sessionId,
       resolution: session.mixer.explorerResolution,
-      broadcast: changed
+      broadcast: changed,
+      deprecated
     });
   } catch (error) {
     console.error('Zoom mode error:', error);
@@ -3662,6 +3797,60 @@ app.get('/sessions/now-playing', (req, res) => {
   });
 });
 
+app.get('/internal/metrics', (req, res) => {
+  const snapshot = internalMetrics.getMetricsSnapshot({
+    sessions: {
+      active: audioSessions.size,
+      ephemeral: ephemeralSessions.size
+    },
+    radialSearch: radialSearch.getStats(),
+    adaptiveRadius: internalMetrics.summarizeAdaptiveRadius(audioSessions, ephemeralSessions)
+  });
+  res.json(snapshot);
+});
+
+app.get('/internal/sessions', (req, res) => {
+  const summaries = internalMetrics.collectSessions(audioSessions, ephemeralSessions);
+  const limit = Number(req.query.limit);
+  const payload = Number.isFinite(limit) && limit > 0 ? summaries.slice(0, limit) : summaries;
+  res.json({
+    timestamp: Date.now(),
+    count: summaries.length,
+    sessions: payload
+  });
+});
+
+app.get('/internal/logs/recent', (req, res) => {
+  const limit = Number(req.query.limit);
+  const entries = internalMetrics.getRecentLogs({
+    channel: req.query.channel,
+    level: req.query.level,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : 100
+  });
+  res.json({
+    timestamp: Date.now(),
+    count: entries.length,
+    entries
+  });
+});
+
+app.get('/internal/sessions/:sessionId/events', (req, res) => {
+  const sessionId = req.params.sessionId;
+  const session = getSessionById(sessionId);
+  if (!session || !session.mixer) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  const limit = Number(req.query.limit);
+  const events = Array.isArray(session.mixer.sessionEvents) ? session.mixer.sessionEvents : [];
+  const payload = Number.isFinite(limit) && limit > 0 ? events.slice(-limit) : events;
+  res.json({
+    sessionId,
+    timestamp: Date.now(),
+    count: payload.length,
+    events: payload
+  });
+});
+
 // Session control endpoints (legacy compatibility)
 app.post('/session/seek', async (req, res) => {
   const session = await getSessionForRequest(req, { createIfMissing: false });
@@ -3743,7 +3932,7 @@ function startServer() {
 
   serverInstance = app.listen(port, () => {
     console.log(`🎵 Audio streaming server listening at http://localhost:${port}`);
-    console.log('🎯 No Icecast needed - direct Node.js streaming!');
+    console.log('🎯 PCM mixer engaged - streaming directly from Node.js');
     console.log(`🔒 Server protected by PID ${process.pid}`);
   });
 

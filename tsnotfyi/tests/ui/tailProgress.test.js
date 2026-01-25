@@ -44,7 +44,7 @@ describe('tail progress behaviour', () => {
     expect(state.tailProgress).toBe(0);
     expect(document.documentElement.classList.contains('tail-active')).toBe(false);
 
-    jest.advanceTimersByTime(15_000); // halfway through the tail window
+    jest.advanceTimersByTime(25_000); // allow audio wait fallback + tail ramp
     expect(state.tailProgress).toBeGreaterThan(0.45);
     expect(document.documentElement.classList.contains('tail-active')).toBe(true);
     expect(document.querySelector('.dimension-card.interaction-locked')).toBeNull();

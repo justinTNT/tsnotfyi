@@ -167,7 +167,34 @@ function loadScript(relativePath) {
   const filePath = path.resolve(__dirname, '../../public/scripts', relativePath);
   let source = fs.readFileSync(filePath, 'utf8');
   if (relativePath === 'page.js') {
-    source += `\nif (typeof window !== 'undefined') {\n  if (typeof startProgressAnimationFromPosition === 'function') {\n    window.startProgressAnimationFromPosition = startProgressAnimationFromPosition;\n  }\n  if (typeof stopProgressAnimation === 'function') {\n    window.stopProgressAnimation = stopProgressAnimation;\n  }\n}\n`;
+    source += `
+if (typeof window !== 'undefined') {
+  if (typeof createDimensionCards === 'function') {
+    window.createDimensionCards = createDimensionCards;
+  }
+  if (typeof navigateDirectionToCenter === 'function') {
+    window.navigateDirectionToCenter = navigateDirectionToCenter;
+  }
+  if (typeof rotateCenterCardToNextPosition === 'function') {
+    window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
+  }
+  if (typeof convertToNextTrackStack === 'function') {
+    window.convertToNextTrackStack = convertToNextTrackStack;
+  }
+  if (typeof startProgressAnimationFromPosition === 'function') {
+    window.startProgressAnimationFromPosition = startProgressAnimationFromPosition;
+  }
+  if (typeof stopProgressAnimation === 'function') {
+    window.stopProgressAnimation = stopProgressAnimation;
+  }
+  window.__deckTestHooks = Object.assign({}, window.__deckTestHooks, {
+    createDimensionCards: typeof createDimensionCards === 'function' ? createDimensionCards : undefined,
+    navigateDirectionToCenter: typeof navigateDirectionToCenter === 'function' ? navigateDirectionToCenter : undefined,
+    rotateCenterCardToNextPosition: typeof rotateCenterCardToNextPosition === 'function' ? rotateCenterCardToNextPosition : undefined,
+    convertToNextTrackStack: typeof convertToNextTrackStack === 'function' ? convertToNextTrackStack : undefined
+  });
+}
+`;
   }
   const script = document.createElement('script');
   script.type = 'text/javascript';
@@ -180,6 +207,7 @@ bootstrapMinimalDom();
 // Load dependencies in the same order as the browser
 loadScript('tools.js');
 loadScript('helpers.js');
+loadScript('deck-frame-builder.js');
 
 // Expose helper for direct tests
 if (typeof window.getDisplayTitle === 'function') {
@@ -188,6 +216,9 @@ if (typeof window.getDisplayTitle === 'function') {
 
 // Load page.js after base helpers so we can exercise progress/clock behaviour in tests
 loadScript('page.js');
+
+window.__deckTestHooks = window.__deckTestHooks || {};
+window.__deckTestHooks.forceImmediateRender = true;
 
 // Export a convenience hook for tests needing access to the elements/state
 const resolveProgressHook = () => {
