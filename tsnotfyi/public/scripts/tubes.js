@@ -121,15 +121,19 @@ function hsl(h, s, l) {
       });
 
 
-      // Smooth thickness transition
+      // Smooth thickness transition - only update geometry when scale is changing
+      const prevScale = RADIUS_SCALE;
       RADIUS_SCALE += (RADIUS_SCALE_TARGET - RADIUS_SCALE) * 0.12;
-      beams.forEach((b, i) => {
-          const isHot = (i === selectedLong) || (i === selectedLat);
-          if (isHot) return;
-          const baseFn = makePulledThreadRadiusFn(b.rSeedA, b.rSeedB);
-          const desiredFn = (s) => baseFn(s) * RADIUS_SCALE;
-          retargetTubeRadius(b.mesh.geometry, PATH_RES, RADIAL_SEG, desiredFn);
-      });
+      const scaleChanged = Math.abs(RADIUS_SCALE - prevScale) > 0.001;
+      if (scaleChanged) {
+          beams.forEach((b, i) => {
+              const isHot = (i === selectedLong) || (i === selectedLat);
+              if (isHot) return;
+              const baseFn = makePulledThreadRadiusFn(b.rSeedA, b.rSeedB);
+              const desiredFn = (s) => baseFn(s) * RADIUS_SCALE;
+              retargetTubeRadius(b.mesh.geometry, PATH_RES, RADIAL_SEG, desiredFn);
+          });
+      }
 
       // Rebuild hot beams
       rebuildHotBeamGeometry(beams, selectedLong, t);
@@ -201,7 +205,7 @@ function hsl(h, s, l) {
           }
       }
       pos.needsUpdate = true;
-      geo.computeVertexNormals();
+      // Normals not needed - using MeshBasicMaterial which ignores lighting
   }
 
 
@@ -239,7 +243,7 @@ function hsl(h, s, l) {
           }
       }
       pos.needsUpdate = true;
-      geo.computeVertexNormals();
+      // Normals not needed - using MeshBasicMaterial which ignores lighting
   }
 
   function makePulledThreadRadiusFn(seedA = 0, seedB = 0) {

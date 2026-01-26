@@ -886,21 +886,17 @@ app.get('/events', async (req, res) => {
         session.mixer.isActive &&
         session.mixer.currentTrack.title &&
         session.mixer.currentTrack.title.trim() !== '') {
-      sseLog.info('📡 Sending heartbeat and explorer snapshot to new SSE client');
+      sseLog.info('📡 Sending heartbeat to new SSE client (explorer via POST /explorer)');
       await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
-      session.mixer.broadcastExplorerSnapshot(true, 'sse-connected').catch(err => {
-        sseLog.error('📡 Failed to broadcast explorer snapshot on connect:', err);
-      });
+      // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
     } else {
-      sseLog.info('📡 No valid current track yet; awaiting bootstrap before first snapshot');
+      sseLog.info('📡 No valid current track yet; awaiting bootstrap before first heartbeat');
       try {
         const ready = await session.mixer.awaitCurrentTrackReady?.(15000);
         if (ready && session.mixer.currentTrack && session.mixer.isActive) {
-          sseLog.info('📡 Bootstrap complete; dispatching initial snapshot after wait');
+          sseLog.info('📡 Bootstrap complete; dispatching initial heartbeat after wait');
           await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
-          session.mixer.broadcastExplorerSnapshot(true, 'sse-connected').catch(err => {
-            sseLog.error('📡 Failed to broadcast explorer snapshot on delayed connect:', err);
-          });
+          // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
         } else {
           sseLog.warn('📡 Bootstrap wait timed out; current track still unavailable');
           res.write('data: {"type":"bootstrap_pending","message":"awaiting_current_track"}\n\n');
@@ -1033,14 +1029,13 @@ app.post('/refresh-sse', async (req, res) => {
       return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
     }
 
-    const forceExplorerUpdate = req.body.forceExplorerUpdate === true;
+    // Explorer refresh is now done via POST /explorer - no longer broadcast via SSE
+    // const forceExplorerUpdate = req.body.forceExplorerUpdate === true || req.body.forceExplorerRefresh === true;
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering heartbeat + snapshot for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
+      console.log(`🔄 Triggering heartbeat for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       await session.mixer.broadcastHeartbeat('manual-refresh', { force: true });
-      session.mixer.broadcastExplorerSnapshot(forceExplorerUpdate, 'manual-refresh').catch(err => {
-        console.error('🔄 Failed to broadcast explorer snapshot during refresh:', err);
-      });
+      // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
 
       const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
       const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
@@ -3132,20 +3127,242 @@ app.post('/pca/directional-search', async (req, res) => {
   }
 });
 
+// Dead endpoint - kept for backwards compatibility, returns empty response
 app.post('/pca/explore', async (req, res) => {
+  res.status(410).json({ error: 'This endpoint has been deprecated. Use POST /explorer instead.' });
+});
+
+// New explorer endpoint - request/response model for playlist-aware exploration
+// Replaces SSE-based explorer snapshot broadcasts
+app.post('/explorer', async (req, res) => {
+  const startTime = Date.now();
+  serverLog.info(`🎯 Explorer request received: ${JSON.stringify(req.body)}`);
   try {
-    const { trackId, config = {} } = req.body;
+    const { trackId, sessionId, playlistTrackIds = [], fingerprint: requestFingerprint } = req.body;
 
     if (!trackId) {
+      serverLog.warn('🎯 Explorer request missing trackId');
       return res.status(400).json({ error: 'trackId is required' });
     }
+    serverLog.info(`🎯 Explorer request for trackId: ${trackId.substring(0, 8)}`);
 
-    // Use PCA by default with new explore endpoint
-    const pcaConfig = { usePCA: true, ...config };
-    const result = await radialSearch.exploreFromTrack(trackId, pcaConfig);
-    res.json(result);
+
+    // Resolve session from fingerprint or sessionId
+    let session = null;
+    if (typeof requestFingerprint === 'string' && requestFingerprint.trim()) {
+      const entry = fingerprintRegistry.lookup(requestFingerprint.trim());
+      if (entry) {
+        session = getSessionById(entry.sessionId) || null;
+        fingerprintRegistry.touch(requestFingerprint.trim(), { metadataIp: req.ip });
+      }
+    }
+    if (!session && sessionId) {
+      session = getSessionById(sessionId) || null;
+    }
+
+    // Build track lookup set for playlist filtering
+    const playlistTrackSet = new Set(Array.isArray(playlistTrackIds) ? playlistTrackIds : []);
+
+    // Get artists/albums from playlist tracks for deprioritization
+    const playlistArtists = new Set();
+    const playlistAlbums = new Set();
+    for (const pid of playlistTrackSet) {
+      const trackData = radialSearch.kdTree?.getTrack(pid);
+      if (trackData) {
+        if (trackData.artist) playlistArtists.add(trackData.artist.toLowerCase());
+        if (trackData.album) playlistAlbums.add(trackData.album.toLowerCase());
+      }
+    }
+
+    // Get the track we're exploring from (not necessarily the currently playing track)
+    const sourceTrack = radialSearch.kdTree?.getTrack(trackId);
+    if (!sourceTrack) {
+      serverLog.warn(`🎯 Track not found: ${trackId}`);
+      return res.status(404).json({ error: 'Track not found' });
+    }
+    serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
+
+    // Build explorer data - use session mixer if available, otherwise use radial search directly
+    let explorerData;
+    if (session?.mixer) {
+      serverLog.info(`🎯 Using session mixer for explorer data`);
+
+      // Use the session's mixer to get comprehensive explorer data
+      // Temporarily set the mixer's currentTrack to the source track for exploration
+      const originalCurrentTrack = session.mixer.currentTrack;
+      session.mixer.currentTrack = sourceTrack;
+      try {
+        explorerData = await session.mixer.getComprehensiveExplorerData({ forceFresh: true });
+      } finally {
+        session.mixer.currentTrack = originalCurrentTrack;
+      }
+    } else {
+      serverLog.info(`🎯 Using standalone radial search for explorer data`);
+      // Standalone exploration without session - use radial search directly
+      const rawExplorer = await radialSearch.exploreFromTrack(trackId, { usePCA: true });
+      serverLog.info(`🎯 Raw explorer has ${Object.keys(rawExplorer.directionalOptions || {}).length} directional options`);
+
+      // Convert directionalOptions to directions format expected by client
+      const convertedDirections = {};
+      for (const [dimName, dimData] of Object.entries(rawExplorer.directionalOptions || {})) {
+        // Create positive direction
+        if (dimData.positive && dimData.positive.length > 0) {
+          const posKey = `${dimName}_positive`;
+          convertedDirections[posKey] = {
+            direction: dimName,
+            description: dimData.contextLabel || dimName,
+            domain: 'original',
+            component: dimName,
+            polarity: 'positive',
+            sampleTracks: dimData.positive.map(sample => {
+              const track = sample.track || sample;
+              return {
+                identifier: track.identifier,
+                title: track.title,
+                artist: track.artist,
+                albumCover: track.albumCover,
+                duration: track.length || track.duration,
+                distance: sample.distance || sample.similarity,
+                features: track.features
+              };
+            }),
+            trackCount: dimData.positive.length,
+            explorationPotential: dimData.explorationPotential
+          };
+        }
+        // Create negative direction
+        if (dimData.negative && dimData.negative.length > 0) {
+          const negKey = `${dimName}_negative`;
+          convertedDirections[negKey] = {
+            direction: dimName,
+            description: dimData.contextLabel || dimName,
+            domain: 'original',
+            component: dimName,
+            polarity: 'negative',
+            sampleTracks: dimData.negative.map(sample => {
+              const track = sample.track || sample;
+              return {
+                identifier: track.identifier,
+                title: track.title,
+                artist: track.artist,
+                albumCover: track.albumCover,
+                duration: track.length || track.duration,
+                distance: sample.distance || sample.similarity,
+                features: track.features
+              };
+            }),
+            trackCount: dimData.negative.length,
+            explorationPotential: dimData.explorationPotential
+          };
+        }
+      }
+
+      explorerData = {
+        directions: convertedDirections,
+        currentTrack: rawExplorer.currentTrack,
+        diagnostics: {
+          mode: 'standalone',
+          computationTime: rawExplorer.computationTime,
+          searchMode: rawExplorer.searchCapabilities?.usedMode || 'unknown'
+        }
+      };
+      serverLog.info(`🎯 Converted to ${Object.keys(convertedDirections).length} directions`);
+    }
+
+    serverLog.info(`🎯 Explorer data has ${Object.keys(explorerData.directions || {}).length} directions before filtering`);
+
+    // Filter and deprioritize directions based on playlist
+    const filteredDirections = {};
+    for (const [dirKey, direction] of Object.entries(explorerData.directions || {})) {
+      if (!direction.sampleTracks || !Array.isArray(direction.sampleTracks)) {
+        filteredDirections[dirKey] = direction;
+        continue;
+      }
+
+      // Filter out playlist tracks, deprioritize playlist artists
+      const prioritized = [];
+      const deprioritized = [];
+
+      for (const sample of direction.sampleTracks) {
+        const track = sample.track || sample;
+        const trackIdentifier = track.identifier || track.trackMd5;
+
+        // Skip tracks already in playlist
+        if (playlistTrackSet.has(trackIdentifier)) {
+          continue;
+        }
+
+        // Deprioritize artists/albums from playlist
+        const artistLower = (track.artist || '').toLowerCase();
+        const albumLower = (track.album || '').toLowerCase();
+        const isDeprioritized = playlistArtists.has(artistLower) || playlistAlbums.has(albumLower);
+
+        if (isDeprioritized) {
+          deprioritized.push(sample);
+        } else {
+          prioritized.push(sample);
+        }
+      }
+
+      filteredDirections[dirKey] = {
+        ...direction,
+        sampleTracks: [...prioritized, ...deprioritized],
+        trackCount: prioritized.length + deprioritized.length,
+        filteredCount: direction.sampleTracks.length - (prioritized.length + deprioritized.length)
+      };
+    }
+
+    // Pick recommended next track from filtered directions
+    let nextTrack = null;
+    if (explorerData.nextTrack) {
+      // Use mixer's recommendation if available and not filtered out
+      const recKey = explorerData.nextTrack.directionKey;
+      const recTrackId = explorerData.nextTrack.track?.identifier;
+      if (filteredDirections[recKey] && !playlistTrackSet.has(recTrackId)) {
+        nextTrack = explorerData.nextTrack;
+      }
+    }
+    // Fallback: pick first track from highest-diversity direction
+    if (!nextTrack) {
+      const sortedDirs = Object.entries(filteredDirections)
+        .filter(([_, dir]) => dir.sampleTracks && dir.sampleTracks.length > 0)
+        .sort((a, b) => (b[1].diversityScore || 0) - (a[1].diversityScore || 0));
+      if (sortedDirs.length > 0) {
+        const [dirKey, dir] = sortedDirs[0];
+        const firstTrack = dir.sampleTracks[0];
+        nextTrack = {
+          directionKey: dirKey,
+          direction: dir.direction,
+          track: firstTrack
+        };
+      }
+    }
+
+    const response = {
+      directions: filteredDirections,
+      currentTrack: {
+        identifier: sourceTrack.identifier,
+        title: sourceTrack.title,
+        artist: sourceTrack.artist,
+        albumCover: sourceTrack.albumCover,
+        duration: sourceTrack.length || sourceTrack.duration,
+        features: sourceTrack.features,
+        pca: sourceTrack.pca
+      },
+      nextTrack,
+      diagnostics: {
+        ...explorerData.diagnostics,
+        playlistFilterApplied: playlistTrackSet.size > 0,
+        playlistSize: playlistTrackSet.size,
+        responseTime: Date.now() - startTime
+      }
+    };
+
+    serverLog.info(`🎯 Explorer request for ${trackId.substring(0, 8)} completed in ${Date.now() - startTime}ms`);
+    res.json(response);
+
   } catch (error) {
-    console.error('PCA explore error:', error);
+    console.error('Explorer endpoint error:', error);
     res.status(500).json({ error: error.message });
   }
 });

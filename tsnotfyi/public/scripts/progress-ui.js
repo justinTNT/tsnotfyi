@@ -79,9 +79,6 @@ export function renderProgressBar(progressFraction) {
     }
     const background = document.getElementById('background');
 
-    if (typeof window.updateMetadataFadeFromProgress === 'function') {
-        window.updateMetadataFadeFromProgress(clamped);
-    }
 
     if (clamped <= 0.5) {
         const widthPercent = visualProgress * 2 * 100;
@@ -129,10 +126,24 @@ export function updatePlaybackClockDisplay(forceSeconds = null) {
         return;
     }
 
-    const elapsedSeconds = forceSeconds !== null
-        ? forceSeconds
-        : Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
-    const clampedElapsed = Math.min(elapsedSeconds, state.playbackDurationSeconds);
+    let elapsedSeconds;
+    if (forceSeconds !== null) {
+        elapsedSeconds = forceSeconds;
+    } else {
+        // Prefer audio element's currentTime as source of truth
+        const audioTime = elements.audio && Number(elements.audio.currentTime);
+        const audioOffset = state.audioTrackStartClock || 0;
+        // Use audio time once started, regardless of pause state (avoids source-switching during buffering)
+        const audioHasStarted = audioTime > 0;
+        if (audioHasStarted && Number.isFinite(audioTime) && Number.isFinite(audioOffset) && audioTime >= audioOffset) {
+            elapsedSeconds = audioTime - audioOffset;
+        } else {
+            // Fallback to wall-clock (before audio starts, or in tests)
+            elapsedSeconds = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
+        }
+    }
+
+    const clampedElapsed = Math.min(Math.max(0, elapsedSeconds), state.playbackDurationSeconds);
     const formatted = formatTimecode(clampedElapsed);
     if (formatted === '--:--') {
         elements.playbackClock.textContent = '';
@@ -158,32 +169,16 @@ function shouldLockInteractions(elapsedSeconds, totalDuration) {
     return remaining <= LOCKOUT_THRESHOLD_SECONDS;
 }
 
+// Tail progress is deprecated - the new clock-animation.js handles end-of-track animations
+// These functions are kept as no-ops for backward compatibility
 export function applyTailProgress(value = 0) {
-    if (!rootElement) {
-        state.tailProgress = 0;
-        return;
-    }
-    const normalized = Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
-    state.tailProgress = normalized;
-    rootElement.style.setProperty('--tail-progress', normalized.toFixed(3));
-    const isActive = normalized > 0;
-    rootElement.classList.toggle('tail-active', isActive);
-    rootElement.classList.toggle('tail-complete', normalized >= 0.999);
+    // No-op - tail progress CSS variables removed in favor of clock animation system
+    state.tailProgress = 0;
 }
 
 export function updateTailProgress(elapsedSeconds, totalDuration) {
-    if (!Number.isFinite(totalDuration) || totalDuration <= 0 || !Number.isFinite(elapsedSeconds)) {
-        applyTailProgress(0);
-        return;
-    }
-    const remaining = Math.max(totalDuration - elapsedSeconds, 0);
-    if (remaining <= LOCKOUT_THRESHOLD_SECONDS) {
-        const windowSize = LOCKOUT_THRESHOLD_SECONDS || 1;
-        const fraction = 1 - (remaining / windowSize);
-        applyTailProgress(Math.max(0, Math.min(1, fraction)));
-    } else {
-        applyTailProgress(0);
-    }
+    // No-op - tail progress removed in favor of clock animation system
+    // The new system uses trigger conditions (t-30s or empty playlist) instead
 }
 
 export function getVisualProgressFraction() {
@@ -193,8 +188,21 @@ export function getVisualProgressFraction() {
     if (!Number.isFinite(state.playbackStartTimestamp)) {
         return null;
     }
-    const elapsedSeconds = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
-    return Math.min(1, elapsedSeconds / state.playbackDurationSeconds);
+
+    let elapsedSeconds;
+    // Prefer audio element's currentTime as source of truth
+    const audioTime = elements.audio && Number(elements.audio.currentTime);
+    const audioOffset = state.audioTrackStartClock || 0;
+    // Use audio time once started, regardless of pause state (avoids source-switching during buffering)
+    const audioHasStarted = audioTime > 0;
+    if (audioHasStarted && Number.isFinite(audioTime) && Number.isFinite(audioOffset) && audioTime >= audioOffset) {
+        elapsedSeconds = audioTime - audioOffset;
+    } else {
+        // Fallback to wall-clock (before audio starts, or in tests)
+        elapsedSeconds = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
+    }
+
+    return Math.min(1, Math.max(0, elapsedSeconds) / state.playbackDurationSeconds);
 }
 
 function getServerClockOffsetMs() {
@@ -590,59 +598,9 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     updatePlaybackClockDisplay(clampedStartPosition);
 
     const initialShouldLock = shouldLockInteractions(clampedStartPosition, safeDuration);
-    debugLog('progress', 'Initial lock-state evaluation', {
-        initialShouldLock,
-        dangerZoneReached: window.__progressState?.dangerZoneReached,
-        cardsLocked: window.__progressState?.cardsLocked
-    });
-
-    // Get/set danger zone state via window for cross-module access
-    const getDangerZoneReached = () => window.__progressState?.dangerZoneReached || false;
-    const getCardsLocked = () => window.__progressState?.cardsLocked || false;
-    const setDangerZoneReached = (v) => { window.__progressState = window.__progressState || {}; window.__progressState.dangerZoneReached = v; };
-    const setCardsLocked = (v) => { window.__progressState = window.__progressState || {}; window.__progressState.cardsLocked = v; };
-    const setCardsInactiveTilted = (v) => { window.__progressState = window.__progressState || {}; window.__progressState.cardsInactiveTilted = v; };
-
-    if (resync) {
-        const resyncingSameTrack = !trackChanged && getDangerZoneReached() && initialShouldLock && state.tailProgress >= 0.75;
-        if (resyncingSameTrack) {
-            debugLog('progress', 'Skipping redundant Danger Zone resync');
-            return true;
-        }
-        if (initialShouldLock && state.tailProgress >= 0.75) {
-            if (!getDangerZoneReached() || !getCardsLocked()) {
-                if (typeof window.triggerDangerZoneActions === 'function') {
-                    window.triggerDangerZoneActions();
-                }
-            }
-            setDangerZoneReached(true);
-            setCardsLocked(true);
-            debugLog('progress', 'Resync landed inside Danger Zone → forcing lock state');
-        } else {
-            const clearlyOutsideDangerZone = state.tailProgress < 0.5;
-            if (getCardsLocked() || getDangerZoneReached()) {
-                if (typeof window.unlockCardInteractions === 'function') {
-                    window.unlockCardInteractions();
-                }
-            }
-            if (clearlyOutsideDangerZone) {
-                exitDangerZoneVisualState({ reason: 'resync-outside-danger' });
-            } else if (state.dangerZoneVisualActive) {
-                debugLog('progress', 'Resync ambiguous - keeping danger zone visual state');
-            }
-            setDangerZoneReached(false);
-            setCardsLocked(false);
-            setCardsInactiveTilted(false);
-            debugLog('progress', 'Resync outside Danger Zone → ensuring unlocked state');
-        }
-    } else if (!getDangerZoneReached() && initialShouldLock && state.tailProgress >= 0.75) {
-        if (typeof window.triggerDangerZoneActions === 'function') {
-            window.triggerDangerZoneActions();
-        }
-        setDangerZoneReached(true);
-        setCardsLocked(true);
-        debugLog('progress', 'New track immediately inside Danger Zone');
-    }
+    // Old danger zone and card locking logic removed
+    // The new clock-animation.js system handles pack-away animations
+    // triggered at t-30s when playlist is empty, or manually via tray click
     if (typeof window.publishInteractionState === 'function') {
         window.publishInteractionState();
     }
@@ -656,26 +614,44 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         return true;
     }
 
-    const startTime = Date.now();
+    // Track displayed progress separately from audio progress for smooth animation
+    let displayedProgress = initialProgress;
+    const SMOOTH_FACTOR = 0.15; // How quickly to catch up (0-1, higher = faster)
+    const HARD_RESET_THRESHOLD = 0.1; // Jump if more than 10% off
 
     state.progressAnimation = setInterval(() => {
-        const elapsed = Date.now() - startTime;
-        const elapsedProgress = Math.min(elapsed / remainingDuration, 1);
-        const progress = Math.min(initialProgress + elapsedProgress * (1 - initialProgress), 1);
+        // Get target progress from audio element (source of truth)
+        let targetProgress;
+        const audioTime = elements.audio && Number(elements.audio.currentTime);
+        const audioOffset = state.audioTrackStartClock || 0;
+        // Use audio time once it's started (> 0), regardless of pause state
+        // This avoids jumping between sources during buffering
+        const audioHasStarted = audioTime > 0;
+        if (audioHasStarted && Number.isFinite(audioTime) && Number.isFinite(audioOffset) && audioTime >= audioOffset) {
+            const elapsedSeconds = audioTime - audioOffset;
+            targetProgress = Math.min(1, Math.max(0, elapsedSeconds / safeDuration));
+        } else {
+            // Fallback: wall clock (used before audio starts, or in tests)
+            const wallElapsed = (Date.now() - state.playbackStartTimestamp) / 1000;
+            targetProgress = Math.min(1, Math.max(0, wallElapsed / safeDuration));
+        }
 
+        // Smoothly interpolate toward target, or hard reset if too far off
+        const delta = targetProgress - displayedProgress;
+        if (Math.abs(delta) > HARD_RESET_THRESHOLD) {
+            // Too far off - hard reset
+            displayedProgress = targetProgress;
+        } else {
+            // Smooth interpolation toward target
+            displayedProgress += delta * SMOOTH_FACTOR;
+        }
+
+        const progress = Math.min(1, Math.max(0, displayedProgress));
         renderProgressBar(progress);
         updatePlaybackClockDisplay();
 
-        const elapsedSeconds = progress * safeDuration;
-        if (!getDangerZoneReached() && shouldLockInteractions(elapsedSeconds, safeDuration)) {
-            if (typeof window.triggerDangerZoneActions === 'function') {
-                window.triggerDangerZoneActions();
-            }
-            setDangerZoneReached(true);
-            setCardsLocked(true);
-            debugLog('progress', 'Danger Zone triggered during animation', { elapsedSeconds });
-        }
-        updateTailProgress(elapsedSeconds, safeDuration);
+        // Old danger zone triggers removed - new clock-animation.js handles pack-away
+        // The new system triggers at t-30s when playlist is empty
 
         if (progress >= 1) {
             clearInterval(state.progressAnimation);
@@ -700,13 +676,6 @@ export function stopProgressAnimation() {
     elements.progressWipe.style.left = '0%';
     elements.progressWipe.style.right = 'auto';
 
-    // Reset danger zone state
-    window.__progressState = window.__progressState || {};
-    window.__progressState.midpointReached = false;
-    window.__progressState.cardsLocked = false;
-    window.__progressState.cardsInactiveTilted = false;
-    window.__progressState.dangerZoneReached = false;
-
     exitDangerZoneVisualState({ reason: 'progress-stop' });
     console.log('🛑 Stopped progress animation');
     if (typeof window.publishInteractionState === 'function') {
@@ -714,25 +683,14 @@ export function stopProgressAnimation() {
     }
     clearPlaybackClock();
     stopPlaybackClockTicker();
-    if (typeof window.applyMetadataOpacity === 'function') {
-        window.applyMetadataOpacity(0);
-    }
-    applyTailProgress(0);
     clearPendingProgressStart();
 }
 
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
-    window.__progressState = window.__progressState || {
-        dangerZoneReached: false,
-        cardsLocked: false,
-        cardsInactiveTilted: false,
-        midpointReached: false
-    };
+    // Old danger zone state removed - now using clock-animation.js system
     window.resetDangerZoneState = function() {
-        window.__progressState.dangerZoneReached = false;
-        window.__progressState.cardsLocked = false;
-        window.__progressState.cardsInactiveTilted = false;
+        // No-op stub for backward compatibility
     };
     window.startProgressAnimation = startProgressAnimation;
     window.startProgressAnimationFromPosition = startProgressAnimationFromPosition;

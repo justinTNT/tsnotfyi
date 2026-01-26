@@ -9,10 +9,8 @@
     <script src="scripts/d3.v7.min.js"></script>
     <script src="scripts/three.min.js"></script>
     <link href="scripts/styles.css" rel="stylesheet">
-    <script src="scripts/tools.js"></script>
     <script src="scripts/tubes.js"></script>
     <script src="scripts/scene.js"></script>
-    <script src="scripts/helpers.js"></script>
     <script src="scripts/fzf.js"></script>
     <script src="scripts/stream-controller.js"></script>
 </head>
@@ -41,14 +39,11 @@
         </div>
     </div>
 
-    <!-- Next Track Tray -->
-    <div id="nextTrackTray" aria-label="Upcoming selections">
-        <div class="next-track-tray-preview" aria-hidden="true"></div>
+    <!-- Playlist Tray - Queue with left/right stacks -->
+    <div id="nextTrackTray" aria-label="Playlist queue">
+        <div class="playlist-left-stack" aria-label="Queued tracks"></div>
+        <div class="playlist-right-stack" aria-label="Played tracks"></div>
     </div>
-
-    <!-- Beets metadata chips -->
-    <div id="beetsSegments" class="beets-hidden"></div>
-
 
     <!-- Dimension Cards in Circular Layout -->
     <div id="dimensionCards"></div>
@@ -64,11 +59,6 @@
     </div>
     <div class="diagnostic-bar">
         <div id="playbackClock" class="playback-clock is-hidden" title="Current playback time"></div>
-        <div id="radiusControls" class="radius-controls" title="Search scope">
-            <button type="button" class="radius-button" data-radius-mode="microscope" aria-label="Microscope scope">🔬</button>
-            <button type="button" class="radius-button" data-radius-mode="magnifying" aria-label="Magnifying scope">🔍</button>
-            <button type="button" class="radius-button" data-radius-mode="binoculars" aria-label="Binoculars scope">🔭</button>
-        </div>
     </div>
 
 
@@ -77,15 +67,12 @@
         <span id="searchIconText">?</span>
     </div>
 
-    <!-- Direction key overlay text -->
-    <div id="directionKeyOverlay">
-        <span class="directionKeyText" id="dkt1"></span>
-        <span class="directionKeyText" id="dkt2"></span>
-    </div>
-
     <!-- Manual refresh button -->
-    <div id="refreshButton" title="Refresh session if stuck">
+    <div id="refreshButton" title="Refresh cards">
         <div class="refresh-icon">⟳</div>
+    </div>
+    <div id="hardResetButton" class="secondary-refresh" title="New session">
+        <div class="refresh-icon">✱</div>
     </div>
 
     <!-- Fuzzy search interface -->
@@ -104,6 +91,8 @@
 
     <audio id="audio"></audio>
 
-    <script src="scripts/page.js"></script>
+    <script src="scripts/browser-logger.js"></script>
+    <script src="scripts/deck-frame-builder.js"></script>
+    <script type="module" src="scripts/page.js"></script>
 </body>
 </html>

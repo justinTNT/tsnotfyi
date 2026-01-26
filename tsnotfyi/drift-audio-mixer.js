@@ -263,9 +263,19 @@ class DriftAudioMixer {
         this.pendingCurrentTrack = null;
         promoted = true;
       } else if (reason === 'crossfade_complete' && this.nextTrack) {
-        this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
-        this.nextTrack = null;
-        promoted = true;
+        // Check if user selected a different track during crossfade - don't promote stale nextTrack
+        const userOverrideActive = this.pendingUserOverrideTrackId &&
+            this.pendingUserOverrideTrackId !== this.nextTrack.identifier;
+
+        if (userOverrideActive) {
+          console.log(`🎯 Skipping stale nextTrack promotion (${this.nextTrack.identifier?.substring(0,8)}) - user selected ${this.pendingUserOverrideTrackId?.substring(0,8)}`);
+          this.nextTrack = null;
+          // Don't set promoted = true - the deferred override will handle setting currentTrack
+        } else {
+          this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
+          this.nextTrack = null;
+          promoted = true;
+        }
       }
 
       // Handle stack initialization for first track
@@ -283,9 +293,12 @@ class DriftAudioMixer {
 
       if (reason === 'crossfade_complete') {
         this.crossfadeStartedAt = null;
-        const shouldReapplyOverride = this.userSelectionDeferredForCrossfade && this.pendingUserOverrideTrackId;
+        // Apply pending user override if one exists (either deferred during crossfade or set before)
+        const shouldApplyOverride = this.pendingUserOverrideTrackId &&
+            (!this.currentTrack || this.currentTrack.identifier !== this.pendingUserOverrideTrackId);
         this.userSelectionDeferredForCrossfade = false;
-        if (shouldReapplyOverride) {
+        if (shouldApplyOverride) {
+          console.log(`🎯 Applying pending user override after crossfade: ${this.pendingUserOverrideTrackId?.substring(0,8)}`);
           setTimeout(() => {
             this.applyUserSelectedTrackOverride(this.pendingUserOverrideTrackId);
           }, 0);
@@ -579,11 +592,7 @@ class DriftAudioMixer {
         } catch (err) {
           console.warn(`⚠️ Failed to broadcast ${reason} heartbeat:`, err?.message || err);
         }
-        try {
-          await this.broadcastExplorerSnapshot(true, reason);
-        } catch (err) {
-          console.warn(`⚠️ Failed to broadcast ${reason} explorer snapshot:`, err?.message || err);
-        }
+        // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
       })();
     }, 0);
   }
@@ -991,7 +1000,11 @@ class DriftAudioMixer {
         nextTrackDirection: this.pendingUserOverrideDirection || this.nextTrack?.nextTrackDirection,
         transitionReason: 'user'
       });
-      this.clearPendingUserSelection();
+      // Don't clear pendingUserOverrideGeneration here - an in-flight preparation might need it
+      // Just clear the pending track ID and direction since we've confirmed the track is ready
+      this.pendingUserOverrideTrackId = null;
+      this.pendingUserOverrideDirection = null;
+      this.isUserSelectionPending = false;
       this.broadcastHeartbeat('user-selection-already-prepared', { force: true }).catch(() => {});
       this.broadcastSelectionEvent('selection_ready', {
         status: 'prepared',
@@ -1224,8 +1237,10 @@ class DriftAudioMixer {
         console.log(`📊 Next track analysis: BPM=${nextTrackInfo.bpm}, Key=${nextTrackInfo.key}`);
         if (overrideTrackId) {
           const isLatestSelection = manualGenerationAtStart !== null && manualGenerationAtStart === this.pendingUserOverrideGeneration;
+          // Also commit if this track matches what we locked - even if generation was cleared by "already prepared" path
+          const matchesLockedTrack = this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier === hydratedNextTrack.identifier;
 
-          if (!isLatestSelection) {
+          if (!isLatestSelection && !matchesLockedTrack) {
             console.log('↩️ [override] Prepared override superseded by newer selection; skipping commit');
             this.nextTrack = null;
             return;
@@ -2577,9 +2592,8 @@ class DriftAudioMixer {
   buildNextTrackSummary() {
     let candidate = null;
 
-    if (this.nextTrack && this.nextTrack.identifier) {
-      candidate = this.hydrateTrackRecord(this.nextTrack);
-    } else if (this.lockedNextTrackIdentifier) {
+    // 1. User overrides take precedence
+    if (this.lockedNextTrackIdentifier) {
       candidate = this.hydrateTrackRecord({
         identifier: this.lockedNextTrackIdentifier,
         nextTrackDirection: this.pendingUserOverrideDirection || null,
@@ -2591,6 +2605,20 @@ class DriftAudioMixer {
         nextTrackDirection: this.pendingUserOverrideDirection || null,
         transitionReason: 'user'
       });
+    }
+    // 2. Use last-sent snapshot's nextTrack (ensures consistency with what client has)
+    else if (this.lastExplorerSnapshotPayload?.nextTrack?.track?.identifier) {
+      const snapshotNext = this.lastExplorerSnapshotPayload.nextTrack;
+      candidate = this.hydrateTrackRecord({
+        identifier: snapshotNext.track.identifier,
+        nextTrackDirection: snapshotNext.direction || null,
+        directionKey: snapshotNext.directionKey || null,
+        transitionReason: snapshotNext.transitionReason || 'auto'
+      });
+    }
+    // 3. Fallback to computed next (only before first snapshot sent)
+    else if (this.nextTrack && this.nextTrack.identifier) {
+      candidate = this.hydrateTrackRecord(this.nextTrack);
     }
 
     if (!candidate) {
@@ -3087,9 +3115,7 @@ class DriftAudioMixer {
   async broadcastTrackEvent(force = false, options = {}) {
     const reason = options.reason || 'track-update';
     await this.broadcastHeartbeat(reason, { force: true });
-    if (force || reason === 'track-update' || reason === 'track-started') {
-      await this.broadcastExplorerSnapshot(force, reason);
-    }
+    // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
   }
 
   // Get directional flow options (expensive - use only when needed)
@@ -4026,9 +4052,10 @@ class DriftAudioMixer {
       const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks.slice() : [];
       const domain = direction?.domain || '';
       const priority = (() => {
-        if (domain === 'vae' || directionKey.startsWith('vae_')) return 0;
-        if (domain.includes('pca') || directionKey.includes('_pc') || directionKey.includes('primary_d')) return 1;
-        return 2;
+        // Priority: core features first, then PCA, then VAE
+        if (domain === 'original') return 0;  // Core features highest priority
+        if (domain === 'vae') return 2;       // VAE lowest priority
+        return 1;                              // PCA (tonal, spectral, rhythmic) middle
       })();
       return {
         directionKey,
@@ -5513,13 +5540,12 @@ class DriftAudioMixer {
 
     const selectedDirections = {};
 
-    // Calculate quota: 50/50 split between core and PCA indices
-    const totalVaeDirections = Array.from(vaeMap.values()).reduce((sum, dirs) => sum + dirs.length, 0);
-    const remainingSlots = Math.max(maxDimensions - totalVaeDirections, 0);
-    const coreQuota = Math.floor(remainingSlots / 2);
-    const pcaQuota = remainingSlots - coreQuota;
-    console.log(`🎯 Dimension quota: ${coreQuota} core indices, ${pcaQuota} PCA dimensions (max: ${maxDimensions})`);
-    console.log(`🎯 Available dimensions: ${coreMap.size} core, ${pcaMap.size} PCA, ${vaeMap.size} VAE groups (${totalVaeDirections} directions), ${dimensionMap.size} total`);
+    // Calculate quota: core gets priority, then PCA, VAE fills remaining slots
+    const coreQuota = Math.min(Math.ceil(maxDimensions / 3), coreMap.size);  // ~4 core slots
+    const pcaQuota = Math.min(Math.ceil(maxDimensions / 3), pcaMap.size);    // ~4 PCA slots
+    const vaeQuota = Math.max(maxDimensions - coreQuota - pcaQuota, 0);      // VAE gets remainder
+    console.log(`🎯 Dimension quota: ${coreQuota} core, ${pcaQuota} PCA, ${vaeQuota} VAE (max: ${maxDimensions})`);
+    console.log(`🎯 Available dimensions: ${coreMap.size} core, ${pcaMap.size} PCA, ${vaeMap.size} VAE groups, ${dimensionMap.size} total`);
 
     // Helper function to select best directions from dimension list
     // Returns both directions if they form a good discriminator (75/25 split)
@@ -5598,8 +5624,6 @@ class DriftAudioMixer {
       isVae: true
     })).filter(dim => dim.bestDirections.length > 0);
 
-    const limitedVaeDimensions = vaeCandidates.slice(0, maxDimensions);
-
     const sortedCoreDimensions = coreCandidates
       .filter(dim => {
         if (dim.bestDirections.length === 0) {
@@ -5634,11 +5658,19 @@ class DriftAudioMixer {
       .sort((a, b) => b.bestDirections[0].diversityScore - a.bestDirections[0].diversityScore)
       .slice(0, pcaQuota);
 
-    console.log(`🎯 Selected ${sortedPcaDimensions.length} PCA dimensions:`,
+    console.log(`🎯 Selected ${sortedPcaDimensions.length}/${pcaQuota} PCA dimensions:`,
       sortedPcaDimensions.map(d => d.dimName));
 
-    // Combine core and PCA selections
-    const finalDimensions = [...limitedVaeDimensions, ...sortedCoreDimensions, ...sortedPcaDimensions];
+    // Step 3: Select VAE dimensions for remaining slots
+    const sortedVaeDimensions = vaeCandidates
+      .sort((a, b) => b.bestDirections[0].diversityScore - a.bestDirections[0].diversityScore)
+      .slice(0, vaeQuota);
+
+    console.log(`🎯 Selected ${sortedVaeDimensions.length}/${vaeQuota} VAE dimensions:`,
+      sortedVaeDimensions.map(d => d.dimName));
+
+    // Combine selections: core first, then PCA, then VAE
+    const finalDimensions = [...sortedCoreDimensions, ...sortedPcaDimensions, ...sortedVaeDimensions];
 
     // If we don't have enough dimensions (shouldn't happen), fill from general pool
     if (finalDimensions.length < maxDimensions) {

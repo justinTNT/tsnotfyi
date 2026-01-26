@@ -6,7 +6,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "npm start",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev:watch": "nodemon --watch server.js --watch drift-audio-mixer.js --watch routes --watch services --watch utils --watch public/scripts --ext js,json --exec \"node server.js\"",
+    "logs:tail": "node scripts/logs.js tail",
+    "logs:grep": "node scripts/logs.js grep",
+    "test": "jest",
+    "check:contracts": "python3 ci/check_contracts.py"
   },
   "keywords": [],
   "author": "",
@@ -16,7 +20,18 @@
     "express-session": "^1.18.1",
     "fluent-ffmpeg": "^2.1.3",
     "node-lame": "^1.5.0",
+    "pg": "^8.16.3",
     "sqlite3": "^5.1.7",
-    "pg": "^8.11.3"
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.28.6",
+    "@babel/preset-env": "^7.28.6",
+    "@types/jest": "^30.0.0",
+    "babel-jest": "^30.2.0",
+    "jest": "^30.2.0",
+    "jest-environment-jsdom": "^30.2.0",
+    "nodemon": "^3.1.11",
+    "supertest": "^7.1.4"
   }
 }

@@ -9,7 +9,6 @@ import { state, DEBUG_FLAGS, getCardBackgroundColor } from './globals.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, getDirectionColor, variantFromDirectionType } from './tools.js';
 import { findTrackInExplorer, hydrateTrackDetails } from './explorer-utils.js';
 import { setCardVariant } from './deck-render.js';
-import { collectBeetsChips } from './beets-ui.js';
 
 const HELPERS_DEBUG = {
   colors: false,
@@ -422,336 +421,6 @@ function helpersDuplicateLog(...args) {
       panel.insertAdjacentHTML('beforeend', badgeHtml);
   }
 
-
-
-  const DIRECTION_FEATURE_ALIAS = {
-      'purer_tuning': 'tuning_purity',
-      'impurer_tuning': 'tuning_purity',
-      'stronger_chords': 'chord_strength',
-      'weaker_chords': 'chord_strength',
-      'stronger_fifths': 'fifths_strength',
-      'weaker_fifths': 'fifths_strength',
-      'more_air_sizzle': 'air_sizzle',
-      'less_air_sizzle': 'air_sizzle',
-      'more_air': 'air_sizzle',
-      'less_air': 'air_sizzle',
-      'more_energetic': 'spectral_energy',
-      'calmer': 'spectral_energy',
-      'higher_energy': 'spectral_energy',
-      'lower_energy': 'spectral_energy',
-      'more_danceable': 'danceable',
-      'less_danceable': 'danceable',
-      'busier_onsets': 'onset_rate',
-      'denser_onsets': 'onset_rate',
-      'sparser_onsets': 'onset_rate',
-      'punchier_beats': 'beat_punch',
-      'smoother_beats': 'beat_punch',
-      'more_punchy': 'crest',
-      'less_punchy': 'crest',
-      'smoother': 'crest',
-      'more_complex': 'entropy',
-      'simpler': 'entropy',
-      'more_tonal': 'tonal_clarity',
-      'more_atonal': 'tonal_clarity',
-      'brighter': 'spectral_centroid',
-      'darker': 'spectral_centroid',
-      'fuller_spectrum': 'spectral_rolloff',
-      'narrower_spectrum': 'spectral_rolloff',
-      'peakier_spectrum': 'spectral_kurtosis',
-      'flatter_spectrum': 'spectral_kurtosis',
-      'noisier': 'spectral_flatness',
-      'more_tonal_spectrum': 'spectral_flatness',
-      'more_bass': 'sub_drive',
-      'less_bass': 'sub_drive',
-      'faster': 'bpm',
-      'slower': 'bpm'
-  };
-
-  function getDirectionMetricDescriptor(directionKey, direction) {
-      const candidateKey = directionKey || direction?.key;
-      if (!candidateKey) return null;
-
-      const domain = direction?.domain;
-      const component = direction?.component;
-
-      // PCA-based direction (e.g., spectral pc1)
-      if (domain && component && /^pc\d+$/i.test(component)) {
-          const index = parseInt(component.replace(/pc/i, ''), 10) - 1;
-          if (!Number.isNaN(index)) {
-              return { type: 'pca', domain, index };
-          }
-      }
-
-      const featureKeyFromDirection = direction?.featureKey;
-      if (featureKeyFromDirection) {
-          return { type: 'feature', key: featureKeyFromDirection };
-      }
-
-      if (component && !/^pc\d+$/i.test(component)) {
-          return { type: 'feature', key: component };
-      }
-
-      let base = candidateKey.replace(/_(positive|negative)$/i, '');
-      if (DIRECTION_FEATURE_ALIAS[base]) {
-          base = DIRECTION_FEATURE_ALIAS[base];
-      }
-
-      if (base) {
-          return { type: 'feature', key: base };
-      }
-
-      return null;
-  }
-
-  function extractMetricValue(descriptor, track) {
-      if (!descriptor || !track) return undefined;
-
-      if (descriptor.type === 'feature') {
-          return track.features ? track.features[descriptor.key] : undefined;
-      }
-
-      if (descriptor.type === 'pca') {
-          const domainValues = track.pca ? track.pca[descriptor.domain] : null;
-          if (!domainValues) return undefined;
-          const value = domainValues[descriptor.index];
-          return value;
-      }
-
-      return undefined;
-  }
-
-  const CONSISTENCY_CHECK_TOLERANCE = 1e-3;
-  const CONSISTENCY_DYNAMIC_MIN_TOLERANCE = 0.02;
-  const CONSISTENCY_DYNAMIC_RELATIVE = 0.12;
-  const CONSISTENCY_MIN_SPREAD = 0.05;
-  const CONSISTENCY_MAX_INCONSISTENT_RATIO = 0.34;
-
-  function resolveMetricValueForConsistency(descriptor, rawTrack, direction) {
-      if (!descriptor || !rawTrack) {
-          return undefined;
-      }
-
-      const track = rawTrack.track || rawTrack;
-      if (!track) {
-          return undefined;
-      }
-
-      let value = extractMetricValue(descriptor, track);
-
-      if (value === undefined && track.identifier && state?.latestExplorerData) {
-          const explorerData = state.latestExplorerData;
-          let fallback = null;
-          if (direction?.key) {
-              fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
-          }
-          if (!fallback) {
-              fallback = findTrackInExplorer(null, explorerData, track.identifier);
-          }
-          if (fallback) {
-              value = extractMetricValue(descriptor, fallback);
-          }
-      }
-
-      if (value === undefined) {
-          return undefined;
-      }
-
-      const numeric = Number(value);
-      return Number.isFinite(numeric) ? numeric : undefined;
-  }
-
-  function resolvePrimaryDForConsistency(rawTrack, direction) {
-      const track = rawTrack?.track || rawTrack;
-      if (!track) {
-          return undefined;
-      }
-
-      let value = track?.pca?.primary_d;
-
-      if (!Number.isFinite(Number(value)) && track?.identifier && state?.latestExplorerData) {
-          const explorerData = state.latestExplorerData;
-          let fallback = null;
-          if (direction?.key) {
-              fallback = findTrackInExplorer(direction.key, explorerData, track.identifier);
-          }
-          if (!fallback) {
-              fallback = findTrackInExplorer(null, explorerData, track.identifier);
-          }
-
-          if (fallback?.pca?.primary_d !== undefined) {
-              value = fallback.pca.primary_d;
-          }
-      }
-
-      const numeric = Number(value);
-      return Number.isFinite(numeric) ? numeric : undefined;
-  }
-
-  function evaluateDirectionConsistency(direction, { card = null, sampleTracks = [], currentTrack = null } = {}) {
-      if (!direction) {
-          return;
-      }
-
-      if (direction.skipConsistencyCheck) {
-          helpersColorLog(`🧮 Skipping consistency check for ${direction.key} (flagged synthetic)`);
-          return;
-      }
-
-      const stateRef = state;
-      const activeCurrentTrack = currentTrack || stateRef.latestCurrentTrack;
-      const descriptor = getDirectionMetricDescriptor(direction.key, direction);
-
-      const samples = Array.isArray(sampleTracks) && sampleTracks.length
-          ? sampleTracks
-          : (Array.isArray(direction.sampleTracks) ? direction.sampleTracks : []);
-
-      const polarity = isNegativeDirection(direction.key) ? -1 : 1;
-      const descriptorKey = descriptor
-          ? (descriptor.type === 'feature'
-              ? descriptor.key
-              : `${descriptor.domain}_pc${descriptor.index + 1}`)
-          : null;
-
-      const issues = [];
-      const diffEntries = [];
-
-      const currentMetric = descriptor
-          ? resolveMetricValueForConsistency(descriptor, activeCurrentTrack, direction)
-          : undefined;
-
-      if (descriptor && Number.isFinite(currentMetric)) {
-          samples.forEach(sample => {
-              const metric = resolveMetricValueForConsistency(descriptor, sample, direction);
-              if (Number.isFinite(metric)) {
-                  const track = sample?.track || sample;
-                  const trackId = track?.identifier || track?.trackMd5 || null;
-                  diffEntries.push({
-                      id: trackId,
-                      title: getDisplayTitle(track),
-                      diff: metric - currentMetric
-                  });
-              }
-          });
-
-          if (diffEntries.length > 0) {
-              const metricSpread = diffEntries.reduce((max, entry) => Math.max(max, Math.abs(entry.diff)), 0);
-              const tolerance = resolveConsistencyTolerance(currentMetric, metricSpread);
-
-              if (metricSpread >= Math.max(tolerance, CONSISTENCY_MIN_SPREAD)) {
-                  const inconsistent = diffEntries.filter(entry => (entry.diff * polarity) < -tolerance);
-                  const supporting = diffEntries.filter(entry => (entry.diff * polarity) > tolerance);
-                  if (supporting.length === 0 && inconsistent.length > 0) {
-                      issues.push(`${descriptorKey} diffs oppose implied polarity (${inconsistent.length}/${diffEntries.length})`);
-                  } else if (inconsistent.length > 0 && inconsistent.length / diffEntries.length > CONSISTENCY_MAX_INCONSISTENT_RATIO) {
-                      issues.push(`${descriptorKey} diffs contradict implied polarity for ${inconsistent.length}/${diffEntries.length} samples`);
-                  }
-              } else {
-                  helpersColorLog(`🧮 Skipping ${descriptorKey} metric diff check due to low spread: ${metricSpread.toFixed(3)} < tolerance ${tolerance.toFixed(3)}`);
-              }
-          }
-      }
-
-      const skipPrimaryDeltaCheck = /_pc\d+/i.test(direction.key || '');
-      const primaryDeltas = [];
-      const currentPrimaryD = skipPrimaryDeltaCheck ? undefined : resolvePrimaryDForConsistency(activeCurrentTrack, direction);
-
-      let baselinePrimaryValue = Number.isFinite(currentPrimaryD) ? currentPrimaryD : undefined;
-      let baselinePrimaryId = Number.isFinite(currentPrimaryD)
-          ? (activeCurrentTrack?.identifier || activeCurrentTrack?.trackMd5 || null)
-          : null;
-
-      if (!Number.isFinite(baselinePrimaryValue)) {
-          for (const sample of samples) {
-              const candidatePrimary = resolvePrimaryDForConsistency(sample, direction);
-              if (Number.isFinite(candidatePrimary)) {
-                  const track = sample?.track || sample;
-                  baselinePrimaryValue = candidatePrimary;
-                  baselinePrimaryId = track?.identifier || track?.trackMd5 || null;
-                  break;
-              }
-          }
-      }
-
-      if (!skipPrimaryDeltaCheck && Number.isFinite(baselinePrimaryValue)) {
-          samples.forEach(sample => {
-              const candidatePrimary = resolvePrimaryDForConsistency(sample, direction);
-              if (!Number.isFinite(candidatePrimary)) {
-                  return;
-              }
-              const track = sample?.track || sample;
-              const trackId = track?.identifier || track?.trackMd5 || null;
-              if (trackId && baselinePrimaryId && trackId === baselinePrimaryId) {
-                  return;
-              }
-              primaryDeltas.push({
-                  id: trackId,
-                  title: getDisplayTitle(track),
-                  value: candidatePrimary,
-                  delta: candidatePrimary - baselinePrimaryValue
-              });
-          });
-
-          if (primaryDeltas.length >= 2) {
-              const primarySpread = primaryDeltas.reduce((max, entry) => Math.max(max, Math.abs(entry.delta)), 0);
-              const primaryTolerance = resolveConsistencyTolerance(baselinePrimaryValue, primarySpread);
-
-              if (primarySpread >= Math.max(primaryTolerance, CONSISTENCY_MIN_SPREAD)) {
-                  const supporting = primaryDeltas.filter(entry => (entry.delta * polarity) > primaryTolerance).length;
-                  const contradicting = primaryDeltas.filter(entry => (entry.delta * polarity) < -primaryTolerance).length;
-
-                  const netDelta = primaryDeltas.reduce((sum, entry) => sum + entry.delta * polarity, 0);
-                  const averageSigned = netDelta / primaryDeltas.length;
-
-                  if (Math.abs(averageSigned) <= primaryTolerance) {
-                      helpersColorLog(`🧮 Skipping primary_d polarity check (mean delta ${averageSigned.toFixed(3)} within tolerance ${primaryTolerance.toFixed(3)})`);
-                  } else if (supporting === 0 && contradicting > 0) {
-                      issues.push(`primary_d deltas oppose implied polarity (contradicting=${contradicting})`);
-                  } else if (contradicting > 0 && contradicting / primaryDeltas.length > CONSISTENCY_MAX_INCONSISTENT_RATIO) {
-                      issues.push(`primary_d deltas mixed beyond tolerance (contra=${contradicting}/${primaryDeltas.length})`);
-                  }
-              } else {
-                  helpersColorLog(`🧮 Skipping primary_d check due to low spread: ${primarySpread.toFixed(3)} < tolerance ${primaryTolerance.toFixed(3)}`);
-              }
-          }
-      }
-
-      const status = issues.length ? 'warn' : 'ok';
-
-      const cardElement = card instanceof Element ? card : null;
-      const signature = issues.join(' | ') || 'ok';
-      const previousSignature = cardElement ? cardElement.dataset.consistencySignature || null : null;
-
-      if (cardElement) {
-          cardElement.dataset.consistencyStatus = status;
-          cardElement.dataset.consistencySignature = signature;
-          if (issues.length) {
-              cardElement.dataset.consistencyIssues = signature;
-              cardElement.classList.add('consistency-issue');
-          } else {
-              delete cardElement.dataset.consistencyIssues;
-              cardElement.classList.remove('consistency-issue');
-          }
-      }
-
-      if (signature !== previousSignature) {
-          if (issues.length) {
-              console.warn(`⚠️ Consistency check failed for ${direction.key}`, {
-                  issues,
-                  descriptor: descriptorKey,
-                  metricDiffs: diffEntries,
-                  primaryDeltas
-              });
-          } else if (DEBUG_FLAGS?.consistency && (diffEntries.length || primaryDeltas.length)) {
-              console.debug(`✅ Consistency check passed for ${direction.key}`, {
-                  descriptor: descriptorKey,
-                  sampleCount: samples.length,
-                  metricDiffs: diffEntries,
-                  primaryDeltas
-              });
-          }
-      }
-  }
-
   // Update the stack visualization with remaining track count
   function updateStackSizeIndicator(direction, cardForContext, overrideIndex) {
       const nextTrackCard = cardForContext
@@ -890,335 +559,6 @@ function helpersDuplicateLog(...args) {
           });
 
           nextTrackCard.appendChild(stackLineContainer);
-      }
-
-      const metricsContainer = document.createElement('div');
-      metricsContainer.className = 'track-metrics';
-
-      const hasHttpWord = (text) => {
-          if (!text) return false;
-          const parts = text.split(/\s+/);
-          return parts.some(part => /^https?:/i.test(part));
-      };
-
-      const shouldDisplayMetric = (label, value) => {
-          if (label === null || label === undefined) {
-              return false;
-          }
-          const text = String(label).trim();
-          if (!text) {
-              return false;
-          }
-          if (hasHttpWord(text)) {
-              return false;
-          }
-          if (value !== undefined && value !== null) {
-              const valueText = String(value).trim();
-              if (hasHttpWord(valueText)) {
-                  return false;
-              }
-          }
-          return true;
-      };
-
-      const createMetric = (label, value) => {
-          if (!shouldDisplayMetric(label, value)) {
-              return null;
-          }
-          const container = document.createElement('div');
-          container.className = 'metric-chip';
-          const labelText = String(label).trim();
-          container.innerHTML = `<span class="metric-label">${labelText}</span><span class="metric-value">${value}</span>`;
-          return container;
-      };
-
-      const formatMetric = (value) => {
-          if (value === null || value === undefined) {
-              return '--';
-          }
-          const num = Number(value);
-          if (!Number.isFinite(num)) {
-              return '--';
-          }
-          return num.toFixed(3);
-      };
-
-      const formatDelta = (value) => {
-          if (value === null || value === undefined) {
-              return '--';
-          }
-          const num = Number(value);
-          if (!Number.isFinite(num)) {
-              return '--';
-          }
-          const formatted = num.toFixed(3);
-          if (num > 0) return `+${formatted}`;
-          return formatted;
-      };
-
-      const formatRatio = (value) => {
-          if (value === null || value === undefined) {
-              return '--';
-          }
-          const num = Number(value);
-          if (!Number.isFinite(num)) {
-              return '--';
-          }
-          return num.toFixed(3);
-      };
-
-      const findFeaturesLookup = (identifier) => {
-          if (!identifier || !state?.latestExplorerData) return null;
-          const directions = state.latestExplorerData.directions || {};
-          for (const direction of Object.values(directions)) {
-              const samples = direction.sampleTracks || [];
-              for (const sample of samples) {
-                  const track = sample.track || sample;
-                  if (track?.identifier === identifier && track?.features) {
-                      return track.features;
-                  }
-              }
-          }
-          return null;
-      };
-
-      const findPcaLookup = (identifier) => {
-          if (!identifier || !state?.latestExplorerData) return null;
-          const directions = state.latestExplorerData.directions || {};
-          for (const direction of Object.values(directions)) {
-              const samples = direction.sampleTracks || [];
-              for (const sample of samples) {
-                  const track = sample.track || sample;
-                  if (track?.identifier === identifier && track?.pca) {
-                      return track.pca;
-                  }
-              }
-          }
-          return null;
-      };
-
-      const descriptor = getDirectionMetricDescriptor(directionKey, direction);
-      let candidateValue = descriptor ? extractMetricValue(descriptor, candidateTrack) : undefined;
-      let currentValue = descriptor ? extractMetricValue(descriptor, currentTrack) : undefined;
-      if (descriptor && (candidateValue === undefined || currentValue === undefined)) {
-          const fallback = findTrackInExplorer(directionKey, state.latestExplorerData, state.latestCurrentTrack?.identifier);
-          if (fallback) {
-              if (candidateValue === undefined) {
-                  candidateValue = extractMetricValue(descriptor, fallback);
-              }
-              if (currentValue === undefined) {
-                  currentValue = extractMetricValue(descriptor, fallback);
-              }
-          }
-      }
-      window.debugNextTrackMetrics = window.debugNextTrackMetrics || {
-          stack: true,
-          candidate: true,
-          current: true,
-          delta: true,
-          others: true
-      };
-
-      if (window.debugNextTrackMetrics.candidate) {
-          const metric = createMetric('next', formatMetric(candidateValue));
-          if (metric) {
-              metricsContainer.appendChild(metric);
-          }
-      }
-
-      if (window.debugNextTrackMetrics.current) {
-          const metric = createMetric('curr', formatMetric(currentValue));
-          if (metric) {
-              metricsContainer.appendChild(metric);
-          }
-      }
-
-      if (window.debugNextTrackMetrics.delta) {
-          const diff = (candidateValue !== undefined && currentValue !== undefined)
-              ? Number(candidateValue) - Number(currentValue)
-              : undefined;
-          const metric = createMetric(' Δ ', formatDelta(diff));
-          if (metric) {
-              metricsContainer.appendChild(metric);
-          }
-      }
-
-      if (window.debugNextTrackMetrics.others) {
-          const candidateSlices = candidateTrack?.distanceSlices
-              || candidateTrack?.featureDistanceSlices
-              || candidateTrack?.pcaDistanceSlices
-              || candidateTrack?.track?.distanceSlices
-              || candidateTrack?.track?.featureDistanceSlices
-              || candidateTrack?.track?.pcaDistanceSlices;
-
-          const slices = Array.isArray(candidateSlices?.slices) ? candidateSlices.slices.slice() : [];
-
-          if (slices.length > 0) {
-              const referenceKey = candidateSlices?.reference?.key || candidateSlices?.referenceKey || null;
-
-              slices.sort((a, b) => {
-                  const aIsRef = referenceKey && a.key === referenceKey ? 1 : 0;
-                  const bIsRef = referenceKey && b.key === referenceKey ? 1 : 0;
-                  if (aIsRef !== bIsRef) {
-                      return bIsRef - aIsRef;
-                  }
-                  const aRel = a.relative !== null && a.relative !== undefined ? Math.abs(Number(a.relative)) : 0;
-                  const bRel = b.relative !== null && b.relative !== undefined ? Math.abs(Number(b.relative)) : 0;
-                  if (aRel !== bRel) {
-                      return bRel - aRel;
-                  }
-                  const aFrac = a.fraction !== null && a.fraction !== undefined ? Math.abs(Number(a.fraction)) : 0;
-                  const bFrac = b.fraction !== null && b.fraction !== undefined ? Math.abs(Number(b.fraction)) : 0;
-                  if (aFrac !== bFrac) {
-                      return bFrac - aFrac;
-                  }
-                  return Math.abs(Number(b.delta || 0)) - Math.abs(Number(a.delta || 0));
-              });
-
-              slices.slice(0, 10).forEach(slice => {
-                  const isReference = referenceKey && slice.key === referenceKey;
-                  const label = isReference ? `${slice.key}★` : slice.key;
-                  const deltaText = formatDelta(slice.delta);
-                  const relativeTextRaw = formatRatio(slice.relative);
-                  const relativeText = relativeTextRaw !== '--' ? `${relativeTextRaw}×` : relativeTextRaw;
-                  const fractionText = formatRatio(slice.fraction);
-                  const valueText = `${deltaText} ${relativeText} ${fractionText}`;
-                  const metric = createMetric(label, valueText);
-                  if (metric) {
-                      metricsContainer.appendChild(metric);
-                  }
-              });
-          } else {
-              const otherDiffs = [];
-              const featureSource = candidateTrack?.features || findFeaturesLookup(candidateTrack?.identifier);
-              const currentFeatures = currentTrack?.features || findFeaturesLookup(currentTrack?.identifier);
-              if (featureSource && currentFeatures) {
-                  Object.keys(featureSource).forEach(key => {
-                      if (descriptor?.type === 'feature' && key === descriptor.key) return;
-                      const candVal = Number(featureSource[key]);
-                      const currVal = Number(currentFeatures[key]);
-                      if (!Number.isFinite(candVal) || !Number.isFinite(currVal)) return;
-                      const delta = candVal - currVal;
-                      otherDiffs.push({ key, delta });
-                  });
-              }
-
-              const pcaCandidate = candidateTrack?.pca || findPcaLookup(candidateTrack?.identifier);
-              const pcaCurrent = currentTrack?.pca || findPcaLookup(currentTrack?.identifier);
-              if (pcaCandidate && pcaCurrent) {
-                  Object.keys(pcaCandidate).forEach(domain => {
-                      if (!Array.isArray(pcaCandidate[domain])) return;
-                      const candDomain = pcaCandidate[domain];
-                      const currDomain = Array.isArray(pcaCurrent[domain]) ? pcaCurrent[domain] : null;
-                      if (!currDomain) return;
-                      candDomain.forEach((value, idx) => {
-                          const candVal = Number(value);
-                          const currVal = Number(currDomain[idx]);
-                          if (!Number.isFinite(candVal) || !Number.isFinite(currVal)) return;
-                          const delta = candVal - currVal;
-                          const label = `${domain}_pc${idx + 1}`;
-                          if (descriptor?.type === 'pca' && descriptor.domain === domain && descriptor.index === idx) return;
-                          otherDiffs.push({ key: label, delta });
-                      });
-                  });
-              }
-
-              otherDiffs
-                  .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
-                  .slice(0, 10)
-                  .forEach(({ key, delta }) => {
-                      const metric = createMetric(key, formatDelta(delta));
-                      if (metric) {
-                          metricsContainer.appendChild(metric);
-                      }
-                  });
-          }
-      }
-
-      metricsContainer.querySelectorAll('.metric-value').forEach(el => {
-          if (el.textContent === '--') {
-              el.parentElement.classList.add('metric-empty');
-          }
-      });
-
-      const revealTargets = [];
-
-      metricsContainer.classList.add('hidden');
-      nextTrackCard.appendChild(metricsContainer);
-      revealTargets.push(metricsContainer);
-
-      if (collectBeetsChips) {
-          const trackData = candidateTrack && (candidateTrack.track || candidateTrack);
-          if (trackData) {
-              const beetsMeta = trackData.beetsMeta || trackData.beets || null;
-              const beetsChips = Array.isArray(beetsMeta)
-                  ? beetsMeta
-                  : (beetsMeta ? collectBeetsChips(beetsMeta) : []);
-
-              const chipsArray = Array.isArray(beetsChips) ? beetsChips.slice(0, 12) : [];
-
-              if (chipsArray.length > 0) {
-              const beetsContainer = document.createElement('div');
-              beetsContainer.className = 'track-beets hidden';
-
-                  const escapeHtml = (val) => String(val)
-                      .replace(/&/g, '&amp;')
-                      .replace(/</g, '&lt;')
-                      .replace(/>/g, '&gt;')
-                      .replace(/"/g, '&quot;')
-                      .replace(/'/g, '&#39;');
-
-                  chipsArray.forEach(({ key, value }) => {
-                      if (!key && !value) {
-                          return;
-                      }
-                      const chip = document.createElement('div');
-                      chip.className = 'beets-chip';
-                      const safeKey = escapeHtml(key || 'segment');
-                      const safeValue = escapeHtml(value !== undefined && value !== null ? value : '');
-                      chip.innerHTML = `
-                          <span class="chip-bracket">[</span>
-                          <span class="chip-value">${safeValue}</span>
-                          <span class="chip-separator">:</span>
-                          <span class="chip-key">${safeKey}</span>
-                          <span class="chip-bracket">]</span>
-                      `;
-                      beetsContainer.appendChild(chip);
-                  });
-
-                  if (beetsContainer.children.length > 0) {
-                  nextTrackCard.appendChild(beetsContainer);
-                  revealTargets.push(beetsContainer);
-                  }
-              }
-          }
-      }
-
-      if (revealTargets.length > 0) {
-          const show = () => revealTargets.forEach(el => {
-              el.classList.remove('hidden');
-          });
-          const hide = () => revealTargets.forEach(el => {
-              el.classList.add('hidden');
-          });
-
-          if (nextTrackCard.__chipShowHandler) {
-              nextTrackCard.removeEventListener('mouseenter', nextTrackCard.__chipShowHandler);
-              nextTrackCard.removeEventListener('focus', nextTrackCard.__chipShowHandler);
-          }
-
-          if (nextTrackCard.__chipHideHandler) {
-              nextTrackCard.removeEventListener('mouseleave', nextTrackCard.__chipHideHandler);
-              nextTrackCard.removeEventListener('blur', nextTrackCard.__chipHideHandler);
-          }
-
-          nextTrackCard.__chipShowHandler = show;
-          nextTrackCard.__chipHideHandler = hide;
-
-          nextTrackCard.addEventListener('mouseenter', show);
-          nextTrackCard.addEventListener('mouseleave', hide);
-          nextTrackCard.addEventListener('focus', show);
-          nextTrackCard.addEventListener('blur', hide);
       }
   }
 
@@ -1455,9 +795,6 @@ function helpersDuplicateLog(...args) {
           }
       }
 
-      if (typeof window.updateNextTrackMetadata === 'function') {
-          window.updateNextTrackMetadata(nextTrack);
-      }
 
       // Update server
       sendNextTrack(nextTrack.identifier, directionKey, 'user');
@@ -1639,6 +976,63 @@ function helpersDuplicateLog(...args) {
       if (layer) {
           layer.innerHTML = '';
       }
+  }
+
+  /**
+   * Animate stacked preview cards to pack behind the center card
+   * @returns {Promise} Resolves when animation completes
+   */
+  function packUpStackCards() {
+      return new Promise((resolve) => {
+          const container = document.getElementById('dimensionCards');
+          if (!container) {
+              resolve();
+              return;
+          }
+
+          const layer = container.querySelector('.stacked-preview-layer');
+          if (!layer) {
+              resolve();
+              return;
+          }
+
+          const previewCards = layer.querySelectorAll('.stacked-preview-layer-card');
+          if (previewCards.length === 0) {
+              resolve();
+              return;
+          }
+
+          // Get center card position
+          const centerCard = document.querySelector('.dimension-card.next-track');
+          if (!centerCard) {
+              clearStackedPreviewLayer();
+              resolve();
+              return;
+          }
+
+          const containerRect = container.getBoundingClientRect();
+          const cardRect = centerCard.getBoundingClientRect();
+          const targetX = cardRect.left - containerRect.left;
+          const targetY = cardRect.top - containerRect.top;
+
+          // Animate each preview card to stack directly behind center card
+          previewCards.forEach((preview, index) => {
+              preview.style.transition = 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease';
+              preview.style.transformOrigin = 'center center';
+
+              requestAnimationFrame(() => {
+                  // All cards go to same position (stacked directly behind center)
+                  preview.style.transform = `translate(${targetX}px, ${targetY}px) scale(1)`;
+                  preview.style.opacity = '0';
+              });
+          });
+
+          // Clear after animation completes
+          setTimeout(() => {
+              clearStackedPreviewLayer();
+              resolve();
+          }, 320);
+      });
   }
 
   function renderStackedPreviews(card, direction, selectedIndex) {
@@ -1882,49 +1276,6 @@ function helpersDuplicateLog(...args) {
       }
   }
 
-  // Update the JSON metadata overlay with full next track data
-  function updateDirectionKeyOverlay(direction, trackData) {
-      helpersColorLog(`🎨 JSON 1`);
-      const overlay = document.getElementById('directionKeyOverlay');
-      const text1 = document.getElementById('dkt1');
-      const text2 = document.getElementById('dkt2');
-
-      if (!overlay || !text1 || !text2) return;
-      helpersColorLog(`🎨 JSON 2`);
-
-      const trackPayload = trackData || state.latestExplorerData?.nextTrack?.track || state.latestExplorerData?.nextTrack || state.latestCurrentTrack;
-      const metadata2 = {
-          direction: {
-              key: direction.key,
-              name: direction.name || formatDirectionName(direction.key),
-              description: direction.description,
-              trackCount: direction.trackCount,
-              diversityScore: direction.diversityScore,
-              sampleTracks: direction.sampleTracks?.length || 0
-          },
-          nextTrack: trackPayload ? {
-              identifier: trackPayload.identifier,
-              title: getDisplayTitle(trackPayload),
-              artist: trackPayload.artist || 'Unknown Artist',
-              album: trackPayload.album || null,
-              duration: trackPayload.duration,
-              distance: trackPayload.distance,
-              features: trackPayload.features,
-              beetsMeta: trackPayload.beetsMeta || trackPayload.beets || null
-          } : null,
-      };
-
-      // Format as readable JSON with proper indentation
-      helpersColorLog(`🎨 JSON 3`);
-      const sanitizedTrackPayload = sanitizeMetadataValue(trackPayload) ?? null;
-      text1.textContent = JSON.stringify(sanitizedTrackPayload, null, 2);
-      console.dir({got: text1.textContent, from: trackPayload});
-      const sanitizedMetadata = sanitizeMetadataValue(metadata2) ?? null;
-      text2.textContent = JSON.stringify(sanitizedMetadata, null, 2);
-      console.dir({got: text2.textContent, from: metadata2});
-
-      helpersColorLog(`🎨 JSON metadata overlay updated for: ${direction.key}`);
-  }
 
 
   // Update card content with track details
@@ -2190,7 +1541,6 @@ function helpersDuplicateLog(...args) {
           card.style.marginLeft = sampleCount > 1 ? '-40px' : '0px';
 
           updateStackSizeIndicator(direction, card, stackIndex >= 0 ? stackIndex : undefined);
-          updateDirectionKeyOverlay(direction, track);
           const numericIndex = Number(card.dataset.trackIndex ?? stackIndex ?? 0);
           const resolvedIndex = Number.isFinite(numericIndex) ? numericIndex : 0;
           // TODO(deck-orchestration): Replace double rAF with orchestrated render once deck render pipeline is centralised.
@@ -2209,20 +1559,6 @@ function helpersDuplicateLog(...args) {
           hideDirectionKeyOverlay();
           clearStackedPreviewLayer();
       }
-
-      if (typeof evaluateDirectionConsistency === 'function') {
-          const samplesForCheck = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
-          evaluateDirectionConsistency(direction, {
-              card,
-              sampleTracks: samplesForCheck,
-              currentTrack: state?.latestCurrentTrack
-          });
-      }
-  }
-  function resolveConsistencyTolerance(referenceValue = 0, spreadValue = 0) {
-      const magnitude = Math.max(Math.abs(referenceValue || 0), Math.abs(spreadValue || 0));
-      const relativeComponent = magnitude * CONSISTENCY_DYNAMIC_RELATIVE;
-      return Math.max(CONSISTENCY_CHECK_TOLERANCE, CONSISTENCY_DYNAMIC_MIN_TOLERANCE, relativeComponent);
   }
   function sanitizeMetadataValue(value) {
       if (value === null || value === undefined) {
@@ -2262,15 +1598,16 @@ export {
     cycleStackContents,
     applyDirectionStackIndicator,
     resolveOppositeBorderColor,
+    resolveOppositeDirectionKey,
     createNextTrackCardStack,
     hideStackSizeIndicator,
     applyReverseBadge,
     ensureStackedPreviewLayer,
     clearStackedPreviewLayer,
+    packUpStackCards,
     renderStackedPreviews,
     redrawDimensionCardsWithNewNext,
     hideDirectionKeyOverlay,
-    updateDirectionKeyOverlay,
     decodeHexEncodedPath,
     extractFileStem
 };
@@ -2280,4 +1617,5 @@ if (typeof window !== 'undefined') {
     window.getDisplayTitle = getDisplayTitle;
     window.photoStyle = photoStyle;
     window.updateCardWithTrackDetails = updateCardWithTrackDetails;
+    window.packUpStackCards = packUpStackCards;
 }

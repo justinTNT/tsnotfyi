@@ -6,6 +6,7 @@ import { exitDangerZoneVisualState } from './danger-zone.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
+import { getPlaylistNext, popPlaylistHead, playlistHasItems } from './playlist-tray.js';
 
 // ====== Heartbeat & Sync System ======
 
@@ -37,6 +38,16 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
 
     let md5ToSend = trackMd5;
     let dirToSend = direction;
+
+    // First priority: Check playlist queue for pre-selected next track
+    if (!md5ToSend && allowFallback && playlistHasItems()) {
+        const queuedNext = getPlaylistNext();
+        if (queuedNext) {
+            md5ToSend = queuedNext.trackId;
+            dirToSend = dirToSend || queuedNext.directionKey || null;
+            console.log(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist`);
+        }
+    }
 
     if (!md5ToSend && allowFallback) {
         if (manualOverrideActive && state.selectedIdentifier) {
@@ -659,9 +670,9 @@ export async function requestSSERefresh(options = {}) {
             stage
         };
 
-        if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-            requestBody.requestExplorerData = true;
-        }
+        // Always request fresh explorer data on manual refresh
+        requestBody.requestExplorerData = true;
+        requestBody.forceExplorerRefresh = true;
 
         const response = await fetch('/refresh-sse', {
             method: 'POST',
@@ -792,6 +803,23 @@ export async function requestSSERefresh(options = {}) {
 
 export async function manualRefresh() {
     console.log('🔄 Manual refresh requested');
+
+    // First, try to fetch fresh explorer data for current track
+    const currentTrackId = state.latestCurrentTrack?.identifier;
+    if (currentTrackId) {
+        console.log('🔄 Fetching fresh explorer data for current track');
+        const { fetchExplorerWithPlaylist } = await import('./explorer-fetch.js');
+        const explorerData = await fetchExplorerWithPlaylist(currentTrackId, { forceFresh: true });
+        if (explorerData && Object.keys(explorerData.directions || {}).length > 0) {
+            console.log('🔄 Explorer data refreshed successfully');
+            state.latestExplorerData = explorerData;
+            if (typeof window.createDimensionCards === 'function') {
+                window.createDimensionCards(explorerData, { skipExitAnimation: false, forceRedraw: true });
+            }
+            return 'explorer_refresh';
+        }
+        console.warn('🔄 Explorer refresh returned no directions');
+    }
 
     if (!state.streamFingerprint) {
         console.warn('🛰️ Manual refresh: no fingerprint yet; waiting before attempting rebroadcast');

@@ -1,9 +1,16 @@
 // Deck state management - staleness flags, explorer snapshot timing, backup restoration
 // Dependencies: globals.js (state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS, debugLog)
 // Dependencies: explorer-utils.js (cloneExplorerData)
+// Dependencies: explorer-fetch.js (fetchExplorerWithPlaylist) - loaded dynamically to avoid circular imports
 
 import { state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS, debugLog } from './globals.js';
 import { cloneExplorerData } from './explorer-utils.js';
+
+// Dynamic import to avoid potential circular dependency issues
+async function loadExplorerFetch() {
+  const module = await import('./explorer-fetch.js');
+  return module.fetchExplorerWithPlaylist;
+}
 
 export function setDeckStaleFlag(active, context = {}) {
   if (state.staleExplorerDeck === active) {
@@ -64,7 +71,6 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
   if (!trackId) {
     return;
   }
-  const timeoutMs = context.timeoutMs || state.explorerSnapshotTimeoutMs || PENDING_EXPLORER_FORCE_MS;
   if (state.pendingExplorerTimer) {
     clearTimeout(state.pendingExplorerTimer);
   }
@@ -74,10 +80,59 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
     reason: context.reason || 'unknown'
   };
   setDeckStaleFlag(true, {
-    reason: context.reason || 'waiting-explorer-snapshot'
+    reason: context.reason || 'fetching-explorer'
   });
+
+  // Fetch explorer data via POST /explorer (replaces SSE-based explorer snapshots)
+  console.log(`🎯 Fetching explorer for track ${trackId.substring(0, 8)}...`);
+
+  // Use async wrapper to handle dynamic import
+  (async () => {
+    try {
+      const fetchExplorerWithPlaylist = await loadExplorerFetch();
+      const data = await fetchExplorerWithPlaylist(trackId);
+
+      if (!data) {
+        console.warn('🧭 Explorer fetch returned no data');
+        handleExplorerSnapshotTimeout();
+        return;
+      }
+
+      // Check if we're still waiting for this track's data
+      if (state.pendingExplorerSnapshot?.trackId !== trackId) {
+        console.log('🧭 Explorer data arrived for stale track, ignoring');
+        return;
+      }
+
+      // Apply the explorer data
+      console.log(`🎯 Explorer data received for ${trackId.substring(0, 8)}: ${Object.keys(data.directions || {}).length} directions, nextTrack: ${data.nextTrack?.track?.title || 'none'}`);
+      state.pendingExplorerSnapshot = null;
+      state.latestExplorerData = {
+        ...data,
+        currentTrack: data.currentTrack,
+        directions: data.directions,
+        nextTrack: data.nextTrack || null // Server's recommendation
+      };
+      state.lastExplorerPayload = cloneExplorerData(state.latestExplorerData);
+      setDeckStaleFlag(false, { reason: 'explorer-fetched' });
+
+      // Render the dimension cards
+      if (typeof window.createDimensionCards === 'function') {
+        window.createDimensionCards(state.latestExplorerData, { skipExitAnimation: false, forceRedraw: true });
+      }
+    } catch (error) {
+      console.error('🧭 Explorer fetch failed:', error);
+      handleExplorerSnapshotTimeout();
+    }
+  })();
+
+  // Set a timeout fallback in case fetch hangs
+  const timeoutMs = context.timeoutMs || state.explorerSnapshotTimeoutMs || PENDING_EXPLORER_FORCE_MS;
   state.pendingExplorerTimer = setTimeout(() => {
-    handleExplorerSnapshotTimeout();
+    if (state.pendingExplorerSnapshot?.trackId === trackId) {
+      console.warn('🧭 Explorer fetch timed out');
+      handleExplorerSnapshotTimeout();
+    }
   }, timeoutMs);
 }
 
@@ -87,7 +142,7 @@ function handleExplorerSnapshotTimeout() {
   if (!pending) {
     return;
   }
-  console.warn('🧭 Explorer snapshot delayed; keeping previous directions', {
+  console.warn('🧭 Explorer fetch timeout; using backup if available', {
     trackId: pending.trackId,
     waitedMs: Date.now() - pending.queuedAt,
     reason: pending.reason
@@ -95,15 +150,16 @@ function handleExplorerSnapshotTimeout() {
   state.pendingExplorerSnapshot = null;
   if (!useExplorerBackupDeck(pending)) {
     setDeckStaleFlag(false, { reason: 'backup-missing' });
+    // Retry fetch after a delay
     const now = Date.now();
     if ((now - (state.lastExplorerTimeoutRefreshTs || 0)) > 3000) {
       state.lastExplorerTimeoutRefreshTs = now;
-      console.warn('🛰️ Explorer snapshot missing with no backup; requesting SSE refresh');
-      if (typeof window.requestSSERefresh === 'function') {
-        window.requestSSERefresh({ escalate: false, stage: 'explorer-timeout' }).catch((error) => {
-          console.error('❌ SSE refresh after explorer-timeout failed', error);
-        });
-      }
+      console.warn('🧭 Retrying explorer fetch after timeout');
+      setTimeout(() => {
+        if (pending.trackId && !state.pendingExplorerSnapshot) {
+          armExplorerSnapshotTimer(pending.trackId, { reason: 'retry-after-timeout' });
+        }
+      }, 1000);
     }
   }
 }

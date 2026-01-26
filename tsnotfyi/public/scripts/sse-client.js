@@ -7,6 +7,8 @@ import { exitDangerZoneVisualState, exitCardsDormantState, ensureDeckHydratedAft
 import { cloneExplorerData, explorerContainsTrack, findTrackInExplorer, shouldIgnoreExplorerUpdate, summarizeExplorerSnapshot } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
 import { updateConnectionHealthUI, handleDeadAudioSession } from './audio-manager.js';
+import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray } from './playlist-tray.js';
+import { cancelPackAwayAnimation } from './clock-animation.js';
 
 // Smart SSE connection with health monitoring and reconnection
 export function connectSSE() {
@@ -91,8 +93,10 @@ export function connectSSE() {
       state.playbackStartTimestamp = Date.now() - heartbeat.timing.elapsedMs;
     }
 
+    // When track changes, clear albumCover to avoid stale cover from previous track
+    const baseTrack = trackChanged ? {} : state.latestCurrentTrack;
     state.latestCurrentTrack = {
-      ...state.latestCurrentTrack,
+      ...baseTrack,
       ...currentTrack,
       duration: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null,
       length: state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || null
@@ -103,6 +107,53 @@ export function connectSSE() {
     if ((trackChanged || (!previousTrackId && currentTrackId)) && currentTrackId) {
       state.pendingSnapshotTrackId = currentTrackId;
         armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-track-change' });
+
+      // Pop playlist queue if the new track matches queue head
+      let albumCoverResolved = false;
+      if (trackChanged && playlistHasItems()) {
+        const queueHead = getPlaylistNext();
+        if (queueHead && queueHead.trackId === currentTrackId) {
+          console.log(`🎵 Track change matched queue head - advancing playlist`);
+
+          // Use albumCover from playlist item (server heartbeat doesn't include it)
+          if (queueHead.albumCover) {
+            state.latestCurrentTrack.albumCover = queueHead.albumCover;
+            if (window.state) window.state.latestCurrentTrack = state.latestCurrentTrack;
+            albumCoverResolved = true;
+          }
+
+          popPlaylistHead();
+          renderPlaylistTray();
+
+          // Notify server about new queue head (if any)
+          const newHead = getPlaylistNext();
+          if (newHead && typeof window.sendNextTrack === 'function') {
+            console.log(`🎵 Notifying server of new queue head: ${newHead.trackId.substring(0, 8)}`);
+            window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+          }
+        }
+      }
+
+      // If albumCover not from playlist, try previousNextTrack (track that was "next" before it started playing)
+      if (trackChanged && !albumCoverResolved && !state.latestCurrentTrack.albumCover) {
+        if (state.previousNextTrack?.identifier === currentTrackId && state.previousNextTrack?.albumCover) {
+          state.latestCurrentTrack.albumCover = state.previousNextTrack.albumCover;
+          if (window.state) window.state.latestCurrentTrack = state.latestCurrentTrack;
+          console.log(`🎵 Using albumCover from previousNextTrack for ${currentTrackId.substring(0, 8)}`);
+        }
+      }
+
+      // Add track to session history for explorer exclusions
+      if (!state.sessionTrackHistory) {
+        state.sessionTrackHistory = [];
+      }
+      if (!state.sessionTrackHistory.includes(currentTrackId)) {
+        state.sessionTrackHistory.push(currentTrackId);
+        console.log(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
+      }
+
+      // Cancel any in-progress pack-away animation on track change
+      cancelPackAwayAnimation();
     }
 
     const adoptionResult = typeof window.adoptPendingLiveTrackCandidate === 'function'
@@ -127,16 +178,21 @@ export function connectSSE() {
     }
 
     const durationSeconds = state.playbackDurationSeconds || currentTrack.duration || currentTrack.length || 0;
-    let elapsedSeconds = null;
-    if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
-      elapsedSeconds = Math.max(heartbeat.timing.elapsedMs / 1000, 0);
-    } else if (state.playbackStartTimestamp) {
-      elapsedSeconds = Math.max((Date.now() - state.playbackStartTimestamp) / 1000, 0);
-    }
 
-    if (durationSeconds > 0 && elapsedSeconds != null) {
+    // Only set position from server on track changes - let audio.currentTime drive during playback
+    if (trackChanged && durationSeconds > 0) {
+      let elapsedSeconds = 0;
+      if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
+        elapsedSeconds = Math.max(heartbeat.timing.elapsedMs / 1000, 0);
+      }
       const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-      startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: !trackChanged });
+      startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: false });
+    } else if (durationSeconds > 0 && !state.progressAnimation) {
+      // Start animation if not running (e.g., first heartbeat after page load)
+      const elapsedSeconds = Number.isFinite(heartbeat.timing?.elapsedMs)
+        ? Math.max(heartbeat.timing.elapsedMs / 1000, 0)
+        : 0;
+      startProgressAnimationFromPosition(durationSeconds, Math.min(elapsedSeconds, durationSeconds), { resync: false });
     }
 
     const nextTrackId = heartbeat.nextTrack?.track?.identifier || heartbeat.nextTrack?.identifier || null;
@@ -145,6 +201,16 @@ export function connectSSE() {
       state.serverNextDirection = heartbeat.nextTrack?.direction || heartbeat.nextTrack?.directionKey || null;
       if (!state.manualNextTrackOverride) {
         state.selectedIdentifier = nextTrackId;
+
+        // Update center card with full track details if track changed
+        const centerCard = document.querySelector('.dimension-card.next-track');
+        if (centerCard && centerCard.dataset.trackMd5 !== nextTrackId) {
+          const match = findTrackInExplorer(state.latestExplorerData, nextTrackId);
+          if (match?.track && match?.direction && typeof window.updateCardWithTrackDetails === 'function') {
+            window.updateCardWithTrackDetails(centerCard, match.track, match.direction, true);
+          }
+        }
+
         if (typeof window.updatePlaylistTrayPreview === 'function') {
           window.updatePlaylistTrayPreview();
         }
@@ -176,6 +242,15 @@ export function connectSSE() {
         state.pendingManualTrackId = overrideId;
         if (!state.selectedIdentifier || state.selectedIdentifier === state.serverNextTrack) {
           state.selectedIdentifier = overrideId;
+
+          // Update center card with full track details
+          const centerCard = document.querySelector('.dimension-card.next-track');
+          if (centerCard && centerCard.dataset.trackMd5 !== overrideId) {
+            const match = findTrackInExplorer(state.latestExplorerData, overrideId);
+            if (match?.track && match?.direction && typeof window.updateCardWithTrackDetails === 'function') {
+              window.updateCardWithTrackDetails(centerCard, match.track, match.direction, true);
+            }
+          }
         }
       }
     }
@@ -215,11 +290,15 @@ export function connectSSE() {
     state.selectedIdentifier = trackId;
 
     const match = findTrackInExplorer(state.latestExplorerData, trackId);
-    if (match?.track && typeof window.updateNextTrackMetadata === 'function') {
-      window.updateNextTrackMetadata(match.track);
-    } else if (typeof window.updateNextTrackMetadata === 'function') {
-      window.updateNextTrackMetadata({ identifier: trackId });
+
+    // Update center card with full track details (title, image, trackMd5, etc.)
+    const centerCard = document.querySelector('.dimension-card.next-track');
+    if (centerCard && match?.track && match?.direction) {
+      if (typeof window.updateCardWithTrackDetails === 'function') {
+        window.updateCardWithTrackDetails(centerCard, match.track, match.direction, true);
+      }
     }
+
 
     if (typeof window.refreshCardsWithNewSelection === 'function') {
       window.refreshCardsWithNewSelection();
@@ -231,16 +310,11 @@ export function connectSSE() {
     console.log('🛰️ selection_ready', event);
 
     if (trackId) {
-      const match = findTrackInExplorer(state.latestExplorerData, trackId);
-      if (match?.track && typeof window.updateNextTrackMetadata === 'function') {
-        window.updateNextTrackMetadata(match.track);
-      } else if (typeof window.updateNextTrackMetadata === 'function') {
-        window.updateNextTrackMetadata({ identifier: trackId });
-      }
-    }
+      findTrackInExplorer(state.latestExplorerData, trackId);
 
-    if (trackId && state.pendingManualTrackId === trackId) {
-      state.manualNextTrackOverride = true;
+      if (state.pendingManualTrackId === trackId) {
+        state.manualNextTrackOverride = true;
+      }
     }
   };
 
@@ -254,9 +328,6 @@ export function connectSSE() {
       state.pendingManualTrackId = null;
     }
 
-    if (typeof window.updateNextTrackMetadata === 'function') {
-      window.updateNextTrackMetadata(null);
-    }
     requestSSERefresh({ escalate: false });
   };
 
@@ -623,7 +694,9 @@ export function connectSSE() {
       }
 
       if (data.type === 'explorer_snapshot') {
-        handleExplorerSnapshot(data);
+        // Explorer snapshots are now handled via POST /explorer request/response
+        // This SSE event type is deprecated and will be removed from the server
+        console.log('📡 Ignoring explorer_snapshot SSE event (use POST /explorer instead)');
         return;
       }
 

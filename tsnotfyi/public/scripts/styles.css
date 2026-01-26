@@ -137,52 +137,6 @@ body {
     opacity: 0.95;
 }
 
-.track-metrics .metric-chip {
-    background: rgba(16, 16, 16, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 10px;
-    padding: 2px 8px;
-    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
-    font-size: 0.65rem;
-    color: #fff;
-    display: flex;
-    gap: 4px;
-    align-items: center;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
-}
-
-.track-metrics .metric-label {
-    opacity: 0.7;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-
-.track-metrics .metric-value {
-    font-weight: 600;
-}
-
-.track-metrics .metric-chip.metric-empty {
-    opacity: 0.6;
-}
-
-.track-metrics {
-    position: absolute;
-    top: -4em;
-    right: -11em;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    align-items: flex-end;
-    pointer-events: none;
-    width: 4em;
-    opacity: 1;
-    transition: opacity 1666ms ease;
-}
-
-.track-metrics.hidden {
-    opacity: 0;
-    visibility: hidden;
-}
 
 .track-beets {
     position: absolute;
@@ -276,44 +230,6 @@ body {
     opacity: 0;
     pointer-events: none;
     transform: translateY(-50%) rotateY(-8deg) rotateX(2deg) translateZ(-400px);
-}
-
-.directionKeyText {
-    position: absolute;
-    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
-    font-weight: 400;
-    color: #0a0; /* Volume bar green */
-    opacity: 0.3;
-    transition: opacity 1s linear;
-    letter-spacing: 0.02em;
-    line-height: 1.4;
-    user-select: none;
-    white-space: pre-wrap;
-    background: rgba(0, 0, 0, 0.05);
-    padding: 1rem;
-    border-radius: 4px;
-    border: 1px solid rgba(0, 170, 0, 0.1);
-    backdrop-filter: blur(2px);
-    max-width: 500px;
-    max-height: 70vh;
-    overflow-y: auto;
-    box-shadow:
-        0 0 20px rgba(0, 170, 0, 0.05),
-        0 0 40px rgba(0, 170, 0, 0.02);
-}
-
-#dkt1 {
-    text-align: left;
-    top: 0;
-    left: 40%;
-    font-size: 0.7rem
-}
-
-#dkt2 {
-    text-align: right;
-    bottom: 0;
-    right: 0;
-    font-size: 1.7rem;
 }
 
 /* Custom scrollbar for JSON metadata overlay */
@@ -890,44 +806,134 @@ audio {
     transition: transform 1s ease-out;
 }
 
+/* Playlist Tray - Queue with left/right stacks */
 #nextTrackTray {
     position: fixed;
     top: calc(50% + 220px);
-    left: 50%;
+    left: 15%;
     transform: translate(-50%, 0);
-    width: 220px;
+    width: 300px;
     display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
+    flex-direction: row;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 10px;
     z-index: 120;
     pointer-events: none;
+    padding: 10px 0;
 }
 
-#nextTrackTray.has-track {
+#nextTrackTray.has-items {
     pointer-events: auto;
 }
 
-.next-track-tray-preview {
-    width: 200px;
-    height: 200px;
-    border-radius: 20px;
+/* Left stack - confirm/advance queue */
+.playlist-left-stack {
+    position: relative;
+    width: 120px;
+    height: 120px;
+    cursor: pointer;
+    pointer-events: auto;
+}
+
+/* Right stack - unwind queue */
+.playlist-right-stack {
+    position: relative;
+    width: 120px;
+    height: 120px;
+    cursor: pointer;
+    pointer-events: auto;
+}
+
+/* Stack items (album thumbnails) - z-stacked piles */
+.playlist-left-stack .stack-item,
+.playlist-right-stack .stack-item {
+    position: absolute;
+    width: 120px;
+    height: 120px;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    pointer-events: auto;
+}
+
+/* Left stack: offset toward center (right) */
+.playlist-left-stack .stack-item:nth-child(1) { z-index: 4; top: 0; left: 0; }
+.playlist-left-stack .stack-item:nth-child(2) { z-index: 3; top: 3px; left: 6px; }
+.playlist-left-stack .stack-item:nth-child(3) { z-index: 2; top: 6px; left: 12px; }
+.playlist-left-stack .stack-item:nth-child(4) { z-index: 1; top: 9px; left: 18px; }
+
+/* Right stack: offset toward center (left) */
+.playlist-right-stack .stack-item:nth-child(1) { z-index: 4; top: 0; right: 0; }
+.playlist-right-stack .stack-item:nth-child(2) { z-index: 3; top: 3px; right: 6px; }
+.playlist-right-stack .stack-item:nth-child(3) { z-index: 2; top: 6px; right: 12px; }
+.playlist-right-stack .stack-item:nth-child(4) { z-index: 1; top: 9px; right: 18px; }
+
+.playlist-left-stack .stack-item:hover,
+.playlist-right-stack .stack-item:hover {
+    transform: scale(1.1);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    z-index: 10;
+}
+
+.stack-item img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* Shrinkwrap overlay on stack items */
+.stack-item::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: url('../images/shrinkwrap.png');
     background-size: cover;
     background-position: center;
-    box-shadow: 0 30px 60px rgba(0, 0, 0, 0.55);
-    opacity: 0;
-    transform: translateY(35px) scale(0.8);
-    transition: transform 0.55s cubic-bezier(0.22, 0.61, 0.36, 1), opacity 0.55s ease;
+    pointer-events: none;
+    opacity: 0.85;
 }
 
-.next-track-tray-preview.visible {
-    opacity: 1;
-    transform: translateY(0) scale(1);
+/* Animating card clone flying to tray */
+.animating-to-tray {
+    position: relative;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 }
 
-.next-track-tray-preview.fade-out {
+.animating-to-tray::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: url('../images/shrinkwrap.png');
+    background-size: cover;
+    background-position: center;
+    pointer-events: none;
     opacity: 0;
-    transform: translateY(15px) scale(0.85);
+    transition: opacity 0.25s ease;
+}
+
+.animating-to-tray.shrinkwrap-visible::after {
+    opacity: 0.85;
+}
+
+.animating-to-tray img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+
+/* Legacy support - keep old class for backward compatibility */
+.next-track-tray-preview {
+    display: none; /* Hidden - replaced by playlist tray */
 }
 
 @keyframes dimensionCardExitCurve {
@@ -960,6 +966,41 @@ audio {
     pointer-events: none;
 }
 
+/* Clock Animation - Pack-away and zoom-out */
+.clock-zoom-animation-group {
+    transform-origin: center center;
+    will-change: transform, opacity;
+}
+
+.album-cover-slide-clone {
+    will-change: transform, width, height;
+}
+
+/* Card stack animation during pack-away */
+.dimension-card.stacking {
+    will-change: transform, opacity;
+}
+
+/* Pack-away trigger zone indicator (optional visual feedback) */
+.pack-away-indicator {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.6);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.pack-away-indicator.visible {
+    opacity: 1;
+}
+
 #dimensionCards.cards-dormant .dimension-card {
     opacity: 1;
     filter: none;
@@ -988,24 +1029,6 @@ audio {
     opacity: 0.55;
     filter: saturate(0.55);
     transition: opacity 0.3s ease;
-}
-
-:root.deck-stale #dimensionCards::before {
-    content: 'Waiting for explorer data…';
-    position: absolute;
-    top: 8%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    padding: 6px 14px;
-    font-size: 0.78rem;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: #9dd4ff;
-    background: rgba(8, 12, 20, 0.78);
-    border-radius: 999px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
-    pointer-events: none;
-    z-index: 5;
 }
 
 :root.deck-stale #dimensionCards .dimension-card .label {
@@ -1601,22 +1624,6 @@ audio {
 }
 
 
-#beetsSegments {
-    position: fixed;
-    right: 50%;
-    justify-content: right;
-    top: 0%;
-    width: 220px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    opacity: 0.2;
-    pointer-events: none;
-    transition: opacity 1s linear, transform 0.3s ease;
-    transform-origin: center;
-    z-index: 1;
-    transform: translateY(30%) translateX(-23%) scale(2.34) rotateZ(-20deg)
-}
 #hardResetButton {
     position: fixed;
     top: 20px;

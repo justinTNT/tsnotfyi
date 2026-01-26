@@ -219,7 +219,14 @@ export const state = {
   connectionQuarantineBackoffMs: CONNECTION_QUARANTINE_BASE_MS,
   dangerZoneVisualActive: false,
   dangerZoneDeckCollapsed: false,
-  hasRenderedDeck: false
+  hasRenderedDeck: false,
+
+  // Playlist queue state (new explorer architecture)
+  playlist: [],          // Array of {trackId, albumCover, directionKey, explorerSnapshot}
+  playlistCursor: 0,     // Index of current "next track" in queue
+
+  // Session track history (for explorer exclusions)
+  sessionTrackHistory: [] // Array of track IDs played in this session (most recent last)
 };
 
 // Connection health management - tracks SSE and audio connection status
@@ -268,7 +275,6 @@ export function initializeElements() {
   elements.dimensionCards = document.getElementById('dimensionCards');
   elements.nextTrackPreview = document.getElementById('nextTrackPreview');
   elements.nextTrackPreviewImage = document.querySelector('#nextTrackPreview img');
-  elements.beetsSegments = document.getElementById('beetsSegments');
 
   if (elements.audio) {
     elements.audio.volume = 0.85;

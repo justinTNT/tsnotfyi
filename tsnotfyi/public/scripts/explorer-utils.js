@@ -1,11 +1,9 @@
 // Explorer utilities - direction handling, track normalization, explorer data processing
 // Dependencies: globals.js (state, PANEL_VARIANTS, VARIANT_TO_DIRECTION_TYPE)
 // Dependencies: tools.js (getOppositeDirection, getDirectionColor)
-// Dependencies: beets-ui.js (renderBeetsSegments)
 
 import { state, PANEL_VARIANTS, VARIANT_TO_DIRECTION_TYPE } from './globals.js';
 import { getOppositeDirection, getDirectionColor } from './tools.js';
-import { renderBeetsSegments } from './beets-ui.js';
 
 export function cloneExplorerData(payload) {
   if (!payload) return null;
@@ -671,9 +669,6 @@ export function hydrateTrackDetails(trackOrIdentifier, options = {}) {
       mergeTrackMetadata(trackOrIdentifier, entry.details);
     }
     applyTrackDetailsToExplorer(identifier, entry.details);
-    if (entry.details.beetsMeta && state.selectedIdentifier === identifier) {
-      renderBeetsSegments(entry.details);
-    }
     return Promise.resolve(entry.details);
   }
 
@@ -708,10 +703,6 @@ export function hydrateTrackDetails(trackOrIdentifier, options = {}) {
         mergeTrackMetadata(trackOrIdentifier, payload);
       }
       applyTrackDetailsToExplorer(identifier, payload);
-
-      if (payload.beetsMeta && state.selectedIdentifier === identifier) {
-        renderBeetsSegments(payload);
-      }
 
       return payload;
     })

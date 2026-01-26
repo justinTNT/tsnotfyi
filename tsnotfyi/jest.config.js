@@ -10,8 +10,14 @@ module.exports = {
     {
       displayName: 'ui',
       testEnvironment: 'jsdom',
-      setupFiles: ['<rootDir>/tests/ui/setup.js'],
-      testMatch: ['<rootDir>/tests/ui/**/*.test.js']
+      setupFilesAfterEnv: ['<rootDir>/tests/ui/setup.js'],
+      testMatch: ['<rootDir>/tests/ui/**/*.test.js'],
+      transform: {
+        '^.+\\.js$': 'babel-jest'
+      },
+      transformIgnorePatterns: [
+        '/node_modules/'
+      ]
     }
   ]
 };

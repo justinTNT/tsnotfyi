@@ -2,16 +2,18 @@
 import { state, elements, connectionHealth, audioHealth, rootElement, PANEL_VARIANTS, debugLog, getCardBackgroundColor, initializeElements } from './globals.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
 import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
-import { renderBeetsSegments, hideBeetsSegments } from './beets-ui.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
-import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, mergeTrackMetadata } from './explorer-utils.js';
+import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, resolveCanonicalDirectionKey } from './explorer-utils.js';
 import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer, clearPendingExplorerLookahead, forceApplyPendingExplorerSnapshot } from './deck-state.js';
 import { setCardVariant, getDeckFrameBuilder, runDeckFrameBuild, initDeckRenderWorker, requestDeckRenderFrame, resolveTrackColorAssignment, cacheTrackColorAssignment } from './deck-render.js';
 import { exitDangerZoneVisualState, safelyExitCardsDormantState, enterDangerZoneVisualState, ensureDeckHydratedAfterTrackChange, enterCardsDormantState, exitCardsDormantState, ensureTrayPreviewForDangerZone, collapseDeckForDangerZone } from './danger-zone.js';
 import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, formatTimecode, startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, maybeApplyPendingTrackUpdate, getVisualProgressFraction } from './progress-ui.js';
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
-import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, hideDirectionKeyOverlay, updateDirectionKeyOverlay, resolveOppositeBorderColor } from './helpers.js';
+import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
+import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray } from './playlist-tray.js';
+import { triggerPackAwayAnimation, checkPackAwayTrigger, cancelPackAwayAnimation, isPackAwayInProgress } from './clock-animation.js';
+import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext } from './helpers.js';
 
 (function hydrateStateFromLocation() {
   state.streamUrlBase = '/stream';
@@ -23,6 +25,13 @@ import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDeta
 })();
 
 const RADIUS_MODES = ['microscope', 'magnifying', 'binoculars'];
+
+// Deck API references for ES module exports
+let _createDimensionCards;
+let _navigateDirectionToCenter;
+let _rotateCenterCardToNextPosition;
+let _convertToNextTrackStack;
+let _prioritizeAlternateTrack;
 
 // Explorer track lookup functions moved to explorer-utils.js
 
@@ -352,30 +361,6 @@ async function initializeApp() {
 
   let lastProgressPhase = null;
 
-  // Setup beets hover interaction
-  if (elements.nowPlayingCard && elements.beetsSegments) {
-      const showBeets = () => {
-          if (elements.beetsSegments.dataset.hasData === 'true') {
-              elements.beetsSegments.classList.remove('hidden');
-          }
-      };
-
-      const hideBeets = () => {
-          elements.beetsSegments.classList.add('hidden');
-      };
-
-      elements.nowPlayingCard.addEventListener('mouseenter', showBeets);
-      elements.nowPlayingCard.addEventListener('mouseleave', hideBeets);
-      elements.nowPlayingCard.addEventListener('focus', showBeets, true);
-      elements.nowPlayingCard.addEventListener('blur', hideBeets, true);
-
-      elements.beetsSegments.addEventListener('mouseenter', showBeets);
-      elements.beetsSegments.addEventListener('mouseleave', hideBeets);
-  }
-
-  if (elements.beetsSegments) {
-      elements.beetsSegments.dataset.hasData = elements.beetsSegments.dataset.hasData || 'false';
-  }
 
   function ensureBaseOpacity(node) {
       if (!node) {
@@ -396,50 +381,11 @@ async function initializeApp() {
       return Number.isFinite(parsed) ? parsed : 1;
   }
 
-function applyMetadataOpacity(fadeRatio) {
-      const ratio = Math.max(0, Math.min(fadeRatio, 1));
-      if (state.metadataRevealPending && ratio > 0) {
-          return;
-      }
-      const directionTextNodes = document.querySelectorAll('.directionKeyText');
-      directionTextNodes.forEach(node => {
-          const baseOpacity = ensureBaseOpacity(node);
-          node.style.opacity = (baseOpacity * ratio).toFixed(3);
-      });
-
-      if (elements.beetsSegments) {
-          const baseOpacity = ensureBaseOpacity(elements.beetsSegments);
-          const targetOpacity = baseOpacity * ratio;
-          elements.beetsSegments.style.opacity = targetOpacity.toFixed(3);
-      }
-  }
   if (typeof window !== 'undefined') {
-      window.applyMetadataOpacity = applyMetadataOpacity;
       window.updateNowPlayingCard = updateNowPlayingCard;
       window.updateRadiusControlsUI = updateRadiusControlsUI;
   }
 
-  function updateMetadataFadeFromProgress(progressFraction) {
-      const duration = state.playbackDurationSeconds || 0;
-
-      if (!Number.isFinite(duration) || duration <= 0) {
-          applyMetadataOpacity(0);
-          return;
-      }
-
-      const clampedProgress = Math.max(0, Math.min(progressFraction, 1));
-      const elapsedSeconds = clampedProgress * duration;
-      const fadeWindow = Math.max(Math.min(METADATA_FADE_WINDOW_SECONDS, duration / 2), 0.001);
-
-      const fadeInFactor = Math.min(elapsedSeconds / fadeWindow, 1);
-      const remainingSeconds = Math.max(duration - elapsedSeconds, 0);
-      const fadeOutFactor = Math.min(remainingSeconds / fadeWindow, 1);
-      const fadeRatio = Math.max(0, Math.min(fadeInFactor, fadeOutFactor));
-
-      applyMetadataOpacity(fadeRatio);
-  }
-
-  applyMetadataOpacity(0);
 
   function setReversePreference(trackId, updates = {}) {
       if (!trackId) {
@@ -592,6 +538,7 @@ function applyMetadataOpacity(fadeRatio) {
           });
 }
 // Export immediately after definition so exposeDeckHelpers can find it
+_createDimensionCards = createDimensionCards;
 if (typeof window !== 'undefined') {
     window.createDimensionCards = createDimensionCards;
     window.__driftCreateDimensionCardsRef = createDimensionCards;
@@ -661,16 +608,19 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               };
           }
 
-          state.previousNextTrack = {
-	      identifier: previousNextId,
-	      albumCover: previousNext.albumCover,
-              variant: assignment.variant,
-              borderColor: assignment.border,
-              glowColor: assignment.glow,
-              directionKey: assignment.directionKey
-          };
+          // Only update previousNextTrack if not exploring ahead for playlist
+          if (!options.isPlaylistExploration) {
+              state.previousNextTrack = {
+                  identifier: previousNextId,
+                  albumCover: previousNext.albumCover,
+                  variant: assignment.variant,
+                  borderColor: assignment.border,
+                  glowColor: assignment.glow,
+                  directionKey: assignment.directionKey
+              };
 
-          cacheTrackColorAssignment(previousNextId, assignment);
+              cacheTrackColorAssignment(previousNextId, assignment);
+          }
       }
       state.remainingCounts = {};
       const layoutEntries = {};
@@ -833,6 +783,23 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       // Clear existing cards
       container.innerHTML = '';
+
+      // Restore visibility after pack-away animation
+      container.style.opacity = '';
+      container.style.visibility = '';
+      container.style.transform = '';
+      const clockEl = document.getElementById('playbackClock');
+      const nowPlayingEl = document.getElementById('nowPlayingCard');
+      if (clockEl) {
+          clockEl.style.opacity = '';
+          clockEl.style.visibility = '';
+          clockEl.style.transform = '';
+      }
+      if (nowPlayingEl) {
+          nowPlayingEl.style.opacity = '';
+          nowPlayingEl.style.visibility = '';
+          nowPlayingEl.style.transform = '';
+      }
 
       if (!explorerData) {
           console.error('❌ NO EXPLORER DATA AT ALL!', explorerData);
@@ -1201,7 +1168,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                   reason: 'no next-track cards rendered'
               });
           }
-          updateNextTrackMetadata(null);
           return;
       }
       let selectedCard = null;
@@ -1339,12 +1305,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               labelDiv.innerHTML = `<div class="dimension-label">${baseName}</div>`;
           }
       });
-
-      if (selectedCard && selectedTrackData) {
-          updateNextTrackMetadata(selectedTrackData);
-      } else {
-          updateNextTrackMetadata(null);
-      }
   }
 
   window.refreshCardsWithNewSelection = refreshCardsWithNewSelection;
@@ -1406,7 +1366,9 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
   }
 
   // Click to start
-  elements.clickCatcher.addEventListener('click', startAudio);
+  if (elements.clickCatcher) {
+    elements.clickCatcher.addEventListener('click', startAudio);
+  }
 
   // Handle window resize for force layout
   window.addEventListener('resize', () => {
@@ -1416,22 +1378,26 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
   });
 
   // Keep manual start - do not auto-start
-  elements.audio.addEventListener('canplay', () => {
-      if (state.isStarted) return;
-      // User prefers manual click-to-start
-  });
+  if (elements.audio) {
+    elements.audio.addEventListener('canplay', () => {
+        if (state.isStarted) return;
+        // User prefers manual click-to-start
+    });
+  }
 
   // Volume control
-  elements.volumeControl.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const rect = elements.volumeControl.getBoundingClientRect();
-      const y = e.clientY - rect.top;
-      const percent = 1 - (y / rect.height);
-      const volume = Math.max(0, Math.min(1, percent));
+  if (elements.volumeControl) {
+    elements.volumeControl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const rect = elements.volumeControl.getBoundingClientRect();
+        const y = e.clientY - rect.top;
+        const percent = 1 - (y / rect.height);
+        const volume = Math.max(0, Math.min(1, percent));
 
-      elements.audio.volume = volume;
-      elements.volumeBar.style.height = (volume * 100) + '%';
-  });
+        if (elements.audio) elements.audio.volume = volume;
+        if (elements.volumeBar) elements.volumeBar.style.height = (volume * 100) + '%';
+    });
+  }
 
   // Keyboard controls
   document.addEventListener('keydown', (e) => {
@@ -1472,7 +1438,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               break;
 
           case 'ArrowRight': // rotate the wheel clockwise
-              for (i = nextPosition + 1; i <= nextPosition + 12; i++) {
+              for (let i = nextPosition + 1; i <= nextPosition + 12; i++) {
                   const posFromIndex = (i+11)%12+1;
                   if (occupiedPositions.has(posFromIndex)) {
                       nextPosition = posFromIndex;
@@ -1485,7 +1451,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               break;
 
           case 'ArrowLeft': // rotate the wheel counter-clockwise
-              for (i = nextPosition-1; i >= nextPosition - 12; i--) {
+              for (let i = nextPosition-1; i >= nextPosition - 12; i--) {
                   const posFromIndex = (i-1)%12 + 1;
                   if (occupiedPositions.has(posFromIndex)) {
                       nextPosition = posFromIndex;
@@ -1528,6 +1494,24 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               break;
 
           case 'Escape':
+              // Unwind playlist (same as clicking right pile in tray)
+              if (typeof window.unwindPlaylist === 'function') {
+                  const unwound = window.unwindPlaylist();
+                  if (unwound && unwound.explorerData) {
+                      // Display cached explorer data instantly
+                      if (typeof window.createDimensionCards === 'function') {
+                          window.createDimensionCards(unwound.explorerData, { skipExitAnimation: true });
+                      }
+                  }
+              }
+              e.preventDefault();
+              break;
+
+          case 'Enter':
+              // Promote center card to playlist (same as clicking left pile in tray)
+              if (typeof window.promoteCenterCardToTray === 'function') {
+                  window.promoteCenterCardToTray();
+              }
               e.preventDefault();
               break;
 
@@ -1630,42 +1614,12 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               e.preventDefault();
               break;
 
-          case '1':
-              // Microscope - ultra close examination
-              console.log('🔬 Key 1: Microscope mode');
-
-              fetch('/session/zoom/microscope', {
-                  method: 'POST'
-              }).catch(err => console.error('Microscope request failed:', err));
-              e.preventDefault();
-              rejig();
-              break;
-
-          case '2':
-              // Magnifying glass - detailed examination
-              console.log('🔍 Key 2: Magnifying glass mode');
-              fetch('/session/zoom/magnifying', {
-                  method: 'POST'
-              }).catch(err => console.error('Magnifying request failed:', err));
-              e.preventDefault();
-              rejig();
-              break;
-
-          case '3':
-              // Binoculars - wide exploration
-              console.log('🔭 Key 3: Binoculars mode');
-              fetch('/session/zoom/binoculars', {
-                  method: 'POST'
-              }).catch(err => console.error('Binoculars request failed:', err));
-              e.preventDefault();
-              rejig();
-              break;
       }
   });
 
   animateBeams(sceneInit());
 
-  elements.audio.addEventListener('play', () => {
+  if (elements.audio) elements.audio.addEventListener('play', () => {
       if (state.pendingInitialTrackTimer) return;
 
       state.pendingInitialTrackTimer = setTimeout(() => {
@@ -1822,7 +1776,6 @@ function adoptPendingLiveTrackCandidate(trackDetails, fallbackDriftState = null)
         return { driftState: fallbackDriftState || null, adopted: false };
     }
 
-    mergeTrackMetadata(trackDetails, pending.track);
     const driftState = pending.driftState || fallbackDriftState || null;
     console.log('📌 Pending now-playing candidate applied', {
         trackId: currentId,
@@ -1838,73 +1791,7 @@ function adoptPendingLiveTrackCandidate(trackDetails, fallbackDriftState = null)
     return { driftState, adopted: true };
 }
 
-function updateNextTrackMetadata(track) {
-    if (!elements.beetsSegments) {
-        return;
-    }
 
-    if (!track || !track.identifier) {
-        hideBeetsSegments();
-        return;
-    }
-
-    const existingMeta = track.beetsMeta || track.beets;
-    if (existingMeta) {
-        renderBeetsSegments(track);
-        return;
-    }
-
-    const cache = state.trackMetadataCache || (state.trackMetadataCache = {});
-    const cachedEntry = cache[track.identifier];
-
-    if (cachedEntry?.meta) {
-        track.beetsMeta = cachedEntry.meta;
-        renderBeetsSegments(track);
-        return;
-    }
-
-    hideBeetsSegments();
-
-    if (cachedEntry?.promise) {
-        cachedEntry.promise.then(meta => {
-            if (meta && track.identifier === cachedEntry.id) {
-                track.beetsMeta = meta;
-                renderBeetsSegments(track);
-            }
-        }).catch(() => {});
-        return;
-    }
-
-    const fetchPromise = fetch(`/track/${encodeURIComponent(track.identifier)}/meta`)
-        .then(response => {
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
-            return response.json();
-        })
-        .then(result => {
-            const meta = result?.track?.beetsMeta || result?.track?.beets || null;
-            if (meta) {
-                cache[track.identifier] = { id: track.identifier, meta };
-                track.beetsMeta = meta;
-
-                if (state.selectedIdentifier === track.identifier) {
-                    refreshCardsWithNewSelection();
-                } else {
-                    renderBeetsSegments(track);
-                }
-            }
-        })
-        .catch(error => {
-            console.warn('⚠️ Failed to load beets metadata:', error);
-            cache[track.identifier] = { id: track.identifier, meta: null };
-            hideBeetsSegments();
-        });
-
-    cache[track.identifier] = { id: track.identifier, promise: fetchPromise, meta: null };
-}
-
-window.updateNextTrackMetadata = updateNextTrackMetadata;
 
 // Exports for sse-client.js
 if (typeof window !== 'undefined') {
@@ -1962,18 +1849,20 @@ if (typeof window !== 'undefined') {
       cardsInactiveTilted = false;
 
       // Set new timer for 10 seconds (only in first half)
-      inactivityTimer = setTimeout(() => {
-          // Only apply inactivity if we're still in first half
-          if (!midpointReached && !cardsLocked) {
-              console.log('📱 10s inactivity in first half - tilting direction cards');
-              performInactivityTilt();
-          }
-      }, 10000); // 10 seconds
+      // Inactivity tilt disabled - timer not needed
+      // inactivityTimer = setTimeout(() => {
+      //     if (!midpointReached && !cardsLocked) {
+      //         performInactivityTilt();
+      //     }
+      // }, 10000);
 
       publishInteractionState();
   }
 
   function performInactivityTilt() {
+      // Disabled - inactivity tilt is not useful
+      return;
+
       if (cardsInactiveTilted) return; // Already tilted
 
       console.log('📱 Performing inactivity tilt - rotating 45° on X axis')
@@ -2153,9 +2042,10 @@ if (typeof window !== 'undefined') {
       return samples;
   }
 
-  if (typeof window !== 'undefined') {
-      window.prioritizeAlternateTrack = prioritizeAlternateTrack;
-  }
+_prioritizeAlternateTrack = prioritizeAlternateTrack;
+if (typeof window !== 'undefined') {
+    window.prioritizeAlternateTrack = prioritizeAlternateTrack;
+}
 
   // Redraw the next track stack respecting the reverse flag
   function redrawNextTrackStack(specifiedDimensionKey = null, options = {}) {
@@ -2403,6 +2293,16 @@ if (typeof window !== 'undefined') {
       }
       if (typeof hideStackSizeIndicator === 'function') {
           hideStackSizeIndicator(card);
+      }
+
+      // Set trackMd5 immediately so heartbeats can find the card during animation
+      const direction = state.latestExplorerData?.directions?.[directionKey];
+      const sampleTracks = direction?.sampleTracks || [];
+      const primarySample = sampleTracks[0];
+      const primaryTrack = primarySample?.track || primarySample;
+      if (primaryTrack?.identifier) {
+          card.dataset.trackMd5 = primaryTrack.identifier;
+          state.selectedIdentifier = primaryTrack.identifier;
       }
 
       // Animate to center position
@@ -2689,29 +2589,24 @@ if (typeof window !== 'undefined') {
                          updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           console.log(`🎬 Found existing next track: ${existingNextTrackCard.dataset.directionKey}, rotating to next clock position`);
-                          rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
-                          // Wait for the rotation animation to complete before starting the new one
-                          setTimeout(() => {
-                              state.usingOppositeDirection = false; // Reset reverse flag when selecting new direction
-                              animateDirectionToCenter(direction.key);
-                          }, 400); // Half the animation time for smoother transition
+                          // Pack up stack cards first, then rotate and animate
+                          packUpStackCards().then(() => {
+                              rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
+                              // Wait for the rotation animation to complete before starting the new one
+                              setTimeout(() => {
+                                  state.usingOppositeDirection = false; // Reset reverse flag when selecting new direction
+                                  animateDirectionToCenter(direction.key);
+                              }, 400); // Half the animation time for smoother transition
+                          });
                       }
                   }
 
-                  // Update server with the new selection
-                  const track = direction.sampleTracks[0].track || direction.sampleTracks[0];
-                  sendNextTrack(track.identifier, direction.key, 'user');
-          });
-      }
-
-      if (typeof evaluateDirectionConsistency === 'function') {
-          const samplesForCheck = Array.isArray(directionTracks) && directionTracks.length
-              ? directionTracks
-              : (Array.isArray(direction.sampleTracks) ? direction.sampleTracks : []);
-          evaluateDirectionConsistency(direction, {
-              card,
-              sampleTracks: samplesForCheck,
-              currentTrack: state.latestCurrentTrack
+                  // Only tell server if playlist is empty (immediate selection needed)
+                  // Otherwise, track will be queued and server notified via playlist
+                  if (!playlistHasItems()) {
+                      const track = direction.sampleTracks[0].track || direction.sampleTracks[0];
+                      sendNextTrack(track.identifier, direction.key, 'user');
+                  }
           });
       }
 
@@ -2797,9 +2692,10 @@ if (typeof window !== 'undefined') {
           card.style.transition = '';
       }, 800);
   }
-  if (typeof window !== 'undefined') {
-      window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
-  }
+_rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
+if (typeof window !== 'undefined') {
+    window.rotateCenterCardToNextPosition = rotateCenterCardToNextPosition;
+}
 
   // Reset a card back to simple direction display (when moving from center to clock position)
   function resetCardToDirectionDisplay(card, directionKey) {
@@ -2812,10 +2708,6 @@ if (typeof window !== 'undefined') {
       const lingeringStackVisual = card.querySelector('.stack-line-visual');
       if (lingeringStackVisual) {
           lingeringStackVisual.remove();
-      }
-      const lingeringMetrics = card.querySelector('.track-metrics');
-      if (lingeringMetrics) {
-          lingeringMetrics.remove();
       }
 
       // Remove reversed classes and restore original direction
@@ -2921,14 +2813,6 @@ if (typeof window !== 'undefined') {
       }
       if (!document.querySelector('.dimension-card.next-track')) {
           state.currentOppositeDirectionKey = null;
-      }
-
-      if (typeof evaluateDirectionConsistency === 'function') {
-          evaluateDirectionConsistency(direction, {
-              card,
-              sampleTracks: direction.sampleTracks || [],
-              currentTrack: state.latestCurrentTrack
-          });
       }
   }
 
@@ -3143,15 +3027,12 @@ if (typeof window !== 'undefined') {
           showNextTrackPreview(selectedTrack);
       }
 
-      if (typeof updateNextTrackMetadata === 'function') {
-          updateNextTrackMetadata(selectedTrack);
-      }
-
       // Stack depth indication is now handled via CSS pseudo-elements on the main card
   }
-  if (typeof window !== 'undefined') {
-      window.convertToNextTrackStack = convertToNextTrackStack;
-  }
+_convertToNextTrackStack = convertToNextTrackStack;
+if (typeof window !== 'undefined') {
+    window.convertToNextTrackStack = convertToNextTrackStack;
+}
 
   // Periodic status check (optional, for monitoring)
   setInterval(() => {
@@ -3183,14 +3064,6 @@ if (typeof window !== 'undefined') {
       if (currentCenterKey && currentCenterKey === canonicalDirectionKey) {
           cycleStackContents(canonicalDirectionKey, state.stackIndex);
           return;
-      }
-      let promotionDelay = 0;
-
-      if (currentCenterKey && currentCenterKey !== canonicalDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
-          const demoted = rotateCenterCardToNextPosition(currentCenterKey);
-          if (demoted) {
-              promotionDelay = 820;
-          }
       }
 
       const performPromotion = () => {
@@ -3234,8 +3107,12 @@ if (typeof window !== 'undefined') {
           });
       };
 
-      if (promotionDelay > 0) {
-          setTimeout(performPromotion, promotionDelay);
+      // Pack up stack cards, then rotate existing center out, then promote new one
+      if (currentCenterKey && currentCenterKey !== canonicalDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
+          packUpStackCards().then(() => {
+              rotateCenterCardToNextPosition(currentCenterKey);
+              setTimeout(performPromotion, 400);
+          });
       } else {
           performPromotion();
       }
@@ -3243,9 +3120,10 @@ if (typeof window !== 'undefined') {
       tryFlushPendingCenterPromotion();
   }
 
-  if (typeof window !== 'undefined') {
-      window.navigateDirectionToCenter = navigateDirectionToCenter;
-  }
+_navigateDirectionToCenter = navigateDirectionToCenter;
+if (typeof window !== 'undefined') {
+    window.navigateDirectionToCenter = navigateDirectionToCenter;
+}
 
   function queueCenterPromotion(directionKey, options = {}) {
       const canonicalKey = resolveCanonicalDirectionKey(directionKey);
@@ -3342,6 +3220,9 @@ document.addEventListener('DOMContentLoaded', function () {
     }
     setupRadiusControls();
     setupFzfSearch(function () { state.journeyMode = true; });
+
+    // Initialize playlist tray
+    initPlaylistTray();
 
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
@@ -3456,3 +3337,14 @@ function exposeDeckHelpers(attempt = 0) {
 if (typeof window !== 'undefined') {
     exposeDeckHelpers();
 }
+
+// ES module exports for deck API (used by tests)
+// Assignments happen right after each function definition (see lines ~2164, ~2809, ~3162, ~3257)
+
+export {
+    _createDimensionCards as createDimensionCards,
+    _navigateDirectionToCenter as navigateDirectionToCenter,
+    _rotateCenterCardToNextPosition as rotateCenterCardToNextPosition,
+    _convertToNextTrackStack as convertToNextTrackStack,
+    _prioritizeAlternateTrack as prioritizeAlternateTrack
+};
