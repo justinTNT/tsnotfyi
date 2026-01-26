@@ -1011,13 +1011,19 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
           state.nextTrackAnimationTimer = null;
       }
 
+      // Cards appear instantly now (stagger is disabled), so use short delay for paint/CSS
+      const animationDelay = 150;
+      console.log(`🎯 Scheduling center animation in ${animationDelay}ms for: ${explorerData.nextTrack?.directionKey || 'none'}`);
+
       state.nextTrackAnimationTimer = setTimeout(() => {
           if (explorerData.nextTrack) {
-              deckLog(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
+              console.log(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
               animateDirectionToCenter(explorerData.nextTrack.directionKey);
+          } else {
+              console.log(`🎯 No nextTrack in explorerData, skipping center animation`);
           }
           state.nextTrackAnimationTimer = null;
-      }, directions.length * 150 + 1500); // Wait for all cards to appear
+      }, animationDelay);
 
       deckLog(`🎯 FINISHED creating ${cardsCreated} cards in container`);
       state.hasRenderedDeck = cardsCreated > 0;

@@ -420,6 +420,106 @@ class RadialSearchService {
         }
     }
 
+    async getAdaptiveNeighborhood(trackId, config = {}) {
+        if (!this.initialized) {
+            throw new Error('Radial search service not initialized');
+        }
+
+        const track = this.kdTree.getTrack(trackId);
+        if (!track || !track.pca) {
+            throw new Error(`Track not found or missing PCA data: ${trackId}`);
+        }
+
+        const toFinite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
+        const targetMin = Math.max(0, Math.floor(toFinite(config.targetMin, 350)));
+        const targetMax = Math.max(targetMin, Math.floor(toFinite(config.targetMax, 450)));
+        const maxIterations = Math.max(1, Math.floor(toFinite(config.maxIterations, 6)));
+        const limit = Math.max(50, Math.floor(toFinite(config.limit, 1200)));
+
+        const calibrationByResolution = this.kdTree.calibrationSettings.magnifying_glass || {};
+        const calibratedPrimary = calibrationByResolution.primary_d || null;
+        const baseOuter = calibratedPrimary && calibratedPrimary.outer_radius && calibratedPrimary.outer_radius > 0
+            ? calibratedPrimary.outer_radius
+            : 0.08;
+
+        const initialRadius = toFinite(config.initialRadius, null);
+        const initialScale = toFinite(config.initialScale, null);
+
+        let scale = initialScale && initialScale > 0 ? initialScale : 1;
+        if (initialRadius && initialRadius > 0 && baseOuter > 0) {
+            scale = initialRadius / baseOuter;
+        }
+        if (!Number.isFinite(scale) || scale <= 0) {
+            scale = 1;
+        }
+
+        const targetMid = (targetMin + targetMax) / 2;
+        let lowerScale = 0;
+        let upperScale = Number.POSITIVE_INFINITY;
+        let bestResult = null;
+
+        for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+            const outerRadius = Math.max(baseOuter * scale, 0.01);
+            const neighborhood = this.kdTree.pcaRadiusSearch(track, 'adaptive', 'primary_d', limit, {
+                inner_radius: 0,
+                outer_radius: outerRadius,
+                applyScalingFactor: false
+            });
+
+            const count = neighborhood.length;
+
+            const currentResult = {
+                neighbors: neighborhood,
+                radius: outerRadius,
+                scale,
+                count,
+                iterations: iteration + 1,
+                withinTarget: count >= targetMin && count <= targetMax
+            };
+
+            const diff = Math.abs(count - targetMid);
+            if (!bestResult || diff < Math.abs(bestResult.count - targetMid)) {
+                bestResult = currentResult;
+            }
+
+            if (currentResult.withinTarget) {
+                return currentResult;
+            }
+
+            if (count < targetMin) {
+                lowerScale = scale;
+                if (Number.isFinite(upperScale)) {
+                    scale = (scale + upperScale) / 2;
+                } else {
+                    scale = scale <= 0 ? 1 : scale * 2;
+                    if (scale > 64) {
+                        break;
+                    }
+                }
+            } else {
+                upperScale = scale;
+                if (lowerScale > 0) {
+                    scale = (scale + lowerScale) / 2;
+                } else {
+                    scale = scale / 2;
+                }
+            }
+
+            if (!Number.isFinite(scale) || scale <= 0) {
+                scale = 1;
+            }
+        }
+
+        return bestResult || {
+            neighbors: [],
+            radius: Math.max(baseOuter, 0.05),
+            scale: 1,
+            count: 0,
+            iterations: maxIterations,
+            withinTarget: false
+        };
+    }
+
     // Enhanced directional search using PCA
     async getPCADirectionalCandidates(trackId, pcaDomain, pcaComponent, direction, config = {}) {
         if (!this.initialized) {
@@ -428,7 +528,9 @@ class RadialSearchService {
 
         const {
             resolution = 'magnifying_glass',
-            limit = 20
+            limit = 20,
+            adaptiveRadius = null,
+            precomputedNeighbors = null
         } = config;
 
         try {
@@ -437,8 +539,20 @@ class RadialSearchService {
                 throw new Error(`Track not found or missing PCA data: ${trackId}`);
             }
 
-            // Get neighborhood using specified PCA discriminator
-            const neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, resolution, pcaDomain, 500);
+            const lookupLimit = Math.max(limit * 4, 120);
+
+            let neighborhood;
+            if (Array.isArray(precomputedNeighbors)) {
+                neighborhood = precomputedNeighbors;
+            } else if (Number.isFinite(adaptiveRadius) && adaptiveRadius > 0) {
+                neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, 'adaptive', pcaDomain, lookupLimit, {
+                    inner_radius: 0,
+                    outer_radius: adaptiveRadius,
+                    applyScalingFactor: false
+                });
+            } else {
+                neighborhood = this.kdTree.pcaRadiusSearch(currentTrack, resolution, pcaDomain, lookupLimit);
+            }
 
             // Filter by PCA direction and make sure we never include the center track itself
             const candidates = neighborhood.filter(result => {
@@ -495,10 +609,10 @@ class RadialSearchService {
             }
 
             const calibrated = this.kdTree.vaeCalibratedSearch(currentTrack, resolution, limit * 4);
-            const neighbors = Array.isArray(calibrated?.neighbors) ? calibrated.neighbors : [];
+            let neighbors = Array.isArray(calibrated?.neighbors) ? calibrated.neighbors : [];
             const currentValue = latentVector[latentIndex];
 
-            const candidates = neighbors
+            const buildCandidates = (list) => list
                 .filter(result => {
                     const track = result?.track;
                     if (!track?.identifier || track.identifier === currentTrack.identifier) {
@@ -526,6 +640,28 @@ class RadialSearchService {
                 .sort((a, b) => direction === 'positive'
                     ? b.delta - a.delta
                     : a.delta - b.delta);
+
+            let candidates = buildCandidates(neighbors);
+
+            if (candidates.length === 0) {
+                const baseRadius = this.kdTree.defaultVaeRadius || 0.3;
+                const multipliers = [2, 4, 6, 8];
+                const fallbackRadii = multipliers
+                    .map(multiplier => baseRadius * multiplier)
+                    .map(r => (Number.isFinite(r) && r > 0) ? r : baseRadius)
+                    .filter((radius, index, array) => array.indexOf(radius) === index);
+
+                for (const radius of fallbackRadii) {
+                    const fallbackNeighbors = this.kdTree.vaeRadiusSearch(currentTrack, radius, limit * 4);
+                    const fallbackCandidates = buildCandidates(fallbackNeighbors);
+                    if (fallbackCandidates.length > 0) {
+                        console.log(`🧠 VAE adaptive fallback radius applied (${radius.toFixed(3)})`);
+                        neighbors = fallbackNeighbors;
+                        candidates = fallbackCandidates;
+                        break;
+                    }
+                }
+            }
 
             return {
                 candidates: candidates.slice(0, limit),

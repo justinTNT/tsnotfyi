@@ -1123,11 +1123,9 @@ app.post('/refresh-sse-simple', async (req, res) => {
     }
 
     if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
-      console.log(`🔄 Triggering heartbeat + snapshot for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
+      console.log(`🔄 Triggering heartbeat for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
       await session.mixer.broadcastHeartbeat('manual-refresh-simple', { force: true });
-      session.mixer.broadcastExplorerSnapshot(true, 'manual-refresh-simple').catch(err => {
-        console.error('🔄 Failed to broadcast explorer snapshot during simple refresh:', err);
-      });
+      // Note: Explorer snapshots are now fetched via POST /explorer - SSE snapshots deprecated
 
       const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
       const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
@@ -3132,6 +3130,83 @@ app.post('/pca/explore', async (req, res) => {
   res.status(410).json({ error: 'This endpoint has been deprecated. Use POST /explorer instead.' });
 });
 
+/**
+ * Strip heavy/unused fields from explorer data before sending to client.
+ * Removes: features, pca, path, component, polarity, neighborhood stats, etc.
+ */
+function stripExplorerDataForClient(data, logLabel = 'explorer') {
+  if (!data) return data;
+
+  const beforeSize = JSON.stringify(data).length;
+
+  // Strip track object - remove features/pca arrays but keep useful metadata
+  const stripTrack = (track) => {
+    if (!track) return track;
+    const t = track.track || track;
+    return {
+      identifier: t.identifier || t.trackMd5,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      year: t.year,
+      albumCover: t.albumCover,
+      duration: t.duration || t.length,
+      distance: track.distance || track.similarity
+    };
+  };
+
+  // Strip direction - remove heavy fields but keep useful references
+  const stripDirection = (dir) => {
+    if (!dir) return dir;
+    const stripped = {
+      direction: dir.direction,
+      domain: dir.domain,
+      component: dir.component,    // e.g. 'pc1', 'energy', 'latent_0'
+      polarity: dir.polarity,      // 'positive' or 'negative'
+      sampleTracks: (dir.sampleTracks || []).map(stripTrack),
+      trackCount: dir.trackCount || dir.sampleTracks?.length || 0,
+      hasOpposite: dir.hasOpposite,
+      isOutlier: dir.isOutlier,
+      diversityScore: dir.diversityScore
+    };
+    // Include opposite direction if present (also stripped)
+    if (dir.oppositeDirection) {
+      stripped.oppositeDirection = {
+        key: dir.oppositeDirection.key,
+        direction: dir.oppositeDirection.direction,
+        component: dir.oppositeDirection.component,
+        polarity: dir.oppositeDirection.polarity,
+        sampleTracks: (dir.oppositeDirection.sampleTracks || []).map(stripTrack),
+        trackCount: dir.oppositeDirection.trackCount || dir.oppositeDirection.sampleTracks?.length || 0
+      };
+    }
+    return stripped;
+  };
+
+  const result = {
+    currentTrack: stripTrack(data.currentTrack),
+    directions: {},
+    nextTrack: data.nextTrack ? {
+      directionKey: data.nextTrack.directionKey,
+      direction: data.nextTrack.direction,
+      track: stripTrack(data.nextTrack.track)
+    } : null
+  };
+
+  // Strip each direction
+  for (const [key, dir] of Object.entries(data.directions || {})) {
+    result.directions[key] = stripDirection(dir);
+  }
+
+  const afterSize = JSON.stringify(result).length;
+  const reduction = ((beforeSize - afterSize) / beforeSize * 100).toFixed(1);
+  const dirCount = Object.keys(result.directions).length;
+  const trackCount = Object.values(result.directions).reduce((sum, d) => sum + (d.sampleTracks?.length || 0), 0);
+  serverLog.info(`📦 ${logLabel}: ${(beforeSize/1024).toFixed(1)}KB → ${(afterSize/1024).toFixed(1)}KB (-${reduction}%) [${dirCount} dirs, ${trackCount} tracks]`);
+
+  return result;
+}
+
 // New explorer endpoint - request/response model for playlist-aware exploration
 // Replaces SSE-based explorer snapshot broadcasts
 app.post('/explorer', async (req, res) => {
@@ -3338,25 +3413,14 @@ app.post('/explorer', async (req, res) => {
       }
     }
 
-    const response = {
+    // Build response and strip heavy fields before sending
+    const rawResponse = {
       directions: filteredDirections,
-      currentTrack: {
-        identifier: sourceTrack.identifier,
-        title: sourceTrack.title,
-        artist: sourceTrack.artist,
-        albumCover: sourceTrack.albumCover,
-        duration: sourceTrack.length || sourceTrack.duration,
-        features: sourceTrack.features,
-        pca: sourceTrack.pca
-      },
-      nextTrack,
-      diagnostics: {
-        ...explorerData.diagnostics,
-        playlistFilterApplied: playlistTrackSet.size > 0,
-        playlistSize: playlistTrackSet.size,
-        responseTime: Date.now() - startTime
-      }
+      currentTrack: sourceTrack,
+      nextTrack
     };
+
+    const response = stripExplorerDataForClient(rawResponse);
 
     serverLog.info(`🎯 Explorer request for ${trackId.substring(0, 8)} completed in ${Date.now() - startTime}ms`);
     res.json(response);
@@ -3678,9 +3742,7 @@ app.post('/session/zoom/:mode', async (req, res) => {
 
     if (changed) {
       await session.mixer.broadcastHeartbeat('zoom-change', { force: false });
-      session.mixer.broadcastExplorerSnapshot(true, 'zoom-change').catch(err => {
-        console.error('Failed to broadcast explorer snapshot after zoom change:', err);
-      });
+      // Note: Explorer snapshots are now fetched via POST /explorer - SSE snapshots deprecated
     }
 
     const modeEmoji = {

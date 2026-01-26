@@ -214,6 +214,11 @@ export function renderPlaylistTray() {
 export async function promoteCenterCardToTray() {
     // Find the current center card (next-track)
     const centerCard = document.querySelector('.dimension-card.next-track');
+    console.log('🎯 promoteCenterCardToTray: Looking for center card', {
+        found: !!centerCard,
+        allCards: document.querySelectorAll('.dimension-card').length,
+        nextTrackCards: document.querySelectorAll('.dimension-card.next-track').length
+    });
     if (!centerCard) {
         console.log('promoteCenterCardToTray: No center card found');
         return null;
@@ -251,6 +256,7 @@ export async function promoteCenterCardToTray() {
     const explorerData = state.latestExplorerData ? JSON.parse(JSON.stringify(state.latestExplorerData)) : null;
 
     // Add to playlist
+    console.log(`🎯 Adding to playlist: ${trackId?.substring(0, 8)} (${title})`);
     const item = addToPlaylist({
         trackId,
         albumCover,
@@ -261,8 +267,10 @@ export async function promoteCenterCardToTray() {
     });
 
     if (!item) {
+        console.log('🎯 addToPlaylist returned falsy - track may be duplicate or invalid');
         return null;
     }
+    console.log(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
 
     // Only tell server if this is the first item (immediate next track needed)
     if (wasEmpty && typeof window.sendNextTrack === 'function') {
@@ -310,11 +318,18 @@ export async function promoteCenterCardToTray() {
     // Step 5: Wait for explorer data and render new cards
     try {
         const newExplorerData = await explorerPromise;
+        console.log('🎯 Explorer data received:', {
+            hasData: !!newExplorerData,
+            directionCount: Object.keys(newExplorerData?.directions || {}).length,
+            nextTrack: newExplorerData?.nextTrack?.directionKey || 'none',
+            nextTrackId: newExplorerData?.nextTrack?.track?.identifier?.substring(0, 8) || 'none'
+        });
         if (newExplorerData) {
             state.latestExplorerData = newExplorerData;
             if (typeof window.createDimensionCards === 'function') {
                 // isPlaylistExploration: true prevents polluting now-playing state
                 // skipExitAnimation: true since we already triggered exit above
+                console.log('🎯 Calling createDimensionCards with new explorer data');
                 window.createDimensionCards(newExplorerData, {
                     skipExitAnimation: true,
                     forceRedraw: true,
