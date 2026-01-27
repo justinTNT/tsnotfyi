@@ -108,11 +108,12 @@ export function connectSSE() {
       state.pendingSnapshotTrackId = currentTrackId;
         armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-track-change' });
 
-      // Pop playlist queue if the new track matches queue head
+      // Handle playlist queue on track change
       let albumCoverResolved = false;
       if (trackChanged && playlistHasItems()) {
         const queueHead = getPlaylistNext();
         if (queueHead && queueHead.trackId === currentTrackId) {
+          // Server played what we expected - advance the queue
           console.log(`🎵 Track change matched queue head - advancing playlist`);
 
           // Use albumCover from playlist item (server heartbeat doesn't include it)
@@ -130,6 +131,13 @@ export function connectSSE() {
           if (newHead && typeof window.sendNextTrack === 'function') {
             console.log(`🎵 Notifying server of new queue head: ${newHead.trackId.substring(0, 8)}`);
             window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+          }
+        } else if (queueHead) {
+          // Server played something different - force-feed our queue head
+          console.log(`🎵 Track change mismatch - server played ${currentTrackId.substring(0, 8)}, queue expected ${queueHead.trackId.substring(0, 8)}`);
+          console.log(`🎵 Force-feeding queue head to server: ${queueHead.trackId.substring(0, 8)} (${queueHead.title})`);
+          if (typeof window.sendNextTrack === 'function') {
+            window.sendNextTrack(queueHead.trackId, queueHead.directionKey, 'user');
           }
         }
       }

@@ -401,6 +401,7 @@ class DriftAudioMixer {
 
     // Track preparation coordination
     this.pendingPreparationPromise = null;
+    this._preparationInProgress = false;  // Sync guard for concurrent prepare calls
     this.userSelectionDeferredForCrossfade = false;
     this.nextTrackLoadPromise = null;
     this.crossfadeStartedAt = null;
@@ -997,7 +998,7 @@ class DriftAudioMixer {
     if (this.nextTrack && this.nextTrack.identifier === trackMd5) {
       console.log('🎯 User-selected track already prepared after debounce; no refresh needed');
       this.nextTrack = this.hydrateTrackRecord(this.nextTrack, {
-        nextTrackDirection: this.pendingUserOverrideDirection || this.nextTrack?.nextTrackDirection,
+        direction: this.pendingUserOverrideDirection || this.nextTrack?.direction,
         transitionReason: 'user'
       });
       // Don't clear pendingUserOverrideGeneration here - an in-flight preparation might need it
@@ -1057,7 +1058,7 @@ class DriftAudioMixer {
           this.broadcastSelectionEvent('selection_auto_requeued', {
             status: 'prepared',
             trackId: this.nextTrack.identifier,
-            direction: this.nextTrack.nextTrackDirection || this.driftPlayer.currentDirection || null
+            direction: this.nextTrack.direction || this.driftPlayer.currentDirection || null
           });
         }
       } catch (recoveryErr) {
@@ -1078,6 +1079,13 @@ class DriftAudioMixer {
 
     console.log(`🎯 [prepare] begin (reason=${reason}, force=${forceRefresh}, override=${overrideTrackId || 'none'})`);
 
+    // Guard against concurrent preparations using both a sync flag and promise
+    // The sync flag catches races before the promise is assigned
+    if (this._preparationInProgress && !forceRefresh) {
+      console.log('⏳ Next track preparation already in progress (sync guard); skipping duplicate call');
+      return this.pendingPreparationPromise || Promise.resolve();
+    }
+
     if (this.pendingPreparationPromise) {
       if (!forceRefresh) {
         console.log('⏳ Next track preparation already in progress; skipping duplicate call');
@@ -1092,19 +1100,25 @@ class DriftAudioMixer {
       }
     }
 
+    // Set sync guard immediately - before any async operations
+    this._preparationInProgress = true;
+
     if (forceRefresh && reason === 'user-selection' && !overrideTrackId && !this.pendingUserOverrideTrackId) {
       console.log('🔁 Skipping forced preparation: user selection already resolved');
+      this._preparationInProgress = false;
       return;
     }
 
     if (this.isUserSelectionPending && !forceRefresh) {
       console.log('⏳ Skipping auto next-track preparation while user selection is pending');
+      this._preparationInProgress = false;
       return;
     }
 
     if (!forceRefresh && this.lockedNextTrackIdentifier && this.nextTrack &&
         this.nextTrack.identifier === this.lockedNextTrackIdentifier) {
       console.log('🔒 User-selected next track locked; skipping auto preparation');
+      this._preparationInProgress = false;
       return;
     }
 
@@ -1120,7 +1134,7 @@ class DriftAudioMixer {
             transitionReason: 'user'
           };
           if (overrideDirection || this.pendingUserOverrideDirection) {
-            annotations.nextTrackDirection = overrideDirection || this.pendingUserOverrideDirection;
+            annotations.direction = overrideDirection || this.pendingUserOverrideDirection;
           }
           hydratedNextTrack = this.hydrateTrackRecord(overrideTrackId, annotations);
 
@@ -1258,7 +1272,7 @@ class DriftAudioMixer {
           await this.broadcastHeartbeat('user-next-prepared', { force: true });
           this.recordSessionEvent('manual_override_prepared', {
             trackId: hydratedNextTrack.identifier,
-            direction: this.pendingUserOverrideDirection || hydratedNextTrack.nextTrackDirection || null,
+            direction: this.pendingUserOverrideDirection || hydratedNextTrack.direction || null,
             generation: manualGenerationAtStart
           });
         } else {
@@ -1274,7 +1288,7 @@ class DriftAudioMixer {
             this.broadcastSelectionEvent('selection_ready', {
               status: 'prepared',
               trackId: hydratedNextTrack.identifier,
-              direction: this.pendingUserOverrideDirection || hydratedNextTrack.nextTrackDirection || this.driftPlayer.currentDirection || null,
+              direction: this.pendingUserOverrideDirection || hydratedNextTrack.direction || this.driftPlayer.currentDirection || null,
               generation: manualGenerationAtStart
             });
             this.clearPendingUserSelection(manualGenerationAtStart);
@@ -1283,7 +1297,7 @@ class DriftAudioMixer {
           this.broadcastSelectionEvent('selection_ready', {
             status: 'prepared',
             trackId: hydratedNextTrack.identifier,
-            direction: this.pendingUserOverrideDirection || hydratedNextTrack.nextTrackDirection || this.driftPlayer.currentDirection || null
+            direction: this.pendingUserOverrideDirection || hydratedNextTrack.direction || this.driftPlayer.currentDirection || null
           });
           this.clearPendingUserSelection();
         }
@@ -1314,6 +1328,7 @@ class DriftAudioMixer {
     try {
       await preparation;
     } finally {
+      this._preparationInProgress = false;
       if (this.pendingPreparationPromise === preparation) {
         this.pendingPreparationPromise = null;
       }
@@ -1410,8 +1425,8 @@ class DriftAudioMixer {
         const explorerAnnotations = {
           transitionReason: nextTrackFromExplorer.transitionReason || 'explorer'
         };
-        if (nextTrackFromExplorer.nextTrackDirection) {
-          explorerAnnotations.nextTrackDirection = nextTrackFromExplorer.nextTrackDirection;
+        if (nextTrackFromExplorer.direction) {
+          explorerAnnotations.direction = nextTrackFromExplorer.direction;
         }
         if (nextTrackFromExplorer.directionKey) {
           explorerAnnotations.directionKey = nextTrackFromExplorer.directionKey;
@@ -1434,7 +1449,7 @@ class DriftAudioMixer {
           if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== track.identifier) {
             this.lockedNextTrackIdentifier = null;
           }
-          console.log(`✅ Using explorer-selected track: ${track.title} by ${track.artist} via ${nextTrackFromExplorer.nextTrackDirection}`);
+          console.log(`✅ Using explorer-selected track: ${track.title} by ${track.artist} via ${nextTrackFromExplorer.direction}`);
           return track;
         }
       }
@@ -1804,7 +1819,7 @@ class DriftAudioMixer {
         || this.nextTrack?.identifier
         || null,
       direction: this.pendingUserOverrideDirection
-        || this.nextTrack?.nextTrackDirection
+        || this.nextTrack?.direction
         || this.driftPlayer?.currentDirection
         || null,
       pendingGeneration: this.pendingUserOverrideGeneration,
@@ -2083,7 +2098,7 @@ class DriftAudioMixer {
         title: track.title,
         artist: track.artist,
         album: track.album || null,
-        direction: track.nextTrackDirection || track.direction || null,
+        direction: track.direction || track.direction || null,
         length: track.length || null,
         duration: track.duration || track.length || null
       };
@@ -2596,13 +2611,13 @@ class DriftAudioMixer {
     if (this.lockedNextTrackIdentifier) {
       candidate = this.hydrateTrackRecord({
         identifier: this.lockedNextTrackIdentifier,
-        nextTrackDirection: this.pendingUserOverrideDirection || null,
+        direction: this.pendingUserOverrideDirection || null,
         transitionReason: 'user'
       });
     } else if (this.pendingUserOverrideTrackId) {
       candidate = this.hydrateTrackRecord({
         identifier: this.pendingUserOverrideTrackId,
-        nextTrackDirection: this.pendingUserOverrideDirection || null,
+        direction: this.pendingUserOverrideDirection || null,
         transitionReason: 'user'
       });
     }
@@ -2611,7 +2626,7 @@ class DriftAudioMixer {
       const snapshotNext = this.lastExplorerSnapshotPayload.nextTrack;
       candidate = this.hydrateTrackRecord({
         identifier: snapshotNext.track.identifier,
-        nextTrackDirection: snapshotNext.direction || null,
+        direction: snapshotNext.direction || null,
         directionKey: snapshotNext.directionKey || null,
         transitionReason: snapshotNext.transitionReason || 'auto'
       });
@@ -2630,7 +2645,7 @@ class DriftAudioMixer {
       return null;
     }
 
-    const direction = candidate.nextTrackDirection || candidate.direction || null;
+    const direction = candidate.direction || candidate.direction || null;
     const directionKey = candidate.directionKey || null;
 
     return {
@@ -2917,7 +2932,7 @@ class DriftAudioMixer {
 
       const nominatedDirectionKey =
         explorerData.nextTrack?.directionKey ||
-        explorerData.nextTrack?.nextTrackDirection ||
+        explorerData.nextTrack?.direction ||
         explorerData.nextTrack?.direction;
       if (nominatedDirectionKey && !(explorerData.directions || {}).hasOwnProperty(nominatedDirectionKey)) {
         const availableKeys = Object.keys(explorerData.directions || {});
@@ -3568,7 +3583,7 @@ class DriftAudioMixer {
       trackId: this.currentTrack?.identifier || null,
       resolution: this.explorerResolution || 'adaptive',
       neighborhoodSize: totalNeighborhoodSize,
-      nextDirection: explorerData.nextTrack?.nextTrackDirection || explorerData.nextTrack?.direction || null,
+      nextDirection: explorerData.nextTrack?.direction || explorerData.nextTrack?.direction || null,
       diversity: explorerData.diversityMetrics || null,
       topDirections,
       radius: radiusDiagnostics || null,
@@ -5878,8 +5893,8 @@ class DriftAudioMixer {
       if (anyDirection) {
         return {
           ...anyDirection.sampleTracks[0],
-          nextTrackDirection: anyDirection.direction,
-          transitionReason: 'autopilot', // Stuck in a zone, using outliers
+          direction: anyDirection.direction,
+          transitionReason: 'autopilot',
           diversityScore: anyDirection.diversityScore,
           directionKey: Object.keys(explorerData.directions).find(key =>
             explorerData.directions[key] === anyDirection
@@ -5998,8 +6013,8 @@ class DriftAudioMixer {
 
     return {
       ...selectedTrack,
-      nextTrackDirection: selectedDirection.direction,
-      transitionReason: 'explorer', // Roaming free based on diversity
+      direction: selectedDirection.direction,
+      transitionReason: 'explorer',
       diversityScore: selectedDirection.diversityScore,
       weightedDiversityScore: selectedDirection.weightedDiversityScore,
       domain: selectedDirection.domain,
@@ -6450,6 +6465,7 @@ class DriftAudioMixer {
     }
 
     this.pendingPreparationPromise = null;
+    this._preparationInProgress = false;
     this.isUserSelectionPending = false;
     this.lockedNextTrackIdentifier = null;
     this.userSelectionDeferredForCrossfade = false;

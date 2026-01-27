@@ -3387,29 +3387,55 @@ app.post('/explorer', async (req, res) => {
       };
     }
 
+    // Diagnostic: log filtered directions status
+    const filteredDirSummary = Object.entries(filteredDirections).map(([k, d]) => ({
+      key: k,
+      trackCount: d.sampleTracks?.length || 0,
+      diversityScore: d.diversityScore
+    }));
+    serverLog.info(`🎯 Filtered directions: ${JSON.stringify(filteredDirSummary)}`);
+
     // Pick recommended next track from filtered directions
     let nextTrack = null;
     if (explorerData.nextTrack) {
-      // Use mixer's recommendation if available and not filtered out
-      const recKey = explorerData.nextTrack.directionKey;
-      const recTrackId = explorerData.nextTrack.track?.identifier;
-      if (filteredDirections[recKey] && !playlistTrackSet.has(recTrackId)) {
-        nextTrack = explorerData.nextTrack;
+      // Mixer returns flat format (identifier on root), normalize to nested { directionKey, direction, track }
+      const rawNext = explorerData.nextTrack;
+      const recKey = rawNext.directionKey;
+      const recTrackId = rawNext.track?.identifier || rawNext.identifier;
+      serverLog.info(`🎯 Mixer recommended: dirKey=${recKey}, trackId=${recTrackId?.substring(0,8)}, inFiltered=${!!filteredDirections[recKey]}, inPlaylist=${playlistTrackSet.has(recTrackId)}`);
+      if (recKey && filteredDirections[recKey] && !playlistTrackSet.has(recTrackId)) {
+        nextTrack = {
+          directionKey: recKey,
+          direction: rawNext.direction,
+          track: rawNext.track || {
+            identifier: rawNext.identifier,
+            title: rawNext.title,
+            artist: rawNext.artist,
+            albumCover: rawNext.albumCover,
+            duration: rawNext.duration || rawNext.length
+          }
+        };
       }
+    } else {
+      serverLog.info(`🎯 No mixer recommendation (explorerData.nextTrack is falsy)`);
     }
     // Fallback: pick first track from highest-diversity direction
     if (!nextTrack) {
       const sortedDirs = Object.entries(filteredDirections)
         .filter(([_, dir]) => dir.sampleTracks && dir.sampleTracks.length > 0)
         .sort((a, b) => (b[1].diversityScore || 0) - (a[1].diversityScore || 0));
+      serverLog.info(`🎯 Fallback: ${sortedDirs.length} directions with tracks after filter`);
       if (sortedDirs.length > 0) {
         const [dirKey, dir] = sortedDirs[0];
         const firstTrack = dir.sampleTracks[0];
+        serverLog.info(`🎯 Fallback picked: ${dirKey} with track ${firstTrack?.identifier?.substring(0,8)}`);
         nextTrack = {
           directionKey: dirKey,
           direction: dir.direction,
           track: firstTrack
         };
+      } else {
+        serverLog.warn(`🎯 Fallback found no directions with tracks!`);
       }
     }
 
@@ -3828,7 +3854,7 @@ app.post('/next-track', async (req, res) => {
     if (isDeckSelection && deckMatch) {
       const deckDirection = advertisedDirection || deckMatch.directionKey || null;
       const hydrated = session.mixer.hydrateTrackRecord(deckMatch.track || cleanMd5, {
-        nextTrackDirection: deckDirection,
+        direction: deckDirection,
         transitionReason: 'deck-selection'
       });
 
