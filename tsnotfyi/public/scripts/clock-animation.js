@@ -1,5 +1,5 @@
 // Clock animation - pack-away and zoom-out animations
-// Replaces danger-zone animation system
+// Handles visual transitions when track nears end
 // Dependencies: globals.js (state, elements), playlist-tray.js
 
 import { state, elements } from './globals.js';
@@ -210,13 +210,14 @@ function animateAlbumCoverSlide(nextTrackCard, nextTrack) {
         // Create clone of album cover
         const coverClone = document.createElement('div');
         coverClone.className = 'album-cover-slide-clone';
+        const escapedCover = nextTrack.albumCover.replace(/'/g, "\\'");
         coverClone.style.cssText = `
             position: fixed;
             top: 50%;
             left: 50%;
             width: 200px;
             height: 200px;
-            background-image: url('${nextTrack.albumCover}');
+            background-image: url('${escapedCover}');
             background-size: cover;
             background-position: center;
             border-radius: 16px;
@@ -284,7 +285,7 @@ export function checkPackAwayTrigger(remainingSeconds) {
 }
 
 /**
- * Reaffirm next track to server when entering danger zone
+ * Reaffirm next track to server when track nears end
  * Uses playlist head if available, otherwise explorer suggestion
  */
 function reaffirmNextTrack() {
@@ -296,13 +297,13 @@ function reaffirmNextTrack() {
         // Use playlist head
         trackId = playlistNext.trackId;
         directionKey = playlistNext.directionKey;
-        console.log(`🎯 Danger zone: reaffirming playlist head ${trackId?.substring(0, 8)}`);
+        console.log(`🎯 Track ending: reaffirming playlist head ${trackId?.substring(0, 8)}`);
     } else {
         // Use explorer suggestion
         const explorerNext = state.latestExplorerData?.nextTrack;
         trackId = explorerNext?.track?.identifier || explorerNext?.identifier || state.selectedIdentifier;
         directionKey = explorerNext?.directionKey || state.manualNextDirectionKey;
-        console.log(`🎯 Danger zone: reaffirming explorer suggestion ${trackId?.substring(0, 8)}`);
+        console.log(`🎯 Track ending: reaffirming explorer suggestion ${trackId?.substring(0, 8)}`);
     }
 
     if (trackId && typeof window.sendNextTrack === 'function') {
@@ -332,10 +333,80 @@ export function isPackAwayInProgress() {
     return animationInProgress;
 }
 
+/**
+ * Animate track change - fast zoom out for old content, then allow new content
+ * Different from pack-away: faster, no tray animation, immediate replacement
+ * @param {Function} onMidpoint - Called at animation midpoint (update now-playing card)
+ * @param {Function} onComplete - Called when animation finishes (render new cards)
+ */
+export function animateTrackChange(onMidpoint, onComplete) {
+    const deckContainer = document.getElementById('dimensionCards');
+    const clockElement = document.getElementById('playbackClock');
+
+    // If no deck container or already animating pack-away, skip animation
+    if (!deckContainer || animationInProgress) {
+        onMidpoint?.();
+        onComplete?.();
+        return;
+    }
+
+    console.log('🔄 Starting track change animation');
+
+    // Collect elements to animate
+    const elementsToAnimate = [deckContainer, clockElement].filter(Boolean);
+
+    if (elementsToAnimate.length === 0) {
+        onMidpoint?.();
+        onComplete?.();
+        return;
+    }
+
+    // Store original styles for restoration
+    const originalStyles = elementsToAnimate.map(el => ({
+        element: el,
+        transform: el.style.transform,
+        opacity: el.style.opacity,
+        transition: el.style.transition,
+        visibility: el.style.visibility
+    }));
+
+    // Apply zoom-out animation
+    elementsToAnimate.forEach(el => {
+        el.style.transition = 'transform 600ms ease-in, opacity 600ms ease-in';
+        el.style.transform = 'translateZ(-800px) scale(0.3)';
+        el.style.opacity = '0';
+    });
+
+    // Midpoint: update now-playing card while old cards still animating out
+    setTimeout(() => {
+        onMidpoint?.();
+    }, 300);
+
+    // Complete: clear old content and restore styles for new content
+    setTimeout(() => {
+        // Clear deck container
+        if (deckContainer) {
+            deckContainer.innerHTML = '';
+        }
+
+        // Restore styles so new cards render normally
+        originalStyles.forEach(({ element, transform, opacity, transition, visibility }) => {
+            element.style.transition = '';
+            element.style.transform = transform || '';
+            element.style.opacity = opacity || '';
+            element.style.visibility = visibility || '';
+        });
+
+        console.log('🔄 Track change animation complete');
+        onComplete?.();
+    }, 600);
+}
+
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
     window.triggerPackAwayAnimation = triggerPackAwayAnimation;
     window.checkPackAwayTrigger = checkPackAwayTrigger;
     window.cancelPackAwayAnimation = cancelPackAwayAnimation;
     window.isPackAwayInProgress = isPackAwayInProgress;
+    window.animateTrackChange = animateTrackChange;
 }

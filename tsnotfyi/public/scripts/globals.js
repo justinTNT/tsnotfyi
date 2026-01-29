@@ -86,7 +86,7 @@ export const VARIANT_TO_DIRECTION_TYPE = {
   'red-variant': 'rhythmic_core',
   'green-variant': 'tonal_core',
   'blue-variant': 'spectral_core',
-  'yellow-variant': 'outlier'
+  'yellow-variant': 'latent'
 };
 
 export const CARD_BACKGROUND_BY_DIRECTION_TYPE = {
@@ -96,7 +96,7 @@ export const CARD_BACKGROUND_BY_DIRECTION_TYPE = {
   tonal_pca: '#182a1a',
   spectral_core: '#18222a',
   spectral_pca: '#18222a',
-  outlier: '#2a1810'
+  latent: '#2a1810'
 };
 
 export function getCardBackgroundColor(directionType) {
@@ -186,8 +186,6 @@ export const state = {
   pendingExplorerLookaheadTimer: null,
   awaitingDirectionRefresh: false,
   metadataRevealPending: false,
-  dangerZoneDeferredExplorer: null,
-  dangerZoneBackupExplorer: null,
   refreshTapHistory: [],
   noTrackRefreshCount: 0,
   lastExplorerPayload: null,
@@ -217,8 +215,6 @@ export const state = {
   connectionQuarantineUntil: 0,
   connectionQuarantineReason: null,
   connectionQuarantineBackoffMs: CONNECTION_QUARANTINE_BASE_MS,
-  dangerZoneVisualActive: false,
-  dangerZoneDeckCollapsed: false,
   hasRenderedDeck: false,
 
   // Playlist queue state (new explorer architecture)

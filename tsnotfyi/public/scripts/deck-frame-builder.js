@@ -225,19 +225,11 @@
                 delete directionsMap[oppositeKey];
             }
 
+            // Server filtered out the opposite (too weak) - respect that decision
+            // Don't create synthetic opposites with copied tracks
             direction.hasOpposite = false;
             if (direction.oppositeDirection) {
                 delete direction.oppositeDirection;
-            }
-
-            if (!directionsMap[oppositeKey]) {
-                directionsMap[oppositeKey] = {
-                    key: oppositeKey,
-                    direction: oppositeKey,
-                    sampleTracks: baseSamples.map((sample) => wrapSampleEntry(sample?.track || sample)).filter(Boolean),
-                    generatedOpposite: true,
-                    isSynthetic: true
-                };
             }
 
             processedPairs.add(pairKey);

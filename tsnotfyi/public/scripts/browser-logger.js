@@ -2,7 +2,7 @@
 // Must be loaded before page.js
 
 // Set to true to disable all client-to-server logging (for performance testing)
-const BROWSER_LOGGING_DISABLED = true;
+const BROWSER_LOGGING_DISABLED = false;
 
 const CLIENT_LOG_ENDPOINT = '/client-logs';
 const BROWSER_LOG_BATCH_LIMIT = 40;

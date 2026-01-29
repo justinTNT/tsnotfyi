@@ -3,12 +3,12 @@ import { state, connectionHealth, audioHealth, PENDING_EXPLORER_FORCE_MS, TRACK_
 import { composeEventsEndpoint, syncEventsEndpoint, applyFingerprint, normalizeResolution } from './session-utils.js';
 import { requestSSERefresh, createNewJourneySession, scheduleHeartbeat } from './sync-manager.js';
 import { armExplorerSnapshotTimer, clearExplorerSnapshotTimer, setDeckStaleFlag, clearPendingExplorerLookahead, forceApplyPendingExplorerSnapshot } from './deck-state.js';
-import { exitDangerZoneVisualState, exitCardsDormantState, ensureDeckHydratedAfterTrackChange } from './danger-zone.js';
+import { exitCardsDormantState, ensureDeckHydratedAfterTrackChange } from './card-state.js';
 import { cloneExplorerData, explorerContainsTrack, findTrackInExplorer, shouldIgnoreExplorerUpdate, summarizeExplorerSnapshot } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
 import { updateConnectionHealthUI, handleDeadAudioSession } from './audio-manager.js';
 import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray } from './playlist-tray.js';
-import { cancelPackAwayAnimation } from './clock-animation.js';
+import { cancelPackAwayAnimation, animateTrackChange } from './clock-animation.js';
 
 // Smart SSE connection with health monitoring and reconnection
 export function connectSSE() {
@@ -162,6 +162,13 @@ export function connectSSE() {
 
       // Cancel any in-progress pack-away animation on track change
       cancelPackAwayAnimation();
+
+      // Capture the direction this track came from (before serverNextDirection is overwritten)
+      // Priority: pending candidate's direction > serverNextDirection > manual selection
+      const pendingDirection = state.pendingLiveTrackCandidate?.driftState?.currentDirection
+          || state.pendingLiveTrackCandidate?.context?.directionKey;
+      state.currentTrackDirection = pendingDirection || state.serverNextDirection || state.manualNextDirectionKey || null;
+      console.log(`🎵 Track promoted with direction: ${state.currentTrackDirection || 'unknown'}`);
     }
 
     const adoptionResult = typeof window.adoptPendingLiveTrackCandidate === 'function'
@@ -189,22 +196,19 @@ export function connectSSE() {
 
     // Only set position from server on track changes - let audio.currentTime drive during playback
     if (trackChanged && durationSeconds > 0) {
-      let elapsedSeconds = 0;
-      if (Number.isFinite(heartbeat.timing?.elapsedMs)) {
-        elapsedSeconds = Math.max(heartbeat.timing.elapsedMs / 1000, 0);
-      }
-      const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-      startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: false });
+      // Force progress to start from 0 on track change - server elapsed may be stale
+      startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
     } else if (durationSeconds > 0 && !state.progressAnimation) {
       // Start animation if not running (e.g., first heartbeat after page load)
-      const elapsedSeconds = Number.isFinite(heartbeat.timing?.elapsedMs)
-        ? Math.max(heartbeat.timing.elapsedMs / 1000, 0)
-        : 0;
-      startProgressAnimationFromPosition(durationSeconds, Math.min(elapsedSeconds, durationSeconds), { resync: false });
+      // Don't trust server elapsed time - audio stream position may differ from server's position
+      // Start from 0 and let audio.currentTime drive the display
+      startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackId: currentTrackId });
     }
 
     const nextTrackId = heartbeat.nextTrack?.track?.identifier || heartbeat.nextTrack?.identifier || null;
-    if (nextTrackId) {
+    // Guard: nextTrack should never be the same as currentTrack (server bug if it is)
+    const nextTrackValid = nextTrackId && nextTrackId !== currentTrackId;
+    if (nextTrackValid) {
       state.serverNextTrack = nextTrackId;
       state.serverNextDirection = heartbeat.nextTrack?.direction || heartbeat.nextTrack?.directionKey || null;
       if (!state.manualNextTrackOverride) {
@@ -240,6 +244,10 @@ export function connectSSE() {
           );
         }
       }
+    } else if (nextTrackId && nextTrackId === currentTrackId) {
+      console.warn('⚠️ Heartbeat nextTrack === currentTrack (server bug); ignoring', {
+        trackId: nextTrackId.substring(0, 8)
+      });
     }
 
     const overrideInfo = heartbeat.override || null;
@@ -277,8 +285,28 @@ export function connectSSE() {
     }
 
     const driftStateForCard = adoptionResult.driftState || heartbeat.driftState || null;
-    if (typeof window.updateNowPlayingCard === 'function') {
-      window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
+
+    // Trigger track change animation only when:
+    // 1. Track actually changed
+    // 2. Playlist is empty (if playlist has items, deck context doesn't change dramatically)
+    if (trackChanged && !playlistHasItems()) {
+      animateTrackChange(
+        // Midpoint: update now-playing card while old content animates out
+        () => {
+          if (typeof window.updateNowPlayingCard === 'function') {
+            window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
+          }
+        },
+        // Complete: mark animation done (new cards render from snapshot handler)
+        () => {
+          state.trackChangeAnimationComplete = true;
+        }
+      );
+    } else {
+      // No animation needed - update now-playing card immediately
+      if (typeof window.updateNowPlayingCard === 'function') {
+        window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
+      }
     }
   };
 
@@ -305,11 +333,14 @@ export function connectSSE() {
       if (typeof window.updateCardWithTrackDetails === 'function') {
         window.updateCardWithTrackDetails(centerCard, match.track, match.direction, true);
       }
-    }
-
-
-    if (typeof window.refreshCardsWithNewSelection === 'function') {
-      window.refreshCardsWithNewSelection();
+      // Only refresh cards if we successfully updated the center card
+      if (typeof window.refreshCardsWithNewSelection === 'function') {
+        window.refreshCardsWithNewSelection();
+      }
+    } else if (centerCard) {
+      // Track not in explorer data - just update the trackMd5 so state stays consistent
+      console.log(`🛰️ selection_ack: track ${trackId.substring(0,8)} not in explorer, updating card dataset only`);
+      centerCard.dataset.trackMd5 = trackId;
     }
   };
 
@@ -419,7 +450,6 @@ export function connectSSE() {
       if (typeof window.hideNextTrackPreview === 'function') {
         window.hideNextTrackPreview({ immediate: false });
       }
-      exitDangerZoneVisualState({ reason: 'snapshot-track-change' });
     } else if (state.cardsDormant) {
       if (typeof window.resolveNextTrackData === 'function') {
         const info = window.resolveNextTrackData();
@@ -558,11 +588,22 @@ export function connectSSE() {
           }
         }
         state.remainingCounts = {};
-        console.log('🟢 DIAG: SSE handler calling createDimensionCards', { trackId: snapshot.explorer?.currentTrack?.identifier, trackChanged });
-        if (typeof window.createDimensionCards === 'function') {
-          window.createDimensionCards(state.latestExplorerData);
+
+        // On initial load or track change, preload album covers before rendering
+        const isInitialRender = !previousExplorerData || trackChanged;
+        const renderCards = () => {
+          console.log('🟢 DIAG: SSE handler calling createDimensionCards', { trackId: snapshot.explorer?.currentTrack?.identifier, trackChanged });
+          if (typeof window.createDimensionCards === 'function') {
+            window.createDimensionCards(state.latestExplorerData);
+          }
+          state.lastExplorerPayload = cloneExplorerData(snapshot.explorer);
+        };
+
+        if (isInitialRender && typeof window.preloadAlbumCovers === 'function') {
+          window.preloadAlbumCovers(snapshot.explorer).then(renderCards);
+        } else {
+          renderCards();
         }
-        state.lastExplorerPayload = cloneExplorerData(snapshot.explorer);
       }
     }
 
@@ -583,11 +624,14 @@ export function connectSSE() {
     }
 
     const durationSeconds = snapshot.currentTrack?.duration || snapshot.currentTrack?.length || state.playbackDurationSeconds || 0;
-    const startTimeMs = snapshot.currentTrack?.startTime || state.playbackStartTimestamp || null;
-    if (durationSeconds > 0 && startTimeMs) {
-      const elapsedSeconds = Math.max((Date.now() - startTimeMs) / 1000, 0);
-      const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-      startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: !trackChanged });
+    if (durationSeconds > 0) {
+      if (trackChanged) {
+        // Track changed - start from 0, let audio.currentTime drive timing
+        startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
+      } else if (state.playbackStartTimestamp) {
+        // Ongoing playback - resync using existing local timing, not server's startTime
+        startProgressAnimationFromPosition(durationSeconds, 0, { resync: true, trackId: currentTrackId });
+      }
     }
 
     ensureDeckHydratedAfterTrackChange('explorer-snapshot');

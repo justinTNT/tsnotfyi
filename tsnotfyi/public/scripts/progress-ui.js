@@ -1,6 +1,6 @@
 // Progress bar and playback clock UI
 // Dependencies: globals.js (state, elements, rootElement, PROGRESS_*, LOCKOUT_*, TRACK_*, etc.)
-// Dependencies: danger-zone.js (exitDangerZoneVisualState, safelyExitCardsDormantState)
+// Dependencies: card-state.js (safelyExitCardsDormantState)
 
 import {
     state,
@@ -18,13 +18,13 @@ import {
     MAX_PENDING_TRACK_DELAY_MS,
     TRACK_CHANGE_DESYNC_GRACE_MS
 } from './globals.js';
-import { exitDangerZoneVisualState, safelyExitCardsDormantState } from './danger-zone.js';
+import { safelyExitCardsDormantState } from './card-state.js';
 
 let playbackClockAnimationId = null;
 let lastProgressPhase = null;
 
-export function startProgressAnimation(durationSeconds) {
-    startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true });
+export function startProgressAnimation(durationSeconds, trackId = null) {
+    startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true, trackId });
 }
 
 export function clearPendingProgressStart() {
@@ -144,14 +144,16 @@ export function updatePlaybackClockDisplay(forceSeconds = null) {
     }
 
     const clampedElapsed = Math.min(Math.max(0, elapsedSeconds), state.playbackDurationSeconds);
-    const formatted = formatTimecode(clampedElapsed);
-    if (formatted === '--:--') {
+    const formattedElapsed = formatTimecode(clampedElapsed);
+    const formattedTotal = formatTimecode(state.playbackDurationSeconds);
+    if (formattedElapsed === '--:--') {
         elements.playbackClock.textContent = '';
         elements.playbackClock.classList.add('is-hidden');
         return;
     }
 
-    elements.playbackClock.textContent = formatted;
+    // Show elapsed/total format for diagnostics (e.g., "1:23/4:56")
+    elements.playbackClock.textContent = `${formattedElapsed}/${formattedTotal}`;
     elements.playbackClock.classList.remove('is-hidden');
 }
 
@@ -449,12 +451,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     }
 
     if (trackChanged) {
-        // Reset danger zone state for new track
-        if (typeof window.resetDangerZoneState === 'function') {
-            window.resetDangerZoneState();
-        }
         lastProgressPhase = null;
-        exitDangerZoneVisualState({ reason: 'track-change' });
     }
 
     if (resync && state.playbackStartTimestamp) {
@@ -508,10 +505,12 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     const initialProgress = safeDuration > 0 ? (clampedStartPosition / safeDuration) : 0;
     const remainingDuration = Math.max((safeDuration - clampedStartPosition) * 1000, 0);
 
-    const trackCurrentlyMatching =
-        trackId &&
+    // If trackId provided, verify it matches current track
+    // If trackId is null, skip check (can't verify, assume it's valid)
+    const trackCurrentlyMatching = !trackId || (
         state.latestCurrentTrack &&
-        (state.latestCurrentTrack.identifier === trackId || state.latestCurrentTrack.trackMd5 === trackId);
+        (state.latestCurrentTrack.identifier === trackId || state.latestCurrentTrack.trackMd5 === trackId)
+    );
     if (trackChanged && !trackCurrentlyMatching && !forceStart) {
         console.warn('⚠️ Progress start aborted: heartbeat reference mismatch', {
             durationSeconds,
@@ -598,13 +597,6 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     updatePlaybackClockDisplay(clampedStartPosition);
 
     const initialShouldLock = shouldLockInteractions(clampedStartPosition, safeDuration);
-    // Old danger zone and card locking logic removed
-    // The new clock-animation.js system handles pack-away animations
-    // triggered at t-30s when playlist is empty, or manually via tray click
-    if (typeof window.publishInteractionState === 'function') {
-        window.publishInteractionState();
-    }
-
     if (remainingDuration <= 0) {
         debugLog('progress', 'Remaining duration <= 0; forcing completion');
         renderProgressBar(1);
@@ -616,8 +608,12 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
 
     // Track displayed progress separately from audio progress for smooth animation
     let displayedProgress = initialProgress;
-    const SMOOTH_FACTOR = 0.15; // How quickly to catch up (0-1, higher = faster)
-    const HARD_RESET_THRESHOLD = 0.1; // Jump if more than 10% off
+    let ratchetedProgress = initialProgress; // One-way ratchet: only moves forward
+    const SMOOTH_FACTOR = 0.08; // How quickly to catch up (lower = smoother)
+    const FORWARD_JUMP_THRESHOLD = 0.15; // Hard jump if target is >15% ahead
+
+    // Ease-out function: fast start, slow finish (feels natural for catching up)
+    const easeOut = (t) => 1 - Math.pow(1 - t, 3);
 
     state.progressAnimation = setInterval(() => {
         // Get target progress from audio element (source of truth)
@@ -636,22 +632,27 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
             targetProgress = Math.min(1, Math.max(0, wallElapsed / safeDuration));
         }
 
-        // Smoothly interpolate toward target, or hard reset if too far off
-        const delta = targetProgress - displayedProgress;
-        if (Math.abs(delta) > HARD_RESET_THRESHOLD) {
-            // Too far off - hard reset
-            displayedProgress = targetProgress;
-        } else {
-            // Smooth interpolation toward target
-            displayedProgress += delta * SMOOTH_FACTOR;
+        // One-way ratchet: only move forward (ignore backward jitter)
+        // The ratchet only resets on track change (handled by resetting displayedProgress)
+        if (targetProgress > ratchetedProgress) {
+            ratchetedProgress = targetProgress;
         }
+
+        // Smoothly interpolate toward ratcheted target
+        const delta = ratchetedProgress - displayedProgress;
+        if (delta > FORWARD_JUMP_THRESHOLD) {
+            // Target jumped way ahead - ease into it quickly
+            displayedProgress += delta * 0.3;
+        } else if (delta > 0) {
+            // Normal forward motion - smooth eased lerp
+            const easedFactor = easeOut(SMOOTH_FACTOR) + SMOOTH_FACTOR;
+            displayedProgress += delta * easedFactor;
+        }
+        // Never go backward (delta <= 0 is ignored)
 
         const progress = Math.min(1, Math.max(0, displayedProgress));
         renderProgressBar(progress);
         updatePlaybackClockDisplay();
-
-        // Old danger zone triggers removed - new clock-animation.js handles pack-away
-        // The new system triggers at t-30s when playlist is empty
 
         if (progress >= 1) {
             clearInterval(state.progressAnimation);
@@ -676,11 +677,7 @@ export function stopProgressAnimation() {
     elements.progressWipe.style.left = '0%';
     elements.progressWipe.style.right = 'auto';
 
-    exitDangerZoneVisualState({ reason: 'progress-stop' });
     console.log('🛑 Stopped progress animation');
-    if (typeof window.publishInteractionState === 'function') {
-        window.publishInteractionState();
-    }
     clearPlaybackClock();
     stopPlaybackClockTicker();
     clearPendingProgressStart();
@@ -688,10 +685,6 @@ export function stopProgressAnimation() {
 
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
-    // Old danger zone state removed - now using clock-animation.js system
-    window.resetDangerZoneState = function() {
-        // No-op stub for backward compatibility
-    };
     window.startProgressAnimation = startProgressAnimation;
     window.startProgressAnimationFromPosition = startProgressAnimationFromPosition;
     window.stopProgressAnimation = stopProgressAnimation;

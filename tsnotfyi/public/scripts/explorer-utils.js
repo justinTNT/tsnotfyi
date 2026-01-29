@@ -134,7 +134,7 @@ export function pickPanelVariant() {
 }
 
 export function colorsForVariant(variant) {
-  const directionType = VARIANT_TO_DIRECTION_TYPE[variant] || 'outlier';
+  const directionType = VARIANT_TO_DIRECTION_TYPE[variant] || 'latent';
   const colors = getDirectionColor(directionType, `${directionType}_positive`);
   return {
     border: colors.border,
@@ -800,24 +800,24 @@ export function fallbackEnsureSyntheticOpposites(data) {
 
     if (oppositeDirectionEntry) {
       const oppositeSamples = cloneSampleList(oppositeDirectionEntry.sampleTracks || []);
-      if (!oppositeSamples.length && hasBase) {
-        oppositeDirectionEntry.sampleTracks = baseSamples.map(sample => ({ track: { ...sample.track } }));
-        oppositeDirectionEntry.generatedOpposite = true;
-        oppositeDirectionEntry.isSynthetic = true;
-      } else if (oppositeSamples.length && !hasBase) {
-        direction.sampleTracks = oppositeSamples.map(sample => ({ track: { ...sample.track } }));
-        direction.generatedOpposite = true;
-        direction.isSynthetic = true;
+      // Only set hasOpposite if BOTH directions have distinct samples
+      const bothHaveSamples = hasBase && oppositeSamples.length > 0;
+
+      if (bothHaveSamples) {
+        direction.hasOpposite = true;
+        oppositeDirectionEntry.hasOpposite = true;
+        oppositeDirectionEntry.oppositeDirection = {
+          key,
+          direction: direction.direction || key,
+          domain: direction.domain || oppositeDirectionEntry.domain || null,
+          sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } })),
+          generatedOpposite: false
+        };
+      } else {
+        // One or both directions empty - no real opposite relationship
+        direction.hasOpposite = false;
+        oppositeDirectionEntry.hasOpposite = false;
       }
-      direction.hasOpposite = true;
-      oppositeDirectionEntry.hasOpposite = true;
-      oppositeDirectionEntry.oppositeDirection = {
-        key,
-        direction: direction.direction || key,
-        domain: direction.domain || oppositeDirectionEntry.domain || null,
-        sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } })),
-        generatedOpposite: false
-      };
 
       processedPairs.add(pairKey);
       return;
@@ -827,19 +827,11 @@ export function fallbackEnsureSyntheticOpposites(data) {
       delete directionsMap[oppositeKey];
     }
 
+    // Server filtered out the opposite (too weak) - respect that decision
+    // Don't create synthetic opposites with copied tracks
     direction.hasOpposite = false;
     if (direction.oppositeDirection) {
       delete direction.oppositeDirection;
-    }
-
-    if (!directionsMap[oppositeKey]) {
-      directionsMap[oppositeKey] = {
-        key: oppositeKey,
-        direction: oppositeKey,
-        sampleTracks: baseSamples.map(sample => ({ track: { ...sample.track } })),
-        generatedOpposite: true,
-        isSynthetic: true
-      };
     }
 
     processedPairs.add(pairKey);

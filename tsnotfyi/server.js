@@ -11,6 +11,7 @@ const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
 const serverLogger = require('./server-logger');
 const internalMetrics = require('./metrics/internalMetrics');
+const { ExplorerResponse, validateOrWarn } = require('./contracts-zod');
 
 const startupLog = serverLogger.createLogger('startup');
 const serverLog = serverLogger.createLogger('server');
@@ -3193,9 +3194,11 @@ function stripExplorerDataForClient(data, logLabel = 'explorer') {
     } : null
   };
 
-  // Strip each direction
+  // Strip each direction (skip empty directions)
   for (const [key, dir] of Object.entries(data.directions || {})) {
-    result.directions[key] = stripDirection(dir);
+    if (dir.sampleTracks?.length > 0) {
+      result.directions[key] = stripDirection(dir);
+    }
   }
 
   const afterSize = JSON.stringify(result).length;
@@ -3265,9 +3268,12 @@ app.post('/explorer', async (req, res) => {
       // Use the session's mixer to get comprehensive explorer data
       // Temporarily set the mixer's currentTrack to the source track for exploration
       const originalCurrentTrack = session.mixer.currentTrack;
+      const isSameTrack = originalCurrentTrack?.identifier === sourceTrack?.identifier;
       session.mixer.currentTrack = sourceTrack;
       try {
-        explorerData = await session.mixer.getComprehensiveExplorerData({ forceFresh: true });
+        // Only force fresh if exploring a DIFFERENT track than current
+        // This allows sharing pendingExplorerPromise with prepareNextTrackForCrossfade
+        explorerData = await session.mixer.getComprehensiveExplorerData({ forceFresh: !isSameTrack });
       } finally {
         session.mixer.currentTrack = originalCurrentTrack;
       }
@@ -3402,8 +3408,9 @@ app.post('/explorer', async (req, res) => {
       const rawNext = explorerData.nextTrack;
       const recKey = rawNext.directionKey;
       const recTrackId = rawNext.track?.identifier || rawNext.identifier;
-      serverLog.info(`🎯 Mixer recommended: dirKey=${recKey}, trackId=${recTrackId?.substring(0,8)}, inFiltered=${!!filteredDirections[recKey]}, inPlaylist=${playlistTrackSet.has(recTrackId)}`);
-      if (recKey && filteredDirections[recKey] && !playlistTrackSet.has(recTrackId)) {
+      const dirHasTracks = filteredDirections[recKey]?.sampleTracks?.length > 0;
+      serverLog.info(`🎯 Mixer recommended: dirKey=${recKey}, trackId=${recTrackId?.substring(0,8)}, inFiltered=${!!filteredDirections[recKey]}, hasTracks=${dirHasTracks}, inPlaylist=${playlistTrackSet.has(recTrackId)}`);
+      if (recKey && dirHasTracks && !playlistTrackSet.has(recTrackId)) {
         nextTrack = {
           directionKey: recKey,
           direction: rawNext.direction,
@@ -3439,6 +3446,24 @@ app.post('/explorer', async (req, res) => {
       }
     }
 
+    // If explorer's nextTrack differs from what mixer prepared, re-prepare
+    if (session?.mixer && nextTrack?.track?.identifier) {
+      const preparedNextId = session.mixer.nextTrack?.identifier;
+      const explorerNextId = nextTrack.track.identifier;
+      if (preparedNextId && preparedNextId !== explorerNextId) {
+        serverLog.info(`🔄 Re-preparing: mixer has ${preparedNextId?.substring(0,8)}, explorer wants ${explorerNextId?.substring(0,8)}`);
+        // Trigger re-preparation with the explorer's recommendation
+        session.mixer.prepareNextTrackForCrossfade({
+          forceRefresh: true,
+          reason: 'explorer-correction',
+          overrideTrackId: explorerNextId,
+          overrideDirection: nextTrack.direction
+        }).catch(err => {
+          serverLog.warn(`⚠️ Re-preparation failed: ${err?.message || err}`);
+        });
+      }
+    }
+
     // Build response and strip heavy fields before sending
     const rawResponse = {
       directions: filteredDirections,
@@ -3447,6 +3472,9 @@ app.post('/explorer', async (req, res) => {
     };
 
     const response = stripExplorerDataForClient(rawResponse);
+
+    // Validate response matches contract before sending
+    validateOrWarn(ExplorerResponse, response, `explorer:${trackId.substring(0, 8)}`);
 
     serverLog.info(`🎯 Explorer request for ${trackId.substring(0, 8)} completed in ${Date.now() - startTime}ms`);
     res.json(response);

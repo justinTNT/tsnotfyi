@@ -41,6 +41,8 @@ class AdvancedAudioMixer {
       isCrossfading: false,
       crossfadePosition: 0,
       crossfadeDuration: config.audio.crossfadeDuration,
+      crossfadeStartTime: null, // When crossfade started (for stuck detection)
+      crossfadeMaxWaitMs: 8000, // Max time to wait for next buffer during crossfade
 
       // Stream control
       streamTimer: null,
@@ -528,6 +530,7 @@ class AdvancedAudioMixer {
 
     this.engine.isStreaming = false;
     this.engine.isCrossfading = false;
+    this.engine.crossfadeStartTime = null;
 
     console.log('⏹️ Audio stream stopped');
   }
@@ -563,7 +566,8 @@ class AdvancedAudioMixer {
     }
 
     // Handle buffer depletion (but don't end track yet - audio may still be playing)
-    if (remainingBytes <= 0) {
+    // IMPORTANT: Don't return early if crossfading - we need to continue feeding next track chunks
+    if (remainingBytes <= 0 && !this.engine.isCrossfading) {
       // Buffer is empty but track may still be playing from internal audio buffers
       return;
     }
@@ -608,6 +612,21 @@ class AdvancedAudioMixer {
     let chunk;
     if (this.engine.isCrossfading && this.engine.nextTrack.buffer) {
       chunk = this.createCrossfadeChunk();
+    } else if (this.engine.isCrossfading && !this.engine.nextTrack.buffer) {
+      // Crossfade started but next buffer not ready - check for stuck state
+      const crossfadeAge = this.engine.crossfadeStartTime
+        ? Date.now() - this.engine.crossfadeStartTime
+        : 0;
+
+      if (crossfadeAge > this.engine.crossfadeMaxWaitMs) {
+        console.error(`🚨 STUCK CROSSFADE: Waited ${crossfadeAge}ms for next buffer that never arrived`);
+        console.error(`🚨 Canceling crossfade and continuing current track`);
+        this.engine.isCrossfading = false;
+        this.engine.crossfadePosition = 0;
+        this.engine.crossfadeStartTime = null;
+      }
+      // Continue normal playback while waiting (or after cancel)
+      chunk = this.createNormalChunk(remainingBytes);
     } else {
       // Normal playback with potential tempo adjustment
       chunk = this.createNormalChunk(remainingBytes);
@@ -695,6 +714,7 @@ class AdvancedAudioMixer {
   startCrossfade() {
     this.engine.isCrossfading = true;
     this.engine.crossfadePosition = 0;
+    this.engine.crossfadeStartTime = Date.now();
 
     // Initialize next track position if not set
     if (!this.engine.nextTrack.position) {
@@ -1011,6 +1031,7 @@ class AdvancedAudioMixer {
 
     this.engine.isCrossfading = false;
     this.engine.crossfadePosition = 0;
+    this.engine.crossfadeStartTime = null;
     this.engine.tempoAdjustment = 1.0;
     this.trackMetadata.current = this.trackMetadata.next || null;
     this.trackMetadata.next = null;

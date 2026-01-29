@@ -20,14 +20,14 @@ export function variantFromDirectionType(directionType) {
         tonal_pca: 'green-variant',
         spectral_core: 'blue-variant',
         spectral_pca: 'blue-variant',
-        outlier: 'yellow-variant'
+        latent: 'yellow-variant'
     };
     return variantMap[directionType] || 'yellow-variant';
 }
 
 // Categorize direction into 7 distinct types for color coding
 export function getDirectionType(directionKey) {
-    // 7 categories: Core vs PCA for rhythmic/tonal/spectral, plus outliers
+    // 7 categories: Core vs PCA for rhythmic/tonal/spectral, plus latent (VAE/learned)
     if (directionKey.includes('rhythmic_pc') || (directionKey.includes('pc') && directionKey.includes('rhythmic'))) {
         return 'rhythmic_pca'; // Rhythmic PCA directions
     } else if (directionKey.includes('rhythmic') || directionKey.includes('bpm') || directionKey.includes('dance') || directionKey.includes('onset')) {
@@ -41,7 +41,7 @@ export function getDirectionType(directionKey) {
     } else if (directionKey.includes('spectral') || directionKey.includes('centroid') || directionKey.includes('rolloff') || directionKey.includes('flatness')) {
         return 'spectral_core'; // Core spectral features
     } else {
-        return 'outlier'; // Outliers, entropy, crest, and miscellaneous
+        return 'latent'; // VAE latent dimensions, beat_punch, entropy, crest
     }
 }
 
@@ -249,11 +249,11 @@ export function getOppositeDirection(directionKey) {
 
 // Check if the next track direction has an opposite direction available in current SSE data
 export function hasOppositeDirection(currentDirectionKey, explorerData) {
-    // Outliers never have opposite directions
+    // Weak directions (<3 tracks) never have opposite directions
     if (explorerData.directions && explorerData.directions[currentDirectionKey]) {
         const direction = explorerData.directions[currentDirectionKey];
         if (direction.isOutlier) {
-            return false; // Outliers don't have reverse pairs
+            return false; // Weak directions don't have reverse pairs
         }
         return direction.hasOpposite === true;
     }
@@ -355,14 +355,14 @@ export function getDirectionColor(directionType, dimensionKey) {
             border: hslToHex(257, 1.0, 0.75),  // Ultra bright purple
             glow: hslToHex(257, 1.0, 0.65)     // Vivid purple
         },
-        outlier: {           // Magenta primary: 309°
+        latent: {            // Magenta primary: 309°
             border: hslToHex(309, 1.0, 0.75),  // Ultra bright magenta
             glow: hslToHex(309, 1.0, 0.65)     // Vivid magenta
         }
     };
 
     // Get base colors for the direction type
-    const colors = baseColors[directionType] || baseColors.outlier;
+    const colors = baseColors[directionType] || baseColors.latent;
 
     // Detect polarity and apply variation
     const isNegative = (dimensionKey.includes('_negative') ||
@@ -398,7 +398,7 @@ export function getDirectionColor(directionType, dimensionKey) {
             case 'spectral_pca':
                 baseHue = 257; baseSaturation = 1.0; baseLightness = 0.75;
                 glowSaturation = 1.0; glowLightness = 0.65; break;
-            case 'outlier':
+            case 'latent':
                 baseHue = 309; baseSaturation = 1.0; baseLightness = 0.75;
                 glowSaturation = 1.0; glowLightness = 0.65; break;
             default:
@@ -434,7 +434,6 @@ export function getDirectionColor(directionType, dimensionKey) {
     }
 
     // Return original bright colors for positive directions
-    console.log(`🎨 getDirectionColor: ${dimensionKey} (${directionType}) -> isNegative=${isNegative}, colors=`, colors);
     return colors;
 }
 

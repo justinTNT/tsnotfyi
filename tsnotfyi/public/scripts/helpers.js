@@ -28,11 +28,74 @@ function helpersDuplicateLog(...args) {
 }
 
   // create all the styling for album covers
-  const albumCoverBackground = (albumCover) =>
-    `url('${albumCover}')`
+  const albumCoverBackground = (albumCover) => {
+    const escaped = albumCover ? albumCover.replace(/'/g, "\\'") : '';
+    return `url('${escaped}')`;
+  }
 
   const photoStyle = (albumCover) =>
     `background: ${albumCoverBackground(albumCover)}; background-size: 120%; background-position-x: 45%`
+
+  // Preload album cover images before rendering
+  // Returns a promise that resolves when all critical covers are loaded (or fail)
+  function preloadAlbumCovers(explorerData, options = {}) {
+    const { timeout = 3000 } = options;
+    const covers = new Set();
+
+    // Current track cover (most important)
+    if (explorerData?.currentTrack?.albumCover) {
+      covers.add(explorerData.currentTrack.albumCover);
+    }
+
+    // Next track cover
+    const nextTrack = explorerData?.nextTrack?.track || explorerData?.nextTrack;
+    if (nextTrack?.albumCover) {
+      covers.add(nextTrack.albumCover);
+    }
+
+    // First sample from each direction (visible on initial render)
+    if (explorerData?.directions) {
+      Object.values(explorerData.directions).forEach(dir => {
+        const firstSample = dir.sampleTracks?.[0];
+        const track = firstSample?.track || firstSample;
+        if (track?.albumCover) {
+          covers.add(track.albumCover);
+        }
+      });
+    }
+
+    if (covers.size === 0) {
+      return Promise.resolve([]);
+    }
+
+    console.log(`🖼️ Preloading ${covers.size} album covers...`);
+
+    const loadPromises = Array.from(covers).map(url => {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve({ url, status: 'loaded' });
+        img.onerror = () => resolve({ url, status: 'error' });
+        img.src = url;
+      });
+    });
+
+    // Race against timeout - don't block forever on slow/failed images
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => resolve({ status: 'timeout' }), timeout);
+    });
+
+    return Promise.race([
+      Promise.all(loadPromises).then(results => {
+        const loaded = results.filter(r => r.status === 'loaded').length;
+        console.log(`🖼️ Preloaded ${loaded}/${covers.size} album covers`);
+        return results;
+      }),
+      timeoutPromise.then(() => {
+        console.log(`🖼️ Album cover preload timed out after ${timeout}ms`);
+        return [{ status: 'timeout' }];
+      })
+    ]);
+  }
 
   function decodeHexEncodedPath(candidate) {
       if (!candidate || typeof candidate !== 'string') {
@@ -328,6 +391,8 @@ function helpersDuplicateLog(...args) {
   }
 
   function hasActualOpposite(direction, resolvedKey) {
+      // Check if an opposite direction exists with DISTINCT tracks
+      // User expects different music when switching directions
       const stateRef = state;
       const directionsMap = stateRef.latestExplorerData?.directions || {};
       const inlineOpposite = direction?.oppositeDirection;
@@ -347,17 +412,12 @@ function helpersDuplicateLog(...args) {
           return false;
       }
 
+      // Check that opposite has at least one track different from primary
       const primaryIds = new Set(extractSampleIdentifiers(direction?.sampleTracks || []));
-      let hasDistinctOpposite = false;
       if (primaryIds.size === 0) {
-          hasDistinctOpposite = true;
-      } else {
-          hasDistinctOpposite = oppositeIds.some(id => !primaryIds.has(id));
+          return true; // No primary tracks, any opposite tracks are "distinct"
       }
-
-      const inlineValid = inlineIds.length > 0 && inlineOpposite?.isSynthetic !== true;
-      const externalValid = externalIds.length > 0 && externalDirection?.isSynthetic !== true;
-      return hasDistinctOpposite && (inlineValid || externalValid);
+      return oppositeIds.some(id => !primaryIds.has(id));
   }
 
   function applyReverseBadge(card, direction, context, { interactive = false, extraClasses = '', highlightOverride = null } = {}) {
@@ -368,6 +428,7 @@ function helpersDuplicateLog(...args) {
       }
 
       const oppositeKey = resolveOppositeDirectionKey(direction) || getOppositeDirection(context.resolvedKey);
+      // Only show reverse icon if there are actual distinct tracks in the opposite direction
       const hasOppositeStack = hasActualOpposite(direction, context.resolvedKey);
 
       if (!hasOppositeStack || !panel) {
@@ -402,8 +463,6 @@ function helpersDuplicateLog(...args) {
       classSet.add('has-opposite');
       if (enableInteraction) {
           classSet.add('enabled');
-      } else {
-          classSet.add('disabled');
       }
       if (extraClasses) {
           extraClasses.split(/\s+/).filter(Boolean).forEach(cls => classSet.add(cls));
@@ -760,8 +819,6 @@ function helpersDuplicateLog(...args) {
       const nextIndex = (currentTrackIndex + 1) % sampleTracks.length;
       const nextTrack = sampleTracks[nextIndex].track || sampleTracks[nextIndex];
 
-      console.log(`🔄 Cycling stack: from index ${currentTrackIndex} to ${nextIndex}, track: ${nextTrack.title}`);
-
       // Update global track index
       state.stackIndex = nextIndex;
 
@@ -823,7 +880,7 @@ function helpersDuplicateLog(...args) {
       card.dataset.totalTracks = totalTracks;
       card.dataset.trackTitle = getDisplayTitle(track) || '';
       card.dataset.trackArtist = track.artist || '';
-      card.dataset.trackAlbum = track.album || '';
+      card.dataset.trackAlbum = track.album || track.beetsMeta?.album?.album || track.beetsMeta?.item?.album || '';
       if (track.albumCover) {
           card.dataset.trackAlbumCover = track.albumCover;
       } else {
@@ -884,6 +941,12 @@ function helpersDuplicateLog(...args) {
 
       const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
 
+      const albumName = track.album
+          || track.beetsMeta?.album?.album
+          || track.beetsMeta?.item?.album
+          || card.dataset.trackAlbum
+          || '';
+
       card.innerHTML = `
           <div class="panel ${colorVariant}">
               <div class="photo" style="${photoStyle(track.albumCover)}"></div>
@@ -892,8 +955,7 @@ function helpersDuplicateLog(...args) {
                   <h2>${directionName}</h2>
                   <h3>${getDisplayTitle(track)}</h3>
                   <h4>${track.artist || 'Unknown Artist'}</h4>
-                  <h5>${track.album || ''}</h5>
-                  <p>${duration} · FLAC</p>
+                  <h5>${albumName}</h5>
               </div>
           </div>
       `;
@@ -917,11 +979,8 @@ function helpersDuplicateLog(...args) {
 
       card.addEventListener('click', (e) => {
           if (e.target.closest('.uno-reverse')) {
-              console.log(`🔄 Clicked on reverse icon, ignoring card click`);
               return;
           }
-
-          console.log(`🔄 Cycling stack for dimension: ${resolvedKey} from track index ${state.stackIndex}`);
           cycleStackContents(resolvedKey, state.stackIndex);
       });
 
@@ -934,8 +993,6 @@ function helpersDuplicateLog(...args) {
                   console.warn('🔒 Reverse toggle ignored while cards are locked');
                   return;
               }
-              console.log(`🔄 Swapping stack contents from ${resolvedKey} to opposite`);
-
               const currentDirection = state.latestExplorerData.directions[resolvedKey];
               if (currentDirection && currentDirection.oppositeDirection) {
                   const oppositeKey = getOppositeDirection(resolvedKey);
@@ -1125,7 +1182,9 @@ function helpersDuplicateLog(...args) {
           const photo = document.createElement('div');
           photo.className = 'preview-photo';
           if (sample.albumCover) {
-              photo.style.backgroundImage = `url("${sample.albumCover}")`;
+              // Escape quotes in path for CSS url()
+              const escapedCover = sample.albumCover.replace(/["']/g, '\\$&');
+              photo.style.backgroundImage = `url("${escapedCover}")`;
           }
 
           const rim = document.createElement('span');
@@ -1376,7 +1435,9 @@ function helpersDuplicateLog(...args) {
 
       const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
       const hasOpposite = declaredOpposite || oppositeAvailable;
-      const wantsInteractiveReverse = oppositeAvailable && (card.classList.contains('next-track') || card.classList.contains('track-detail-card'));
+      // Center cards (promoted cards) should also get interactive reverse if opposite is available
+      const isCardInCenter = card.classList.contains('center') || card.classList.contains('now-playing') || card.classList.contains('current-track');
+      const wantsInteractiveReverse = oppositeAvailable && (card.classList.contains('next-track') || card.classList.contains('track-detail-card') || isCardInCenter);
       card.dataset.directionType = directionType;
       let maskIsNegative = isNegative;
 
@@ -1395,7 +1456,7 @@ function helpersDuplicateLog(...args) {
       // Persist core track metadata so later refreshes can fall back to the latest details
       card.dataset.trackTitle = getDisplayTitle(track) || '';
       card.dataset.trackArtist = track.artist || '';
-      card.dataset.trackAlbum = track.album || '';
+      card.dataset.trackAlbum = track.album || track.beetsMeta?.album?.album || track.beetsMeta?.item?.album || '';
 
       const numericDuration = Number(track.duration ?? track.length);
       if (Number.isFinite(numericDuration)) {
@@ -1470,6 +1531,12 @@ function helpersDuplicateLog(...args) {
           panelClasses = `panel ${variantClass}`;
       }
 
+      const albumName = track.album
+          || track.beetsMeta?.album?.album
+          || track.beetsMeta?.item?.album
+          || card.dataset.trackAlbum
+          || '';
+
       const newHTML = `
           <div class="${panelClasses}">
               <div class="photo" style="${photoStyle(track.albumCover)}"></div>
@@ -1478,8 +1545,7 @@ function helpersDuplicateLog(...args) {
                   <h2>${directionName}</h2>
                   <h3>${getDisplayTitle(track)}</h3>
                   <h4>${track.artist || 'Unknown Artist'}</h4>
-                  <h5>${track.album || ''}</h5>
-                  <p>${duration} · FLAC</p>
+                  <h5>${albumName}</h5>
               </div>
           </div>
       `;
@@ -1512,15 +1578,9 @@ function helpersDuplicateLog(...args) {
           reverseButton.classList.toggle('reversed', state.usingOppositeDirection);
           reverseButton.addEventListener('click', (e) => {
               e.stopPropagation();
-              console.log(`🔄 Reverse icon clicked for ${resolvedKey}`);
-
               const oppositeKey = getOppositeDirection(resolvedKey);
-              console.log(`🔄 Opposite key found: ${oppositeKey}`);
               if (oppositeKey) {
-                  console.log(`🔄 About to call swapStackContents(${resolvedKey}, ${oppositeKey})`);
                   swapFn(resolvedKey, oppositeKey);
-              } else {
-                  console.warn(`No opposite direction found for ${resolvedKey}`);
               }
           });
       }
@@ -1593,6 +1653,7 @@ export {
     getDisplayTitle,
     photoStyle,
     albumCoverBackground,
+    preloadAlbumCovers,
     renderReverseIcon,
     updateCardWithTrackDetails,
     cycleStackContents,
@@ -1602,6 +1663,7 @@ export {
     createNextTrackCardStack,
     hideStackSizeIndicator,
     applyReverseBadge,
+    hasActualOpposite,
     ensureStackedPreviewLayer,
     clearStackedPreviewLayer,
     packUpStackCards,
@@ -1618,4 +1680,5 @@ if (typeof window !== 'undefined') {
     window.photoStyle = photoStyle;
     window.updateCardWithTrackDetails = updateCardWithTrackDetails;
     window.packUpStackCards = packUpStackCards;
+    window.preloadAlbumCovers = preloadAlbumCovers;
 }

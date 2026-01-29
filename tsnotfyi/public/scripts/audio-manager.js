@@ -661,7 +661,8 @@ export function attachBaseAudioEventListeners(audioEl = elements.audio) {
       const drift = Math.abs(audioElapsed - visualElapsed);
       if (drift > 1.25 && audioCallbacks.startProgressAnimationFromPosition) {
         debugLog('timing', 'Audio-driven resync', { audioClock, audioElapsed, visualElapsed, drift });
-        audioCallbacks.startProgressAnimationFromPosition(state.playbackDurationSeconds, audioElapsed, { resync: true });
+        const trackId = state.latestCurrentTrack?.identifier || null;
+        audioCallbacks.startProgressAnimationFromPosition(state.playbackDurationSeconds, audioElapsed, { resync: true, trackId });
       }
     }
 

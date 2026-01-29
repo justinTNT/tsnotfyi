@@ -77,7 +77,8 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
   state.pendingExplorerSnapshot = {
     trackId,
     queuedAt: Date.now(),
-    reason: context.reason || 'unknown'
+    reason: context.reason || 'unknown',
+    retryCount: context.retryCount || 0
   };
   setDeckStaleFlag(true, {
     reason: context.reason || 'fetching-explorer'
@@ -120,6 +121,11 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
       if (typeof window.createDimensionCards === 'function') {
         window.createDimensionCards(state.latestExplorerData, { skipExitAnimation: false, forceRedraw: true });
       }
+
+      // Update now-playing card with explorer's album cover (fixes first track cover delay)
+      if (data.currentTrack?.albumCover && typeof window.updateNowPlayingCard === 'function') {
+        window.updateNowPlayingCard(state.latestCurrentTrack || data.currentTrack, null);
+      }
     } catch (error) {
       console.error('🧭 Explorer fetch failed:', error);
       handleExplorerSnapshotTimeout();
@@ -142,25 +148,55 @@ function handleExplorerSnapshotTimeout() {
   if (!pending) {
     return;
   }
-  console.warn('🧭 Explorer fetch timeout; using backup if available', {
-    trackId: pending.trackId,
+
+  const retryCount = pending.retryCount || 0;
+  const maxRetries = 3;
+
+  console.warn('🧭 Explorer fetch timeout; retrying', {
+    trackId: pending.trackId?.substring(0, 8),
     waitedMs: Date.now() - pending.queuedAt,
-    reason: pending.reason
+    reason: pending.reason,
+    retryCount
   });
+
   state.pendingExplorerSnapshot = null;
-  if (!useExplorerBackupDeck(pending)) {
-    setDeckStaleFlag(false, { reason: 'backup-missing' });
-    // Retry fetch after a delay
-    const now = Date.now();
-    if ((now - (state.lastExplorerTimeoutRefreshTs || 0)) > 3000) {
-      state.lastExplorerTimeoutRefreshTs = now;
-      console.warn('🧭 Retrying explorer fetch after timeout');
-      setTimeout(() => {
-        if (pending.trackId && !state.pendingExplorerSnapshot) {
-          armExplorerSnapshotTimer(pending.trackId, { reason: 'retry-after-timeout' });
-        }
-      }, 1000);
+
+  // Retry immediately rather than using stale backup
+  if (retryCount < maxRetries && pending.trackId) {
+    // Verify this is still the current track before retrying
+    const currentTrackId = state.latestCurrentTrack?.identifier;
+    if (pending.trackId === currentTrackId) {
+      console.log(`🧭 Retrying explorer fetch (attempt ${retryCount + 1}/${maxRetries})`);
+      armExplorerSnapshotTimer(pending.trackId, {
+        reason: 'retry-after-timeout',
+        retryCount: retryCount + 1
+      });
+      return;
+    } else {
+      console.log('🧭 Skipping retry - track has changed', {
+        pendingTrackId: pending.trackId.substring(0, 8),
+        currentTrackId: currentTrackId?.substring(0, 8)
+      });
     }
+  }
+
+  // After max retries, try backup only if it matches current track
+  if (!useExplorerBackupDeck(pending)) {
+    // Backup rejected (wrong track) - schedule another retry with backoff
+    const currentTrackId = state.latestCurrentTrack?.identifier;
+    if (pending.trackId === currentTrackId) {
+      console.log('🧭 Backup rejected; scheduling delayed retry');
+      setTimeout(() => {
+        // Re-check track hasn't changed
+        if (state.latestCurrentTrack?.identifier === pending.trackId && !state.pendingExplorerSnapshot) {
+          armExplorerSnapshotTimer(pending.trackId, {
+            reason: 'retry-after-backup-rejected',
+            retryCount: 0  // Reset retry count for new attempt cycle
+          });
+        }
+      }, 2000);  // 2s backoff before next retry cycle
+    }
+    setDeckStaleFlag(false, { reason: 'backup-missing' });
   }
 }
 
@@ -170,6 +206,18 @@ function useExplorerBackupDeck(pendingContext = {}) {
     console.warn('⚠️ Explorer backup unavailable; no directions to display');
     return false;
   }
+
+  // Don't use stale backup from a different track
+  const backupTrackId = backup.currentTrack?.identifier || null;
+  const wantedTrackId = pendingContext.trackId || state.latestCurrentTrack?.identifier || null;
+  if (backupTrackId && wantedTrackId && backupTrackId !== wantedTrackId) {
+    console.warn('⚠️ Explorer backup is for wrong track; ignoring stale data', {
+      backupTrackId: backupTrackId.substring(0, 8),
+      wantedTrackId: wantedTrackId.substring(0, 8)
+    });
+    return false;
+  }
+
   try {
     setDeckStaleFlag(true, { reason: 'backup-deck' });
     state.latestExplorerData = backup;

@@ -2,7 +2,6 @@
 import { state, elements, audioHealth, connectionHealth, DEBUG_FLAGS } from './globals.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint } from './session-utils.js';
 import { clearPendingExplorerLookahead, setDeckStaleFlag } from './deck-state.js';
-import { exitDangerZoneVisualState } from './danger-zone.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
@@ -215,7 +214,7 @@ function analyzeAndAct(data, source, sentMd5) {
 
     if (!data || !currentTrack) {
         console.warn('⚠️ Invalid server response');
-        scheduleHeartbeat(60000);
+        scheduleHeartbeat(90000);
         return;
     }
 
@@ -307,7 +306,7 @@ function analyzeAndAct(data, source, sentMd5) {
                 acknowledged: sentMd5,
                 source
             });
-            scheduleHeartbeat(60000);
+            scheduleHeartbeat(90000);
             return;
         }
 
@@ -317,7 +316,7 @@ function analyzeAndAct(data, source, sentMd5) {
                 source
             });
             promoteTrackToNextStack(nextTrack);
-            scheduleHeartbeat(60000);
+            scheduleHeartbeat(90000);
         } else {
             console.log(`${ICON} ACTION full-resync-needed`, {
                 track: nextTrack,
@@ -329,19 +328,9 @@ function analyzeAndAct(data, source, sentMd5) {
         }
     }
 
-    if (typeof duration === 'number' && typeof remaining === 'number' && duration > 0) {
-        const durationSeconds = Math.max(duration / 1000, 0);
-        const elapsedSeconds = Math.max((duration - remaining) / 1000, 0);
-        const clampedElapsed = Math.min(elapsedSeconds, durationSeconds);
-        console.log(`${ICON} ACTION timing-update`, {
-            durationSeconds,
-            elapsedSeconds: clampedElapsed,
-            source
-        });
-        if (typeof window.startProgressAnimationFromPosition === 'function') {
-            startProgressAnimationFromPosition(durationSeconds, clampedElapsed, { resync: true });
-        }
-    }
+    // Server timing intentionally NOT used here - audio.currentTime drives the display
+    // Using server elapsed would cause desync when client joins mid-stream
+    // (server knows where playhead is, but audio stream starts from current position)
 
     console.log(`${ICON} ACTION sync-ok`, { source });
 
@@ -354,7 +343,7 @@ function analyzeAndAct(data, source, sentMd5) {
         }
     }
 
-    scheduleHeartbeat(60000);
+    scheduleHeartbeat(90000);
 }
 
 function isTrackInNeighborhood(trackMd5) {
@@ -476,7 +465,7 @@ export async function fullResync() {
 
         if (result.ok) {
             console.log('✅ Resync broadcast triggered, waiting for SSE update...');
-            scheduleHeartbeat(60000);
+            scheduleHeartbeat(90000);
 
             if (state.pendingResyncCheckTimer) {
               clearTimeout(state.pendingResyncCheckTimer);
@@ -560,7 +549,6 @@ export async function createNewJourneySession(reason = 'unknown') {
 
         clearPendingExplorerLookahead({ reason: 'session-reset' });
         setDeckStaleFlag(false, { reason: 'session-reset' });
-        exitDangerZoneVisualState({ reason: 'session-reset' });
 
         if (state.pendingInitialTrackTimer) {
             clearTimeout(state.pendingInitialTrackTimer);
@@ -778,7 +766,7 @@ export async function requestSSERefresh(options = {}) {
 
                 if (result.currentTrack.duration) {
                     if (typeof window.startProgressAnimation === 'function') {
-                        startProgressAnimation(result.currentTrack.duration);
+                        startProgressAnimation(result.currentTrack.duration, result.currentTrack.identifier);
                     }
                 }
 
@@ -857,7 +845,25 @@ export function setupManualRefreshButton() {
         return;
     }
 
-    refreshButton.addEventListener('click', async () => {
+    let clickTimer = null;
+    const DOUBLE_CLICK_DELAY = 666; // ms to wait for second click
+
+    refreshButton.addEventListener('click', () => {
+        if (clickTimer) {
+            // Second click arrived - it's a double-click (hard reset)
+            clearTimeout(clickTimer);
+            clickTimer = null;
+            handleHardReset();
+        } else {
+            // First click - wait to see if second click comes
+            clickTimer = setTimeout(() => {
+                clickTimer = null;
+                handleRefresh();
+            }, DOUBLE_CLICK_DELAY);
+        }
+    });
+
+    async function handleRefresh() {
         console.log('🔄 Manual refresh button clicked');
         refreshButton.classList.add('refreshing');
 
@@ -869,24 +875,21 @@ export function setupManualRefreshButton() {
             console.error('❌ Manual refresh failed:', error);
             refreshButton.classList.remove('refreshing');
         }
-    });
-
-    const hardResetButton = document.getElementById('hardResetButton');
-    if (hardResetButton) {
-        hardResetButton.addEventListener('click', async () => {
-            console.warn('🛑 Hard reset requested by user');
-            hardResetButton.classList.add('refreshing');
-            try {
-                await createNewJourneySession('manual_hard_reset');
-            } catch (error) {
-                console.error('❌ Hard reset failed:', error);
-            } finally {
-                setTimeout(() => hardResetButton.classList.remove('refreshing'), 1500);
-            }
-        });
     }
 
-    console.log('🔄 Manual refresh button set up');
+    async function handleHardReset() {
+        console.warn('🛑 Hard reset requested by user (double-click)');
+        refreshButton.classList.add('refreshing');
+        try {
+            await createNewJourneySession('manual_hard_reset');
+        } catch (error) {
+            console.error('❌ Hard reset failed:', error);
+        } finally {
+            setTimeout(() => refreshButton.classList.remove('refreshing'), 1500);
+        }
+    }
+
+    console.log('🔄 Manual refresh button set up (single-click: refresh, double-click: new session)');
 }
 
 // Expose globally for backward compatibility and console debugging

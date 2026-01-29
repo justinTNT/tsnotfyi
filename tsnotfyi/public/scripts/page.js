@@ -5,15 +5,15 @@ import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, 
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
 import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, resolveCanonicalDirectionKey } from './explorer-utils.js';
 import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer, clearPendingExplorerLookahead, forceApplyPendingExplorerSnapshot } from './deck-state.js';
-import { setCardVariant, getDeckFrameBuilder, runDeckFrameBuild, initDeckRenderWorker, requestDeckRenderFrame, resolveTrackColorAssignment, cacheTrackColorAssignment } from './deck-render.js';
-import { exitDangerZoneVisualState, safelyExitCardsDormantState, enterDangerZoneVisualState, ensureDeckHydratedAfterTrackChange, enterCardsDormantState, exitCardsDormantState, ensureTrayPreviewForDangerZone, collapseDeckForDangerZone } from './danger-zone.js';
+import { setCardVariant, getDeckFrameBuilder, runDeckFrameBuild, initDeckRenderWorker, requestDeckRenderFrame, resolveTrackColorAssignment, cacheTrackColorAssignment, deckLog } from './deck-render.js';
+import { safelyExitCardsDormantState, ensureDeckHydratedAfterTrackChange, exitCardsDormantState } from './card-state.js';
 import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, formatTimecode, startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, maybeApplyPendingTrackUpdate, getVisualProgressFraction } from './progress-ui.js';
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
 import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
 import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray } from './playlist-tray.js';
 import { triggerPackAwayAnimation, checkPackAwayTrigger, cancelPackAwayAnimation, isPackAwayInProgress } from './clock-animation.js';
-import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext } from './helpers.js';
+import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
 
 (function hydrateStateFromLocation() {
   state.streamUrlBase = '/stream';
@@ -127,37 +127,69 @@ let nextTrackPreviewFadeTimer = null;
       }
 
       // Update direction based on current drift direction
-      const currentDirectionKey = driftState && driftState.currentDirection ? driftState.currentDirection : null;
-      const directionText = currentDirectionKey ?
-          formatDirectionName(currentDirectionKey) :
-          'Journey';
+      // Fallback chain: driftState > state.currentTrackDirection > manualNextDirectionKey > 'Journey'
+      const currentDirectionKey = (driftState && driftState.currentDirection)
+          ? driftState.currentDirection
+          : (state.currentTrackDirection || state.manualNextDirectionKey || null);
+      const directionText = currentDirectionKey
+          ? formatDirectionName(currentDirectionKey)
+          : 'Journey';
       document.getElementById('cardDirection').textContent = directionText;
 
       document.getElementById('cardTitle').textContent = getDisplayTitle(trackData);
       document.getElementById('cardArtist').textContent = trackData.artist || 'Unknown Artist';
-      document.getElementById('cardAlbum').textContent = ''; // No album data currently
 
-      // Format duration and metadata
-      const duration = (trackData.duration || trackData.length) ?
-          `${Math.floor((trackData.duration || trackData.length) / 60)}:${String(Math.floor((trackData.duration || trackData.length) % 60)).padStart(2, '0')}` :
-          '??:??';
-      document.getElementById('cardMeta').textContent = `${duration} · FLAC`;
+      // Get album name from various possible sources
+      const albumName = trackData.album
+          || trackData.beetsMeta?.album?.album
+          || trackData.beetsMeta?.item?.album
+          || '';
+      document.getElementById('cardAlbum').textContent = albumName;
 
       // Update visualization tubes based on track data
       updateSelectedTubes(trackData);
 
       const photo = document.getElementById('cardPhoto');
-      const cover =
-	  state.previousNextTrack?.identifier === trackData.identifier
-	  ? state.previousNextTrack?.albumCover
-	  : trackData.albumCover;
-      photo.style.background = `url('${cover}')`
+      // Resolve album cover with comprehensive fallback chain
+      const trackId = trackData.identifier || trackData.trackMd5 || trackData.md5 || null;
+      let cover = trackData.albumCover || null;
+
+      // Fallback 1: previousNextTrack (cached when it was "next")
+      if (!cover && state.previousNextTrack?.identifier === trackId && state.previousNextTrack?.albumCover) {
+          cover = state.previousNextTrack.albumCover;
+      }
+      // Fallback 2: current explorer's nextTrack (if it matches - track just promoted)
+      if (!cover && state.latestExplorerData?.nextTrack?.track?.identifier === trackId) {
+          cover = state.latestExplorerData.nextTrack.track.albumCover;
+      }
+      // Fallback 3: current explorer's currentTrack
+      if (!cover && state.latestExplorerData?.currentTrack?.identifier === trackId) {
+          cover = state.latestExplorerData.currentTrack.albumCover;
+      }
+      // Fallback 4: search direction sampleTracks for matching track
+      if (!cover && trackId && state.latestExplorerData?.directions) {
+          for (const dir of Object.values(state.latestExplorerData.directions)) {
+              const match = dir.sampleTracks?.find(s => (s.track?.identifier || s.identifier) === trackId);
+              if (match) {
+                  cover = match.track?.albumCover || match.albumCover;
+                  if (cover) break;
+              }
+          }
+      }
+
+      if (cover) {
+          // Escape single quotes in path for CSS url()
+          const escapedCover = cover.replace(/'/g, "\\'");
+          photo.style.background = `url('${escapedCover}')`;
+          photo.style.backgroundSize = 'cover';
+          photo.style.backgroundPosition = 'center';
+      }
 
       // Resolve panel color variant based on track + direction (deterministic per track)
       const panel = document.querySelector('#nowPlayingCard .panel');
       const cardFrame = document.querySelector('#nowPlayingCard .card');
       const rim = document.querySelector('#nowPlayingCard .rim');
-      const trackId = trackData.identifier || trackData.trackMd5 || trackData.md5 || null;
+      // trackId already declared above for albumCover resolution
       const trackIdentity = trackData.identifier
           || trackData.trackMd5
           || trackData.md5
@@ -196,6 +228,7 @@ let nextTrackPreviewFadeTimer = null;
               cardFrame.style.setProperty('--card-border-color', '#ffffff');
           }
       } else {
+          // Try to get colors from previousNextTrack cache
           if (state.previousNextTrack?.identifier === trackId) {
               const prior = state.previousNextTrack;
               const directionMatches = prior.directionKey && currentDirectionKey
@@ -211,8 +244,23 @@ let nextTrackPreviewFadeTimer = null;
               }
           }
 
+          // Fallback: check if track matches explorer's nextTrack (just promoted)
+          if (!assignment && state.latestExplorerData?.nextTrack?.track?.identifier === trackId) {
+              const nextTrackDir = state.latestExplorerData.nextTrack.directionKey;
+              if (nextTrackDir) {
+                  const directionType = getDirectionType(nextTrackDir);
+                  const colors = getDirectionColor(directionType, nextTrackDir);
+                  assignment = {
+                      variant: variantFromDirectionType(directionType),
+                      border: colors.border,
+                      glow: colors.glow,
+                      directionKey: nextTrackDir
+                  };
+              }
+          }
+
           if (!assignment) {
-              assignment = resolveTrackColorAssignment(trackData, { directionKey: currentDirectionKey || assignment?.directionKey || null });
+              assignment = resolveTrackColorAssignment(trackData, { directionKey: currentDirectionKey || null });
           } else if (trackId) {
               cacheTrackColorAssignment(trackId, assignment);
           }
@@ -612,7 +660,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
           if (!options.isPlaylistExploration) {
               state.previousNextTrack = {
                   identifier: previousNextId,
-                  albumCover: previousNext.albumCover,
+                  albumCover: previousNext.track?.albumCover || previousNext.albumCover,
                   variant: assignment.variant,
                   borderColor: assignment.border,
                   glowColor: assignment.glow,
@@ -634,14 +682,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       const container = document.getElementById('dimensionCards');
       deckLog('🎯 Container element:', container);
-
-      if (state.dangerZoneVisualActive && options.forceDangerZoneRender !== true) {
-          console.log('🔴 DIAG: applyDeckRenderFrame BLOCKED by dangerZoneVisualActive');
-          deckLog('⏳ Danger Zone active; deferring deck render');
-          state.dangerZoneDeferredExplorer = explorerData;
-          state.lastDirectionSignature = null;
-          return;
-      }
 
       if (!container) {
           console.error('❌ NO CONTAINER ELEMENT FOUND!');
@@ -853,28 +893,27 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       // ✅ Server now prioritizes larger stacks as primary, smaller as oppositeDirection
 
-      // Separate outliers from regular directions
-      const outlierDirections = allDirections.filter(d =>
-          d.key.includes('outlier') ||
+      // Separate latent (VAE) directions from regular directions
+      const latentDirections = allDirections.filter(d =>
           d.key.includes('unknown') ||
-          getDirectionType(d.key) === 'outlier'
+          getDirectionType(d.key) === 'latent'
       );
-      const regularDirections = allDirections.filter(d => !outlierDirections.includes(d));
+      const regularDirections = allDirections.filter(d => !latentDirections.includes(d));
 
-      deckLog(`🎯 Found ${regularDirections.length} regular directions, ${outlierDirections.length} outliers`);
+      deckLog(`🎯 Found ${regularDirections.length} regular directions, ${latentDirections.length} latent`);
 
       // Apply smart limits
       let directions;
-      if (outlierDirections.length > 0) {
-          // 11 regular + outliers (up to 12 total)
-          const maxRegular = Math.min(11, 12 - outlierDirections.length);
-          directions = regularDirections.slice(0, maxRegular).concat(outlierDirections.slice(0, 12 - maxRegular));
+      if (latentDirections.length > 0) {
+          // 11 regular + latent (up to 12 total)
+          const maxRegular = Math.min(11, 12 - latentDirections.length);
+          directions = regularDirections.slice(0, maxRegular).concat(latentDirections.slice(0, 12 - maxRegular));
       } else {
-          // 12 regular directions if no outliers
+          // 12 regular directions if no latent
           directions = regularDirections.slice(0, 12);
       }
 
-      deckLog(`🎯 Using ${directions.length} total directions: ${directions.length - outlierDirections.length} regular + ${outlierDirections.length} outliers`);
+      deckLog(`🎯 Using ${directions.length} total directions: ${directions.length - latentDirections.length} regular + ${latentDirections.length} latent`);
       const consolidationResult = consolidateDirectionsForDeck(directions);
       if (consolidationResult) {
           directions = consolidationResult.directions;
@@ -893,27 +932,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
           return;
       }
 
-      // Handle separate outliers data if provided (legacy support)
-      if (explorerData.outliers && outlierDirections.length === 0) {
-          const legacyOutliers = Object.entries(explorerData.outliers).map(([key, directionInfo]) => ({
-              key: key,
-              name: directionInfo.direction || key,
-              trackCount: directionInfo.trackCount,
-              description: directionInfo.description,
-              diversityScore: directionInfo.diversityScore,
-              sampleTracks: directionInfo.sampleTracks || [],
-              isOutlier: true
-          }));
-
-          // Apply same smart filtering
-          const totalSpaceUsed = directions.length;
-          const outlierSpaceAvailable = 12 - totalSpaceUsed;
-          if (outlierSpaceAvailable > 0) {
-              const outliersToAdd = legacyOutliers.slice(0, outlierSpaceAvailable);
-              directions.push(...outliersToAdd);
-              deckLog(`🌟 Added ${outliersToAdd.length} legacy outlier directions (${outlierSpaceAvailable} slots available)`);
-          }
-      }
 
       // Server now handles bidirectional prioritization - just trust the hasOpposite flag
       const bidirectionalDirections = directions.filter(direction => direction.hasOpposite);
@@ -939,26 +957,18 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
           }
       });
 
-      // NEW STRATEGY: Create ALL directions as clock-positioned direction cards first
-      console.log(`🎯 Creating all ${directions.length} directions as clock-positioned cards`);
-
+      // Create ALL directions as clock-positioned direction cards first
       directions.forEach((direction, index) => {
-          // Server provides only primary directions - trust the hasOpposite flag for reverse capability
-          const hasReverse = direction.hasOpposite === true;
+          // Use hasActualOpposite to verify there are distinct tracks in the opposite direction
+          const hasReverse = hasActualOpposite(direction, direction.key);
           const tracks = direction.sampleTracks || [];
           const trackCount = tracks.length;
           for (const t of tracks) preloadImage(t.albumCover);
 
-          deckLog(`🎯 Creating direction card ${index}: ${direction.key} (${trackCount} tracks)${hasReverse ? ' with reverse' : ''}`);
+          const oppositeTracks = direction.oppositeDirection?.sampleTracks || [];
           if (hasReverse) {
-              const oppositeTracks = direction.oppositeDirection?.sampleTracks || [];
-              const oppositeCount = oppositeTracks.length;
               for (const t of oppositeTracks) preloadImage(t.albumCover);
-              deckLog(`🔄 Reverse available: ${oppositeCount} tracks in opposite direction`);
           }
-
-          // All start as direction cards in clock positions (no special next-track handling yet)
-          deckLog(`Create direction card ${index}`);
           let card;
           try {
               card = createDirectionCard(direction, index, directions.length, false, null, hasReverse, null, directions);
@@ -1013,14 +1023,9 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       // Cards appear instantly now (stagger is disabled), so use short delay for paint/CSS
       const animationDelay = 150;
-      console.log(`🎯 Scheduling center animation in ${animationDelay}ms for: ${explorerData.nextTrack?.directionKey || 'none'}`);
-
       state.nextTrackAnimationTimer = setTimeout(() => {
           if (explorerData.nextTrack) {
-              console.log(`🎯 Animating ${explorerData.nextTrack.directionKey} to center as next track`);
               animateDirectionToCenter(explorerData.nextTrack.directionKey);
-          } else {
-              console.log(`🎯 No nextTrack in explorerData, skipping center animation`);
           }
           state.nextTrackAnimationTimer = null;
       }, animationDelay);
@@ -1143,7 +1148,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
   function refreshCardsWithNewSelection() {
       const ICON = '🛰️';
       if (!state.latestExplorerData || !state.selectedIdentifier) return;
-      console.log('🔄 Seamlessly updating selection:', state.selectedIdentifier);
 
       const extractStoredTrackFromCard = (cardEl) => {
           if (!cardEl) return null;
@@ -1263,7 +1267,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
               const resolvedTitle = track.title || card.dataset.trackTitle || getDisplayTitle({ identifier: cardTrackMd5 });
               const resolvedArtist = track.artist || card.dataset.trackArtist || 'Unknown Artist';
-              const resolvedAlbum = track.album || card.dataset.trackAlbum || '';
+              const resolvedAlbum = track.album || track.beetsMeta?.album?.album || track.beetsMeta?.item?.album || card.dataset.trackAlbum || '';
 
               const numericDuration = Number(track.duration ?? track.length ?? card.dataset.trackDurationSeconds);
               const durationDisplay = Number.isFinite(numericDuration)
@@ -1287,7 +1291,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                   <h3>${resolvedTitle}</h3>
                   <h4>${resolvedArtist || 'Unknown Artist'}</h4>
                   <h5>${resolvedAlbum || ''}</h5>
-                  <p>${durationDisplay} · FLAC</p>
               `;
 
               // Update stacked card colors based on other tracks in this direction
@@ -1587,7 +1590,8 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                                       }
 
                                       // Restart animation for remaining time
-                                      startProgressAnimationFromPosition(data.newDuration, data.currentPosition, { resync: true });
+                                      const trackId = data.trackId || state.latestCurrentTrack?.identifier || null;
+                                      startProgressAnimationFromPosition(data.newDuration, data.currentPosition, { resync: true, trackId });
 
                                       // Remove temporary event listener
                                       if (connectionHealth.currentEventSource) {
@@ -1734,8 +1738,6 @@ function updatePlaylistTrayPreview({ immediate = false } = {}) {
     trayRoot?.classList.add('has-track');
 }
 
-// Danger zone functions moved to danger-zone.js
-
 function resolveTrackIdentifier(trackLike) {
     if (!trackLike || typeof trackLike !== 'object') {
         return null;
@@ -1807,77 +1809,20 @@ if (typeof window !== 'undefined') {
   window.adoptPendingLiveTrackCandidate = adoptPendingLiveTrackCandidate;
 }
 
-// ====== Inactivity Management ======
-  let inactivityTimer = null;
+// ====== Activity Management ======
+  // Card interactions are always enabled - server handles track selection arbitration
   let lastActivityTime = Date.now();
-  let cardsInactiveTilted = false; // Track if cards are already tilted from inactivity
-  let midpointReached = false; // Track if we've hit the lockout threshold
-  let cardsLocked = false; // Track if card interactions are locked
-  let dangerZoneReached = false;
-
-  function publishInteractionState() {
-      if (typeof window === 'undefined') {
-          return;
-      }
-      window.__deckInteractionState = window.__deckInteractionState || {};
-      window.__deckInteractionState.cardsLocked = cardsLocked;
-      window.__deckInteractionState.dangerZoneReached = midpointReached;
-  }
-  window.publishInteractionState = publishInteractionState;
-  publishInteractionState();
 
   function markActivity() {
       lastActivityTime = Date.now();
+      exitCardsDormantState();
 
-      const canReactivate = !midpointReached && !cardsLocked;
-
-      if (canReactivate) {
-          exitCardsDormantState();
-      }
-
-      // Only respond to activity if we're in the first half and cards aren't locked
-      if (!canReactivate) {
-          console.log('📱 Activity detected but cards are locked in second half');
-          return;
-      }
-
-      // Clear any existing timer
-      if (inactivityTimer) {
-          clearTimeout(inactivityTimer);
-      }
-
-      // Immediately bring cards back to attention if they were inactive
+      // Bring cards back to active state
       const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
       directionCards.forEach(card => {
           card.classList.remove('inactive-tilt');
           card.classList.add('active');
       });
-      cardsInactiveTilted = false;
-
-      // Set new timer for 10 seconds (only in first half)
-      // Inactivity tilt disabled - timer not needed
-      // inactivityTimer = setTimeout(() => {
-      //     if (!midpointReached && !cardsLocked) {
-      //         performInactivityTilt();
-      //     }
-      // }, 10000);
-
-      publishInteractionState();
-  }
-
-  function performInactivityTilt() {
-      // Disabled - inactivity tilt is not useful
-      return;
-
-      if (cardsInactiveTilted) return; // Already tilted
-
-      console.log('📱 Performing inactivity tilt - rotating 45° on X axis')
-      const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
-      directionCards.forEach(card => {
-          card.classList.remove('active');
-          card.classList.add('inactive-tilt');
-      });
-      cardsInactiveTilted = true;
   }
 
   // Activity detection events
@@ -1888,114 +1833,17 @@ if (typeof window !== 'undefined') {
   // Initialize activity tracking
   markActivity();
 
-  // Progress bar functions moved to progress-ui.js
-
   function resetProgressAndDeck(reason = 'manual') {
       console.warn(`🧹 Forcing deck recovery (${reason})`);
       if (typeof window.stopProgressAnimation === 'function') {
           window.stopProgressAnimation();
       }
-      if (typeof window.resetDangerZoneState === 'function') {
-          window.resetDangerZoneState();
-      }
-      cardsInactiveTilted = false;
-      midpointReached = false;
-      window.exitDangerZoneVisualState({ reason: 'deck-reset' });
-      cardsLocked = false;
       state.usingOppositeDirection = false;
       state.lastProgressDesync = null;
       state.progressEverStarted = false;
-      publishInteractionState();
       clearReversePreference();
       window.safelyExitCardsDormantState({ immediate: true });
-      unlockCardInteractions();
       markActivity();
-  }
-
-  function triggerMidpointActions() {
-      // Defer danger zone entry if deck render is in progress to avoid blocking
-      if (state.isRenderingDeck || state.pendingDeckHydration) {
-          console.log('🎯 Deferring danger zone entry - deck render in progress');
-          setTimeout(() => {
-              if (!state.dangerZoneVisualActive && !state.isRenderingDeck && !state.pendingDeckHydration) {
-                  triggerMidpointActions();
-              }
-          }, 50);
-          return;
-      }
-
-      console.log(`🎯 Locking in selection - ${LOCKOUT_THRESHOLD_SECONDS}s or less remaining`);
-
-      // Clear inactivity timer - no longer needed in second half
-      if (inactivityTimer) {
-          clearTimeout(inactivityTimer);
-          inactivityTimer = null;
-      }
-
-      enterCardsDormantState();
-
-      // Tilt back all non-selected direction cards (if not already tilted from inactivity)
-      const directionCards = document.querySelectorAll('.dimension-card:not(.track-detail-card)');
-      directionCards.forEach(card => {
-          // Remove any inactivity classes and apply midpoint tilt
-          card.classList.remove('inactive-tilt', 'active');
-          card.classList.add('midpoint-tilt');
-      });
-      cardsInactiveTilted = false; // Reset since we're now using midpoint tilt
-
-      // Hide all reverse icons when entering second swipe
-      const reverseIcons = document.querySelectorAll('.uno-reverse');
-      reverseIcons.forEach(icon => {
-          console.log('🔄 Hiding reverse icon for second swipe');
-          icon.style.opacity = '0';
-          icon.style.pointerEvents = 'none';
-      });
-
-      // Lock card interactions
-      lockCardInteractions();
-      enterDangerZoneVisualState();
-  }
-
-  function triggerDangerZoneActions() {
-      triggerMidpointActions();
-  }
-
-  function lockCardInteractions() {
-      console.log('🔒 Locking card interactions until next track');
-      cardsLocked = true;
-
-      const allCards = document.querySelectorAll('.dimension-card');
-      allCards.forEach(card => {
-          card.classList.add('interaction-locked');
-          card.style.pointerEvents = 'none';
-      });
-
-      publishInteractionState();
-  }
-
-  function unlockCardInteractions() {
-      console.log('🔓 Unlocking card interactions for new track');
-      cardsLocked = false;
-      cardsInactiveTilted = false;
-
-      exitCardsDormantState({ immediate: true });
-
-      const allCards = document.querySelectorAll('.dimension-card');
-      allCards.forEach(card => {
-          card.classList.remove('interaction-locked', 'midpoint-tilt', 'inactive-tilt');
-          card.classList.add('active');
-          card.style.pointerEvents = 'auto';
-      });
-
-      // Restore reverse icons for new track (first swipe)
-      const reverseIcons = document.querySelectorAll('.uno-reverse');
-      reverseIcons.forEach(icon => {
-          console.log('🔄 Restoring reverse icon for new track');
-          icon.style.opacity = '';
-          icon.style.pointerEvents = '';
-      });
-
-      publishInteractionState();
   }
 
   console.log('🚢 Awaiting audio start to establish session.');
@@ -2003,15 +1851,11 @@ if (typeof window !== 'undefined') {
 
   // Swap stack contents between current and opposite direction
   function swapStackContents(currentDimensionKey, oppositeDimensionKey) {
-      console.log(`🔄 swapStackContents called with ${currentDimensionKey} → ${oppositeDimensionKey}`);
-
       // Toggle the simple opposite direction flag
       state.usingOppositeDirection = !state.usingOppositeDirection;
-      console.log(`🔄 Toggled reverse mode: now using opposite direction = ${state.usingOppositeDirection}`);
 
       // Reset track index when flipping to opposite direction
       state.stackIndex = 0;
-      console.log(`🔄 Reset track index to 0 for opposite direction`);
 
       // Determine base/opposite keys from state and current card metadata
       const centerCard = document.querySelector('.dimension-card.next-track');
@@ -2024,9 +1868,7 @@ if (typeof window !== 'undefined') {
           || state.currentOppositeDirectionKey
           || getOppositeDirection(baseKey);
 
-      console.log(`🔄 About to call redrawNextTrackStack with baseDirectionKey: ${baseKey}, oppositeHint: ${oppositeHint}`);
       redrawNextTrackStack(baseKey, { oppositeKey: oppositeHint });
-      console.log(`🔄 Finished calling redrawNextTrackStack`);
   }
 
   window.swapStackContents = swapStackContents;
@@ -2082,11 +1924,6 @@ if (typeof window !== 'undefined') {
           displayDimensionKey = forcedOppositeKey || fallbackOppositeKey;
           displayDirection = displayDimensionKey ? state.latestExplorerData.directions[displayDimensionKey] : null;
 
-          console.log(`🔄 Current direction data:`, baseDirection);
-          console.log(`🔄 Has oppositeDirection:`, !!baseDirection?.oppositeDirection);
-          console.log(`🔄 Opposite key target:`, displayDimensionKey);
-          console.log(`🔄 Opposite exists in directions:`, !!displayDirection);
-
           if (baseDirection?.oppositeDirection) {
               displayDirection = baseDirection.oppositeDirection;
               displayDirection.hasOpposite = true;
@@ -2095,7 +1932,6 @@ if (typeof window !== 'undefined') {
                   || displayDimensionKey
                   || resolvedOppositeKey
                   || getOppositeDirection(baseDimensionKey);
-              console.log(`🔄 Using embedded opposite direction data: ${displayDimensionKey}`);
           } else if (!displayDirection) {
               const searchKey = displayDimensionKey || resolvedOppositeKey || getOppositeDirection(baseDimensionKey);
               console.warn(`🔄 Opposite direction ${searchKey} missing in top-level list; searching embedded data`);
@@ -2104,7 +1940,6 @@ if (typeof window !== 'undefined') {
                   if (dirData.oppositeDirection?.key === searchKey || dirData.oppositeDirection?.direction === searchKey) {
                       displayDirection = dirData.oppositeDirection;
                       displayDimensionKey = searchKey;
-                      console.log(`🔄 Found embedded opposite direction ${searchKey} inside ${dirKey}.oppositeDirection`);
                       break;
                   }
               }
@@ -2125,7 +1960,6 @@ if (typeof window !== 'undefined') {
                   if (dirData.oppositeDirection?.key === baseDimensionKey) {
                       displayDirection = dirData.oppositeDirection;
                       displayDimensionKey = baseDimensionKey;
-                      console.log(`🔄 Found embedded direction data for ${baseDimensionKey} in ${dirKey}.oppositeDirection`);
                       if (!resolvedOppositeKey) {
                           resolvedOppositeKey = dirKey;
                       }
@@ -2153,10 +1987,6 @@ if (typeof window !== 'undefined') {
 
       state.currentOppositeDirectionKey = resolvedOppositeKey;
 
-      console.log(`🔄 Redrawing next track stack: base=${baseDimensionKey}, display=${displayDimensionKey}, reversed=${state.usingOppositeDirection}`);
-      console.log(`🔄 Direction sample tracks count:`, displayDirection?.sampleTracks?.length || 0);
-      console.log(`🔄 First track in direction:`, displayDirection?.sampleTracks?.[0]?.title || 'None');
-
       const currentCard = document.querySelector('.dimension-card.next-track');
       if (!currentCard) {
           console.error('🔄 Could not find current next-track card');
@@ -2178,18 +2008,8 @@ if (typeof window !== 'undefined') {
 
       const trackToShow = displayTracks[0];
 
-      console.log(`🔄 TRACK SELECTION DEBUG:`, {
-          usingOppositeDirection: state.usingOppositeDirection,
-          baseDimensionKey,
-          displayDimensionKey,
-          displayTracksCount: displayTracks.length,
-          selectedTrack: trackToShow.title,
-          selectedTrackId: trackToShow.identifier
-      });
-
       state.stackIndex = 0;
       state.selectedIdentifier = trackToShow.identifier;
-      console.log(`🔄 Updated selection to first track of ${state.usingOppositeDirection ? 'OPPOSITE' : 'ORIGINAL'} stack (${displayDimensionKey}): ${trackToShow.title} (${trackToShow.identifier})`);
 
       sendNextTrack(trackToShow.identifier, displayDimensionKey, 'user');
 
@@ -2197,13 +2017,10 @@ if (typeof window !== 'undefined') {
       delete currentCard.dataset.originalGlowColor;
       delete currentCard.dataset.borderColor;
       delete currentCard.dataset.glowColor;
-      console.log(`🔄 Cleared ALL stored colors for direction switch to ${displayDimensionKey}`);
 
       displayDirection.key = displayDimensionKey;
-      console.log(`🔄 Updated displayDirection.key to ${displayDimensionKey} for color calculation`);
 
       currentCard.dataset.directionKey = displayDimensionKey;
-      console.log(`🔄 Updated card data-direction-key to ${displayDimensionKey} to match displayed direction`);
 
       if (state.usingOppositeDirection) {
           currentCard.dataset.oppositeDirectionKey = displayDimensionKey;
@@ -2261,11 +2078,8 @@ if (typeof window !== 'undefined') {
 
           // FALLBACK: Try to find the opposite direction if this direction doesn't exist
           const oppositeKey = getOppositeDirection(directionKey);
-          console.log(`🎬 Trying fallback to opposite direction: ${oppositeKey}`);
-
           const fallbackCard = oppositeKey ? document.querySelector(`[data-direction-key="${oppositeKey}"]`) : null;
           if (fallbackCard) {
-              console.log(`🎬 Found fallback card for ${oppositeKey}, using it instead`);
               return animateDirectionToCenter(oppositeKey);
           }
 
@@ -2289,8 +2103,6 @@ if (typeof window !== 'undefined') {
           console.error(`🎬 No fallback card found either, skipping animation`);
           return;
       }
-
-      console.log(`🎬 Found card element, animating ${directionKey} from clock position to center`);
 
       // Transform this direction card into a next-track stack
       card.classList.add('next-track', 'track-detail-card', 'animating-to-center');
@@ -2329,7 +2141,6 @@ if (typeof window !== 'undefined') {
 
 
   function createDirectionCard(direction, index, total, isNextTrack, nextTrackData, hasReverse = false, counterpart = null, directions) {
-      console.log(`🕐 Card ${direction.key} (index ${index}): clockPosition=TBD`);
       const card = document.createElement('div');
       let cardClasses = 'dimension-card';
 
@@ -2364,27 +2175,8 @@ if (typeof window !== 'undefined') {
 
       // Calculate clock-based position - simple sequential assignment
       // Use the creation index directly to assign positions around the clock
-      let clockPosition;
-      if (direction.isOutlier) {
-          // Outliers go to 11 o'clock
-          clockPosition = 11;
-      } else {
-          // Even distribution around clock face (skip 12 for outliers)
-          const totalRegularCards = directions.filter(d => !d.isOutlier).length;
-          const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]; // Skip 11 for outliers
-          const regularCardIndex = directions.filter((d, i) => i <= index && !d.isOutlier).length - 1;
-
-          if (totalRegularCards <= availablePositions.length) {
-              // Evenly distribute cards around the clock
-              const step = availablePositions.length / totalRegularCards;
-              const positionIndex = Math.round(regularCardIndex * step) % availablePositions.length;
-              clockPosition = availablePositions[positionIndex];
-          } else {
-              // Fallback if somehow we have too many cards
-              clockPosition = availablePositions[regularCardIndex % availablePositions.length];
-          }
-      }
-      console.log(`🕐 Card ${direction.key} (index ${index}): clockPosition=${clockPosition}`);
+      const availablePositions = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9 ];
+      let clockPosition = availablePositions[index];
 
       // Store position for animation return
       card.dataset.clockPosition = clockPosition;
@@ -2392,11 +2184,8 @@ if (typeof window !== 'undefined') {
 
       // Get direction type and assign colors
       const directionType = getDirectionType(direction.key);
-      console.log(`🎨 INITIAL COLOR DEBUG for ${direction.key}: directionType=${directionType}, isNegative=${direction.key.includes('_negative')}`);
       const colors = getDirectionColor(directionType, direction.key);
       const colorVariant = variantFromDirectionType(directionType);
-      console.log(`🎨 INITIAL COLOR RESULT for ${direction.key}:`, colors);
-      console.log(`🎨 Card ${direction.key}: type=${directionType}, colors=`, colors);
 
       // Store direction type and colors for consistent coloring
       card.dataset.directionType = directionType;
@@ -2429,26 +2218,24 @@ if (typeof window !== 'undefined') {
       let labelContent = '';
       if (isNextTrack && nextTrackData && nextTrackData.track) {
           // Full track details for next track
-          console.log(`🐞 NEXT TRACK CARD: Using full track metadata for ${direction.key}`);
           const track = nextTrackData.track;
-          const duration = (track.duration || track.length) ?
-              `${Math.floor((track.duration || track.length) / 60)}:${String(Math.floor((track.duration || track.length) % 60)).padStart(2, '0')}` :
-              '??:??';
+
+          const albumName = track.album
+              || track.beetsMeta?.album?.album
+              || track.beetsMeta?.item?.album
+              || '';
 
           const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
           labelContent = `
               <h2>${directionName}</h2>
               <h3>${getDisplayTitle(track)}</h3>
               <h4>${track.artist || 'Unknown Artist'}</h4>
-              <h5>${track.album || ''}</h5>
-              <p>${duration} · FLAC</p>
+              <h5>${albumName}</h5>
           `;
       } else {
           // Check if this is an outlier direction - use "Outlier" label instead of direction name
-          console.log(`🐞 REGULAR CARD: Using direction name only for ${direction.key}`);
           const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
           labelContent = `<div class="dimension-label">${directionName}</div>`;
-          console.log(`🐞 REGULAR CARD labelContent: ${labelContent}`);
       }
 
       let unoReverseHtml = '';
@@ -2469,8 +2256,6 @@ if (typeof window !== 'undefined') {
                   unoReverseHtml = renderReverseIcon({ interactive: false, topColor, bottomColor, highlight, extraClasses: 'has-opposite' });
               }
           }
-
-          console.log(`🔄 Generated reverse HTML for ${direction.key}:`, unoReverseHtml);
       } else {
           delete card.dataset.oppositeBorderColor;
       }
@@ -2541,22 +2326,16 @@ if (typeof window !== 'undefined') {
           let currentTrackIndex = 0; // Track which sample is currently shown
 
           card.addEventListener('click', (e) => {
-              console.log(`🎬 Card clicked for dimension: ${direction.key}`);
-
               // Check if clicking on the reverse icon - if so, don't swap roles
               if (e.target.closest('.uno-reverse')) {
-                  console.log(`🎬 Clicked on reverse icon, ignoring card click`);
                   return; // Let the reverse icon handle its own behavior
               }
-
-              console.log(`🎬 Valid card click, triggering animation: ${direction.key} to center`);
 
               // Find any existing next track card (more reliable than using latestExplorerData)
               const existingNextTrackCard = document.querySelector('.dimension-card.next-track');
 
               if (!existingNextTrackCard) {
                   // No existing next track, animate directly to center
-                  console.log(`🎬 No existing next track found, animating ${direction.key} directly to center`);
                   state.usingOppositeDirection = false; // Reset reverse flag when selecting new direction
                   animateDirectionToCenter(direction.key);
               } else {
@@ -2566,27 +2345,16 @@ if (typeof window !== 'undefined') {
                      const baseClickedDirection = direction.key.replace(/_positive$|_negative$/, '');
                      const isSameDimension = baseCurrentDirection === baseClickedDirection || currentCardDirection === direction.key;
 
-                     console.log(`🎯 CLICK COMPARISON DEBUG:`);
-                     console.log(`🎯   Current card direction: ${currentCardDirection}`);
-                     console.log(`🎯   Clicked direction: ${direction.key}`);
-                     console.log(`🎯   Base current: ${baseCurrentDirection}`);
-                     console.log(`🎯   Base clicked: ${baseClickedDirection}`);
-                     console.log(`🎯   Same dimension? ${isSameDimension}`);
-
                      if (isSameDimension) {
                          // it's already there so start cycling through the deck
-                         console.log(`🔄 Cycling stack for ${direction.key}, current card shows ${currentCardDirection}, usingOppositeDirection = ${state.usingOppositeDirection}`);
-
                          // Determine which tracks to cycle through based on reverse flag
                          let tracksToUse, dimensionToShow;
                          if (state.usingOppositeDirection && direction.oppositeDirection?.sampleTracks) {
                              tracksToUse = direction.oppositeDirection.sampleTracks;
                              dimensionToShow = direction.oppositeDirection;
-                             console.log(`🔄 Cycling through opposite direction tracks`);
                          } else {
                              tracksToUse = direction.sampleTracks;
                              dimensionToShow = direction;
-                             console.log(`🔄 Cycling through original direction tracks`);
                          }
 
                          // Cycle the appropriate tracks
@@ -2594,7 +2362,6 @@ if (typeof window !== 'undefined') {
                          const track = tracksToUse[0].track || tracksToUse[0];
                          updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
-                          console.log(`🎬 Found existing next track: ${existingNextTrackCard.dataset.directionKey}, rotating to next clock position`);
                           // Pack up stack cards first, then rotate and animate
                           packUpStackCards().then(() => {
                               rotateCenterCardToNextPosition(existingNextTrackCard.dataset.directionKey);
@@ -2624,8 +2391,6 @@ if (typeof window !== 'undefined') {
       const card = document.querySelector(`[data-direction-key="${directionKey}"].next-track`);
       if (!card) return;
 
-      console.log(`🔄 Rotating center card ${directionKey} to next clock position`);
-
       if (typeof hideStackSizeIndicator === 'function') {
           hideStackSizeIndicator(card);
       }
@@ -2639,21 +2404,16 @@ if (typeof window !== 'undefined') {
           }))
           .sort((a, b) => a.position - b.position);
 
-      console.log(`🔄 Current clock positions:`, clockCards.map(c => `${c.key}@${c.position}`));
-
       // Find first available empty position on the clock face
       const occupiedPositions = new Set(clockCards.map(c => c.position));
-      console.log(`🔄 Occupied positions:`, Array.from(occupiedPositions).sort((a, b) => a - b));
 
       // Check if we should try to return to the original position first
       const originalPosition = card.dataset.originalClockPosition ? parseInt(card.dataset.originalClockPosition) : null;
-      console.log(`🔄 Card ${directionKey} original position was: ${originalPosition}`);
 
       let nextPosition = 1;
       if (originalPosition && !occupiedPositions.has(originalPosition)) {
           // Return to original position if it's available
           nextPosition = originalPosition;
-          console.log(`🔄 Returning ${directionKey} to original position ${nextPosition}`);
       } else {
           // Find first available gap in positions 1-12 (preferring non-outlier positions)
           const availablePositions = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 11]; // Check 11 (outlier) last
@@ -2663,10 +2423,7 @@ if (typeof window !== 'undefined') {
                   break;
               }
           }
-          console.log(`🔄 Found first available position: ${nextPosition}`);
       }
-
-      console.log(`🔄 Moving ${directionKey} to position ${nextPosition}`);
 
       // Calculate position coordinates
       const angle = ((nextPosition - 1) / 12) * Math.PI * 2 - Math.PI / 2;
@@ -2705,10 +2462,7 @@ if (typeof window !== 'undefined') {
 
   // Reset a card back to simple direction display (when moving from center to clock position)
   function resetCardToDirectionDisplay(card, directionKey) {
-      console.log(`🔄 Resetting card ${directionKey} to direction display`);
-
-      // IMPORTANT: Reset reverse state and restore original face
-      console.log(`🔄 Restoring original face for ${directionKey} (removing any reversed state)`);
+      // Reset reverse state and restore original face
       card.classList.remove('track-detail-card');
 
       const lingeringStackVisual = card.querySelector('.stack-line-visual');
@@ -2730,7 +2484,6 @@ if (typeof window !== 'undefined') {
                       ...baseDirection.oppositeDirection,
                       hasOpposite: baseDirection.oppositeDirection.hasOpposite === true || baseDirection.hasOpposite === true
                   };
-                  console.log(`🔄 Found embedded direction data for ${baseDirectionKey} inside ${baseKey}.oppositeDirection`);
                   break;
               }
           }
@@ -2764,20 +2517,17 @@ if (typeof window !== 'undefined') {
       const rimElement = card.querySelector('.rim');
       if (rimElement) {
           rimElement.style.background = ''; // Clear any reversed rim styling
-          console.log(`🔄 Cleared reversed rim styling for ${directionKey}`);
       }
 
       const intrinsicNegative = isNegativeDirection(resolvedKey);
       card.classList.toggle('negative-direction', intrinsicNegative);
 
-      // Reset to simple direction content
+      // Reset to simple direction content (direction label only, no track title)
       const directionName = direction?.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
       const sample = Array.isArray(direction.sampleTracks) ? direction.sampleTracks[0] : null;
       const sampleTrack = sample?.track || sample || {};
       const albumCover = sampleTrack.albumCover || sample?.albumCover || '';
-      const labelContent = sampleTrack?.title
-          ? `<div class="dimension-label"><div class="track-title">${sampleTrack.title}</div><div class="direction-name">${directionName}</div></div>`
-          : `<div class="dimension-label">${directionName}</div>`;
+      const labelContent = `<div class="dimension-label">${directionName}</div>`;
 
       card.innerHTML = `
           <div class="panel ${colorVariant}">
@@ -2789,9 +2539,10 @@ if (typeof window !== 'undefined') {
           </div>
       `;
 
-      if (typeof renderReverseIcon === 'function') {
-          const hasOpposite = direction.hasOpposite === true || !!resolveOppositeDirectionKey(direction);
-          if (hasOpposite) {
+      // Only show reverse icon if there are actual distinct tracks in the opposite direction
+      if (typeof renderReverseIcon === 'function' && typeof hasActualOpposite === 'function') {
+          const hasDistinctOpposite = hasActualOpposite(direction, resolvedKey);
+          if (hasDistinctOpposite) {
               const reverseColor = typeof resolveOppositeBorderColor === 'function'
                   ? resolveOppositeBorderColor(direction, colors.border)
                   : colors.border;
@@ -2803,16 +2554,16 @@ if (typeof window !== 'undefined') {
                   const bottomColor = isNegative ? colors.border : (reverseColor || colors.border);
                   panel.insertAdjacentHTML('beforeend', renderReverseIcon({ interactive: false, topColor, bottomColor, highlight: null, extraClasses: 'has-opposite' }));
               }
+              direction.hasOpposite = true;
           } else {
               delete card.dataset.oppositeBorderColor;
+              direction.hasOpposite = false;
           }
       }
 
       if (typeof applyDirectionStackIndicator === 'function') {
           applyDirectionStackIndicator(direction, card);
       }
-
-      console.log(`🔄 Card ${resolvedKey} reset to simple direction display`);
 
       if (state.baseDirectionKey === directionKey || state.baseDirectionKey === resolvedKey) {
           state.baseDirectionKey = null;
@@ -2881,21 +2632,14 @@ if (typeof window !== 'undefined') {
 
   // Convert a direction card into a next track stack (add track details and indicators)
   function convertToNextTrackStack(directionKey) {
-      console.log(`🔄 Converting ${directionKey} to next track stack...`);
-      console.log(`🔄 Latest explorer data:`, state.latestExplorerData);
-      console.log(`🔄 Direction data:`, state.latestExplorerData?.directions[directionKey]);
-
       let directionData = state.latestExplorerData?.directions[directionKey];
       let actualDirectionKey = directionKey;
 
       if (!directionData) {
           const oppositeKey = getOppositeDirection(directionKey);
-          console.log(`🔄 No data for ${directionKey}, trying opposite: ${oppositeKey}`);
-
           if (oppositeKey && state.latestExplorerData?.directions[oppositeKey]) {
               directionData = state.latestExplorerData.directions[oppositeKey];
               actualDirectionKey = oppositeKey;
-              console.log(`🔄 Using opposite direction data: ${oppositeKey}`);
           }
       }
 
@@ -3017,17 +2761,11 @@ if (typeof window !== 'undefined') {
           delete card.dataset.oppositeDirectionKey;
       }
       card.classList.add('track-detail-card');
-      console.log(`🔄 Found card for ${actualDirectionKey}, updating with track details...`);
-      console.log(`🔄 Card element:`, card);
-      console.log(`🔄 Sample tracks:`, sampleTracks);
 
       const primarySample = sampleTracks[0] || {};
       const selectedTrack = primarySample.track || primarySample;
 
-      console.log(`🔄 Selected track:`, selectedTrack);
-      console.log(`🔄 About to call updateCardWithTrackDetails with preserveColors=true...`);
       updateCardWithTrackDetails(card, selectedTrack, direction, true, swapStackContents);
-      console.log(`🔄 Finished calling updateCardWithTrackDetails`);
 
       if (state.cardsDormant) {
           showNextTrackPreview(selectedTrack);
