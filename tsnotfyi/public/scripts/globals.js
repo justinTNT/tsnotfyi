@@ -15,12 +15,9 @@ export const TRACK_SWITCH_PROGRESS_THRESHOLD = 0.9;
 export const PROGRESS_TICK_INTERVAL_MS = 100;
 export const PROGRESS_ENVELOPE_STRETCH = 2.4;
 export const PROGRESS_PULSE_AMPLITUDE = 0.04;
-export const MIN_PROGRESS_DURATION_SECONDS = 2;
 export const PROGRESS_AUDIO_WAIT_TIMEOUT_MS = 10000;
 export const PROGRESS_DESYNC_MARGIN_SECONDS = 5;
 export const TRACK_CHANGE_DESYNC_GRACE_MS = 7000;
-export const CURRENT_TRACK_APPLY_LEAD_MS = 2500;
-export const MAX_PENDING_TRACK_DELAY_MS = 120000;
 export const MAX_PLAY_RETRY_ATTEMPTS = 4;
 export const PLAY_RETRY_DELAY_MS = 700;
 export const FORCE_SKIP_COOLDOWN_MS = 1500;
@@ -31,54 +28,6 @@ export const AUDIO_DEAD_REBUILD_THRESHOLD = 2;
 export const DECK_STALE_FAILSAFE_MS = 5000;
 export const PENDING_EXPLORER_FORCE_MS = 6000;
 export const LOCKOUT_THRESHOLD_SECONDS = 30;
-export const TAIL_LOCK_THRESHOLD = 0.75;
-export const METADATA_FADE_WINDOW_SECONDS = 30;
-
-// Debug flags
-const DEFAULT_DEBUG_FLAGS = {
-  all: false,
-  deck: false,
-  duplicates: false,
-  colors: false,
-  consistency: false,
-  progress: false,
-  timing: false,
-  sse: false
-};
-
-export const DEBUG_FLAGS = (() => {
-  if (typeof window !== 'undefined' && window.DEBUG_FLAGS) {
-    return { ...DEFAULT_DEBUG_FLAGS, ...window.DEBUG_FLAGS };
-  }
-  return { ...DEFAULT_DEBUG_FLAGS };
-})();
-
-// Expose debug flag utilities on window for console access
-if (typeof window !== 'undefined') {
-  window.DEBUG_FLAGS = DEBUG_FLAGS;
-  window.setDebugFlags = function setDebugFlags(overrides = {}) {
-    if (!overrides || typeof overrides !== 'object') return;
-    Object.assign(DEBUG_FLAGS, overrides);
-    console.log('🛠 Debug flags updated', DEBUG_FLAGS);
-  };
-  window.getDebugFlags = function getDebugFlags() {
-    return { ...DEBUG_FLAGS };
-  };
-}
-
-export function debugLog(flag, ...args) {
-  if (!DEBUG_FLAGS) {
-    return;
-  }
-  if (!DEBUG_FLAGS.all && !DEBUG_FLAGS[flag]) {
-    return;
-  }
-  try {
-    console.log(...args);
-  } catch (error) {
-    console.log('debugLog error', error);
-  }
-}
 
 // Card styling constants
 export const PANEL_VARIANTS = ['red-variant', 'green-variant', 'yellow-variant', 'blue-variant'];
@@ -116,8 +65,6 @@ export const state = {
   usingOppositeDirection: false,
   directionKeyAliases: {},
   reversePreference: null,
-  lastSelectionGeneration: null,
-  tailProgress: 0,
   journeyMode: true,
   selectedIdentifier: null,
   stackIndex: 0,
@@ -137,10 +84,7 @@ export const state = {
   streamUrlBase: STREAM_ENDPOINT_BASE,
   eventsEndpointBase: EVENTS_ENDPOINT_BASE,
   currentResolution: 'adaptive',
-  useMediaSource: false,
-  streamController: null,
   manualNextTrackOverride: false,
-  manualSelectionPending: false,
   nextTrackAnimationTimer: null,
   manualNextDirectionKey: null,
   playbackStartTimestamp: null,
@@ -148,7 +92,6 @@ export const state = {
   lastTrackUpdateTs: 0,
   pendingInitialTrackTimer: null,
   pendingResyncCheckTimer: null,
-  pendingAudioConfirmTimer: null,
   creatingNewSession: false,
   audioLoadPending: false,
   audioLoadStartedAt: 0,
@@ -161,7 +104,6 @@ export const state = {
   pendingSnapshotTrackId: null,
   pendingCenterPromotionKey: null,
   pendingCenterPromotionOptions: null,
-  pendingLiveTrackCandidate: null,
   awaitingSSE: false,
   cardsDormant: false,
   nextTrackPreviewTrackId: null,
@@ -181,19 +123,11 @@ export const state = {
   staleExplorerDeck: false,
   deckStaleFailsafeTimer: null,
   deckStaleContext: null,
-  pendingExplorerLookaheadTrackId: null,
-  pendingExplorerLookaheadSnapshot: null,
-  pendingExplorerLookaheadTimer: null,
-  awaitingDirectionRefresh: false,
-  metadataRevealPending: false,
-  refreshTapHistory: [],
   noTrackRefreshCount: 0,
   lastExplorerPayload: null,
   pendingExplorerNext: null,
   pendingDeckHydration: false,
-  pendingTrackUpdate: null,
   audioTrackStartClock: null,
-  audioClockEpoch: null,
   playRetryTimer: null,
   playRetryAttempts: 0,
   forceSkipInFlight: false,
@@ -207,8 +141,6 @@ export const state = {
   isRenderingDeck: false,
   progressEverStarted: false,
   lastProgressDesync: null,
-  serverClockOffsetMs: 0,
-  lastTrackChangeTs: 0,
   lastTrackChangeGraceLog: null,
   hasSuccessfulAudioStart: false,
   audioStartupGraceUntil: 0,
@@ -219,10 +151,12 @@ export const state = {
 
   // Playlist queue state (new explorer architecture)
   playlist: [],          // Array of {trackId, albumCover, directionKey, explorerSnapshot}
-  playlistCursor: 0,     // Index of current "next track" in queue
 
   // Session track history (for explorer exclusions)
-  sessionTrackHistory: [] // Array of track IDs played in this session (most recent last)
+  sessionTrackHistory: [], // Array of track IDs played in this session (most recent last)
+
+  // Defer initial now-playing card until explorer data arrives (labels + cover + colors together)
+  awaitingInitialExplorer: false
 };
 
 // Connection health management - tracks SSE and audio connection status
@@ -269,8 +203,6 @@ export function initializeElements() {
   elements.playbackClock = document.getElementById('playbackClock');
   elements.nowPlayingCard = document.getElementById('nowPlayingCard');
   elements.dimensionCards = document.getElementById('dimensionCards');
-  elements.nextTrackPreview = document.getElementById('nextTrackPreview');
-  elements.nextTrackPreviewImage = document.querySelector('#nextTrackPreview img');
 
   if (elements.audio) {
     elements.audio.volume = 0.85;
@@ -284,5 +216,4 @@ if (typeof window !== 'undefined') {
   window.audioHealth = audioHealth;
   window.elements = elements;
   window.initializeElements = initializeElements;
-  window.debugLog = debugLog;
 }

@@ -6,6 +6,24 @@ const path = require('path');
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
+// Sentinel patterns: 16-byte sequences injected into PCM stream for client-side event detection
+// All patterns use both 0x7FFF and -32768 to avoid false positives from clipped audio
+const SENTINEL_TRACK_BOUNDARY = Buffer.alloc(16);
+for (let i = 0; i < 8; i += 2) SENTINEL_TRACK_BOUNDARY.writeInt16LE(0x7FFF, i);
+for (let i = 8; i < 16; i += 2) SENTINEL_TRACK_BOUNDARY.writeInt16LE(-32768, i);
+
+const SENTINEL_CROSSFADE_START = Buffer.alloc(16);
+for (let i = 0; i < 16; i += 4) {
+  SENTINEL_CROSSFADE_START.writeInt16LE(0x7FFF, i);
+  SENTINEL_CROSSFADE_START.writeInt16LE(-32768, i + 2);
+}
+
+const SENTINEL_CROSSFADE_END = Buffer.alloc(16);
+for (let i = 0; i < 16; i += 4) {
+  SENTINEL_CROSSFADE_END.writeInt16LE(-32768, i);
+  SENTINEL_CROSSFADE_END.writeInt16LE(0x7FFF, i + 2);
+}
+
 class AdvancedAudioMixer {
   constructor(options = {}) {
     this.sampleRate = options.sampleRate || config.audio.sampleRate;
@@ -80,11 +98,12 @@ class AdvancedAudioMixer {
   }
 
   calculateStreamingParams() {
-    // Calculate streaming parameters for smooth playback
-    this.engine.bytesPerSecond = this.sampleRate * this.channels * 2; // 16-bit PCM
-    this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond / config.audio.chunkDivisor); // ~40ms chunks
+    // Streaming raw PCM: sampleRate × channels × 2 bytes (16-bit)
+    this.engine.bytesPerSecond = this.sampleRate * this.channels * 2;
+    this.engine.tickMs = 500; // 2 ticks/sec — large chunks, revisit when crossfade mixing is live
+    this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond * this.engine.tickMs / 1000);
 
-    console.log(`📊 Streaming: ${this.engine.chunkSize} bytes per chunk at ${this.sampleRate}Hz`);
+    console.log(`📊 Streaming PCM: ${this.engine.chunkSize} bytes/chunk every ${this.engine.tickMs}ms (${this.sampleRate}Hz ${this.channels}ch 16-bit, ${Math.round(this.engine.bytesPerSecond / 1000)}kB/s)`);
   }
 
   // Load and process a track into the buffer with aggressive caching
@@ -135,22 +154,17 @@ class AdvancedAudioMixer {
       // Step 3: Trim silence and get actual duration
       const trimmedResult = this.trimSilence(rawBuffer);
 
-      // Step 4: Convert back to streaming format (MP3)
-      const streamBuffer = await this.convertToMp3(trimmedResult.buffer);
-
-      // Store in appropriate slot first
+      // Store trimmed PCM directly — no MP3 encoding, crossfade happens in PCM
       const track = this.engine[slot === 'current' ? 'currentTrack' : 'nextTrack'];
 
-      // Cache the processed result with recalculated duration
-      // Include crossfade lead time in cached analysis
       const extendedAnalysis = {
         ...analysis,
         actualDuration: trimmedResult.actualDuration,
         crossfadeLeadTime: slot === 'next' ? track.crossfadeLeadTime : undefined
       };
 
-      this.cacheTrackMixdown(trackPath, streamBuffer, extendedAnalysis);
-      track.buffer = streamBuffer;
+      this.cacheTrackMixdown(trackPath, trimmedResult.buffer, extendedAnalysis);
+      track.buffer = trimmedResult.buffer;
       track.bpm = analysis.bpm;
       track.key = analysis.key;
       track.analyzed = true;
@@ -162,13 +176,13 @@ class AdvancedAudioMixer {
         console.log(`🎯 Next track crossfade lead time: ${track.crossfadeLeadTime}s`);
       }
 
-      console.log(`✅ Track processed and cached: BPM=${analysis.bpm}, Key=${analysis.key}, Size=${streamBuffer.length} bytes`);
+      console.log(`✅ Track processed and cached: BPM=${analysis.bpm}, Key=${analysis.key}, Size=${trimmedResult.buffer.length} bytes (PCM)`);
 
       const trackDetails = {
         bpm: analysis.bpm,
         key: analysis.key,
-        duration: trimmedResult.actualDuration, // Return the recalculated duration
-        size: streamBuffer.length
+        duration: trimmedResult.actualDuration,
+        size: trimmedResult.buffer.length
       };
       this.setSlotMetadata(slot, metadata);
 
@@ -234,43 +248,6 @@ class AdvancedAudioMixer {
           reject(new Error(`FFmpeg PCM conversion failed with code ${code}`));
         }
       });
-    });
-  }
-
-  // Convert PCM buffer to MP3 for streaming
-  async convertToMp3(pcmBuffer) {
-    return new Promise((resolve, reject) => {
-      const ffmpegArgs = [
-        '-f', 's16le',
-        '-ar', this.sampleRate.toString(),
-        '-ac', this.channels.toString(),
-        '-i', 'pipe:0',
-        '-f', 'mp3',
-        '-b:a', `${this.bitRate}k`,
-        '-q:a', '2',             // High quality
-        'pipe:1'
-      ];
-
-      const process = spawn('ffmpeg', ffmpegArgs, {
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      let mp3Buffer = Buffer.alloc(0);
-
-      process.stdout.on('data', (chunk) => {
-        mp3Buffer = Buffer.concat([mp3Buffer, chunk]);
-      });
-
-      process.on('close', (code) => {
-        if (code === 0) {
-          resolve(mp3Buffer);
-        } else {
-          reject(new Error(`FFmpeg MP3 conversion failed with code ${code}`));
-        }
-      });
-
-      process.stdin.write(pcmBuffer);
-      process.stdin.end();
     });
   }
 
@@ -509,6 +486,7 @@ class AdvancedAudioMixer {
     this.engine.isStreaming = true;
     this.engine.currentTrack.position = 0;
     this.engine.streamingStartTime = Date.now(); // Track actual streaming start time
+    if (this.onData) this.onData(SENTINEL_TRACK_BOUNDARY);
 
     if (this.onTrackStart) {
       this.onTrackStart();
@@ -516,7 +494,7 @@ class AdvancedAudioMixer {
 
     this.engine.streamTimer = setInterval(() => {
       this.streamTick();
-    }, 40); // 25fps for smooth streaming
+    }, 40); // 25 ticks/sec for real-time streaming
 
     return true;
   }
@@ -581,7 +559,7 @@ class AdvancedAudioMixer {
     const bytesRemaining = this.engine.currentTrack.buffer ?
       this.engine.currentTrack.buffer.length - this.engine.currentTrack.position : 0;
     const estimatedBitrate = this.engine.currentTrack.buffer && estimatedDuration ?
-      this.engine.currentTrack.buffer.length / estimatedDuration : 44100 * 2 * 2; // fallback: 44.1kHz stereo 16-bit
+      this.engine.currentTrack.buffer.length / estimatedDuration : this.engine.bytesPerSecond;
     const byteBasedRemaining = bytesRemaining / estimatedBitrate;
 
     // Primary timing logic (wall-clock based) - use next track's optimal lead time
@@ -599,12 +577,13 @@ class AdvancedAudioMixer {
       // Still proceed with wall-clock timing, but we've logged the issue
     }
 
-    // Guardrail: Emergency crossfade trigger
+    // Guardrail: Log when byte-based estimate diverges from wall-clock (diagnostic only)
+    // Trust wall-clock timing — byte estimation is unreliable with VBR and tempo adjustment
     if (!this.engine.isCrossfading && this.engine.nextTrack.buffer && byteBasedRemaining < 1.0 && remainingSeconds > 1.0) {
-      console.error(`🚨 EMERGENCY CROSSFADE: Only ${byteBasedRemaining.toFixed(1)}s left by bytes but wall-clock shows ${remainingSeconds.toFixed(1)}s!`);
-      console.error(`🚨 Forcing crossfade to prevent dead air - this indicates a timing calibration issue`);
-      this.startCrossfade();
-    } else if (shouldStartCrossfade) {
+      console.warn(`⚠️ Byte-based estimate (${byteBasedRemaining.toFixed(1)}s) diverges from wall-clock (${remainingSeconds.toFixed(1)}s) — trusting wall-clock`);
+    }
+
+    if (shouldStartCrossfade) {
       console.log(`🔄 Starting crossfade with ${remainingSeconds.toFixed(1)}s remaining (lead time: ${crossfadeLeadTime}s)`);
       this.startCrossfade();
     }
@@ -705,13 +684,12 @@ class AdvancedAudioMixer {
 
   // Estimate remaining playback time
   estimateRemainingTime(remainingBytes) {
-    // Rough estimation - would be more accurate with proper MP3 frame analysis
-    const avgBytesPerSecond = this.engine.bytesPerSecond / 8; // MP3 compression estimate
-    return remainingBytes / avgBytesPerSecond;
+    return remainingBytes / this.engine.bytesPerSecond;
   }
 
   // Start crossfade transition
   startCrossfade() {
+    if (this.onData) this.onData(SENTINEL_CROSSFADE_START);
     this.engine.isCrossfading = true;
     this.engine.crossfadePosition = 0;
     this.engine.crossfadeStartTime = Date.now();
@@ -867,12 +845,13 @@ class AdvancedAudioMixer {
 
   // Create crossfade chunk with proper cosine curve mixing
   createCrossfadeChunk() {
-    const totalCrossfadeBytes = this.engine.crossfadeDuration * (this.engine.bytesPerSecond / 8);
+    const totalCrossfadeBytes = this.engine.crossfadeDuration * this.engine.bytesPerSecond;
     const fadeProgress = this.engine.crossfadePosition / totalCrossfadeBytes;
 
     if (fadeProgress >= 1.0) {
       // Crossfade complete, finalize transition and keep streaming seamlessly
       this.completeCrossfade();
+      if (this.onData) this.onData(SENTINEL_CROSSFADE_END);
 
       const chunk = this.getCurrentTrackChunk();
       return chunk && chunk.length > 0 ? chunk : null;
@@ -889,26 +868,25 @@ class AdvancedAudioMixer {
       return null;
     }
 
-    // For now, implement volume-based crossfade at chunk level
-    // Future: real PCM mixing would happen here
-    let selectedChunk;
-    if (fadeProgress < 0.5) {
-      // First half of crossfade - favor current track
-      selectedChunk = currentChunk || nextChunk;
+    // Real PCM crossfade: mix both tracks at sample level using cosine volumes
+    let mixed;
+    if (currentChunk && nextChunk) {
+      mixed = this.mixPCMAudio(currentChunk, nextChunk, currentVolume, nextVolume);
+    } else if (currentChunk) {
+      mixed = this.applyVolume(currentChunk, currentVolume);
     } else {
-      // Second half - favor next track
-      selectedChunk = nextChunk || currentChunk;
+      mixed = this.applyVolume(nextChunk, nextVolume);
     }
 
     // Update crossfade position
-    this.engine.crossfadePosition += (selectedChunk ? selectedChunk.length : this.engine.chunkSize);
+    this.engine.crossfadePosition += (mixed ? mixed.length : this.engine.chunkSize);
 
     // Log crossfade progress
     if (Math.random() < 0.1) { // 10% chance to log
       console.log(`🎵 Crossfade: ${(fadeProgress * 100).toFixed(1)}% (cosine volumes: ${currentVolume.toFixed(2)}/${nextVolume.toFixed(2)})`);
     }
 
-    return selectedChunk;
+    return mixed;
   }
 
   // Calculate smooth cosine fade volumes
@@ -965,42 +943,39 @@ class AdvancedAudioMixer {
     return chunk;
   }
 
-  // Convert MP3 chunk to PCM for mixing (simplified)
-  async mp3ToPCM(mp3Chunk) {
-    // In a full implementation, this would use FFmpeg to decode MP3 to PCM
-    // For now, return a placeholder that represents the audio data
-    // Real implementation would pipe mp3Chunk through FFmpeg decoder
-
-    return new Promise((resolve) => {
-      // Placeholder: simulate PCM conversion
-      // Real: spawn FFmpeg process to decode this specific chunk
-      resolve(mp3Chunk); // Simplified - treating as if it were PCM
-    });
-  }
-
-  // Convert PCM back to MP3 (simplified)
-  async pcmToMp3(pcmData) {
-    // In a full implementation, this would encode PCM to MP3
-    // For now, return the data as-is
-    return new Promise((resolve) => {
-      resolve(pcmData); // Simplified
-    });
-  }
-
   // Mix two PCM audio streams with volume levels
   mixPCMAudio(pcm1, pcm2, volume1, volume2) {
-    // Simplified mixing - in reality would operate on actual PCM samples
-    // This is a placeholder for proper audio mixing
-
+    // Mix two 16-bit signed PCM buffers with volume scaling
+    // Each sample is 2 bytes (Int16LE), so step by 2
     const mixedLength = Math.min(pcm1.length, pcm2.length);
-    const mixed = Buffer.alloc(mixedLength);
+    // Ensure even length (aligned to sample boundary)
+    const alignedLength = mixedLength & ~1;
+    const mixed = Buffer.alloc(alignedLength);
 
-    for (let i = 0; i < mixedLength; i++) {
-      // Simplified mix: weighted average (not proper audio mixing)
-      mixed[i] = Math.floor(pcm1[i] * volume1 + pcm2[i] * volume2);
+    for (let i = 0; i < alignedLength; i += 2) {
+      const sample1 = pcm1.readInt16LE(i);
+      const sample2 = pcm2.readInt16LE(i);
+      const mixedSample = Math.round(sample1 * volume1 + sample2 * volume2);
+      // Clamp to Int16 range
+      mixed.writeInt16LE(Math.max(-32768, Math.min(32767, mixedSample)), i);
     }
 
     return mixed;
+  }
+
+  // Apply volume to a 16-bit signed PCM buffer
+  applyVolume(pcmBuffer, volume) {
+    if (volume >= 0.999) return pcmBuffer; // No-op for full volume
+    const alignedLength = pcmBuffer.length & ~1;
+    const result = Buffer.alloc(alignedLength);
+
+    for (let i = 0; i < alignedLength; i += 2) {
+      const sample = pcmBuffer.readInt16LE(i);
+      const scaled = Math.round(sample * volume);
+      result.writeInt16LE(Math.max(-32768, Math.min(32767, scaled)), i);
+    }
+
+    return result;
   }
 
   // Complete crossfade and switch to next track
@@ -1019,7 +994,7 @@ class AdvancedAudioMixer {
 
     // Reset streaming start time for the new track
     this.engine.streamingStartTime = Date.now();
-    console.log(`🕐 Reset streaming timer for new track (${this.engine.currentTrack.estimatedDuration?.toFixed(1)}s duration)`);
+    console.log(`🕐 Reset streaming timer for new track (${this.engine.currentTrack.estimatedDuration?.toFixed(1)}s duration, ${this.engine.chunkSize} bytes/chunk)`);
 
     // Clear next track
     this.engine.nextTrack = {
@@ -1051,6 +1026,7 @@ class AdvancedAudioMixer {
 
     if (this.engine.nextTrack.buffer) {
       this.completeCrossfade();
+      if (this.onData) this.onData(SENTINEL_CROSSFADE_END);
       return;
     }
 
@@ -1063,6 +1039,7 @@ class AdvancedAudioMixer {
       // Abrupt cut - no crossfade
       console.log('🎮 Forcing immediate CUT');
       this.completeCrossfade();
+      if (this.onData) this.onData(SENTINEL_CROSSFADE_END);
       return true;
     } else if (this.engine.nextTrack.buffer && !this.engine.isCrossfading) {
       console.log('🎮 Forcing immediate crossfade');
@@ -1070,32 +1047,6 @@ class AdvancedAudioMixer {
       return true;
     }
     return false;
-  }
-
-  // Manual tempo adjustment controls (for future DJ interface)
-  setCurrentTrackTempo(tempoMultiplier) {
-    // Allow manual tempo adjustment of current track
-    tempoMultiplier = Math.max(0.5, Math.min(2.0, tempoMultiplier)); // 50% to 200%
-
-    this.engine.targetTrackTempo = tempoMultiplier;
-    this.engine.enableTempoAdjustment = true;
-
-    console.log(`🎛️ Manual tempo adjustment: ${this.engine.currentTrackTempo.toFixed(3)} → ${tempoMultiplier.toFixed(3)}`);
-
-    return this.engine.targetTrackTempo;
-  }
-
-  // Get current tempo info
-  getTempoInfo() {
-    return {
-      currentTrackBPM: this.engine.currentTrack.bpm,
-      nextTrackBPM: this.engine.nextTrack.bpm,
-      currentTempo: this.engine.currentTrackTempo,
-      targetTempo: this.engine.targetTrackTempo,
-      isAdjusting: this.engine.enableTempoAdjustment,
-      adjustmentProgress: this.engine.enableTempoAdjustment ?
-        Math.abs(this.engine.targetTrackTempo - this.engine.currentTrackTempo) : 0
-    };
   }
 
   // Clear mixdown cache (called on neighborhood transitions)
@@ -1145,13 +1096,6 @@ class AdvancedAudioMixer {
     };
   }
 
-  getSlotMetadata(slot) {
-    if (slot !== 'current' && slot !== 'next') {
-      return null;
-    }
-    return this.trackMetadata[slot] || null;
-  }
-
   getCurrentPlaybackMetadata() {
     return this.trackMetadata.current || null;
   }
@@ -1197,77 +1141,6 @@ class AdvancedAudioMixer {
       },
       cache: this.getCacheStats()
     };
-  }
-
-  // Pre-cache multiple tracks from neighborhood (background processing)
-  async preCacheNeighborhood(trackPaths, priority = 'background') {
-    if (!Array.isArray(trackPaths)) return;
-
-    const uncachedPaths = trackPaths.filter(path => !this.mixdownCache.has(path));
-    if (uncachedPaths.length === 0) {
-      console.log(`🚀 All ${trackPaths.length} neighborhood tracks already cached!`);
-      return;
-    }
-
-    console.log(`🏭 Pre-caching ${uncachedPaths.length} tracks from neighborhood (${priority} priority)`);
-
-    // Process tracks in background (don't await if background priority)
-    if (priority === 'background') {
-      // Fire-and-forget background caching
-      this.backgroundCacheProcess(uncachedPaths);
-    } else {
-      // Synchronous caching for immediate use
-      for (const trackPath of uncachedPaths) {
-        try {
-          await this.loadTrackToCache(trackPath);
-        } catch (error) {
-          console.warn(`⚠️ Failed to pre-cache ${trackPath}: ${error.message}`);
-        }
-      }
-    }
-  }
-
-  // Background cache processing (async, non-blocking)
-  async backgroundCacheProcess(trackPaths) {
-    for (const trackPath of trackPaths) {
-      try {
-        // Check if we're still within cache limits
-        if (this.mixdownCache.size >= this.maxCacheSize) {
-          console.log(`🛑 Background caching stopped - cache full (${this.mixdownCache.size}/${this.maxCacheSize})`);
-          break;
-        }
-
-        await this.loadTrackToCache(trackPath);
-
-        // Small delay to avoid overwhelming the system
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-      } catch (error) {
-        console.warn(`⚠️ Background cache failed for ${trackPath}: ${error.message}`);
-      }
-    }
-
-    console.log(`✅ Background caching complete. Cache: ${this.mixdownCache.size}/${this.maxCacheSize}`);
-  }
-
-  // Load track directly to cache (without affecting current/next slots)
-  async loadTrackToCache(trackPath) {
-    if (this.mixdownCache.has(trackPath)) {
-      return; // Already cached
-    }
-
-    console.log(`💾 Background caching: ${trackPath}`);
-
-    // Same processing pipeline as loadTrack, but only for caching
-    const rawBuffer = await this.convertToPCM(trackPath);
-    const analysis = await this.analyzeAudio(rawBuffer);
-    const trimmedResult = this.trimSilence(rawBuffer);
-    const streamBuffer = await this.convertToMp3(trimmedResult.buffer);
-
-    this.cacheTrackMixdown(trackPath, streamBuffer, {
-      ...analysis,
-      actualDuration: trimmedResult.actualDuration
-    });
   }
 
   // Analyze audio buffer to determine optimal crossfade lead time
@@ -1348,23 +1221,6 @@ class AdvancedAudioMixer {
     }
 
     return maxRMS;
-  }
-
-  logPlaybackSummary(event = 'playback') {
-    const metadata = this.trackMetadata.current || null;
-    const startTime = this.engine.streamingStartTime;
-    if (!metadata || !metadata.identifier || !startTime) {
-      return;
-    }
-    const elapsedSeconds = (Date.now() - startTime) / 1000;
-    const estimatedDuration = this.engine.currentTrack?.estimatedDuration || null;
-    console.log('🕒 [timing] Track playback summary', {
-      event,
-      trackId: metadata.identifier,
-      title: metadata.title,
-      elapsedSeconds: Number(elapsedSeconds.toFixed(3)),
-      estimatedDuration
-    });
   }
 
   // Clean up resources

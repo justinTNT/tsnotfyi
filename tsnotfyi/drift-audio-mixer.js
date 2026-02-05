@@ -28,8 +28,6 @@ const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
 const CROSSFADE_GUARD_MS = 6000;
-const LIVE_PROMOTION_WINDOW_MS = 2000;
-const MIN_LIVE_PROMOTION_DELAY_MS = 250;
 const STREAM_IDLE_GRACE_MS = 5000;
 const STREAM_OVERRIDE_GRACE_MS = 20000;
 const HEARTBEAT_DIVERGENCE_THRESHOLD_MS = 2000;
@@ -129,8 +127,9 @@ class DriftAudioMixer {
     this.driftPlayer = new DirectionalDriftPlayer(radialSearch);
     this.currentTrack = null;
     this.pendingCurrentTrack = null;
-    this.pendingLivePromotion = null;
+    this.currentTrackDirection = null;
     this.nextTrack = null;
+    this.explorerRecommendedNext = null; // Sticky recommendation from explorer endpoint
     this.trackStartTime = null;
     this.isTransitioning = false;
     this._lastBroadcastTrackId = null;
@@ -208,10 +207,6 @@ class DriftAudioMixer {
 
     // Track loading state to prevent concurrent playCurrentTrack calls
     this.currentTrackLoadingPromise = null; // Seeding vs seeded distinction
-    this.visualCurrentTrack = null;
-    this.visualTrackStartTime = null;
-    this.pendingVisualCurrentTrack = null;
-    this.pendingVisualTrackStartTime = null;
 
     // Audio configuration
     this.sampleRate = config.audio.sampleRate;
@@ -323,6 +318,10 @@ class DriftAudioMixer {
       if (promoted && this.lastExplorerSnapshotPayload?.nextTrack?.track?.identifier === this.currentTrack?.identifier) {
         this.lastExplorerSnapshotPayload.nextTrack = null;
       }
+      // Clear explorer recommendation only if the recommended track is now playing
+      if (promoted && this.explorerRecommendedNext?.trackId === this.currentTrack?.identifier) {
+        this.explorerRecommendedNext = null;
+      }
 
       if (promoted) {
         this.resetManualOverrideLock();
@@ -386,21 +385,17 @@ class DriftAudioMixer {
       const engineTimeIsRecent = engineStartTime && (now - engineStartTime) < 5000;
       this.trackStartTime = (promoted && !engineTimeIsRecent) ? now : (engineStartTime || now);
 
-      // Clear stale pending visual state when track is promoted
-      if (promoted) {
-        this.pendingVisualTrackStartTime = null;
-        this.visualTrackStartTime = this.trackStartTime;
-      }
-
-      const visualStartTime = this.pendingVisualTrackStartTime || this.trackStartTime;
-      this.pendingVisualCurrentTrack = this.currentTrack;
-      this.pendingVisualTrackStartTime = visualStartTime;
       const playbackMetadataSeconds = Number.isFinite(this.currentTrack?.length)
         ? this.currentTrack.length
         : Number.isFinite(this.currentTrack?.duration)
           ? this.currentTrack.duration
           : null;
       const playbackTrimmedSeconds = this.audioMixer?.engine?.currentTrack?.estimatedDuration || null;
+      // Apply the promoted track's direction to drift state (deferred from user selection)
+      if (promoted && this.currentTrack?.direction && this.driftPlayer) {
+        this.driftPlayer.currentDirection = this.currentTrack.direction;
+      }
+      this.currentTrackDirection = this.driftPlayer?.currentDirection || null;
       console.log('🕒 [timing] Track playback started', {
         trackId: this.currentTrack?.identifier || null,
         title: this.currentTrack?.title || null,
@@ -408,10 +403,6 @@ class DriftAudioMixer {
         trimmedSeconds: playbackTrimmedSeconds,
         startTimestamp: this.trackStartTime
       });
-      if (this.clients.size === 0) {
-        this.commitPendingVisualTrack('no-active-stream', this.currentTrack?.identifier || null);
-      }
-
       if (!this.currentTrack) {
         console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
         return;
@@ -429,9 +420,6 @@ class DriftAudioMixer {
         );
         this.currentFingerprint = fingerprint;
       }
-
-      // Commit visual track so heartbeat shows correct track info
-      this.commitPendingVisualTrack('track-start', identifier);
 
       console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
       this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
@@ -459,11 +447,6 @@ class DriftAudioMixer {
     this.audioMixer.onCrossfadeStart = (info) => {
       console.log(`🔄 Advanced mixer: Crossfade started (${info.currentBPM} → ${info.nextBPM} BPM)`);
       this.crossfadeStartedAt = Date.now();
-      // Defer visual/state promotion until the new audio buffer actually begins streaming.
-      // Previously we pre-populated the visual track using the crossfade start timestamp,
-      // which made the UI jump ~leadTime seconds ahead of the real audio hand-off.
-      this.pendingVisualCurrentTrack = null;
-      this.pendingVisualTrackStartTime = null;
       this.broadcastHeartbeat('crossfade-start', { force: true }).catch(() => {});
     };
 
@@ -523,42 +506,12 @@ class DriftAudioMixer {
     return oppositeDirections[directionKey];
   }
 
-  setDisplayCurrentTrack(track, { startTime = Date.now() } = {}) {
-    if (!track) {
-      return;
-    }
-    const liveIdentifier = this.currentTrack?.identifier || null;
-    if (liveIdentifier && track.identifier && track.identifier !== liveIdentifier) {
-      console.warn('🛰️ [display] Ignoring visual update for non-current track', {
-        sessionId: this.sessionId,
-        requestedId: track.identifier,
-        liveIdentifier,
-        pendingVisualId: this.pendingVisualCurrentTrack?.identifier || null
-      });
-      return;
-    }
-    const previousDisplayId = this.visualCurrentTrack?.identifier || null;
-    this.visualCurrentTrack = track;
-    this.visualTrackStartTime = startTime;
-    if (previousDisplayId !== track.identifier) {
-      console.log('🛰️ [display] Visual current track updated', {
-        sessionId: this.sessionId,
-        previousDisplayId,
-        newDisplayId: track.identifier,
-        startTime,
-        liveCurrentId: this.currentTrack?.identifier || null,
-        lockedNextId: this.lockedNextTrackIdentifier || null,
-        preparedNextId: this.nextTrack?.identifier || null
-      });
-    }
-  }
-
   getDisplayCurrentTrack() {
-    return this.visualCurrentTrack || this.currentTrack || null;
+    return this.currentTrack || null;
   }
 
   getDisplayTrackStartTime() {
-    return this.visualTrackStartTime || this.trackStartTime || null;
+    return this.trackStartTime || null;
   }
 
   getDisplayTrackTiming() {
@@ -615,70 +568,6 @@ class DriftAudioMixer {
     );
   }
 
-  commitPendingVisualTrack(reason = 'auto', expectedTrackId = null) {
-    const pending = this.pendingVisualCurrentTrack;
-    if (!pending) {
-      return;
-    }
-    if (expectedTrackId && pending.identifier && pending.identifier !== expectedTrackId) {
-      return;
-    }
-    const startTime = this.pendingVisualTrackStartTime || Date.now();
-    this.setDisplayCurrentTrack(pending, { startTime });
-    console.log('🕒 [timing] Visual track committed', {
-      reason,
-      trackId: pending.identifier,
-      startTimestamp: startTime
-    });
-    this.pendingVisualCurrentTrack = null;
-    this.pendingVisualTrackStartTime = null;
-  }
-
-  cancelPendingLivePromotion() {
-    if (this.pendingLivePromotion?.timer) {
-      clearTimeout(this.pendingLivePromotion.timer);
-    }
-    this.pendingLivePromotion = null;
-  }
-
-  scheduleLivePromotion(trackId, delayMs) {
-    this.cancelPendingLivePromotion();
-    const delay = Math.max(delayMs, MIN_LIVE_PROMOTION_DELAY_MS);
-    console.log('⏱️ [timing] Delaying live promotion', {
-      sessionId: this.sessionId,
-      trackId,
-      delayMs: delay
-    });
-    const timer = setTimeout(() => {
-      if (!this.liveStreamState || this.liveStreamState.trackId !== trackId) {
-        console.warn('⏱️ [timing] Skipping delayed promotion; live stream moved on', {
-          sessionId: this.sessionId,
-          trackId,
-          liveTrackId: this.liveStreamState?.trackId || null
-        });
-        this.pendingLivePromotion = null;
-        return;
-      }
-      this.pendingLivePromotion = null;
-      this.flushLivePromotion('delayed-live-chunk', trackId);
-    }, delay);
-    this.pendingLivePromotion = { trackId, timer };
-  }
-
-  flushLivePromotion(reason = 'live-chunk', trackId = null) {
-    this.cancelPendingLivePromotion();
-    this.commitPendingVisualTrack(reason, trackId);
-    setTimeout(() => {
-      (async () => {
-        try {
-          await this.broadcastHeartbeat(reason, { force: true });
-        } catch (err) {
-          console.warn(`⚠️ Failed to broadcast ${reason} heartbeat:`, err?.message || err);
-        }
-        // Explorer snapshots now fetched via POST /explorer - no longer broadcast via SSE
-      })();
-    }, 0);
-  }
 
   resolvePendingTrackReady(success) {
     if (!this.pendingTrackReadyResolvers || this.pendingTrackReadyResolvers.size === 0) {
@@ -704,8 +593,12 @@ class DriftAudioMixer {
       this.pendingCrossfadePrepTimer = null;
     }
 
-    const delayMs = reason === 'crossfade_complete' ? 0 : 8000;
-    const deferredReason = delayMs === 0 ? reason : `${reason}-deferred`;
+    // Always use a non-zero delay. The 0ms crossfade_complete delay caused a cascade
+    // where the just-promoted track was killed 21ms after starting: the synchronous
+    // auto-prep selected a new track and loaded it into the current slot before the
+    // promoted track could establish.
+    const delayMs = reason === 'crossfade_complete' ? 2000 : 8000;
+    const deferredReason = `${reason}-deferred`;
 
     const execute = () => {
       this.pendingCrossfadePrepTimer = null;
@@ -717,11 +610,7 @@ class DriftAudioMixer {
       });
     };
 
-    if (delayMs === 0) {
-      execute();
-    } else {
-      this.pendingCrossfadePrepTimer = setTimeout(execute, delayMs);
-    }
+    this.pendingCrossfadePrepTimer = setTimeout(execute, delayMs);
   }
 
   awaitCurrentTrackReady(timeoutMs = 15000) {
@@ -926,6 +815,19 @@ class DriftAudioMixer {
     const { direction = null, debounceMs = this.userSelectionDebounceMs } = options;
 
     console.log(`🎯 [override] handleUserSelectedNextTrack requested ${trackMd5} (direction=${direction || 'none'})`);
+
+    // If this track is already locked and prepared, no-op — don't clear and re-debounce.
+    if (this.lockedNextTrackIdentifier === trackMd5 && this.nextTrack?.identifier === trackMd5) {
+      console.log(`🎯 [override] ${trackMd5.substring(0, 8)} already locked and prepared — skipping`);
+      this.broadcastSelectionEvent('selection_ack', {
+        status: 'prepared',
+        trackId: trackMd5,
+        direction: this.pendingUserOverrideDirection || direction || null,
+        generation: this.manualSelectionGeneration
+      });
+      return;
+    }
+
     this.recordSessionEvent('manual_override_requested', {
       trackId: trackMd5,
       direction
@@ -940,9 +842,6 @@ class DriftAudioMixer {
     if (selectedTrack?.artist) this.seenTrackArtists.add(selectedTrack.artist);
     if (selectedTrack?.album) this.seenTrackAlbums.add(selectedTrack.album);
 
-    if (direction) {
-      this.driftPlayer.currentDirection = direction;
-    }
     this.pendingUserOverrideDirection = direction || null;
     this.pendingUserOverrideTrackId = trackMd5;
     this.isUserSelectionPending = true;
@@ -964,6 +863,7 @@ class DriftAudioMixer {
         console.log('🧹 [override] Clearing previously prepared next track to honor manual selection');
       }
       this.nextTrack = null;
+      this.explorerRecommendedNext = null;
     } else {
       console.log('🧹 [override] Preserving crossfade buffer until fade completes; will refresh once idle');
     }
@@ -1226,6 +1126,11 @@ class DriftAudioMixer {
 
     const manualGenerationAtStart = overrideTrackId ? (overrideGeneration ?? this.pendingUserOverrideGeneration) : null;
 
+    // Preparation generation: each call gets a unique ID so stale preparations
+    // don't null out this.nextTrack that was set by a newer preparation.
+    if (!this._nextPrepGeneration) this._nextPrepGeneration = 0;
+    const prepGeneration = ++this._nextPrepGeneration;
+
     const preparation = (async () => {
       try {
         let hydratedNextTrack = null;
@@ -1334,7 +1239,13 @@ class DriftAudioMixer {
             console.log(`🎯 [prepare] Loading track into mixer (${hydratedNextTrack.path})`);
             return await this.audioMixer.loadTrack(hydratedNextTrack.path, 'next', this.buildTrackMetadata(hydratedNextTrack));
           } catch (loadErr) {
-            this.nextTrack = previousNext || null;
+            // Only null out nextTrack if we're still the latest preparation.
+            // A newer concurrent preparation may have already set a different nextTrack.
+            if (this._nextPrepGeneration === prepGeneration) {
+              this.nextTrack = previousNext || null;
+            } else {
+              console.log(`↩️ [prepare] Skipping nextTrack rollback — superseded by newer preparation (gen ${prepGeneration} < ${this._nextPrepGeneration})`);
+            }
             if (overrideTrackId) {
               this.lockedNextTrackIdentifier = null;
               this.clearPendingUserSelection();
@@ -1358,7 +1269,10 @@ class DriftAudioMixer {
 
           if (!isLatestSelection && !matchesLockedTrack) {
             console.log('↩️ [override] Prepared override superseded by newer selection; skipping commit');
-            this.nextTrack = null;
+            // Only null nextTrack if we're still the latest preparation
+            if (this._nextPrepGeneration === prepGeneration) {
+              this.nextTrack = null;
+            }
             return;
           }
 
@@ -1520,6 +1434,29 @@ class DriftAudioMixer {
   async selectNextFromCandidates() {
     try {
       console.log('🎯 Using explorer-based selection for next track');
+
+      // Prefer sticky explorer recommendation if still valid
+      if (this.explorerRecommendedNext) {
+        const rec = this.explorerRecommendedNext;
+        const recId = rec.trackId;
+        const alreadyPlayed = this.sessionHistory.some(h => h.identifier === recId);
+        const isCurrent = this.currentTrack?.identifier === recId;
+        if (!alreadyPlayed && !isCurrent) {
+          const hydrated = this.hydrateTrackRecord(recId, {
+            transitionReason: 'explorer',
+            direction: rec.direction,
+            directionKey: rec.directionKey
+          });
+          if (hydrated?.path) {
+            console.log(`📌 Using stored explorer recommendation: ${hydrated.title} (${recId.substring(0,8)})`);
+            this.explorerRecommendedNext = null;
+            return hydrated;
+          }
+        }
+        console.log(`📌 Stored explorer recommendation ${recId?.substring(0,8)} no longer valid (played=${alreadyPlayed}, current=${isCurrent}); falling through to fresh selection`);
+        this.explorerRecommendedNext = null;
+      }
+
       const explorerData = await this.getComprehensiveExplorerData();
       const nextTrackFromExplorer = await this.selectNextTrackFromExplorer(explorerData);
 
@@ -1770,20 +1707,52 @@ class DriftAudioMixer {
     }
   }
 
+  // Build a WAV header for indefinite PCM streaming (44100Hz, 16-bit, stereo)
+  buildWavHeader() {
+    const sampleRate = this.audioMixer?.sampleRate || 44100;
+    const channels = this.audioMixer?.channels || 2;
+    const bitsPerSample = 16;
+    const byteRate = sampleRate * channels * (bitsPerSample / 8);
+    const blockAlign = channels * (bitsPerSample / 8);
+
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);                          // ChunkID
+    header.writeUInt32LE(0xFFFFFFFF, 4);               // ChunkSize (max = streaming/unknown)
+    header.write('WAVE', 8);                           // Format
+    header.write('fmt ', 12);                          // Subchunk1ID
+    header.writeUInt32LE(16, 16);                      // Subchunk1Size (PCM)
+    header.writeUInt16LE(1, 20);                       // AudioFormat (1 = PCM)
+    header.writeUInt16LE(channels, 22);                // NumChannels
+    header.writeUInt32LE(sampleRate, 24);               // SampleRate
+    header.writeUInt32LE(byteRate, 28);                 // ByteRate
+    header.writeUInt16LE(blockAlign, 32);               // BlockAlign
+    header.writeUInt16LE(bitsPerSample, 34);            // BitsPerSample
+    header.write('data', 36);                          // Subchunk2ID
+    header.writeUInt32LE(0xFFFFFFFF, 40);               // Subchunk2Size (max = streaming/unknown)
+
+    return header;
+  }
+
   // Add a client to receive the stream
   addClient(response) {
     console.log(`Adding client to drift session: ${this.sessionId}`);
 
-    // Set proper headers for MP3 streaming
+    // Set proper headers for WAV/PCM streaming
+    // Note: no Content-Length or Transfer-Encoding — Node handles chunked encoding
+    // implicitly, and not advertising it helps Firefox's WAV demuxer treat this
+    // as a progressive download rather than a fixed-size file.
     response.writeHead(200, {
-      'Content-Type': 'audio/mpeg',
+      'Content-Type': 'audio/wav',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Transfer-Encoding': 'chunked',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Headers': 'Range',
       'Accept-Ranges': 'none'
     });
+
+    // Send WAV header for the stream (size=0xFFFFFFFF for indefinite streaming)
+    const wavHeader = this.buildWavHeader();
+    response.write(wavHeader);
 
     this.clients.add(response);
     this.pendingClientBootstrap = false;
@@ -2005,6 +1974,7 @@ class DriftAudioMixer {
     this.trackStartTime = null;
     this.currentTrack = null;
     this.nextTrack = null;
+    this.explorerRecommendedNext = null;
     this.pendingCurrentTrack = null;
     this.lastExplorerSnapshotPayload = null;
     this.lastExplorerSnapshotSummary = null;
@@ -2067,57 +2037,22 @@ class DriftAudioMixer {
       const humanLabel = metadata?.title || fallbackTrack?.title || trackId;
       console.log(`📡 Live stream chunk now sourced from ${humanLabel}`);
 
-      // Synchronize currentTrack with what's actually playing
-      // IMPORTANT: Also check pendingCurrentTrack to avoid false positive during normal transitions
-      // (loadNextTrackIntoMixer sets pendingCurrentTrack before currentTrack is updated)
+      // Detect live stream vs session track mismatch (diagnostic only)
+      // The pendingCurrentTrack guard avoids false positives during normal transitions
       if (metadata?.identifier && this.currentTrack?.identifier &&
           metadata.identifier !== this.currentTrack.identifier &&
           metadata.identifier !== this.pendingCurrentTrack?.identifier) {
-        console.warn('⚠️ Live playback identifier differs from session current track - syncing', {
+        console.warn('⚠️ Live playback identifier differs from session current track (diagnostic only)', {
           sessionId: this.sessionId,
           liveTrackId: metadata.identifier,
-          sessionTrackId: this.currentTrack.identifier
+          liveTitle: metadata.title || null,
+          sessionTrackId: this.currentTrack.identifier,
+          sessionTitle: this.currentTrack.title || null
         });
-        // Force currentTrack to match what the live stream is actually playing
-        const liveTrack = this.hydrateTrackRecord(metadata) || metadata;
-        if (liveTrack) {
-          console.log(`🔄 Live sync correction: promoting ${liveTrack.title || liveTrack.identifier}`);
-          this.currentTrack = liveTrack;
-          this.trackStartTime = now;
-          this.visualCurrentTrack = liveTrack;
-          this.visualTrackStartTime = now;
-          this.pendingVisualCurrentTrack = null;
-
-          // Clear stale nextTrack if it matches what we just promoted
-          if (this.nextTrack?.identifier === liveTrack.identifier) {
-            this.nextTrack = null;
-          }
-
-          // Add to session history if not already there
-          const alreadyInHistory = this.sessionHistory.some(
-            entry => entry.identifier === liveTrack.identifier
-          );
-          if (!alreadyInHistory) {
-            this.addToHistory(liveTrack, now, this.driftPlayer?.currentDirection || null, 'live-sync');
-          }
-
-          // Broadcast track event so client knows a new track started (resets timer, requests explorer)
-          this.broadcastTrackEvent(true, { reason: 'live-sync-correction' }).catch(() => {});
-
-          // Trigger fresh explorer data computation for the correct track
-          this.scheduleAutoCrossfadePrep('live-sync-correction');
-        }
       }
 
-      const timing = this.getDisplayTrackTiming();
-      const remainingMs = timing?.remainingMs ?? null;
-      const needsDelay = Number.isFinite(remainingMs) && remainingMs > LIVE_PROMOTION_WINDOW_MS;
-      if (needsDelay) {
-        const delayMs = Math.max(remainingMs - LIVE_PROMOTION_WINDOW_MS, MIN_LIVE_PROMOTION_DELAY_MS);
-        this.scheduleLivePromotion(trackId, delayMs);
-      } else {
-        this.flushLivePromotion('live-chunk', trackId);
-      }
+      // Broadcast heartbeat so clients see the track change
+      this.broadcastHeartbeat('live-chunk', { force: true }).catch(() => {});
     }
 
     this.liveStreamState = {
@@ -2329,6 +2264,35 @@ class DriftAudioMixer {
     };
 
     this.sessionHistory.push(historyEntry);
+
+    // Structured transition log for offline analysis
+    const prevEntry = this.sessionHistory.length >= 2
+      ? this.sessionHistory[this.sessionHistory.length - 2]
+      : null;
+    console.log(JSON.stringify({
+      _type: 'track_transition',
+      ts: new Date().toISOString(),
+      sessionId: this.sessionId,
+      seq: this.sessionHistory.length,
+      track: {
+        id: track.identifier,
+        title: track.title,
+        artist: track.artist,
+        features: track.features || null,
+        pca: track.pca || null
+      },
+      prev: prevEntry ? {
+        id: prevEntry.identifier,
+        features: prevEntry.features || null
+      } : null,
+      direction: direction,
+      transitionReason: transitionReason,
+      neighborhood: this.currentAdaptiveRadius
+        ? { radius: this.currentAdaptiveRadius.radius, count: this.currentAdaptiveRadius.count }
+        : this.adaptiveRadiusCache?.get(track.identifier)
+          ? { radius: this.adaptiveRadiusCache.get(track.identifier).radius, count: this.adaptiveRadiusCache.get(track.identifier).count, cached: true }
+          : null
+    }));
 
     // Track seen artists and albums for filtering
     if (track.artist && this.noArtist) {
@@ -2839,8 +2803,8 @@ class DriftAudioMixer {
       if (shouldUseLiveElapsed) {
         elapsedMs = liveElapsedMs;
         if (!trackMismatch && liveStartTime != null && displayTrack.identifier === liveTrackId) {
-          if (!Number.isFinite(this.visualTrackStartTime) || this.visualTrackStartTime !== liveStartTime) {
-            this.visualTrackStartTime = liveStartTime;
+          if (!Number.isFinite(this.trackStartTime) || this.trackStartTime !== liveStartTime) {
+            this.trackStartTime = liveStartTime;
             rebasedVisualStart = true;
           }
         }
@@ -2946,7 +2910,8 @@ class DriftAudioMixer {
       },
       drift: {
         currentDirection: this.driftPlayer.currentDirection
-      }
+      },
+      currentTrackDirection: this.currentTrackDirection || this.driftPlayer.currentDirection || null
     };
   }
 
@@ -3301,26 +3266,27 @@ class DriftAudioMixer {
 
   // Get comprehensive explorer data with PCA-enhanced directions and diversity scoring
   async runComprehensiveExplorerData(options = {}) {
-    if (!this.currentTrack) {
-      throw new Error('No current track for explorer data');
+    const targetTrackId = options.trackId || this.currentTrack?.identifier;
+    if (!targetTrackId) {
+      throw new Error('No target track for explorer data');
     }
     const retryDepth = Number.isFinite(options.retryDepth) ? options.retryDepth : 0;
 
     // Check session-level cache first
     const resolution = this.explorerResolution || 'adaptive';
-    const cacheKey = `${this.currentTrack.identifier}_${resolution}`;
+    const cacheKey = `${targetTrackId}_${resolution}`;
 
     if (this.explorerDataCache.has(cacheKey)) {
-      console.log(`🚀 Explorer cache HIT: ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (${this.explorerDataCache.size} cached)`);
+      console.log(`🚀 Explorer cache HIT: ${targetTrackId.substring(0,8)} @ ${resolution} (${this.explorerDataCache.size} cached)`);
       const cachedData = this.explorerDataCache.get(cacheKey);
       // Recompute nextTrack based on CURRENT session history - cached nextTrack may be stale
       cachedData.nextTrack = await this.selectNextTrackFromExplorer(cachedData);
       return cachedData;
     }
 
-    console.log(`📊 Computing explorer data for ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (cache miss)`);
+    console.log(`📊 Computing explorer data for ${targetTrackId.substring(0,8)} @ ${resolution} (cache miss)`);
 
-    const currentTrackData = this.radialSearch.kdTree.getTrack(this.currentTrack.identifier);
+    const currentTrackData = this.radialSearch.kdTree.getTrack(targetTrackId);
     if (!currentTrackData || !currentTrackData.pca) {
       this.currentNeighborhoodSnapshot = null;
       // Fallback to legacy exploration if no PCA data
@@ -3337,7 +3303,8 @@ class DriftAudioMixer {
     console.log(`📊 Getting neighborhood for track: ${currentTrackData.identifier}`);
     console.log(`📊 Track has PCA data:`, !!currentTrackData.pca);
 
-    const cachedAdaptive = this.adaptiveRadiusCache.get(this.currentTrack.identifier) || null;
+    const targetTrack = currentTrackData;  // resolved track object for sub-methods
+    const cachedAdaptive = this.adaptiveRadiusCache.get(targetTrackId) || null;
     const dynamicRadius = Number.isFinite(this.dynamicRadiusState.currentRadius)
       ? this.dynamicRadiusState.currentRadius
       : null;
@@ -3346,7 +3313,7 @@ class DriftAudioMixer {
     this.currentNeighborhoodSnapshot = null;
 
     try {
-      const adaptiveResult = await this.radialSearch.getAdaptiveNeighborhood(this.currentTrack.identifier, {
+      const adaptiveResult = await this.radialSearch.getAdaptiveNeighborhood(targetTrackId, {
         targetMin: 350,
         targetMax: 450,
         initialRadius: dynamicRadius
@@ -3367,7 +3334,7 @@ class DriftAudioMixer {
           targetMax: 450,
           cachedRadiusReused: Boolean(cachedAdaptive)
         };
-        this.adaptiveRadiusCache.set(this.currentTrack.identifier, {
+        this.adaptiveRadiusCache.set(targetTrackId, {
           radius: adaptiveResult.radius,
           count: adaptiveResult.count,
           scale: adaptiveResult.scale,
@@ -3467,8 +3434,8 @@ class DriftAudioMixer {
         // Multi-component domains (tonal, spectral, rhythmic)
         for (const [component, componentInfo] of Object.entries(domainInfo)) {
           const directionKey = `${domain}_${component}`;
-          await this.exploreDirection(explorerData, domain, component, componentInfo.positive, componentInfo.description, 'positive', totalNeighborhoodSize);
-          await this.exploreDirection(explorerData, domain, component, componentInfo.negative, componentInfo.description, 'negative', totalNeighborhoodSize);
+          await this.exploreDirection(explorerData, domain, component, componentInfo.positive, componentInfo.description, 'positive', totalNeighborhoodSize, targetTrack);
+          await this.exploreDirection(explorerData, domain, component, componentInfo.negative, componentInfo.description, 'negative', totalNeighborhoodSize, targetTrack);
         }
       }
     }
@@ -3512,13 +3479,13 @@ class DriftAudioMixer {
 
     for (const feature of originalFeatures) {
       console.log(`📊 Exploring original feature: ${feature.name} (${feature.description})`);
-      await this.exploreOriginalFeatureDirection(explorerData, feature, 'positive', totalNeighborhoodSize);
-      await this.exploreOriginalFeatureDirection(explorerData, feature, 'negative', totalNeighborhoodSize);
+      await this.exploreOriginalFeatureDirection(explorerData, feature, 'positive', totalNeighborhoodSize, targetTrack);
+      await this.exploreOriginalFeatureDirection(explorerData, feature, 'negative', totalNeighborhoodSize, targetTrack);
     }
 
     if (currentTrackData.vae?.latent && Array.isArray(currentTrackData.vae.latent)) {
       console.log(`🧠 Exploring VAE latent directions (${currentTrackData.vae.latent.length} axes)`);
-      await this.exploreVaeDirections(explorerData);
+      await this.exploreVaeDirections(explorerData, targetTrack);
     }
 
     const summarizeDirectionsByDomain = (label, directions) => {
@@ -3675,7 +3642,7 @@ class DriftAudioMixer {
 
     explorerData.diagnostics = {
       timestamp: Date.now(),
-      currentTrackId: this.currentTrack.identifier,
+      currentTrackId: targetTrackId,
       radius: radiusDiagnostics,
       neighborhood: {
         total: totalNeighborhoodSize,
@@ -3703,7 +3670,7 @@ class DriftAudioMixer {
 
     // Cache the computed explorer data for this session
     this.explorerDataCache.set(cacheKey, explorerData);
-    console.log(`💾 Cached explorer data for ${this.currentTrack.identifier.substring(0,8)} @ ${resolution} (cache size: ${this.explorerDataCache.size})`);
+    console.log(`💾 Cached explorer data for ${targetTrackId.substring(0,8)} @ ${resolution} (cache size: ${this.explorerDataCache.size})`);
 
     return explorerData;
   }
@@ -3755,13 +3722,14 @@ class DriftAudioMixer {
   }
 
   async getComprehensiveExplorerData(options = {}) {
-    if (!options.forceFresh && this.pendingExplorerPromise) {
+    const isCurrentTrack = !options.trackId || options.trackId === this.currentTrack?.identifier;
+    if (!options.forceFresh && isCurrentTrack && this.pendingExplorerPromise) {
       return this.pendingExplorerPromise;
     }
 
     const basePromise = this.runComprehensiveExplorerData(options);
 
-    if (options.forceFresh) {
+    if (options.forceFresh || !isCurrentTrack) {
       return basePromise;
     }
 
@@ -3788,7 +3756,7 @@ class DriftAudioMixer {
   }
 
   // Explore a specific PCA direction
-  async exploreDirection(explorerData, domain, component, directionName, description, polarity = null, totalNeighborhoodSize = 100) {
+  async exploreDirection(explorerData, domain, component, directionName, description, polarity = null, totalNeighborhoodSize = 100, targetTrack = this.currentTrack) {
     const directionKey = polarity ? `${domain}_${component}_${polarity}` : `${domain}_${polarity || component}`;
 
     try {
@@ -3804,7 +3772,7 @@ class DriftAudioMixer {
       };
 
       const candidates = await this.radialSearch.getPCADirectionalCandidates(
-        this.currentTrack.identifier,
+        targetTrack.identifier,
         domain,
         component,
         polarity || component,
@@ -3815,12 +3783,12 @@ class DriftAudioMixer {
       // Smart filtering: exclude played tracks, deprioritize actually seen tracks/artists/albums
       // const smartFiltered = this.filterAndDeprioritizeCandidates(candidates.candidates || []);
       // TODO: later?
-      const strategicSamples = this.selectStrategicSamples(candidates.candidates || [], this.currentTrack);
+      const strategicSamples = this.selectStrategicSamples(candidates.candidates || [], targetTrack);
 
       const formattedTracks = strategicSamples.map(sample => {
         const track = sample.track || sample;
         const pcaSlices = this.radialSearch.kdTree.calculatePcaContributionFractions(
-          this.currentTrack,
+          targetTrack,
           track,
           domain,
           `${directionKey}:${track.identifier}`,
@@ -3901,18 +3869,18 @@ class DriftAudioMixer {
   }
 
   // Explore original feature direction using legacy directional search
-  async exploreOriginalFeatureDirection(explorerData, feature, polarity, totalNeighborhoodSize) {
+  async exploreOriginalFeatureDirection(explorerData, feature, polarity, totalNeighborhoodSize, targetTrack = this.currentTrack) {
     const direction = polarity === 'positive' ? feature.positive : feature.negative;
     const directionKey = `${feature.name}_${polarity}`;
 
     try {
       console.log(`🔍 CORE SEARCH: Starting legacy search for '${direction}' (feature: ${feature.name})`);
-      console.log(`🔍 CORE SEARCH: Current track identifier: ${this.currentTrack.identifier}`);
-      console.log(`🔍 CORE SEARCH: Calling this.radialSearch.getDirectionalCandidates('${this.currentTrack.identifier}', '${direction}')`);
+      console.log(`🔍 CORE SEARCH: Target track identifier: ${targetTrack.identifier}`);
+      console.log(`🔍 CORE SEARCH: Calling this.radialSearch.getDirectionalCandidates('${targetTrack.identifier}', '${direction}')`);
 
       // Use legacy directional search for original features - get all candidates
       const candidates = await this.radialSearch.getDirectionalCandidates(
-        this.currentTrack.identifier,
+        targetTrack.identifier,
         direction
         // No limit - get all available candidates for strategic sampling
       );
@@ -3939,7 +3907,7 @@ class DriftAudioMixer {
         console.log(`🚨 This suggests too aggressive artist/album filtering or session history is too large`);
       }
 
-      const strategicSamples = this.selectStrategicSamples(filteredCandidates, this.currentTrack, 50);
+      const strategicSamples = this.selectStrategicSamples(filteredCandidates, targetTrack, 50);
       console.log(`🔍 CORE SAMPLING: Selected ${strategicSamples.length} sample tracks from ${filteredCandidates.length} filtered candidates`);
 
       // Skip directions with 0 tracks (completely ignore them)
@@ -3960,7 +3928,7 @@ class DriftAudioMixer {
         const directionDim = this.radialSearch.kdTree.getDirectionDimension(direction);
         const activeDimensions = this.radialSearch.kdTree.dimensions.filter(dim => dim !== directionDim);
         const featureSlices = this.radialSearch.kdTree.calculateFeatureContributionFractions(
-          this.currentTrack,
+          targetTrack,
           track,
           activeDimensions,
           null,
@@ -4037,6 +4005,7 @@ class DriftAudioMixer {
   }
 
   async exploreVaeDirection(explorerData, latentIndex, polarity, options = {}) {
+    const targetTrack = options.targetTrack || this.currentTrack;
     const directionKey = `vae_latent_${latentIndex}_${polarity}`;
     const baseLabel = VAE_LATENT_LABELS[latentIndex] || `Latent Axis ${latentIndex + 1}`;
     const directionName = baseLabel;
@@ -4067,7 +4036,7 @@ class DriftAudioMixer {
         attemptedResolutions.push(resolutionCandidate);
         try {
           result = await this.radialSearch.getVAEDirectionalCandidates(
-            this.currentTrack.identifier,
+            targetTrack.identifier,
             latentIndex,
             polarity,
             {
@@ -4089,7 +4058,9 @@ class DriftAudioMixer {
         return;
       }
 
-      const formattedTracks = candidates.map(candidate => {
+      const strategicSamples = this.selectStrategicSamples(candidates, targetTrack);
+
+      const formattedTracks = strategicSamples.map(candidate => {
         const track = candidate.track || {};
         return {
           identifier: track.identifier,
@@ -4128,15 +4099,15 @@ class DriftAudioMixer {
     }
   }
 
-  async exploreVaeDirections(explorerData) {
-    const latentVector = this.currentTrack?.vae?.latent;
+  async exploreVaeDirections(explorerData, targetTrack = this.currentTrack) {
+    const latentVector = targetTrack?.vae?.latent;
     if (!Array.isArray(latentVector) || latentVector.length === 0) {
       return;
     }
 
     for (let index = 0; index < latentVector.length; index += 1) {
-      await this.exploreVaeDirection(explorerData, index, 'positive');
-      await this.exploreVaeDirection(explorerData, index, 'negative');
+      await this.exploreVaeDirection(explorerData, index, 'positive', { targetTrack });
+      await this.exploreVaeDirection(explorerData, index, 'negative', { targetTrack });
     }
   }
 

@@ -1,5 +1,7 @@
 // ====== Fuzzy Search (fzf) Interface ======
 
+const fzfLog = (typeof window.createLogger === 'function') ? window.createLogger('fzf') : { info: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console), debug: () => {} };
+
 let fzfState = {
     isVisible: false,
     currentResults: [],
@@ -17,7 +19,7 @@ function setupFzfSearch(cleanupCallback) {
     const fzfResults = document.getElementById('fzfResults');
 
     if (!fzfSearch || !fzfInput || !fzfResults) {
-        console.warn('🔍 Fuzzy search elements not found in DOM');
+        fzfLog.warn('🔍 Fuzzy search elements not found in DOM');
         return;
     }
 
@@ -84,7 +86,7 @@ function setupFzfSearch(cleanupCallback) {
         }
     });
 
-    console.log('🔍 Fuzzy search interface set up (Ctrl+K to open)');
+    fzfLog.info('🔍 Fuzzy search interface set up (Ctrl+K to open)');
 
     // Set up search icon click handler
     const searchIcon = document.getElementById('searchIcon');
@@ -94,7 +96,7 @@ function setupFzfSearch(cleanupCallback) {
                 openFzfSearch();
             }
         });
-        console.log('🔍 Search icon click handler set up');
+        fzfLog.info('🔍 Search icon click handler set up');
     }
 }
 
@@ -114,7 +116,7 @@ function openFzfSearch() {
 
         clearFzfResults();
 
-        console.log('🔍 Opened fuzzy search interface');
+        fzfLog.info('🔍 Opened fuzzy search interface');
     }
 }
 
@@ -135,7 +137,7 @@ function closeFzfSearch() {
             fzfState.searchTimeout = null;
         }
 
-        console.log('🔍 Closed fuzzy search interface');
+        fzfLog.info('🔍 Closed fuzzy search interface');
     }
 
    if (typeof onExit === 'function') {
@@ -153,7 +155,7 @@ async function performFzfSearch(query) {
     fzfResults.innerHTML = '<div class="fzf-loading">Searching...</div>';
 
     try {
-        console.log(`🔍 Searching for: "${query}"`);
+        fzfLog.info(`🔍 Searching for: "${query}"`);
 
         const response = await fetch(`/search?q=${encodeURIComponent(query)}&limit=20`);
 
@@ -163,7 +165,7 @@ async function performFzfSearch(query) {
 
         const data = await response.json();
 
-        console.log(`🔍 Found ${data.results.length} results for "${query}"`);
+        fzfLog.info(`🔍 Found ${data.results.length} results for "${query}"`);
 
         fzfState.currentResults = data.results;
         fzfState.selectedIndex = 0;
@@ -171,7 +173,7 @@ async function performFzfSearch(query) {
         renderFzfResults();
 
     } catch (error) {
-        console.error('🔍 Search error:', error);
+        fzfLog.error('🔍 Search error:', error);
         fzfResults.innerHTML = '<div class="fzf-no-results">Search failed. Please try again.</div>';
     }
 }
@@ -261,17 +263,17 @@ async function selectFzfResult() {
             null;
 
         if (!trackId) {
-            console.warn('🔍 Selected search result is missing an identifier', selectedResult);
+            fzfLog.warn('🔍 Selected search result is missing an identifier', selectedResult);
             return;
         }
 
-        console.log(`🔍 Selected track: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
+        fzfLog.info(`🔍 Selected track: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
 
         // Jump to this track (use the SHA endpoint)
         try {
             await jumpToTrack(trackId, selectedResult);
         } catch (error) {
-            console.error('🎯 Fuzzy jump failed:', error);
+            fzfLog.error('🎯 Fuzzy jump failed:', error);
             showFzfError('Failed to queue track – see console');
             return;
         }
@@ -281,35 +283,48 @@ async function selectFzfResult() {
     }
 }
 
-// Jump to a specific track by MD5
+// Jump to a specific track by MD5 — adds to playlist tray and notifies server
 async function jumpToTrack(trackMd5, metadata = {}) {
     if (!trackMd5) {
-        console.warn('🎯 jumpToTrack called without a track ID');
+        fzfLog.warn('🎯 jumpToTrack called without a track ID');
         return;
     }
 
     try {
-        console.log(`🎯 Jumping to track: ${trackMd5}`);
+        fzfLog.info(`🎯 fzf: adding ${trackMd5.substring(0, 8)} to tray`);
 
-        if (typeof window.sendNextTrack === 'function') {
-            if (window.state) {
-                window.state.suppressPreviewTrackId = trackMd5;
+        // Add to playlist tray
+        if (typeof window.addToPlaylist === 'function') {
+            const wasEmpty = !window.playlistHasItems || !window.playlistHasItems();
+            window.addToPlaylist({
+                trackId: trackMd5,
+                albumCover: metadata.albumCover || metadata.artpath || null,
+                directionKey: metadata.directionKey || metadata.direction || null,
+                title: metadata.title || 'Unknown',
+                artist: metadata.artist || 'Unknown Artist'
+            });
+
+            // Notify server of the new next track (only if this is the first item)
+            if (wasEmpty && typeof window.sendNextTrack === 'function') {
+                const preferredDirection = metadata.directionKey || metadata.direction || null;
+                await window.sendNextTrack(trackMd5, preferredDirection, {
+                    source: 'user',
+                    origin: 'fzf-search'
+                });
             }
-            if (typeof window.hideNextTrackPreview === 'function') {
-                window.hideNextTrackPreview({ immediate: true });
-            }
+        } else if (typeof window.sendNextTrack === 'function') {
+            // Fallback if playlist not available
             const preferredDirection = metadata.directionKey || metadata.direction || null;
             await window.sendNextTrack(trackMd5, preferredDirection, {
                 source: 'user',
                 origin: 'fzf-search'
             });
         } else {
-            console.warn('🎯 sendNextTrack not available; falling back to page navigation');
-            window.location.href = `/${trackMd5}`;
+            fzfLog.warn('🎯 No playlist or sendNextTrack available');
         }
 
     } catch (error) {
-        console.error('🎯 Failed to jump to track:', error);
+        fzfLog.error('🎯 Failed to queue track:', error);
         throw error;
     }
 }

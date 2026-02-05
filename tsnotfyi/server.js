@@ -1,6 +1,7 @@
 require('./utils/logTimestamps');
 const express = require('express');
 const session = require('express-session');
+const https = require('https');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -524,6 +525,26 @@ async function getSessionForRequest(req, { createIfMissing = true } = {}) {
   const queryIdRaw = req.query && typeof req.query.session === 'string' ? req.query.session.trim() : null;
   const queryId = queryIdRaw || null;
   const cookieId = req.session?.audioSessionId || null;
+
+  // Resolve session from fingerprint query param (used by /current-track sentinel fetch)
+  const fingerprintParam = req.query && typeof req.query.fingerprint === 'string' ? req.query.fingerprint.trim() : null;
+  if (fingerprintParam && !queryId) {
+    const entry = fingerprintRegistry.lookup(fingerprintParam);
+    if (entry) {
+      const session = getSessionById(entry.sessionId);
+      if (session) {
+        logSessionResolution(req, 'fingerprint', {
+          requested: fingerprintParam.substring(0, 12),
+          sessionId: session.sessionId,
+          created: false
+        });
+        session.lastAccess = new Date();
+        fingerprintRegistry.touch(fingerprintParam, { metadataIp: req.ip });
+        return session;
+      }
+    }
+  }
+
   if (queryId) {
     let session = getSessionById(queryId);
     let createdViaQuery = false;
@@ -1766,7 +1787,7 @@ app.get('/:sessionName/export', async (req, res) => {
   }
 });
 
-const RESERVED_SESSION_PREFIXES = new Set(['api', 'sessions', 'playlist', 'stream', 'events', 'status', 'search', 'track', 'vae']);
+const RESERVED_SESSION_PREFIXES = new Set(['api', 'sessions', 'playlist', 'stream', 'events', 'status', 'search', 'track', 'vae', 'current-track', 'favicon.ico', 'health']);
 
 // Named session with position navigation: /name/4/20
 app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res, next) => {
@@ -3038,6 +3059,25 @@ app.get('/status', async (req, res) => {
   });
 });
 
+// Current track info (sentinel-driven track change — client fetches on sentinel)
+app.get('/current-track', async (req, res) => {
+  const session = await getSessionForRequest(req, { createIfMissing: false });
+  if (!session?.mixer) return res.status(404).json({ error: 'No active session' });
+
+  const payload = session.mixer.buildHeartbeatPayload('current-track-request');
+  if (!payload?.currentTrack) return res.status(204).send();
+
+  res.json({
+    currentTrack: payload.currentTrack,
+    timing: payload.timing,
+    nextTrack: payload.nextTrack,
+    override: payload.override,
+    fingerprint: payload.fingerprint,
+    driftState: payload.drift,
+    currentTrackDirection: payload.currentTrackDirection
+  });
+});
+
 // Session status (backward compatibility)
 app.get('/status/:sessionId', (req, res) => {
   console.log(`⚠️ Deprecated status URL requested: /status/${req.params.sessionId}`);
@@ -3260,94 +3300,59 @@ app.post('/explorer', async (req, res) => {
     }
     serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
 
-    // Build explorer data - use session mixer if available, otherwise use radial search directly
+    // Build explorer data — always use the mixer's comprehensive pipeline
     let explorerData;
+    const isSameTrack = session?.mixer?.currentTrack?.identifier === sourceTrack?.identifier;
     if (session?.mixer) {
-      serverLog.info(`🎯 Using session mixer for explorer data`);
-
-      // Use the session's mixer to get comprehensive explorer data
-      // Temporarily set the mixer's currentTrack to the source track for exploration
-      const originalCurrentTrack = session.mixer.currentTrack;
-      const isSameTrack = originalCurrentTrack?.identifier === sourceTrack?.identifier;
-      session.mixer.currentTrack = sourceTrack;
-      try {
-        // Only force fresh if exploring a DIFFERENT track than current
-        // This allows sharing pendingExplorerPromise with prepareNextTrackForCrossfade
-        explorerData = await session.mixer.getComprehensiveExplorerData({ forceFresh: !isSameTrack });
-      } finally {
-        session.mixer.currentTrack = originalCurrentTrack;
-      }
+      serverLog.info(`🎯 Using session mixer for explorer data (trackId=${trackId.substring(0,8)}, isSameTrack=${isSameTrack})`);
+      explorerData = await session.mixer.getComprehensiveExplorerData({
+        trackId: sourceTrack.identifier,
+        forceFresh: !isSameTrack
+      });
     } else {
-      serverLog.info(`🎯 Using standalone radial search for explorer data`);
-      // Standalone exploration without session - use radial search directly
+      // No session — truly standalone (rare: direct API call without active session)
+      serverLog.info(`🎯 No session available, using standalone radial search for explorer data`);
       const rawExplorer = await radialSearch.exploreFromTrack(trackId, { usePCA: true });
-      serverLog.info(`🎯 Raw explorer has ${Object.keys(rawExplorer.directionalOptions || {}).length} directional options`);
-
-      // Convert directionalOptions to directions format expected by client
+      const rawOptionCount = Object.keys(rawExplorer.directionalOptions || {}).length;
+      serverLog.info(`🎯 Standalone: ${rawOptionCount} directional options (fallback path)`);
+      // Minimal conversion for the no-session edge case
       const convertedDirections = {};
       for (const [dimName, dimData] of Object.entries(rawExplorer.directionalOptions || {})) {
-        // Create positive direction
-        if (dimData.positive && dimData.positive.length > 0) {
-          const posKey = `${dimName}_positive`;
-          convertedDirections[posKey] = {
-            direction: dimName,
-            description: dimData.contextLabel || dimName,
-            domain: 'original',
-            component: dimName,
-            polarity: 'positive',
-            sampleTracks: dimData.positive.map(sample => {
-              const track = sample.track || sample;
-              return {
-                identifier: track.identifier,
-                title: track.title,
-                artist: track.artist,
-                albumCover: track.albumCover,
-                duration: track.length || track.duration,
-                distance: sample.distance || sample.similarity,
-                features: track.features
-              };
-            }),
-            trackCount: dimData.positive.length,
-            explorationPotential: dimData.explorationPotential
-          };
-        }
-        // Create negative direction
-        if (dimData.negative && dimData.negative.length > 0) {
-          const negKey = `${dimName}_negative`;
-          convertedDirections[negKey] = {
-            direction: dimName,
-            description: dimData.contextLabel || dimName,
-            domain: 'original',
-            component: dimName,
-            polarity: 'negative',
-            sampleTracks: dimData.negative.map(sample => {
-              const track = sample.track || sample;
-              return {
-                identifier: track.identifier,
-                title: track.title,
-                artist: track.artist,
-                albumCover: track.albumCover,
-                duration: track.length || track.duration,
-                distance: sample.distance || sample.similarity,
-                features: track.features
-              };
-            }),
-            trackCount: dimData.negative.length,
-            explorationPotential: dimData.explorationPotential
-          };
+        const posCandidates = dimData.positive?.candidates || dimData.positive || [];
+        const negCandidates = dimData.negative?.candidates || dimData.negative || [];
+        for (const pole of [
+          { key: `${dimName}_positive`, candidates: posCandidates, polarity: 'positive' },
+          { key: `${dimName}_negative`, candidates: negCandidates, polarity: 'negative' }
+        ]) {
+          if (pole.candidates.length > 0) {
+            convertedDirections[pole.key] = {
+              direction: dimName,
+              description: dimData.contextLabel || dimName,
+              domain: 'original',
+              component: dimName,
+              polarity: pole.polarity,
+              sampleTracks: pole.candidates.map(sample => {
+                const track = sample.track || sample;
+                return {
+                  identifier: track.identifier,
+                  title: track.title,
+                  artist: track.artist,
+                  albumCover: track.albumCover,
+                  duration: track.length || track.duration,
+                  distance: sample.distance || sample.similarity,
+                  features: track.features
+                };
+              }),
+              trackCount: pole.candidates.length
+            };
+          }
         }
       }
-
       explorerData = {
         directions: convertedDirections,
         currentTrack: rawExplorer.currentTrack,
-        diagnostics: {
-          mode: 'standalone',
-          computationTime: rawExplorer.computationTime,
-          searchMode: rawExplorer.searchCapabilities?.usedMode || 'unknown'
-        }
+        diagnostics: { mode: 'standalone' }
       };
-      serverLog.info(`🎯 Converted to ${Object.keys(convertedDirections).length} directions`);
     }
 
     serverLog.info(`🎯 Explorer data has ${Object.keys(explorerData.directions || {}).length} directions before filtering`);
@@ -3446,22 +3451,63 @@ app.post('/explorer', async (req, res) => {
       }
     }
 
-    // If explorer's nextTrack differs from what mixer prepared, re-prepare
-    if (session?.mixer && nextTrack?.track?.identifier) {
-      const preparedNextId = session.mixer.nextTrack?.identifier;
-      const explorerNextId = nextTrack.track.identifier;
-      if (preparedNextId && preparedNextId !== explorerNextId) {
-        serverLog.info(`🔄 Re-preparing: mixer has ${preparedNextId?.substring(0,8)}, explorer wants ${explorerNextId?.substring(0,8)}`);
-        // Trigger re-preparation with the explorer's recommendation
-        session.mixer.prepareNextTrackForCrossfade({
-          forceRefresh: true,
-          reason: 'explorer-correction',
-          overrideTrackId: explorerNextId,
-          overrideDirection: nextTrack.direction
-        }).catch(err => {
-          serverLog.warn(`⚠️ Re-preparation failed: ${err?.message || err}`);
-        });
+    // Reconcile explorer recommendation with what the mixer has prepared.
+    // If the mixer already has a next track loaded, the client must see THAT track
+    // (not a fresh computation that may differ). Otherwise store the recommendation
+    // so crossfade prep can honor it later.
+    const currentTrackId = session?.mixer?.currentTrack?.identifier;
+    const preparedNextId = session?.mixer?.nextTrack?.identifier;
+    const explorerNextId = nextTrack?.track?.identifier;
+    const isPreparationInProgress = session?.mixer?._preparationInProgress || session?.mixer?.pendingPreparationPromise;
+
+    if (session?.mixer && explorerNextId && trackId === currentTrackId) {
+      if (preparedNextId && preparedNextId !== explorerNextId && preparedNextId !== currentTrackId) {
+        // Mixer already has a different track prepared — override the response
+        // so the client displays what will actually play, not a stale recommendation.
+        const preparedTrack = session.mixer.nextTrack;
+        const preparedDirection = preparedTrack?.direction || preparedTrack?.transitionDirection || null;
+        const preparedDirKey = preparedTrack?.directionKey || preparedTrack?.transitionDirectionKey || null;
+        serverLog.info(`📌 Explorer recommends ${explorerNextId?.substring(0,8)} but mixer has ${preparedNextId?.substring(0,8)} prepared — overriding response`);
+        nextTrack = {
+          directionKey: preparedDirKey,
+          direction: preparedDirection,
+          track: {
+            identifier: preparedTrack.identifier,
+            title: preparedTrack.title,
+            artist: preparedTrack.artist,
+            albumCover: preparedTrack.albumCover,
+            duration: preparedTrack.duration || preparedTrack.length
+          }
+        };
+      } else if (preparedNextId && preparedNextId === currentTrackId) {
+        // Mixer has stale data — its "next track" is the current track. Ignore it.
+        serverLog.warn(`📌 Mixer nextTrack ${preparedNextId?.substring(0,8)} === currentTrack — ignoring stale mixer state`);
+        // Don't overwrite explorerRecommendedNext — the prepared track takes precedence
+      } else {
+        // No prepared track, or it matches the recommendation — store it
+        session.mixer.explorerRecommendedNext = {
+          trackId: explorerNextId,
+          direction: nextTrack.direction,
+          directionKey: nextTrack.directionKey,
+          track: nextTrack.track
+        };
+        serverLog.info(`📌 Stored explorer recommendation: ${explorerNextId?.substring(0,8)}`);
       }
+    } else if (session?.mixer && explorerNextId) {
+      serverLog.info(`📌 Skipping explorer recommendation store: exploring from ${trackId?.substring(0,8)}, current is ${currentTrackId?.substring(0,8)}`);
+    }
+
+    // Only trigger preparation if the mixer has NO next track at all.
+    if (session?.mixer && explorerNextId && !preparedNextId && !isPreparationInProgress) {
+      serverLog.info(`🔄 Explorer filling empty next slot: ${explorerNextId?.substring(0,8)}`);
+      session.mixer.prepareNextTrackForCrossfade({
+        forceRefresh: false,
+        reason: 'explorer-fill',
+        overrideTrackId: explorerNextId,
+        overrideDirection: nextTrack.direction
+      }).catch(err => {
+        serverLog.warn(`⚠️ Explorer-fill preparation failed: ${err?.message || err}`);
+      });
     }
 
     // Build response and strip heavy fields before sending
@@ -3474,6 +3520,12 @@ app.post('/explorer', async (req, res) => {
     const response = stripExplorerDataForClient(rawResponse);
 
     // Validate response matches contract before sending
+    const undefinedDirs = Object.entries(response.directions || {})
+      .filter(([, v]) => !v || typeof v.direction !== 'string')
+      .map(([k, v]) => `${k}: direction=${v?.direction}, domain=${v?.domain}`);
+    if (undefinedDirs.length > 0) {
+      serverLog.warn(`🔍 Directions with undefined .direction field: ${undefinedDirs.join(' | ')}`);
+    }
     validateOrWarn(ExplorerResponse, response, `explorer:${trackId.substring(0, 8)}`);
 
     serverLog.info(`🎯 Explorer request for ${trackId.substring(0, 8)} completed in ${Date.now() - startTime}ms`);
@@ -4263,11 +4315,28 @@ function startServer() {
     hasRegisteredSigintHandler = true;
   }
 
-  serverInstance = app.listen(port, () => {
-    console.log(`🎵 Audio streaming server listening at http://localhost:${port}`);
-    console.log('🎯 PCM mixer engaged - streaming directly from Node.js');
-    console.log(`🔒 Server protected by PID ${process.pid}`);
-  });
+  const tlsKeyPath = path.join(__dirname, 'certs', 'key.pem');
+  const tlsCertPath = path.join(__dirname, 'certs', 'cert.pem');
+  const hasTLS = fs.existsSync(tlsKeyPath) && fs.existsSync(tlsCertPath);
+
+  if (hasTLS) {
+    const tlsOptions = {
+      key: fs.readFileSync(tlsKeyPath),
+      cert: fs.readFileSync(tlsCertPath)
+    };
+    serverInstance = https.createServer(tlsOptions, app).listen(port, () => {
+      console.log(`🎵 Audio streaming server listening at https://localhost:${port}`);
+      console.log('🎯 PCM mixer engaged - streaming directly from Node.js');
+      console.log(`🔒 Server protected by PID ${process.pid} (TLS enabled)`);
+    });
+  } else {
+    serverInstance = app.listen(port, () => {
+      console.log(`🎵 Audio streaming server listening at http://localhost:${port}`);
+      console.log('🎯 PCM mixer engaged - streaming directly from Node.js');
+      console.log(`🔒 Server protected by PID ${process.pid} (no TLS)`);
+      console.warn('⚠️ AudioWorklet requires HTTPS - place certs in certs/key.pem and certs/cert.pem');
+    });
+  }
 
   serverInstance.on('close', () => {
     if (cleanupTimer) {

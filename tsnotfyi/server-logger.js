@@ -38,6 +38,8 @@ const LOG_DIRECTORIES = {
   client: path.join(DEFAULT_LOG_ROOT, 'client')
 };
 const logStreams = new Map();
+// Per-restart suffix so each server start gets its own log file
+const RESTART_SUFFIX = new Date().toISOString().slice(11, 19).replace(/:/g, '');
 
 function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -54,7 +56,7 @@ function getLogStream(type) {
   if (logStreams.has(streamKey)) {
     return logStreams.get(streamKey);
   }
-  const filePath = path.join(dirPath, `${dateKey}.log`);
+  const filePath = path.join(dirPath, `${dateKey}_${RESTART_SUFFIX}.log`);
   const stream = fs.createWriteStream(filePath, { flags: 'a' });
   logStreams.set(streamKey, stream);
   return stream;

@@ -5,27 +5,12 @@
 //  *) updateCardWithTrackDetails
 //  *) createDirectionCard
 
-import { state, DEBUG_FLAGS, getCardBackgroundColor } from './globals.js';
+import { state, getCardBackgroundColor } from './globals.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, getDirectionColor, variantFromDirectionType } from './tools.js';
 import { findTrackInExplorer, hydrateTrackDetails } from './explorer-utils.js';
 import { setCardVariant } from './deck-render.js';
+import { playlistHasItems } from './playlist-tray.js';
 
-const HELPERS_DEBUG = {
-  colors: false,
-  duplicates: false
-};
-
-function helpersColorLog(...args) {
-  if (HELPERS_DEBUG.colors) {
-    console.log(...args);
-  }
-}
-
-function helpersDuplicateLog(...args) {
-  if (HELPERS_DEBUG.duplicates) {
-    console.log(...args);
-  }
-}
 
   // create all the styling for album covers
   const albumCoverBackground = (albumCover) => {
@@ -703,105 +688,6 @@ function helpersDuplicateLog(...args) {
       card.appendChild(stackLineContainer);
   }
 
-  // Comprehensive duplicate detection system
-
-  function performDuplicateAnalysis(explorerData, context = "unknown") {
-      if (!HELPERS_DEBUG.duplicates) {
-          return;
-      }
-
-      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS START (${context}) ===`);
-
-      const allTracks = new Map(); // identifier -> {track, locations: [{direction, index}]}
-      const directionDuplicates = new Map(); // direction -> duplicate info
-      const globalDuplicates = new Map(); // identifier -> locations array
-
-      // Collect all tracks with their locations
-      Object.entries(explorerData.directions).forEach(([directionKey, direction]) => {
-          const sampleTracks = direction.sampleTracks || [];
-          const directionTrackIds = new Set();
-          const directionLocalDups = [];
-
-          sampleTracks.forEach((trackObj, index) => {
-              const track = trackObj.track || trackObj;
-              const id = track.identifier;
-              const location = { direction: directionKey, index };
-
-              // Check for duplicates within this direction (VERY BAD)
-              if (directionTrackIds.has(id)) {
-                  directionLocalDups.push({
-                      id, title: track.title, artist: track.artist,
-                      indices: [directionLocalDups.find(d => d.id === id)?.indices || [], index].flat()
-                  });
-                  console.error(`🃏 VERY BAD: Duplicate in same direction ${directionKey}:`, {
-                      id, title: track.title, artist: track.artist, index
-                  });
-              }
-              directionTrackIds.add(id);
-
-              // Track for global analysis
-              if (!allTracks.has(id)) {
-                  allTracks.set(id, { track, locations: [] });
-              }
-              allTracks.get(id).locations.push(location);
-          });
-
-          // Store direction-level duplicate info
-          if (directionLocalDups.length > 0) {
-              directionDuplicates.set(directionKey, directionLocalDups);
-          }
-      });
-
-      // Analyze for cross-direction and cross-dimension duplicates
-      let crossDirectionCount = 0;
-      let crossDimensionCount = 0;
-
-      allTracks.forEach(({ track, locations }, id) => {
-          if (locations.length > 1) {
-              globalDuplicates.set(id, locations);
-
-              // Check if duplicates span different dimensions
-              const dimensions = new Set(locations.map(loc => {
-                  // Extract base dimension (remove _positive/_negative)
-                  return loc.direction.replace(/_(?:positive|negative)$/, '');
-              }));
-
-              if (dimensions.size > 1) {
-                  crossDimensionCount++;
-                  console.warn(`🃏 WORSE: Cross-dimension duplicate:`, {
-                      id, title: track.title, artist: track.artist,
-                      dimensions: Array.from(dimensions),
-                      locations: locations.map(l => `${l.direction}[${l.index}]`)
-                  });
-              } else {
-                  crossDirectionCount++;
-                  helpersDuplicateLog(`🃏 INTERESTING: Cross-direction duplicate:`, {
-                      id, title: track.title, artist: track.artist,
-                      directions: locations.map(l => l.direction),
-                      locations: locations.map(l => `${l.direction}[${l.index}]`)
-                  });
-              }
-          }
-      });
-
-      // Summary report
-      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS SUMMARY (${context}) ===`);
-      helpersDuplicateLog(`🃏 Direction-level duplicates (VERY BAD): ${directionDuplicates.size} directions affected`);
-      helpersDuplicateLog(`🃏 Cross-dimension duplicates (WORSE): ${crossDimensionCount} tracks`);
-      helpersDuplicateLog(`🃏 Cross-direction duplicates (INTERESTING): ${crossDirectionCount} tracks`);
-      helpersDuplicateLog(`🃏 Total duplicate tracks: ${globalDuplicates.size}`);
-      helpersDuplicateLog(`🃏 === DUPLICATE ANALYSIS END ===`);
-
-      return {
-          directionDuplicates,
-          crossDimensionCount,
-          crossDirectionCount,
-          globalDuplicates,
-          totalDuplicates: globalDuplicates.size
-      };
-  }
-
-
   // Cycle through stack contents for back card clicks
   function cycleStackContents(directionKey, currentTrackIndex) {
       const stack = state.latestExplorerData.directions[directionKey];
@@ -809,11 +695,6 @@ function helpersDuplicateLog(...args) {
 
       const sampleTracks = stack.sampleTracks || [];
       if (sampleTracks.length <= 1) return;
-
-      // 🃏 FOCUSED DEBUG: Check this specific stack during cycling
-      console.log(`🃏 CYCLE: Checking ${directionKey} stack during cycling...`);
-      const stackAnalysis = { directions: { [directionKey]: { sampleTracks } } };
-      performDuplicateAnalysis(stackAnalysis, `cycling-${directionKey}`);
 
       // Move to next track in stack, wrapping around
       const nextIndex = (currentTrackIndex + 1) % sampleTracks.length;
@@ -853,8 +734,10 @@ function helpersDuplicateLog(...args) {
       }
 
 
-      // Update server
-      sendNextTrack(nextTrack.identifier, directionKey, 'user');
+      // Update server (only if playlist is empty — playlist takes priority)
+      if (!playlistHasItems()) {
+          sendNextTrack(nextTrack.identifier, directionKey, 'user');
+      }
 
       // Refresh UI
       refreshCardsWithNewSelection();
@@ -1470,7 +1353,6 @@ function helpersDuplicateLog(...args) {
 
       if (preserveColors) {
           // When preserving colors (e.g., card promotion to center), use existing CSS custom properties
-          helpersColorLog(`🎨 PRESERVE: Keeping existing colors for ${resolvedKey}`);
           const computedStyle = getComputedStyle(card);
           borderColor = computedStyle.getPropertyValue('--border-color').trim() ||
                        card.style.getPropertyValue('--border-color').trim();
@@ -1479,18 +1361,12 @@ function helpersDuplicateLog(...args) {
 
           // Fallback: if no existing colors, calculate fresh ones
           if (!borderColor || !glowColor) {
-              helpersColorLog(`🎨 PRESERVE FALLBACK: No existing colors found, calculating fresh ones`);
               const freshColors = getDirectionColor(directionType, resolvedKey);
               borderColor = borderColor || freshColors.border;
               glowColor = glowColor || freshColors.glow;
           }
       } else {
           // Always respect the intrinsic palette of the resolved direction
-          if (state.usingOppositeDirection) {
-              helpersColorLog(`🎨 OPPOSITE: Using intrinsic colors for ${resolvedKey} (${directionType})`);
-          } else {
-              helpersColorLog(`🎨 NORMAL: Using intrinsic colors for ${resolvedKey} (${directionType})`);
-          }
           borderColor = directionColors.border;
           glowColor = directionColors.glow;
       }

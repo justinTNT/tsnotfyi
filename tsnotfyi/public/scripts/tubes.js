@@ -98,9 +98,38 @@ function hsl(h, s, l) {
   let t0 = performance.now();
   const tmpColor = new THREE.Color();
 
+  let beamsAnimationId = null;
+
+  function startBeamsAnimation() {
+      if (beamsAnimationId !== null) return;
+      t0 = performance.now(); // reset clock to avoid jump
+      animateBeams();
+  }
+
+  function stopBeamsAnimation() {
+      if (beamsAnimationId !== null) {
+          cancelAnimationFrame(beamsAnimationId);
+          beamsAnimationId = null;
+      }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+          stopBeamsAnimation();
+      } else {
+          startBeamsAnimation();
+      }
+  });
+
+  const FRAME_INTERVAL_MS = 1000 / 30; // 30fps cap
+  let lastFrameTime = 0;
+
   function animateBeams() {
-      requestAnimationFrame(animateBeams);
-      const t = (performance.now() - t0) * 0.001;
+      beamsAnimationId = requestAnimationFrame(animateBeams);
+      const now = performance.now();
+      if (now - lastFrameTime < FRAME_INTERVAL_MS) return;
+      lastFrameTime = now;
+      const t = (now - t0) * 0.001;
 
       // Animate beams
       beams.forEach((b, i) => {

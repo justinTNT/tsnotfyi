@@ -1,4 +1,6 @@
 // Audio Manager - handles audio streaming, health monitoring, and recovery
+// Pipeline (HTTPS): fetch() → Int16→Float32 → postMessage → AudioWorkletProcessor → GainNode → destination
+// Pipeline (HTTP):  fetch() → Int16→Float32 → main-thread ring buffer → ScriptProcessorNode → GainNode → destination
 // Dependencies: globals.js (state, elements, connectionHealth, audioHealth, constants)
 
 import {
@@ -6,7 +8,6 @@ import {
   elements,
   connectionHealth,
   audioHealth,
-  debugLog,
   AUDIO_STARTUP_GRACE_MS,
   CONNECTION_QUARANTINE_BASE_MS,
   CONNECTION_QUARANTINE_MAX_MS,
@@ -17,22 +18,688 @@ import {
   AUDIO_DEAD_REBUILD_WINDOW_MS,
   AUDIO_DEAD_REBUILD_THRESHOLD
 } from './globals.js';
+import { createLogger } from './log.js';
+const log = createLogger('audio');
+const sentinelLog = createLogger('sentinel');
 
 // Callbacks to be set by page.js - allows audio-manager to trigger page-level actions
 const audioCallbacks = {
   connectSSE: null,
-  maybeApplyPendingTrackUpdate: null,
   startProgressAnimationFromPosition: null,
   clearPendingProgressStart: null,
   verifyExistingSessionOrRestart: null,
   createNewJourneySession: null,
   clearFingerprint: null,
   composeStreamEndpoint: null,
-  fullResync: null
+  fullResync: null,
+  onSentinel: null
 };
 
 export function setAudioCallbacks(callbacks) {
   Object.assign(audioCallbacks, callbacks);
+}
+
+// ====== PCM Pipeline State ======
+
+let audioContext = null;
+let workletNode = null;
+let gainNode = null;
+let fetchAbortController = null;
+let softwareClock = 0;
+let pipelineStreamUrl = null;
+let workletSampleRate = 44100; // actual rate reported by worklet, may differ from 44100
+let workletBufferedFrames = 0; // last-reported buffer fill from worklet (for throttling)
+let workletTotalSent = 0;      // total frames sent to worklet via postMessage
+
+// ====== ScriptProcessorNode Fallback State ======
+
+let scriptNode = null;
+let useScriptProcessor = false;
+let mtBuffer = null;         // main-thread ring buffer (Float32 interleaved stereo)
+let mtBufferSize = 0;        // total float32 slots (frames × 2 channels)
+let mtWritePos = 0;
+let mtReadPos = 0;
+let mtSamplesWritten = 0;    // frames written (includes overflow-discarded)
+let mtSamplesPlayed = 0;     // frames consumed from buffer (includes overflow-skipped)
+let mtFramesRendered = 0;    // frames actually sent to audio output (clock source)
+let mtReadySent = false;
+let mtUnderrunReported = false;
+let mtHalfSecondFrames = 0;
+let mtReadyThresholdFrames = 0;
+let mtLastPositionReport = 0;
+
+// ====== Sentinel Detection State ======
+
+// All three sentinel patterns use only 0x7FFF and -32768 (0x8000) as Int16 values.
+// We hold samples while we see only those two values. After 8 held samples, classify:
+//   8× 0x7FFF                         → 'track-boundary'
+//   4× [0x7FFF, -32768]               → 'crossfade-start'
+//   4× [-32768, 0x7FFF]               → 'crossfade-end'
+// If 8 held samples don't match any pattern, or a non-sentinel value arrives before 8,
+// restore all held samples as real audio.
+
+let sentinelHeldValues = [];        // Int16 values held pending sentinel classification
+let sentinelPendingEvent = null;    // debounce: only one sentinel per microtask
+
+const SENTINEL_VAL_MAX = 0x7FFF;    // 32767
+const SENTINEL_VAL_MIN = -32768;    // 0x8000
+
+function classifySentinel(held) {
+  // held is an array of exactly 8 Int16 values
+  // All three patterns use both 0x7FFF and -32768 to avoid false positives from clipped audio
+
+  // track-boundary: first 4 = 0x7FFF, last 4 = -32768
+  const firstFourMax = held[0] === SENTINEL_VAL_MAX && held[1] === SENTINEL_VAL_MAX &&
+                       held[2] === SENTINEL_VAL_MAX && held[3] === SENTINEL_VAL_MAX;
+  const lastFourMin = held[4] === SENTINEL_VAL_MIN && held[5] === SENTINEL_VAL_MIN &&
+                      held[6] === SENTINEL_VAL_MIN && held[7] === SENTINEL_VAL_MIN;
+  if (firstFourMax && lastFourMin) return 'track-boundary';
+
+  // crossfade-start: alternating 0x7FFF, -32768 (starting with 0x7FFF)
+  let isCrossfadeStart = true;
+  let isCrossfadeEnd = true;
+  for (let i = 0; i < 8; i++) {
+    if (i % 2 === 0) {
+      if (held[i] !== SENTINEL_VAL_MAX) isCrossfadeStart = false;
+      if (held[i] !== SENTINEL_VAL_MIN) isCrossfadeEnd = false;
+    } else {
+      if (held[i] !== SENTINEL_VAL_MIN) isCrossfadeStart = false;
+      if (held[i] !== SENTINEL_VAL_MAX) isCrossfadeEnd = false;
+    }
+  }
+  if (isCrossfadeStart) return 'crossfade-start';
+  if (isCrossfadeEnd) return 'crossfade-end';
+
+  return null; // not a sentinel
+}
+
+function fireSentinel(type) {
+  if (!sentinelPendingEvent) {
+    sentinelPendingEvent = type;
+    queueMicrotask(() => {
+      const event = sentinelPendingEvent;
+      sentinelPendingEvent = null;
+      if (event) handlePipelineEvent({ type: 'sentinel', sentinel: event });
+    });
+  }
+}
+
+// ====== Int16 LE → Float32 Conversion ======
+
+function isSentinelValue(int16) {
+  return int16 === SENTINEL_VAL_MAX || int16 === SENTINEL_VAL_MIN;
+}
+
+function int16ToFloat32(uint8Array) {
+  // uint8Array is raw bytes of Int16 LE PCM (stereo interleaved)
+  const dataView = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
+  const numSamples = Math.floor(uint8Array.byteLength / 2);
+  const float32 = new Float32Array(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    const int16 = dataView.getInt16(i * 2, true); // little-endian
+
+    if (isSentinelValue(int16)) {
+      sentinelHeldValues.push(int16);
+      float32[i] = 0; // Hold as silence until classification
+
+      if (sentinelHeldValues.length >= 8) {
+        const type = classifySentinel(sentinelHeldValues);
+        if (type) {
+          // Confirmed sentinel — held samples stay zeroed
+          fireSentinel(type);
+        } else {
+          // 8 sentinel-possible values but no pattern match — restore as audio
+          const restoreCount = sentinelHeldValues.length;
+          for (let j = 0; j < restoreCount && i - (restoreCount - 1 - j) >= 0; j++) {
+            float32[i - (restoreCount - 1 - j)] = sentinelHeldValues[j] / 32768;
+          }
+        }
+        sentinelHeldValues = [];
+      }
+    } else {
+      if (sentinelHeldValues.length > 0) {
+        // False alarm: non-sentinel value broke the run — restore held samples
+        const restoreCount = sentinelHeldValues.length;
+        for (let j = 0; j < restoreCount && i - (restoreCount - j) >= 0; j++) {
+          float32[i - (restoreCount - j)] = sentinelHeldValues[j] / 32768;
+        }
+        sentinelHeldValues = [];
+      }
+      float32[i] = int16 / 32768;
+    }
+  }
+  return float32;
+}
+
+// ====== Fetch + Decode Pump ======
+
+async function fetchAndPump(streamUrl) {
+  fetchAbortController = new AbortController();
+  let isFirstChunk = true;
+  let remainder = null; // leftover bytes carried across chunks for alignment
+  let chunkCount = 0;
+  let lastPumpLog = 0;
+  let throttleCount = 0;
+  let totalBytesRead = 0;
+
+  try {
+    const response = await fetch(streamUrl, { signal: fetchAbortController.signal });
+    if (!response.ok) {
+      throw new Error(`Stream fetch failed: ${response.status}`);
+    }
+    const reader = response.body.getReader();
+    log.info('Fetch pump started');
+
+    while (true) {
+      const readStart = Date.now();
+      const { done, value } = await reader.read();
+      const readMs = Date.now() - readStart;
+      if (readMs > 2000) {
+        log.warn(`pump: reader.read() blocked ${readMs}ms (server stall?)`);
+      }
+      if (done) {
+        log.info('Stream ended');
+        handleStreamEnd();
+        break;
+      }
+
+      totalBytesRead += value.byteLength;
+      let pcmBytes = value;
+
+      // Strip 44-byte WAV header from first chunk
+      if (isFirstChunk) {
+        isFirstChunk = false;
+        if (pcmBytes.byteLength > 44) {
+          pcmBytes = pcmBytes.subarray(44);
+        } else {
+          // Partial or exact header — consume header bytes, carry remainder to next chunk
+          // (44-byte header may span multiple reader chunks in theory)
+          continue;
+        }
+      }
+
+      // Prepend any leftover bytes from previous chunk
+      if (remainder && remainder.byteLength > 0) {
+        const merged = new Uint8Array(remainder.byteLength + pcmBytes.byteLength);
+        merged.set(remainder);
+        merged.set(pcmBytes, remainder.byteLength);
+        pcmBytes = merged;
+        remainder = null;
+      }
+
+      // Align to 4-byte stereo frame boundary (2 bytes × 2 channels)
+      const tail = pcmBytes.byteLength % 4;
+      if (tail !== 0) {
+        remainder = pcmBytes.slice(pcmBytes.byteLength - tail);
+        pcmBytes = pcmBytes.subarray(0, pcmBytes.byteLength - tail);
+      }
+
+      if (pcmBytes.byteLength === 0) continue;
+
+      const floatData = int16ToFloat32(pcmBytes);
+      const buffer = floatData.buffer;
+
+      if (useScriptProcessor) {
+        // Break large chunks into 1-second segments and throttle between each.
+        // Network reader can return multi-MB chunks (24+ seconds of audio) during backlog,
+        // which would overflow the 8-second ring buffer if enqueued all at once.
+        const mtBufferCapacity = mtBufferSize / 2;
+        const segmentSize = 44100 * 2; // 1 second of stereo float32 (frames * 2 channels)
+        let offset = 0;
+        while (offset < floatData.length) {
+          // Throttle: wait if buffer is >75% full
+          while ((mtSamplesWritten - mtSamplesPlayed) > mtBufferCapacity * 0.75) {
+            throttleCount++;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            if (!mtBuffer) return;
+          }
+          const end = Math.min(offset + segmentSize, floatData.length);
+          const segment = offset === 0 && end === floatData.length
+            ? floatData  // avoid copy if chunk fits in one segment
+            : floatData.subarray(offset, end);
+          enqueuePCMMainThread(segment);
+          offset = end;
+        }
+
+        // Periodic pump diagnostics (every 5 seconds)
+        const now = Date.now();
+        if (now - lastPumpLog > 5000) {
+          const fill = mtSamplesWritten - mtSamplesPlayed;
+          const fillSec = (fill / 44100).toFixed(1);
+          const capSec = (mtBufferCapacity / 44100).toFixed(1);
+          const chunkSec = (floatData.length / 2 / 44100).toFixed(1);
+          log.info(`pump: chunk#${chunkCount} ${(totalBytesRead/1024).toFixed(0)}KB (${chunkSec}s), buf=${fillSec}/${capSec}s (${(fill/mtBufferCapacity*100).toFixed(0)}%), throttled=${throttleCount}x`);
+          lastPumpLog = now;
+        }
+      } else if (workletNode) {
+        // Break large chunks into 1-second segments and throttle between each.
+        const workletCapacity = (audioContext?.sampleRate || 44100) * 8;
+        const segmentSize = 44100 * 2; // 1 second of stereo float32
+        let offset = 0;
+        while (offset < floatData.length) {
+          // Throttle: estimate fill and wait if >75% full
+          workletTotalSent += 0; // only count when actually sending below
+          const estimatedFill = workletTotalSent - (softwareClock * workletSampleRate);
+          if (estimatedFill > workletCapacity * 0.75) {
+            while (true) {
+              await new Promise(resolve => setTimeout(resolve, 50));
+              if (!workletNode) return;
+              const currentFill = workletTotalSent - (softwareClock * workletSampleRate);
+              if (currentFill <= workletCapacity * 0.5) break;
+            }
+          }
+          const end = Math.min(offset + segmentSize, floatData.length);
+          const segment = floatData.subarray(offset, end);
+          const segBuf = segment.buffer.slice(segment.byteOffset, segment.byteOffset + segment.byteLength);
+          workletTotalSent += (end - offset) / 2;
+          workletNode.port.postMessage({ type: 'pcm', data: segBuf }, [segBuf]);
+          offset = end;
+        }
+      }
+
+      // Yield to event loop periodically so onaudioprocess / worklet can fire
+      chunkCount++;
+      if (chunkCount % 20 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      log.info('Fetch aborted (teardown)');
+      return;
+    }
+    log.error('Stream fetch error:', err);
+    handleStreamError(err);
+  }
+}
+
+function handleStreamEnd() {
+  clearAudioLoadPending('stream-end');
+  audioHealth.isHealthy = false;
+  connectionHealth.audio.status = 'error';
+  updateConnectionHealthUI();
+  handleDeadAudioSession('stream-end');
+}
+
+function handleStreamError(err) {
+  clearAudioLoadPending('error');
+  audioHealth.isHealthy = false;
+  connectionHealth.audio.status = 'error';
+  updateConnectionHealthUI();
+  handleDeadAudioSession('fetch-error');
+}
+
+// ====== ScriptProcessorNode Main-Thread Buffer ======
+
+function enqueuePCMMainThread(floats) {
+  const len = floats.length;
+  const incomingFrames = len / 2;
+  const mtBufferCapacity = mtBufferSize / 2; // max frames the buffer can hold
+  const currentAvail = mtSamplesWritten - mtSamplesPlayed;
+
+  // Overflow protection: if incoming data would exceed buffer capacity,
+  // advance read pointer to discard oldest audio and make room.
+  // This happens when the server has backlogged data (e.g., client connected
+  // minutes after server started streaming).
+  if (currentAvail + incomingFrames > mtBufferCapacity) {
+    const overflow = (currentAvail + incomingFrames) - mtBufferCapacity;
+    mtReadPos = (mtReadPos + overflow * 2) % mtBufferSize;
+    mtSamplesPlayed += overflow;
+  }
+
+  for (let i = 0; i < len; i++) {
+    mtBuffer[mtWritePos] = floats[i];
+    mtWritePos = (mtWritePos + 1) % mtBufferSize;
+  }
+  mtSamplesWritten += incomingFrames;
+
+  if (!mtReadySent) {
+    const buffered = mtSamplesWritten - mtSamplesPlayed;
+    if (buffered >= mtReadyThresholdFrames) {
+      mtReadySent = true;
+      handlePipelineEvent({ type: 'ready' });
+    }
+  }
+  mtUnderrunReported = false;
+}
+
+function handleScriptProcessorAudio(e) {
+  const left = e.outputBuffer.getChannelData(0);
+  const right = e.outputBuffer.getChannelData(1);
+  const frames = left.length;
+  const available = mtSamplesWritten - mtSamplesPlayed;
+
+  if (available < frames) {
+    left.fill(0);
+    right.fill(0);
+    if (!mtUnderrunReported && mtReadySent) {
+      mtUnderrunReported = true;
+      handlePipelineEvent({ type: 'underrun', available, needed: frames });
+    }
+    return;
+  }
+
+  for (let i = 0; i < frames; i++) {
+    left[i] = mtBuffer[mtReadPos];
+    mtReadPos = (mtReadPos + 1) % mtBufferSize;
+    right[i] = mtBuffer[mtReadPos];
+    mtReadPos = (mtReadPos + 1) % mtBufferSize;
+  }
+  mtSamplesPlayed += frames;
+  mtFramesRendered += frames;
+
+  if (mtFramesRendered - mtLastPositionReport >= mtHalfSecondFrames) {
+    mtLastPositionReport = mtFramesRendered;
+    handlePipelineEvent({
+      type: 'position',
+      samplesPlayed: mtFramesRendered,
+      bufferedFrames: mtSamplesWritten - mtSamplesPlayed,
+      overflows: 0
+    });
+  }
+}
+
+// ====== Pipeline Event Handler ======
+
+function handleWorkletMessage(e) {
+  handlePipelineEvent(e.data);
+}
+
+function handlePipelineEvent(msg) {
+  switch (msg.type) {
+    case 'info': {
+      // Worklet reports its actual sample rate
+      workletSampleRate = msg.sampleRate;
+      log.info(`Worklet sample rate: ${workletSampleRate} (requested: 44100, context: ${audioContext?.sampleRate})`);
+      if (workletSampleRate !== 44100) {
+        log.warn(`Sample rate mismatch: worklet running at ${workletSampleRate}, PCM data is 44100`);
+      }
+      break;
+    }
+
+    case 'position': {
+      // Update software clock using actual worklet sample rate
+      softwareClock = msg.samplesPlayed / workletSampleRate;
+      workletBufferedFrames = msg.bufferedFrames || 0;
+
+      if (msg.overflows > 0) {
+        log.warn(`Ring buffer overflows: ${msg.overflows}`);
+      }
+
+      // Same logic as the old 'timeupdate' event
+      audioHealth.lastTimeUpdate = Date.now();
+      audioHealth.bufferingStarted = null;
+      audioHealth.isHealthy = true;
+      audioHealth.lastObservedTime = softwareClock;
+      if (audioHealth.stallTimer) {
+        clearTimeout(audioHealth.stallTimer);
+        audioHealth.stallTimer = null;
+      }
+      connectionHealth.audio.status = 'connected';
+      updateConnectionHealthUI();
+
+      // Pending progress start (mirrors timeupdate handler)
+      if (state.pendingProgressStart && audioCallbacks.clearPendingProgressStart && audioCallbacks.startProgressAnimationFromPosition) {
+        const audioReady = audioContext?.state === 'running';
+        if (audioReady && softwareClock > 0.05) {
+          const pending = state.pendingProgressStart;
+          audioCallbacks.clearPendingProgressStart();
+          audioCallbacks.startProgressAnimationFromPosition(
+            pending.durationSeconds,
+            pending.startPositionSeconds,
+            { ...pending.options, deferIfAudioIdle: false }
+          );
+        }
+      }
+
+      // Drift check (mirrors timeupdate handler)
+      if (Number.isFinite(softwareClock) && Number.isFinite(state.audioTrackStartClock) && state.playbackDurationSeconds > 0) {
+        const audioElapsed = Math.max(0, softwareClock - state.audioTrackStartClock);
+        const visualElapsed = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
+        const drift = Math.abs(audioElapsed - visualElapsed);
+        if (drift > 1.25 && audioCallbacks.startProgressAnimationFromPosition) {
+          log.debug('Audio-driven resync', { softwareClock, audioElapsed, visualElapsed, drift });
+          const trackId = state.latestCurrentTrack?.identifier || null;
+          audioCallbacks.startProgressAnimationFromPosition(state.playbackDurationSeconds, audioElapsed, { resync: true, trackId });
+        }
+      }
+      break;
+    }
+
+    case 'underrun': {
+      log.info(`Audio buffer underrun (available: ${msg.available}, needed: ${msg.needed})`);
+      audioHealth.bufferingStarted = Date.now();
+      audioHealth.lastObservedTime = softwareClock;
+      break;
+    }
+
+    case 'ready': {
+      // Same as 'playing' handler
+      log.info('Audio pipeline ready');
+      clearAudioLoadPending('playing');
+      audioHealth.bufferingStarted = null;
+      audioHealth.lastTimeUpdate = Date.now();
+      audioHealth.isHealthy = true;
+      audioHealth.lastObservedTime = softwareClock;
+      if (audioHealth.stallTimer) {
+        clearTimeout(audioHealth.stallTimer);
+        audioHealth.stallTimer = null;
+      }
+      if (!state.hasSuccessfulAudioStart) {
+        state.hasSuccessfulAudioStart = true;
+      }
+      if (state.audioStartupGraceUntil) {
+        clearAudioStartupGrace();
+      }
+      if (audioHealth.pendingGraceTimer) {
+        clearTimeout(audioHealth.pendingGraceTimer);
+        audioHealth.pendingGraceTimer = null;
+      }
+      if (audioHealth.pendingQuarantineTimer) {
+        clearTimeout(audioHealth.pendingQuarantineTimer);
+        audioHealth.pendingQuarantineTimer = null;
+      }
+      if (state.connectionQuarantineUntil) {
+        resetConnectionQuarantine('audio-playing');
+      }
+      clearPlayRetryTimer();
+      connectionHealth.audio.status = 'connected';
+      updateConnectionHealthUI();
+      if (state.awaitingSSE && !connectionHealth.currentEventSource && audioCallbacks.connectSSE) {
+        state.awaitingSSE = false;
+        audioCallbacks.connectSSE();
+      }
+
+      // Initial track timer (mirrors 'play' event handler)
+      if (!state.pendingInitialTrackTimer) {
+        state.pendingInitialTrackTimer = setTimeout(() => {
+          const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
+          if (!hasTrack) {
+            state.manualNextTrackOverride = false;
+            state.skipTrayDemotionForTrack = null;
+            state.manualNextDirectionKey = null;
+            state.pendingManualTrackId = null;
+            state.selectedIdentifier = null;
+            state.stackIndex = 0;
+            log.warn('ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
+            if (audioCallbacks.fullResync) {
+              audioCallbacks.fullResync();
+            }
+          }
+        }, 10000);
+      }
+      break;
+    }
+
+    case 'sentinel': {
+      const sentinelType = msg.sentinel;
+      const bufferDelay = getBufferDelaySecs();
+      sentinelLog.info(`Sentinel detected: ${sentinelType} (buffer ahead: ${bufferDelay.toFixed(2)}s)`);
+      if (audioCallbacks.onSentinel) {
+        audioCallbacks.onSentinel(sentinelType, { bufferDelaySecs: bufferDelay });
+      }
+      break;
+    }
+  }
+}
+
+// ====== Pipeline Init / Teardown ======
+
+export async function initPCMPipeline(streamUrl, ctx, options = {}) {
+  audioContext = ctx;
+  workletSampleRate = audioContext.sampleRate;
+  useScriptProcessor = !!options.useScriptProcessor;
+
+  const mode = useScriptProcessor ? 'ScriptProcessorNode' : 'AudioWorklet';
+  log.info(`AudioContext created at ${audioContext.sampleRate} Hz (${mode} mode)`);
+
+  // Create gain node for volume control
+  gainNode = audioContext.createGain();
+  gainNode.gain.value = elements.audio?.volume ?? 0.85;
+
+  if (useScriptProcessor) {
+    // Main-thread ring buffer: 8 seconds of stereo interleaved float32
+    mtBufferSize = audioContext.sampleRate * 2 * 8;
+    mtBuffer = new Float32Array(mtBufferSize);
+    mtWritePos = 0;
+    mtReadPos = 0;
+    mtSamplesWritten = 0;
+    mtSamplesPlayed = 0;
+    mtFramesRendered = 0;
+    mtReadySent = false;
+    mtUnderrunReported = false;
+    mtHalfSecondFrames = Math.floor(audioContext.sampleRate / 2);
+    mtReadyThresholdFrames = audioContext.sampleRate * 3; // 3s buffer before triggering SSE
+    mtLastPositionReport = 0;
+
+    scriptNode = audioContext.createScriptProcessor(4096, 0, 2);
+    scriptNode.onaudioprocess = handleScriptProcessorAudio;
+
+    // Chain: scriptProcessor → gain → destination
+    scriptNode.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+  } else {
+    // AudioWorklet path
+    workletNode = new AudioWorkletNode(audioContext, 'pcm-worklet-processor', {
+      outputChannelCount: [2]
+    });
+    workletNode.port.onmessage = handleWorkletMessage;
+
+    // Chain: worklet → gain → destination
+    workletNode.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+  }
+
+  pipelineStreamUrl = streamUrl;
+
+  // Install the audio proxy
+  installAudioProxy();
+
+  // Start the fetch pump
+  fetchAndPump(streamUrl);
+}
+
+export function teardownPipeline() {
+  // Abort fetch
+  if (fetchAbortController) {
+    fetchAbortController.abort();
+    fetchAbortController = null;
+  }
+
+  // Reset worklet buffer
+  if (workletNode) {
+    try {
+      workletNode.port.postMessage({ type: 'reset' });
+      workletNode.disconnect();
+    } catch (e) { /* ignore */ }
+    workletNode = null;
+  }
+
+  // Disconnect ScriptProcessorNode
+  if (scriptNode) {
+    try { scriptNode.disconnect(); } catch (e) { /* ignore */ }
+    scriptNode = null;
+  }
+
+  if (gainNode) {
+    try { gainNode.disconnect(); } catch (e) { /* ignore */ }
+    gainNode = null;
+  }
+
+  if (audioContext) {
+    try { audioContext.close(); } catch (e) { /* ignore */ }
+    audioContext = null;
+  }
+
+  softwareClock = 0;
+  pipelineStreamUrl = null;
+  workletBufferedFrames = 0;
+  workletTotalSent = 0;
+
+  // Reset main-thread buffer state
+  mtBuffer = null;
+  mtBufferSize = 0;
+  mtWritePos = 0;
+  mtReadPos = 0;
+  mtSamplesWritten = 0;
+  mtSamplesPlayed = 0;
+  mtFramesRendered = 0;
+  mtReadySent = false;
+  mtUnderrunReported = false;
+  useScriptProcessor = false;
+}
+
+// ====== Audio Proxy ======
+
+function installAudioProxy() {
+  const previousVolume = (typeof elements.audio?.volume === 'number' && Number.isFinite(elements.audio.volume))
+    ? elements.audio.volume : 0.85;
+
+  elements.audio = {
+    get currentTime() { return softwareClock; },
+    get paused() { return audioContext?.state !== 'running'; },
+    get readyState() { return (workletNode || scriptNode) ? 4 : 0; },
+    get duration() { return Infinity; },
+    get networkState() { return workletNode ? 2 : 0; },
+    get error() { return null; },
+    get currentSrc() { return pipelineStreamUrl || ''; },
+    get src() { return pipelineStreamUrl || ''; },
+    set src(v) {
+      if (v) {
+        connectAudioStream(v, { reason: 'proxy-src-set' });
+      }
+    },
+    get buffered() { return { length: 0 }; },
+    get playbackRate() { return 1; },
+
+    get volume() { return gainNode?.gain.value ?? previousVolume; },
+    set volume(v) {
+      if (gainNode) gainNode.gain.value = Math.max(0, Math.min(1, v));
+    },
+
+    play() {
+      if (audioContext?.state === 'suspended') {
+        return audioContext.resume();
+      }
+      return Promise.resolve();
+    },
+    pause() {
+      if (audioContext) audioContext.suspend();
+    },
+    load() { /* no-op */ },
+    removeAttribute() { /* no-op */ },
+
+    // Stubs for backward compat
+    addEventListener() {},
+    removeEventListener() {},
+    cloneNode() { return this; },
+    get parentElement() { return document.body; },
+    get __driftHandlersAttached() { return true; },
+    set __driftHandlersAttached(_v) { /* no-op */ },
+  };
+
+  // Sync gain to previous volume
+  if (gainNode) gainNode.gain.value = previousVolume;
 }
 
 // ====== Connection Health UI ======
@@ -64,44 +731,18 @@ export function updateConnectionHealthUI() {
 // ====== Audio Diagnostics ======
 
 export function logAudioDiagnostics(label, extra = {}) {
-  const audioEl = elements.audio;
-  if (!audioEl) {
-    console.warn('🎧 Audio diagnostics unavailable', {
-      label,
-      reason: 'no-audio-element',
-      ...extra
-    });
-    return;
-  }
-  const rawCurrentTime = Number(audioEl.currentTime);
-  const rawDuration = Number(audioEl.duration);
-  let bufferedSummary = null;
-  if (audioEl.buffered && audioEl.buffered.length > 0) {
-    try {
-      const lastIndex = audioEl.buffered.length - 1;
-      bufferedSummary = {
-        start: Number(audioEl.buffered.start(lastIndex).toFixed(3)),
-        end: Number(audioEl.buffered.end(lastIndex).toFixed(3)),
-        length: audioEl.buffered.length
-      };
-    } catch (bufferErr) {
-      bufferedSummary = { error: bufferErr?.message || bufferErr };
-    }
-  }
-  console.log('🎧 Audio diagnostics', {
+  log.info('Audio diagnostics', {
     label,
-    paused: audioEl.paused,
-    readyState: audioEl.readyState,
-    networkState: audioEl.networkState,
-    playbackRate: audioEl.playbackRate,
-    currentTime: Number.isFinite(rawCurrentTime) ? Number(rawCurrentTime.toFixed(3)) : null,
-    duration: Number.isFinite(rawDuration) ? Number(rawDuration.toFixed(3)) : null,
-    currentSrc: audioEl.currentSrc || audioEl.src || null,
+    paused: audioContext?.state !== 'running',
+    readyState: workletNode ? 4 : 0,
+    currentTime: Number.isFinite(softwareClock) ? Number(softwareClock.toFixed(3)) : null,
+    pipelineActive: !!(workletNode || scriptNode),
+    pipelineMode: useScriptProcessor ? 'ScriptProcessor' : 'AudioWorklet',
+    audioContextState: audioContext?.state || 'closed',
     audioTrackStartClock: Number.isFinite(state.audioTrackStartClock) ? Number(state.audioTrackStartClock.toFixed(3)) : state.audioTrackStartClock,
     playbackStartTimestamp: state.playbackStartTimestamp,
     latestTrackId: state.latestCurrentTrack?.identifier || null,
     serverNextTrack: state.serverNextTrack || null,
-    buffered: bufferedSummary,
     audioHealth: {
       isHealthy: audioHealth.isHealthy,
       lastTimeUpdate: audioHealth.lastTimeUpdate,
@@ -109,6 +750,24 @@ export function logAudioDiagnostics(label, extra = {}) {
     },
     ...extra
   });
+}
+
+/**
+ * Returns how many seconds of audio are buffered ahead of playback.
+ * Used to delay UI transitions so they align with what the listener hears.
+ */
+export function getBufferDelaySecs() {
+  if (useScriptProcessor && mtBuffer) {
+    const fill = mtSamplesWritten - mtSamplesPlayed;
+    return fill / 44100;
+  }
+  // Worklet path: convert both to seconds to avoid sample-rate mismatch.
+  // workletTotalSent counts 44100 Hz PCM frames; softwareClock is in seconds.
+  if (workletNode) {
+    const totalSentSecs = workletTotalSent / 44100;
+    return Math.max(0, totalSentSecs - softwareClock);
+  }
+  return 0;
 }
 
 // ====== Play Retry Management ======
@@ -123,7 +782,7 @@ export function clearPlayRetryTimer() {
 
 export function schedulePlayRetry(reason = 'unknown', { delay = PLAY_RETRY_DELAY_MS } = {}) {
   if (state.playRetryAttempts >= MAX_PLAY_RETRY_ATTEMPTS) {
-    console.error('🎵 Play retry exhausted', { reason, attempts: state.playRetryAttempts });
+    log.error('Play retry exhausted', { reason, attempts: state.playRetryAttempts });
     recordAudioInstability('dead');
     connectionHealth.audio.status = 'error';
     updateConnectionHealthUI();
@@ -138,7 +797,7 @@ export function schedulePlayRetry(reason = 'unknown', { delay = PLAY_RETRY_DELAY
   const attemptNumber = state.playRetryAttempts;
   state.playRetryTimer = setTimeout(() => {
     state.playRetryTimer = null;
-    console.log('🎵 Retrying audio play', { reason, attempt: attemptNumber });
+    log.info('Retrying audio play', { reason, attempt: attemptNumber });
     playAudioElement('retry', { allowRetry: attemptNumber < MAX_PLAY_RETRY_ATTEMPTS });
   }, delay);
 }
@@ -158,13 +817,7 @@ export function playAudioElement(reason = 'unknown', options = {}) {
         return true;
       })
       .catch(err => {
-        console.error(`🎵 Play failed (${reason}):`, err);
-        console.error('🎵 Audio state when play failed:', {
-          error: elements.audio.error,
-          networkState: elements.audio.networkState,
-          readyState: elements.audio.readyState,
-          src: elements.audio.src
-        });
+        log.error(`Play failed (${reason}):`, err);
         connectionHealth.audio.status = allowRetry ? 'connecting' : 'error';
         updateConnectionHealthUI();
         if (allowRetry) {
@@ -176,7 +829,7 @@ export function playAudioElement(reason = 'unknown', options = {}) {
         return false;
       });
   } catch (err) {
-    console.error(`🎵 Play threw (${reason}):`, err);
+    log.error(`Play threw (${reason}):`, err);
     connectionHealth.audio.status = allowRetry ? 'connecting' : 'error';
     updateConnectionHealthUI();
     if (allowRetry) {
@@ -196,7 +849,7 @@ export function markAudioLoadPending(url, reason = 'initial') {
   state.audioLoadStartedAt = Date.now();
   state.audioLoadReason = reason || null;
   state.audioLoadUrl = url || null;
-  debugLog('timing', 'Marked audio load pending', {
+  log.debug('Marked audio load pending', {
     url,
     reason,
     startedAt: state.audioLoadStartedAt
@@ -208,7 +861,7 @@ export function clearAudioLoadPending(status = 'completed') {
     return;
   }
   const elapsed = Date.now() - (state.audioLoadStartedAt || Date.now());
-  debugLog('timing', 'Clearing audio load pending', {
+  log.debug('Clearing audio load pending', {
     status,
     elapsedMs: elapsed,
     reason: state.audioLoadReason,
@@ -218,9 +871,6 @@ export function clearAudioLoadPending(status = 'completed') {
   state.audioLoadStartedAt = 0;
   state.audioLoadReason = null;
   state.audioLoadUrl = null;
-  if (audioCallbacks.maybeApplyPendingTrackUpdate) {
-    audioCallbacks.maybeApplyPendingTrackUpdate('audio-load-clear');
-  }
 }
 
 // ====== Startup Grace Period ======
@@ -235,7 +885,7 @@ export function extendAudioStartupGrace(reason = 'startup', durationMs = AUDIO_S
     return;
   }
   state.audioStartupGraceUntil = target;
-  debugLog('timing', 'Audio startup grace extended', {
+  log.debug('Audio startup grace extended', {
     reason,
     remainingMs: target - now
   });
@@ -261,7 +911,7 @@ export function enterConnectionQuarantine(reason = 'network', minDurationMs = CO
     state.connectionQuarantineUntil = until;
     state.connectionQuarantineReason = reason;
     state.connectionQuarantineBackoffMs = Math.min(duration * 1.5, CONNECTION_QUARANTINE_MAX_MS);
-    console.warn(`🛑 Connection quarantine engaged (${reason}) for ${Math.round(duration / 1000)}s`);
+    log.warn(`Connection quarantine engaged (${reason}) for ${Math.round(duration / 1000)}s`);
   }
   return state.connectionQuarantineUntil;
 }
@@ -278,33 +928,22 @@ export function resetConnectionQuarantine(context = 'unknown') {
   state.connectionQuarantineUntil = 0;
   state.connectionQuarantineReason = null;
   state.connectionQuarantineBackoffMs = CONNECTION_QUARANTINE_BASE_MS;
-  console.log(`✅ Connection quarantine cleared (${context})`);
+  log.info(`Connection quarantine cleared (${context})`);
 }
 
 // ====== Connect Audio Stream ======
 
 export function connectAudioStream(streamUrl, { forceFallback = false, reason = 'initial' } = {}) {
   if (!streamUrl) {
-    console.warn('connectAudioStream called without streamUrl');
+    log.warn('connectAudioStream called without streamUrl');
     return false;
   }
 
   state.streamUrl = streamUrl;
 
-  if (!forceFallback && state.useMediaSource && state.streamController) {
-    try {
-      state.streamController.start(streamUrl);
-      markAudioLoadPending(streamUrl, reason);
-      return true;
-    } catch (err) {
-      console.warn(`🎧 MediaSource start failed (${reason}); falling back`, err);
-      return connectAudioStream(streamUrl, { forceFallback: true, reason: `${reason}_fallback` });
-    }
-  }
-
   const activeLoadAge = state.audioLoadPending ? Date.now() - (state.audioLoadStartedAt || 0) : null;
   if (state.audioLoadPending && !forceFallback && activeLoadAge !== null && activeLoadAge < 5000) {
-    console.warn('🎵 connectAudioStream skipped: load already pending', {
+    log.warn('connectAudioStream skipped: load already pending', {
       ageMs: activeLoadAge,
       reason,
       pendingReason: state.audioLoadReason
@@ -312,78 +951,35 @@ export function connectAudioStream(streamUrl, { forceFallback = false, reason = 
     return false;
   }
 
-  if (state.streamController) {
-    try {
-      state.streamController.stop();
-    } catch (err) {
-      console.warn('🎧 MediaSource stop failed during fallback:', err);
-    }
-  }
+  // Teardown existing pipeline and restart
+  teardownPipeline();
+  softwareClock = 0;
 
-  state.streamController = null;
-  state.useMediaSource = false;
+  // Create fresh AudioContext and re-init pipeline
+  const ctx = new AudioContext({ sampleRate: 44100 });
 
-  try {
-    elements.audio.pause();
-  } catch (pauseErr) {
-    debugLog('timing', 'Audio pause before reload failed', pauseErr);
-  }
-  elements.audio.removeAttribute('src');
-  elements.audio.load();
-
-  clearPlayRetryTimer();
-  elements.audio.src = streamUrl;
-  elements.audio.load();
-  markAudioLoadPending(streamUrl, reason);
-  if (!state.hasSuccessfulAudioStart) {
-    extendAudioStartupGrace(reason);
-  }
-  return false;
-}
-
-// ====== MediaSource Controller ======
-
-export function initializeMediaStreamController() {
-  if (!state.useMediaSource) {
-    return;
-  }
-  const ControllerCtor = window.MediaStreamController;
-  if (typeof ControllerCtor !== 'function') {
-    state.useMediaSource = false;
-    return;
-  }
-
-  const streamLogger = (event) => {
-    if (!event) return;
-    const level = event.level || 'info';
-    if (level === 'error') {
-      console.error('🎧 MSE error:', event.message, event.error || event);
-    } else if (level === 'warn') {
-      console.warn('🎧 MSE warn:', event.message, event.error || event);
+  const afterInit = () => {
+    markAudioLoadPending(streamUrl, reason);
+    if (!state.hasSuccessfulAudioStart) {
+      extendAudioStartupGrace(reason);
     }
   };
 
-  try {
-    state.streamController = new ControllerCtor(elements.audio, {
-      log: streamLogger,
-      onError: (err) => {
-        console.warn('🎧 MediaSource streaming error; falling back to direct audio', err);
-        connectionHealth.audio.status = 'connecting';
-        updateConnectionHealthUI();
-        audioHealth.isHealthy = false;
-        audioHealth.lastTimeUpdate = null;
-        audioHealth.bufferingStarted = Date.now();
-        startAudioHealthMonitoring();
-        state.awaitingSSE = true;
-        connectAudioStream(state.streamUrl, { forceFallback: true, reason: 'mse-error' });
-        playAudioElement('mse-fallback');
-      }
+  if (ctx.audioWorklet) {
+    ctx.audioWorklet.addModule('scripts/pcm-worklet-processor.js').then(() => {
+      initPCMPipeline(streamUrl, ctx);
+      afterInit();
+    }).catch(err => {
+      log.error('Failed to load PCM worklet during connectAudioStream:', err);
+      connectionHealth.audio.status = 'error';
+      updateConnectionHealthUI();
     });
-  } catch (err) {
-    console.warn('🎧 Failed to initialize MediaSource controller; using direct audio element', err);
-    state.streamController = null;
-    state.useMediaSource = false;
+  } else {
+    initPCMPipeline(streamUrl, ctx, { useScriptProcessor: true });
+    afterInit();
   }
+
+  return false;
 }
 
 // ====== Audio Instability Tracking ======
@@ -401,7 +997,7 @@ export function recordAudioInstability(kind) {
   }
   if (store.length >= threshold) {
     store.length = 0;
-    console.warn(`🔁 Auto audio rebuild triggered (${kind} x${threshold} in ${Math.round(windowMs / 1000)}s)`);
+    log.warn(`Auto audio rebuild triggered (${kind} x${threshold} in ${Math.round(windowMs / 1000)}s)`);
     rebuildAudioElement(`auto-${kind}`);
     return true;
   }
@@ -419,7 +1015,7 @@ async function recoverAudioSession(reason = 'unknown') {
       }
     }
   } catch (err) {
-    console.error('❌ Audio recovery via session rebind failed:', err);
+    log.error('Audio recovery via session rebind failed:', err);
   }
 
   try {
@@ -428,7 +1024,7 @@ async function recoverAudioSession(reason = 'unknown') {
       return true;
     }
   } catch (err) {
-    console.error('❌ Audio recovery via new session failed:', err);
+    log.error('Audio recovery via new session failed:', err);
   }
   return false;
 }
@@ -441,7 +1037,7 @@ export function handleDeadAudioSession(reason = 'unknown') {
   const now = Date.now();
   if (isWithinAudioStartupGrace()) {
     const delay = Math.max(1000, state.audioStartupGraceUntil - now);
-    console.warn(`⏳ Audio restart suppressed (${Math.round(delay / 1000)}s of startup grace remaining)`);
+    log.warn(`Audio restart suppressed (${Math.round(delay / 1000)}s of startup grace remaining)`);
     if (!audioHealth.pendingGraceTimer) {
       audioHealth.pendingGraceTimer = setTimeout(() => {
         audioHealth.pendingGraceTimer = null;
@@ -453,7 +1049,7 @@ export function handleDeadAudioSession(reason = 'unknown') {
 
   if (isConnectionQuarantined()) {
     const delay = Math.max(1000, state.connectionQuarantineUntil - now);
-    console.warn(`🛑 Connection quarantined (${state.connectionQuarantineReason || 'unknown'}); retrying audio restart in ${Math.round(delay / 1000)}s`);
+    log.warn(`Connection quarantined (${state.connectionQuarantineReason || 'unknown'}); retrying audio restart in ${Math.round(delay / 1000)}s`);
     if (!audioHealth.pendingQuarantineTimer) {
       audioHealth.pendingQuarantineTimer = setTimeout(() => {
         audioHealth.pendingQuarantineTimer = null;
@@ -488,7 +1084,7 @@ export function handleDeadAudioSession(reason = 'unknown') {
 
   recordAudioInstability('dead');
 
-  console.error('💀 Audio session is dead - restarting application');
+  log.error('Audio session is dead - restarting application');
   audioHealth.handlingRestart = true;
   audioHealth.isHealthy = false;
   if (audioHealth.checkInterval) {
@@ -502,19 +1098,8 @@ export function handleDeadAudioSession(reason = 'unknown') {
   connectionHealth.audio.status = 'error';
   updateConnectionHealthUI();
 
-  if (state.streamController) {
-    try {
-      state.streamController.stop();
-    } catch (err) {
-      console.warn('⚠️ Failed to stop media stream controller during restart:', err);
-    }
-  }
-
-  try {
-    elements.audio.pause();
-  } catch (err) {
-    console.warn('⚠️ Failed to pause audio during restart:', err);
-  }
+  // Teardown pipeline instead of pausing audio element
+  teardownPipeline();
   clearAudioLoadPending('dead-session');
 
   state.sessionId = null;
@@ -527,7 +1112,7 @@ export function handleDeadAudioSession(reason = 'unknown') {
     try {
       connectionHealth.currentEventSource.close();
     } catch (err) {
-      console.warn('⚠️ Failed to close SSE during restart:', err);
+      log.warn('Failed to close SSE during restart:', err);
     }
     connectionHealth.currentEventSource = null;
   }
@@ -537,12 +1122,12 @@ export function handleDeadAudioSession(reason = 'unknown') {
     audioHealth.handlingRestart = false;
 
     if (!recovered) {
-      console.error('❌ Audio recovery failed; reloading page as last resort');
+      log.error('Audio recovery failed; reloading page as last resort');
       window.location.reload();
       return;
     }
 
-    console.log('✅ Audio session recovery initiated; monitoring stream health');
+    log.info('Audio session recovery initiated; monitoring stream health');
     state.awaitingSSE = true;
     startAudioHealthMonitoring();
     if (audioCallbacks.connectSSE) {
@@ -552,7 +1137,7 @@ export function handleDeadAudioSession(reason = 'unknown') {
       try {
         playAudioElement('audio-recovery');
       } catch (err) {
-        console.warn('⚠️ Failed to resume audio playback after recovery:', err);
+        log.warn('Failed to resume audio playback after recovery:', err);
       }
     }
   })();
@@ -568,14 +1153,14 @@ export function startAudioHealthMonitoring() {
   audioHealth.lastTimeUpdate = null;
   audioHealth.bufferingStarted = null;
   audioHealth.isHealthy = false;
-  audioHealth.lastObservedTime = Number(elements.audio.currentTime) || 0;
+  audioHealth.lastObservedTime = softwareClock;
 
   audioHealth.checkInterval = setInterval(() => {
     if (audioHealth.handlingRestart) {
       return;
     }
 
-    const currentTime = Number(elements.audio.currentTime);
+    const currentTime = softwareClock;
     if (Number.isFinite(currentTime)) {
       if (Math.abs(currentTime - audioHealth.lastObservedTime) > 0.05) {
         audioHealth.lastObservedTime = currentTime;
@@ -597,13 +1182,13 @@ export function startAudioHealthMonitoring() {
     const bufferingDuration = isBuffering ? (now - audioHealth.bufferingStarted) : 0;
 
     if (timeSinceUpdate > 12000) {
-      console.error(`❌ Audio session dead: no timeupdate for ${(timeSinceUpdate / 1000).toFixed(1)}s`);
+      log.error(`Audio session dead: no timeupdate for ${(timeSinceUpdate / 1000).toFixed(1)}s`);
       handleDeadAudioSession();
       return;
     }
 
     if (bufferingDuration > 8000) {
-      console.warn(`⚠️ Audio struggling: buffering for ${(bufferingDuration / 1000).toFixed(1)}s`);
+      log.warn(`Audio struggling: buffering for ${(bufferingDuration / 1000).toFixed(1)}s`);
       connectionHealth.audio.status = 'degraded';
       updateConnectionHealthUI();
       return;
@@ -616,245 +1201,48 @@ export function startAudioHealthMonitoring() {
   }, 2000);
 }
 
-// ====== Audio Event Listeners ======
+// ====== Audio Event Listeners (no-op for worklet pipeline) ======
 
 export function attachBaseAudioEventListeners(audioEl = elements.audio) {
-  if (!audioEl) return;
-  if (audioEl.__driftHandlersAttached) {
-    return;
-  }
-  audioEl.__driftHandlersAttached = true;
-
-  audioEl.addEventListener('timeupdate', () => {
-    audioHealth.lastTimeUpdate = Date.now();
-    audioHealth.bufferingStarted = null;
-    audioHealth.isHealthy = true;
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-    if (Number.isFinite(elements.audio.currentTime)) {
-      state.audioClockEpoch = Date.now() - Number(elements.audio.currentTime) * 1000;
-    }
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-      audioHealth.stallTimer = null;
-    }
-    connectionHealth.audio.status = 'connected';
-    updateConnectionHealthUI();
-
-    if (state.pendingProgressStart && audioCallbacks.clearPendingProgressStart && audioCallbacks.startProgressAnimationFromPosition) {
-      const audioReady = !elements.audio.paused && elements.audio.readyState >= 2;
-      const audioClock = Number(elements.audio.currentTime);
-      if (audioReady && Number.isFinite(audioClock) && audioClock > 0.05) {
-        const pending = state.pendingProgressStart;
-        audioCallbacks.clearPendingProgressStart();
-        audioCallbacks.startProgressAnimationFromPosition(
-          pending.durationSeconds,
-          pending.startPositionSeconds,
-          { ...pending.options, deferIfAudioIdle: false }
-        );
-      }
-    }
-
-    const audioClock = Number(elements.audio.currentTime);
-    if (Number.isFinite(audioClock) && Number.isFinite(state.audioTrackStartClock) && state.playbackDurationSeconds > 0) {
-      const audioElapsed = Math.max(0, audioClock - state.audioTrackStartClock);
-      const visualElapsed = Math.max(0, (Date.now() - state.playbackStartTimestamp) / 1000);
-      const drift = Math.abs(audioElapsed - visualElapsed);
-      if (drift > 1.25 && audioCallbacks.startProgressAnimationFromPosition) {
-        debugLog('timing', 'Audio-driven resync', { audioClock, audioElapsed, visualElapsed, drift });
-        const trackId = state.latestCurrentTrack?.identifier || null;
-        audioCallbacks.startProgressAnimationFromPosition(state.playbackDurationSeconds, audioElapsed, { resync: true, trackId });
-      }
-    }
-
-    if (audioCallbacks.maybeApplyPendingTrackUpdate) {
-      audioCallbacks.maybeApplyPendingTrackUpdate('timeupdate');
-    }
-  });
-
-  audioEl.addEventListener('waiting', () => {
-    console.log('⏳ Audio buffering...');
-    audioHealth.bufferingStarted = Date.now();
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-  });
-
-  audioEl.addEventListener('suspend', () => {
-    clearAudioLoadPending('suspend');
-  });
-
-  audioEl.addEventListener('abort', () => {
-    clearAudioLoadPending('abort');
-  });
-
-  audioEl.addEventListener('emptied', () => {
-    clearAudioLoadPending('emptied');
-  });
-
-  audioEl.addEventListener('playing', () => {
-    console.log('▶️ Audio playing');
-    clearAudioLoadPending('playing');
-    audioHealth.bufferingStarted = null;
-    audioHealth.lastTimeUpdate = Date.now();
-    audioHealth.isHealthy = true;
-    audioHealth.lastObservedTime = Number(elements.audio.currentTime) || audioHealth.lastObservedTime;
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-      audioHealth.stallTimer = null;
-    }
-    if (!state.hasSuccessfulAudioStart) {
-      state.hasSuccessfulAudioStart = true;
-    }
-    if (state.audioStartupGraceUntil) {
-      clearAudioStartupGrace();
-    }
-    if (audioHealth.pendingGraceTimer) {
-      clearTimeout(audioHealth.pendingGraceTimer);
-      audioHealth.pendingGraceTimer = null;
-    }
-    if (audioHealth.pendingQuarantineTimer) {
-      clearTimeout(audioHealth.pendingQuarantineTimer);
-      audioHealth.pendingQuarantineTimer = null;
-    }
-    if (state.connectionQuarantineUntil) {
-      resetConnectionQuarantine('audio-playing');
-    }
-    clearPlayRetryTimer();
-    connectionHealth.audio.status = 'connected';
-    updateConnectionHealthUI();
-    if (state.awaitingSSE && !connectionHealth.currentEventSource && audioCallbacks.connectSSE) {
-      state.awaitingSSE = false;
-      audioCallbacks.connectSSE();
-    }
-  });
-
-  audioEl.addEventListener('error', (e) => {
-    console.error('❌ Audio error - session is dead', e);
-    clearAudioLoadPending('error');
-
-    const mediaError = elements.audio.error;
-    if (mediaError) {
-      console.error('🎵 Audio error details:', {
-        code: mediaError.code,
-        message: mediaError.message,
-        networkState: elements.audio.networkState,
-        readyState: elements.audio.readyState,
-        src: elements.audio.currentSrc,
-        currentTime: elements.audio.currentTime,
-        duration: elements.audio.duration
-      });
-    }
-
-    audioHealth.isHealthy = false;
-    connectionHealth.audio.status = 'error';
-    updateConnectionHealthUI();
-
-    handleDeadAudioSession();
-  });
-
-  audioEl.addEventListener('stalled', () => {
-    console.warn('⏳ Audio reported stalled; verifying...');
-    logAudioDiagnostics('audio-stalled-event', { event: 'stalled' });
-    if (recordAudioInstability('stall')) {
-      return;
-    }
-    clearAudioLoadPending('stalled');
-
-    if (audioHealth.stallTimer) {
-      clearTimeout(audioHealth.stallTimer);
-    }
-
-    const stallSnapshot = {
-      time: Number(elements.audio.currentTime) || 0,
-      readyState: elements.audio.readyState
-    };
-
-    audioHealth.stallTimer = setTimeout(() => {
-      audioHealth.stallTimer = null;
-
-      const now = Date.now();
-      const timeSinceUpdate = audioHealth.lastTimeUpdate ? now - audioHealth.lastTimeUpdate : Infinity;
-      const currentTime = Number(elements.audio.currentTime) || 0;
-      const advanced = Math.abs(currentTime - stallSnapshot.time) > 0.1;
-      const readyOk = elements.audio.readyState >= 3;
-
-      if (advanced || readyOk || timeSinceUpdate <= 1500) {
-        console.log('✅ Audio stall cleared without intervention');
-        return;
-      }
-
-      console.error('❌ Audio stalled - network failed (confirmed)');
-      audioHealth.isHealthy = false;
-      connectionHealth.audio.status = 'error';
-      updateConnectionHealthUI();
-      handleDeadAudioSession('stalled');
-    }, 1500);
-  });
-
-  audioEl.addEventListener('loadstart', () => console.log('🎵 Load started'));
-  audioEl.addEventListener('canplay', () => console.log('🎵 Can play'));
-  audioEl.addEventListener('canplay', () => {
-    if (state.isStarted) return;
-    // Prevent auto-play before user interaction
-  });
-  audioEl.addEventListener('canplaythrough', () => console.log('🎵 Can play through'));
-  audioEl.addEventListener('play', () => {
-    if (state.pendingInitialTrackTimer) return;
-
-    state.pendingInitialTrackTimer = setTimeout(() => {
-      const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
-      if (!hasTrack) {
-        state.manualNextTrackOverride = false;
-        state.skipTrayDemotionForTrack = null;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = null;
-        state.stackIndex = 0;
-        console.warn('🛰️ ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
-        if (audioCallbacks.fullResync) {
-          audioCallbacks.fullResync();
-        }
-      }
-    }, 10000);
-  });
+  // No-op: worklet message handler replaces DOM audio events
 }
 
 // ====== Rebuild Audio Element ======
 
 export function rebuildAudioElement(reason = 'unknown') {
-  const oldAudio = elements.audio;
-  if (!oldAudio || !oldAudio.parentElement) {
-    console.warn('⚠️ Unable to rebuild audio element - missing node', { reason });
-    return false;
-  }
+  const previousVolume = (typeof elements.audio?.volume === 'number' && Number.isFinite(elements.audio.volume))
+    ? elements.audio.volume : 0.85;
 
-  const parent = oldAudio.parentElement;
-  const previousVolume = Number.isFinite(oldAudio.volume) ? oldAudio.volume : 0.85;
+  log.info(`Rebuilding audio pipeline (${reason}), preserving volume=${previousVolume.toFixed(2)}`);
 
-  try {
-    oldAudio.pause();
-    oldAudio.removeAttribute('src');
-    if (typeof oldAudio.load === 'function') {
-      oldAudio.load();
-    }
-  } catch (err) {
-    console.warn('⚠️ Failed to reset old audio element during rebuild', err);
-  }
-
-  const newAudio = oldAudio.cloneNode(false);
-  parent.replaceChild(newAudio, oldAudio);
-  elements.audio = newAudio;
-  delete newAudio.__driftHandlersAttached;
-  newAudio.volume = previousVolume;
+  teardownPipeline();
 
   state.audioElementVersion = (state.audioElementVersion || 1) + 1;
   state.audioElementRebuilds = (state.audioElementRebuilds || 0) + 1;
 
-  attachBaseAudioEventListeners(newAudio);
-
   if (state.isStarted && audioCallbacks.composeStreamEndpoint) {
     const streamUrl = audioCallbacks.composeStreamEndpoint(state.streamFingerprint, Date.now());
-    connectAudioStream(streamUrl, { reason: `rebuild-${reason}` });
-    clearPlayRetryTimer();
-    playAudioElement(`rebuild-${reason}`);
+    const ctx = new AudioContext({ sampleRate: 44100 });
+
+    const afterRebuild = () => {
+      if (gainNode) gainNode.gain.value = previousVolume;
+      clearPlayRetryTimer();
+      playAudioElement(`rebuild-${reason}`);
+    };
+
+    if (ctx.audioWorklet) {
+      ctx.audioWorklet.addModule('scripts/pcm-worklet-processor.js').then(() => {
+        initPCMPipeline(streamUrl, ctx);
+        afterRebuild();
+      }).catch(err => {
+        log.error('Failed to load PCM worklet during rebuild:', err);
+        connectionHealth.audio.status = 'error';
+        updateConnectionHealthUI();
+      });
+    } else {
+      initPCMPipeline(streamUrl, ctx, { useScriptProcessor: true });
+      afterRebuild();
+    }
   }
 
   return true;
@@ -863,8 +1251,7 @@ export function rebuildAudioElement(reason = 'unknown') {
 // ====== Initialization ======
 
 export function initializeAudioManager() {
-  initializeMediaStreamController();
-  attachBaseAudioEventListeners();
+  // No-op: pipeline initialization happens in startAudio() via page.js
 }
 
 // Expose functions globally
@@ -884,11 +1271,12 @@ if (typeof window !== 'undefined') {
   window.isConnectionQuarantined = isConnectionQuarantined;
   window.resetConnectionQuarantine = resetConnectionQuarantine;
   window.connectAudioStream = connectAudioStream;
-  window.initializeMediaStreamController = initializeMediaStreamController;
   window.recordAudioInstability = recordAudioInstability;
   window.handleDeadAudioSession = handleDeadAudioSession;
   window.startAudioHealthMonitoring = startAudioHealthMonitoring;
   window.attachBaseAudioEventListeners = attachBaseAudioEventListeners;
   window.rebuildAudioElement = rebuildAudioElement;
   window.initializeAudioManager = initializeAudioManager;
+  window.initPCMPipeline = initPCMPipeline;
+  window.teardownPipeline = teardownPipeline;
 }

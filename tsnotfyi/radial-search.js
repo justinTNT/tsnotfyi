@@ -31,7 +31,6 @@ class RadialSearchService {
             discriminator = 'primary_d',      // primary_d, tonal, spectral, rhythmic
             radius = 2.0,                    // fallback for legacy mode (increased from 1.0)
             weights = null,
-            ignoreDimensions = [],
             maxDimensions = 6,
             minExplorationPotential = 0.15,
             usePCA = true,                   // Enable PCA-based search by default
@@ -107,19 +106,26 @@ class RadialSearchService {
             );
 
             // Stage 4: Generate directional candidates for selected dimensions
+            // Build ignore list: all dimensions NOT selected as relevant.
+            // The locality filter in getDirectionalCandidates checks non-target dimensions
+            // for excessive PCA movement. Without this, it checks all 20+ dimensions and
+            // rejects candidates for movement in dimensions we don't care about.
+            const relevantDimSet = new Set(relevantDimensions.map(d => d.dimension));
+            const computedIgnoreDimensions = this.kdTree.dimensions.filter(d => !relevantDimSet.has(d));
+
             const directionalOptions = {};
             for (const dimInfo of relevantDimensions) {
                 const positive = this.kdTree.getDirectionalCandidates(
                     trackId,
                     this.getPositiveDirection(dimInfo.dimension),
                     weights,
-                    ignoreDimensions
+                    computedIgnoreDimensions
                 );
                 const negative = this.kdTree.getDirectionalCandidates(
                     trackId,
                     this.getNegativeDirection(dimInfo.dimension),
                     weights,
-                    ignoreDimensions
+                    computedIgnoreDimensions
                 );
 
                 directionalOptions[dimInfo.dimension] = {
@@ -238,15 +244,26 @@ class RadialSearchService {
             minCandidates = 5
         } = criteria;
 
-        const relevantDimensions = Object.entries(dimensionAnalysis)
+        const allDims = Object.entries(dimensionAnalysis);
+        const relevantDimensions = allDims
             .filter(([dimension, analysis]) => {
-                return analysis.explorationPotential > minExplorationPotential &&
+                const pass = analysis.explorationPotential > minExplorationPotential &&
                        analysis.variance > minVariance &&
                        (analysis.bidirectionalOptions.positiveDirection.candidateCount > minCandidates ||
                         analysis.bidirectionalOptions.negativeDirection.candidateCount > minCandidates);
+                if (!pass && allDims.length > 0) {
+                    console.log(`[radial] filtered out ${dimension}: potential=${analysis.explorationPotential.toFixed(3)} variance=${analysis.variance.toFixed(3)} +candidates=${analysis.bidirectionalOptions.positiveDirection.candidateCount} -candidates=${analysis.bidirectionalOptions.negativeDirection.candidateCount}`);
+                }
+                return pass;
             })
             .sort((a, b) => b[1].explorationPotential - a[1].explorationPotential)
             .slice(0, maxDimensions);
+
+        if (relevantDimensions.length === 0 && allDims.length > 0) {
+            console.warn(`[radial] ⚠️ ALL ${allDims.length} dimensions filtered out (thresholds: potential>${minExplorationPotential} variance>${minVariance} candidates>${minCandidates})`);
+        } else {
+            console.log(`[radial] ${relevantDimensions.length}/${allDims.length} dimensions passed filters`);
+        }
 
         return relevantDimensions.map(([dimension, analysis]) => ({
             dimension,
@@ -300,7 +317,9 @@ class RadialSearchService {
             sub_drive: 'more_bass',
             air_sizzle: 'more_air'
         };
-        return directionMap[dimension] || 'faster';
+        // For unmapped dimensions (e.g. opb, pulse_cohesion, spectral_slope),
+        // use dimension+polarity convention — kd-tree handles raw dimension names.
+        return directionMap[dimension] || `${dimension}_up`;
     }
 
     getNegativeDirection(dimension) {
@@ -333,7 +352,7 @@ class RadialSearchService {
             sub_drive: 'less_bass',
             air_sizzle: 'less_air'
         };
-        return directionMap[dimension] || 'slower';
+        return directionMap[dimension] || `${dimension}_down`;
     }
 
     // Simple directional search (bypass full 3-stage algorithm)

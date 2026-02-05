@@ -122,7 +122,7 @@ const ExplorerStateCache = z.object({
   
   // Current explorer state
   latestExplorerData: ExplorerDirections.optional(), // Most recent explorer data
-  explorerResolution: z.enum(['microscope', 'magnifying_glass', 'binoculars']).default('magnifying_glass'),
+  explorerResolution: z.enum(['adaptive', 'microscope', 'magnifying_glass', 'binoculars']).default('adaptive'),
   
   // Loading state
   currentTrackLoadingPromise: z.any().optional(), // Prevents concurrent loads

@@ -6,7 +6,6 @@ import {
     state,
     elements,
     rootElement,
-    debugLog,
     PROGRESS_TICK_INTERVAL_MS,
     PROGRESS_ENVELOPE_STRETCH,
     PROGRESS_PULSE_AMPLITUDE,
@@ -14,14 +13,17 @@ import {
     PROGRESS_DESYNC_MARGIN_SECONDS,
     LOCKOUT_THRESHOLD_SECONDS,
     TRACK_SWITCH_PROGRESS_THRESHOLD,
-    CURRENT_TRACK_APPLY_LEAD_MS,
-    MAX_PENDING_TRACK_DELAY_MS,
     TRACK_CHANGE_DESYNC_GRACE_MS
 } from './globals.js';
+import { createLogger } from './log.js';
+const log = createLogger('progress');
 import { safelyExitCardsDormantState } from './card-state.js';
+import { playlistHasItems } from './playlist-tray.js';
 
 let playbackClockAnimationId = null;
 let lastProgressPhase = null;
+let lastTrackChangeTs = 0;
+let midpointWatchdogFired = false;
 
 export function startProgressAnimation(durationSeconds, trackId = null) {
     startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true, trackId });
@@ -74,7 +76,7 @@ export function renderProgressBar(progressFraction) {
     const visualProgress = applyProgressEnvelope(clamped);
     const phase = clamped <= 0.5 ? 'fill' : 'drain';
     if (phase !== lastProgressPhase) {
-        debugLog('progress', `Progress phase → ${phase}`, { progress: Number(clamped.toFixed(3)) });
+        log.debug(`Progress phase → ${phase}`, { progress: Number(clamped.toFixed(3)) });
         lastProgressPhase = phase;
     }
     const background = document.getElementById('background');
@@ -144,6 +146,23 @@ export function updatePlaybackClockDisplay(forceSeconds = null) {
     }
 
     const clampedElapsed = Math.min(Math.max(0, elapsedSeconds), state.playbackDurationSeconds);
+
+    // Midpoint watchdog: if we're past 50% and the deck has no cards, force a refresh
+    if (!midpointWatchdogFired && state.playbackDurationSeconds > 0 && clampedElapsed > state.playbackDurationSeconds * 0.5) {
+        const deckContainer = document.getElementById('dimensionCards');
+        const hasCards = deckContainer && deckContainer.querySelector('.dimension-card');
+        if (!hasCards) {
+            midpointWatchdogFired = true;
+            log.warn('🐕 Midpoint watchdog: no cards at 50% — forcing refresh');
+            state.manualNextTrackOverride = false;
+            state.manualNextDirectionKey = null;
+            state.pendingManualTrackId = null;
+            if (typeof window.requestSSERefresh === 'function') {
+                window.requestSSERefresh({ escalate: false });
+            }
+        }
+    }
+
     const formattedElapsed = formatTimecode(clampedElapsed);
     const formattedTotal = formatTimecode(state.playbackDurationSeconds);
     if (formattedElapsed === '--:--') {
@@ -175,7 +194,6 @@ function shouldLockInteractions(elapsedSeconds, totalDuration) {
 // These functions are kept as no-ops for backward compatibility
 export function applyTailProgress(value = 0) {
     // No-op - tail progress CSS variables removed in favor of clock animation system
-    state.tailProgress = 0;
 }
 
 export function updateTailProgress(elapsedSeconds, totalDuration) {
@@ -205,135 +223,6 @@ export function getVisualProgressFraction() {
     }
 
     return Math.min(1, Math.max(0, elapsedSeconds) / state.playbackDurationSeconds);
-}
-
-function getServerClockOffsetMs() {
-    return Number.isFinite(state.serverClockOffsetMs) ? state.serverClockOffsetMs : 0;
-}
-
-function toLocalServerTime(serverTimestampMs) {
-    if (!Number.isFinite(serverTimestampMs)) {
-        return null;
-    }
-    return serverTimestampMs - getServerClockOffsetMs();
-}
-
-function estimateServerLeadMs(startTimeMs, elapsedMs) {
-    if (!Number.isFinite(startTimeMs)) {
-        return null;
-    }
-    const effectiveElapsed = Number.isFinite(elapsedMs) ? elapsedMs : 0;
-    const localStart = toLocalServerTime(startTimeMs);
-    if (!Number.isFinite(localStart)) {
-        return null;
-    }
-    return localStart + effectiveElapsed - Date.now();
-}
-
-export function attemptApplyCurrentTrack({ track, trackId, trackChanged, source, context = {}, apply }) {
-    const audioElement = elements.audio || null;
-    const audioClock = audioElement ? Number(audioElement.currentTime) : NaN;
-    const audioPlaybackActive = trackChanged
-        && audioElement
-        && !audioElement.paused
-        && audioElement.readyState >= 2
-        && Number.isFinite(audioClock);
-    const audioLoadPending = state.audioLoadPending === true;
-
-    let leadMs = trackChanged ? estimateServerLeadMs(context.startTimeMs, context.elapsedMs) : null;
-    if (audioPlaybackActive) {
-        leadMs = 0;
-    }
-
-    const progressFraction = getVisualProgressFraction();
-    const shouldDelayForProgress =
-        trackChanged &&
-        source === 'heartbeat' &&
-        progressFraction !== null &&
-        progressFraction < TRACK_SWITCH_PROGRESS_THRESHOLD &&
-        Number.isFinite(leadMs) &&
-        leadMs > CURRENT_TRACK_APPLY_LEAD_MS;
-
-    const shouldDelayForLead = trackChanged && Number.isFinite(leadMs) && leadMs > CURRENT_TRACK_APPLY_LEAD_MS;
-    const shouldDelayForAudio = trackChanged && audioLoadPending;
-    if (shouldDelayForLead || shouldDelayForAudio || shouldDelayForProgress) {
-        if (state.pendingTrackUpdate && state.pendingTrackUpdate.trackId === trackId) {
-            state.pendingTrackUpdate.context = { ...context };
-            state.pendingTrackUpdate.lastLeadMs = leadMs;
-            state.pendingTrackUpdate.updatedAt = Date.now();
-        } else {
-            state.pendingTrackUpdate = {
-                trackId,
-                context: { ...context },
-                apply,
-                source,
-                createdAt: Date.now(),
-                lastLeadMs: leadMs
-            };
-        }
-        const delayContext = {
-            source,
-            leadMs,
-            track: track?.title || trackId || 'unknown',
-            audioLoadPending: shouldDelayForAudio,
-            progressFraction
-        };
-        debugLog('timing', 'Delaying track apply', delayContext);
-        console.warn('⏳ Delaying track apply until audio catches up', delayContext);
-        return 'pending';
-    }
-
-    if (state.pendingTrackUpdate && state.pendingTrackUpdate.trackId === trackId) {
-        state.pendingTrackUpdate = null;
-    }
-
-    apply(context);
-    return 'applied';
-}
-
-export function maybeApplyPendingTrackUpdate(trigger) {
-    const pending = state.pendingTrackUpdate;
-    if (!pending || typeof pending.apply !== 'function') {
-        return;
-    }
-
-    const now = Date.now();
-    const ctx = pending.context || {};
-    const elapsedBase = Number.isFinite(ctx.elapsedMs) ? ctx.elapsedMs : null;
-    const timestampMs = Number.isFinite(ctx.timestampMs) ? ctx.timestampMs : null;
-    const localTimestampMs = Number.isFinite(timestampMs) ? toLocalServerTime(timestampMs) : null;
-    const effectiveElapsedMs = elapsedBase !== null && Number.isFinite(localTimestampMs)
-        ? elapsedBase + (now - localTimestampMs)
-        : elapsedBase;
-    const leadMs = estimateServerLeadMs(ctx.startTimeMs, effectiveElapsedMs);
-    pending.lastLeadMs = leadMs;
-
-    if (
-        !Number.isFinite(leadMs) ||
-        leadMs <= CURRENT_TRACK_APPLY_LEAD_MS ||
-        now - pending.createdAt > MAX_PENDING_TRACK_DELAY_MS
-    ) {
-        if (state.audioLoadPending) {
-            debugLog('timing', 'Pending track apply still waiting for audio load', { trigger, leadMs });
-            return;
-        }
-        if (pending.source === 'heartbeat') {
-            const progressFraction = getVisualProgressFraction();
-            if (progressFraction !== null && progressFraction < TRACK_SWITCH_PROGRESS_THRESHOLD) {
-                debugLog('timing', 'Pending track apply waiting for progress threshold', {
-                    trigger,
-                    progressFraction
-                });
-                return;
-            }
-        }
-        state.pendingTrackUpdate = null;
-        pending.apply({
-            ...ctx,
-            elapsedMs: effectiveElapsedMs,
-            startTimeMs: ctx.startTimeMs
-        });
-    }
 }
 
 export function maybeApplyDeferredNextTrack(trigger = 'progress', options = {}) {
@@ -373,7 +262,7 @@ export function maybeApplyDeferredNextTrack(trigger = 'progress', options = {}) 
     if (typeof window.createDimensionCards === 'function') {
         window.createDimensionCards(state.latestExplorerData, { skipExitAnimation: true, forceRedraw: true });
     }
-    console.log(`🕘 Applied deferred explorer next track (${pending.directionKey || 'unknown'}) via ${trigger}`);
+    log.info(`🕘 Applied deferred explorer next track (${pending.directionKey || 'unknown'}) via ${trigger}`);
     return true;
 }
 
@@ -384,14 +273,32 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     let effectiveStartPosition = Number.isFinite(startPositionSeconds) ? startPositionSeconds : 0;
     if (trackChanged) {
         effectiveStartPosition = 0;
-        state.lastTrackChangeTs = Date.now();
+        lastTrackChangeTs = Date.now();
         state.lastTrackChangeGraceLog = null;
+        midpointWatchdogFired = false;
+
+        // Track-start watchdog: if deck has no cards when a new track begins, force refresh
+        // Debounce: only fire once per track change (refresh re-enters this function)
+        const deckContainer = document.getElementById('dimensionCards');
+        const hasCards = deckContainer && deckContainer.querySelector('.dimension-card');
+        if (!hasCards && state.isStarted && !state._trackStartWatchdogFired) {
+            state._trackStartWatchdogFired = true;
+            log.warn('🐕 Track-start watchdog: no cards at track change — forcing refresh');
+            state.manualNextTrackOverride = false;
+            state.manualNextDirectionKey = null;
+            state.pendingManualTrackId = null;
+            if (typeof window.requestSSERefresh === 'function') {
+                window.requestSSERefresh({ escalate: false });
+            }
+        } else if (hasCards) {
+            state._trackStartWatchdogFired = false;
+        }
     }
     const safeDuration = Math.max(durationSeconds, 0.001);
     const isFirstProgress = !state.progressEverStarted;
     const desyncOverflow = safeDuration > 0 ? (effectiveStartPosition - safeDuration) : 0;
-    const withinTrackChangeGrace = state.lastTrackChangeTs &&
-        (Date.now() - state.lastTrackChangeTs) <= TRACK_CHANGE_DESYNC_GRACE_MS;
+    const withinTrackChangeGrace = lastTrackChangeTs &&
+        (Date.now() - lastTrackChangeTs) <= TRACK_CHANGE_DESYNC_GRACE_MS;
     if (desyncOverflow > PROGRESS_DESYNC_MARGIN_SECONDS) {
         const desyncTrackId = trackId || state.latestCurrentTrack?.identifier || null;
         const logPayload = {
@@ -401,13 +308,13 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
             trackId: desyncTrackId
         };
         if (withinTrackChangeGrace) {
-            const graceAgeMs = Date.now() - state.lastTrackChangeTs;
+            const graceAgeMs = Date.now() - lastTrackChangeTs;
             const shouldLogGrace =
                 !state.lastTrackChangeGraceLog ||
                 state.lastTrackChangeGraceLog.trackId !== desyncTrackId ||
                 graceAgeMs - state.lastTrackChangeGraceLog.ageMs >= 1000;
             if (shouldLogGrace) {
-                console.warn('⏱️ Progress desync ignored during track-change grace', {
+                log.warn('⏱️ Progress desync ignored during track-change grace', {
                     ...logPayload,
                     graceWindowMs: TRACK_CHANGE_DESYNC_GRACE_MS,
                     ageMs: graceAgeMs
@@ -422,7 +329,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
                 state.lastProgressDesync.trackId !== desyncTrackId ||
                 Math.abs(desyncOverflow - (state.lastProgressDesync.overflow || 0)) > 5;
             if (shouldLogDesync) {
-                console.warn('⏱️ Progress desync detected; clamping to track end', logPayload);
+                log.warn('⏱️ Progress desync detected; clamping to track end', logPayload);
                 state.lastProgressDesync = {
                     trackId: desyncTrackId,
                     overflow: desyncOverflow,
@@ -437,7 +344,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         state.lastProgressDesync = null;
     }
     startPositionSeconds = effectiveStartPosition;
-    debugLog('progress', 'startProgressAnimationFromPosition()', {
+    log.debug('startProgressAnimationFromPosition()', {
         durationSeconds,
         startPositionSeconds,
         resync,
@@ -462,7 +369,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
 
         const elapsedDelta = Math.abs(priorElapsed - targetElapsed);
         const durationDelta = Math.abs(priorDuration - targetDuration);
-        debugLog('progress', 'resync delta comparison', {
+        log.debug('resync delta comparison', {
             priorElapsed,
             targetElapsed,
             elapsedDelta,
@@ -512,7 +419,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         (state.latestCurrentTrack.identifier === trackId || state.latestCurrentTrack.trackMd5 === trackId)
     );
     if (trackChanged && !trackCurrentlyMatching && !forceStart) {
-        console.warn('⚠️ Progress start aborted: heartbeat reference mismatch', {
+        log.warn('⚠️ Progress start aborted: heartbeat reference mismatch', {
             durationSeconds,
             clampedStartPosition,
             trackChanged,
@@ -523,6 +430,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         state.playbackDurationSeconds = 0;
         state.playbackStartTimestamp = null;
         state.audioTrackStartClock = null;
+        state._autoPromoted = false;
         stopPlaybackClockTicker();
         renderProgressBar(0);
         updatePlaybackClockDisplay(null);
@@ -539,7 +447,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     const wantsAudioDelay = (trackChanged || shouldDeferForAudio) && shouldDeferForAudio;
 
     if (wantsAudioDelay && isFirstProgress) {
-        console.warn('⏳ First-track progress forcing immediate start despite audio not ready', {
+        log.warn('⏳ First-track progress forcing immediate start despite audio not ready', {
             audioReady,
             audioHasElapsed,
             audioClock,
@@ -551,6 +459,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         state.playbackDurationSeconds = 0;
         state.playbackStartTimestamp = null;
         state.audioTrackStartClock = null;
+        state._autoPromoted = false;
         state.pendingProgressStart = {
             durationSeconds,
             startPositionSeconds,
@@ -564,7 +473,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
             state.pendingProgressStartTimer = null;
             state.pendingProgressStart = null;
             if (pending) {
-                console.warn('⏳ Progress start fallback after audio wait timeout');
+                log.warn('⏳ Progress start fallback after audio wait timeout');
                 startProgressAnimationFromPosition(
                     pending.durationSeconds,
                     pending.startPositionSeconds,
@@ -572,7 +481,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
                 );
             }
         }, PROGRESS_AUDIO_WAIT_TIMEOUT_MS);
-        debugLog('progress', 'Audio not ready; deferring progress animation until playback', {
+        log.debug('Audio not ready; deferring progress animation until playback', {
             audioReady,
             audioHasElapsed,
             audioClock,
@@ -583,6 +492,9 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
 
     clearPendingProgressStart();
     state.progressEverStarted = true;
+    if (trackChanged) {
+        state._autoPromoted = false;
+    }
 
     state.playbackDurationSeconds = safeDuration;
     state.playbackStartTimestamp = Date.now() - clampedStartPosition * 1000;
@@ -598,7 +510,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
 
     const initialShouldLock = shouldLockInteractions(clampedStartPosition, safeDuration);
     if (remainingDuration <= 0) {
-        debugLog('progress', 'Remaining duration <= 0; forcing completion');
+        log.debug('Remaining duration <= 0; forcing completion');
         renderProgressBar(1);
         updatePlaybackClockDisplay(safeDuration);
         applyTailProgress(1);
@@ -654,15 +566,41 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         renderProgressBar(progress);
         updatePlaybackClockDisplay();
 
+        // Update OS media session position (Now Playing widget progress bar)
+        if (navigator.mediaSession && safeDuration > 0) {
+            const pos = progress * safeDuration;
+            try {
+                navigator.mediaSession.setPositionState({
+                    duration: safeDuration,
+                    position: Math.min(pos, safeDuration),
+                    playbackRate: 1
+                });
+            } catch (_) { /* some browsers reject if duration/position are inconsistent */ }
+        }
+
+        // Auto-promote: if playlist tray is empty and <30s remain,
+        // lock in the next track so it's queued for the imminent transition
+        const remainingSeconds = safeDuration * (1 - progress);
+        if (
+            remainingSeconds <= LOCKOUT_THRESHOLD_SECONDS &&
+            remainingSeconds > 0 &&
+            !playlistHasItems() &&
+            !state._autoPromoted &&
+            typeof window.promoteCenterCardToTray === 'function'
+        ) {
+            state._autoPromoted = true;
+            log.info(`🎵 Auto-promoting next track to playlist (${remainingSeconds.toFixed(0)}s remaining)`);
+            window.promoteCenterCardToTray();
+        }
+
         if (progress >= 1) {
             clearInterval(state.progressAnimation);
             state.progressAnimation = null;
             updatePlaybackClockDisplay(safeDuration);
             applyTailProgress(1);
             stopPlaybackClockTicker();
-            debugLog('progress', 'Progress animation completed', { safeDuration });
+            log.debug('Progress animation completed', { safeDuration });
         }
-        maybeApplyPendingTrackUpdate('progress-interval');
     }, PROGRESS_TICK_INTERVAL_MS);
     return true;
 }
@@ -677,7 +615,7 @@ export function stopProgressAnimation() {
     elements.progressWipe.style.left = '0%';
     elements.progressWipe.style.right = 'auto';
 
-    console.log('🛑 Stopped progress animation');
+    log.info('🛑 Stopped progress animation');
     clearPlaybackClock();
     stopPlaybackClockTicker();
     clearPendingProgressStart();
@@ -694,8 +632,6 @@ if (typeof window !== 'undefined') {
     window.updateTailProgress = updateTailProgress;
     window.renderProgressBar = renderProgressBar;
     window.clearPendingProgressStart = clearPendingProgressStart;
-    window.maybeApplyPendingTrackUpdate = maybeApplyPendingTrackUpdate;
-    window.attemptApplyCurrentTrack = attemptApplyCurrentTrack;
     window.formatTimecode = formatTimecode;
     window.updatePlaybackClockDisplay = updatePlaybackClockDisplay;
     window.clearPlaybackClock = clearPlaybackClock;

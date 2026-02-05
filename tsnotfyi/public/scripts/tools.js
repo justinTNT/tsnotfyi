@@ -261,19 +261,6 @@ export function hasOppositeDirection(currentDirectionKey, explorerData) {
 }
 
 
-export function isSwappedOppositeDirection(currentDirectionKey, explorerData) {
-    // Check if any other direction has this as its opposite
-    if (!explorerData.directions) return false;
-
-    for (const [dirKey, dirData] of Object.entries(explorerData.directions)) {
-        if (dirData.oppositeDirection && getOppositeDirection(dirKey) === currentDirectionKey) {
-            return true;
-        }
-    }
-    return false;
-}
-
-
 // ====== Visualization Helper ======
 export function hsl(h, s, l) {
     const c = new THREE.Color();
@@ -446,7 +433,6 @@ if (typeof window !== 'undefined') {
     window.isNegativeDirection = isNegativeDirection;
     window.getOppositeDirection = getOppositeDirection;
     window.hasOppositeDirection = hasOppositeDirection;
-    window.isSwappedOppositeDirection = isSwappedOppositeDirection;
     window.getDirectionColor = getDirectionColor;
     window.VAE_LATENT_NAMES = VAE_LATENT_NAMES;
 }

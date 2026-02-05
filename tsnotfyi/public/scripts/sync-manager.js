@@ -1,11 +1,15 @@
 // Sync manager - heartbeat, server communication, session recovery
-import { state, elements, audioHealth, connectionHealth, DEBUG_FLAGS } from './globals.js';
+import { state, elements, audioHealth, connectionHealth } from './globals.js';
+import { createLogger } from './log.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint } from './session-utils.js';
-import { clearPendingExplorerLookahead, setDeckStaleFlag } from './deck-state.js';
+import { setDeckStaleFlag } from './deck-state.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
 import { getPlaylistNext, popPlaylistHead, playlistHasItems } from './playlist-tray.js';
+
+const log = createLogger('sync');
+const overrideLog = createLogger('override');
 
 // ====== Heartbeat & Sync System ======
 
@@ -16,16 +20,16 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     }
 
     if (!state.streamFingerprint) {
-        console.warn('⚠️ sendNextTrack: No fingerprint yet; waiting for SSE to bind');
+        log.warn('⚠️ sendNextTrack: No fingerprint yet; waiting for SSE to bind');
         const ready = await waitForFingerprint(5000);
 
         if (!ready || !state.streamFingerprint) {
-            console.warn('⚠️ sendNextTrack: Fingerprint still missing after wait; restarting session');
+            log.warn('⚠️ sendNextTrack: Fingerprint still missing after wait; restarting session');
             await createNewJourneySession('missing_fingerprint');
 
             const fallbackReady = await waitForFingerprint(5000);
             if (!fallbackReady || !state.streamFingerprint) {
-                console.error('❌ sendNextTrack: Aborting call - fingerprint unavailable');
+                log.error('❌ sendNextTrack: Aborting call - fingerprint unavailable');
                 scheduleHeartbeat(10000);
                 return;
             }
@@ -44,7 +48,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         if (queuedNext) {
             md5ToSend = queuedNext.trackId;
             dirToSend = dirToSend || queuedNext.directionKey || null;
-            console.log(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist`);
+            log.info(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist`);
         }
     }
 
@@ -86,15 +90,11 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         }
 
         if (!md5ToSend) {
-            const activeCard = document.querySelector('.dimension-card.next-track');
-            if (activeCard) {
-                const datasetMd5 = activeCard.dataset.trackMd5 || activeCard.dataset.trackIdentifier || null;
-                if (datasetMd5) {
-                    md5ToSend = datasetMd5;
-                }
-                if (!dirToSend) {
-                    dirToSend = activeCard.dataset.directionKey || activeCard.dataset.baseDirectionKey || null;
-                }
+            const nextEntry = state.latestExplorerData?.nextTrack;
+            const nextObj = nextEntry?.track || nextEntry;
+            if (nextObj?.identifier) {
+                md5ToSend = nextObj.identifier;
+                dirToSend = dirToSend || nextEntry?.directionKey || null;
             }
         }
 
@@ -116,7 +116,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     }
 
     if (!md5ToSend) {
-        console.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
+        log.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
         state.manualNextTrackOverride = false;
         state.manualNextDirectionKey = null;
         state.pendingManualTrackId = null;
@@ -132,7 +132,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         return;
     }
 
-    console.log(`📤 sendNextTrack (${source}): ${md5ToSend.substring(0,8)}... via ${dirToSend || 'unknown'}`);
+    log.info(`📤 sendNextTrack (${source}): ${md5ToSend.substring(0,8)}... via ${dirToSend || 'unknown'}`);
 
     if (source === 'user') {
         state.manualNextTrackOverride = true;
@@ -173,7 +173,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
 
         if (data.fingerprint) {
             if (state.streamFingerprint !== data.fingerprint) {
-                console.log(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
+                log.info(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
             }
             applyFingerprint(data.fingerprint);
         }
@@ -185,19 +185,17 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         const serverTrack = data.currentTrack;
         const localTrack = state.latestCurrentTrack?.identifier || null;
         if (source === 'heartbeat' && serverTrack && localTrack && serverTrack !== localTrack) {
-            console.error('🛰️ ACTION heartbeat-track-mismatch (immediate)', { serverTrack, localTrack });
+            overrideLog.error('🛰️ ACTION heartbeat-track-mismatch (immediate)', { serverTrack, localTrack });
             fullResync();
             return;
         }
 
-        if (DEBUG_FLAGS.deck) {
-            console.log(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
-        }
+        log.debug(`📥 Server response: next=${data.nextTrack?.substring(0,8)}, current=${data.currentTrack?.substring(0,8)}, remaining=${data.remaining}ms`);
 
         analyzeAndAct(data, source, md5ToSend);
 
     } catch (error) {
-        console.error('❌ sendNextTrack failed:', error);
+        log.error('❌ sendNextTrack failed:', error);
         scheduleHeartbeat(10000);
     }
 }
@@ -206,14 +204,12 @@ function analyzeAndAct(data, source, sentMd5) {
     const { nextTrack, currentTrack, duration, remaining } = data;
 
     if (data.fingerprint && state.streamFingerprint !== data.fingerprint) {
-        if (!DEBUG_FLAGS.deck) {
-            console.log(`🔄 Server response rotated fingerprint to ${data.fingerprint.substring(0, 6)}…`);
-        }
+        log.debug(`🔄 Server response rotated fingerprint to ${data.fingerprint.substring(0, 6)}…`);
         applyFingerprint(data.fingerprint);
     }
 
     if (!data || !currentTrack) {
-        console.warn('⚠️ Invalid server response');
+        log.warn('⚠️ Invalid server response');
         scheduleHeartbeat(90000);
         return;
     }
@@ -233,30 +229,28 @@ function analyzeAndAct(data, source, sentMd5) {
         || state.selectedIdentifier
         || null;
 
-    if (DEBUG_FLAGS.deck) {
-        console.log(`${ICON} Sync snapshot (${source})`, {
-            server: {
-                currentTrack: currentTrack || null,
-                elapsedSeconds: serverElapsedSeconds,
-                durationSeconds: serverDurationSeconds,
-                nextTrack: nextTrack || null
-            },
-            client: {
-                currentTrack: state.latestCurrentTrack?.identifier || null,
-                elapsedSeconds: clientElapsedSeconds,
-                durationSeconds: clientDurationSeconds,
-                nextTrack: clientNextTrack || null,
-                pendingSelection: state.selectedIdentifier || null
-            },
-            sentOverride: sentMd5 || null
-        });
-    }
+    overrideLog.debug(`${ICON} Sync snapshot (${source})`, {
+        server: {
+            currentTrack: currentTrack || null,
+            elapsedSeconds: serverElapsedSeconds,
+            durationSeconds: serverDurationSeconds,
+            nextTrack: nextTrack || null
+        },
+        client: {
+            currentTrack: state.latestCurrentTrack?.identifier || null,
+            elapsedSeconds: clientElapsedSeconds,
+            durationSeconds: clientDurationSeconds,
+            nextTrack: clientNextTrack || null,
+            pendingSelection: state.selectedIdentifier || null
+        },
+        sentOverride: sentMd5 || null
+    });
 
     const currentMd5 = state.latestCurrentTrack?.identifier;
     const currentTrackMismatch = currentMd5 && currentTrack !== currentMd5;
 
     if (currentTrackMismatch) {
-        console.log(`${ICON} ACTION current-track-mismatch`, {
+        overrideLog.info(`${ICON} ACTION current-track-mismatch`, {
             expected: currentMd5,
             received: currentTrack,
             source
@@ -270,7 +264,7 @@ function analyzeAndAct(data, source, sentMd5) {
     const nextTrackMismatch = Boolean(expectedNextMd5 && hasServerNext && nextTrack !== expectedNextMd5);
 
     if (expectedNextMd5 && !hasServerNext) {
-        console.log(`${ICON} ACTION awaiting-server-next`, {
+        overrideLog.info(`${ICON} ACTION awaiting-server-next`, {
             expected: expectedNextMd5,
             source,
             sentMd5
@@ -282,7 +276,7 @@ function analyzeAndAct(data, source, sentMd5) {
 
     if (nextTrackMismatch) {
         if (state.manualNextTrackOverride || state.pendingManualTrackId) {
-            console.log(`${ICON} ACTION server-next-ignored`, {
+            overrideLog.info(`${ICON} ACTION server-next-ignored`, {
                 expected: expectedNextMd5,
                 received: nextTrack,
                 source,
@@ -294,7 +288,7 @@ function analyzeAndAct(data, source, sentMd5) {
             return;
         }
 
-        console.log(`${ICON} ACTION next-track-mismatch`, {
+        overrideLog.info(`${ICON} ACTION next-track-mismatch`, {
             expected: expectedNextMd5,
             received: nextTrack,
             source,
@@ -302,7 +296,7 @@ function analyzeAndAct(data, source, sentMd5) {
         });
 
         if (sentMd5 && nextTrack === sentMd5) {
-            console.log(`${ICON} ACTION confirmation`, {
+            overrideLog.info(`${ICON} ACTION confirmation`, {
                 acknowledged: sentMd5,
                 source
             });
@@ -311,14 +305,14 @@ function analyzeAndAct(data, source, sentMd5) {
         }
 
         if (isTrackInNeighborhood(nextTrack)) {
-            console.log(`${ICON} ACTION promote-neighborhood`, {
+            overrideLog.info(`${ICON} ACTION promote-neighborhood`, {
                 track: nextTrack,
                 source
             });
             promoteTrackToNextStack(nextTrack);
             scheduleHeartbeat(90000);
         } else {
-            console.log(`${ICON} ACTION full-resync-needed`, {
+            overrideLog.info(`${ICON} ACTION full-resync-needed`, {
                 track: nextTrack,
                 reason: 'not_in_neighborhood',
                 source
@@ -332,7 +326,7 @@ function analyzeAndAct(data, source, sentMd5) {
     // Using server elapsed would cause desync when client joins mid-stream
     // (server knows where playhead is, but audio stream starts from current position)
 
-    console.log(`${ICON} ACTION sync-ok`, { source });
+    overrideLog.info(`${ICON} ACTION sync-ok`, { source });
 
     if (state.cardsDormant) {
         if (typeof window.resolveNextTrackData === 'function') {
@@ -358,7 +352,7 @@ function isTrackInNeighborhood(trackMd5) {
                 return track.identifier === trackMd5;
             });
             if (found) {
-                console.log(`🔍 Track ${trackMd5.substring(0,8)} found in direction: ${dirKey}`);
+                log.info(`🔍 Track ${trackMd5.substring(0,8)} found in direction: ${dirKey}`);
                 return true;
             }
         }
@@ -369,7 +363,7 @@ function isTrackInNeighborhood(trackMd5) {
 
 function promoteTrackToNextStack(trackMd5) {
     if (!state.latestExplorerData || !state.latestExplorerData.directions) {
-        console.warn('⚠️ No explorer data to promote track from');
+        log.warn('⚠️ No explorer data to promote track from');
         return;
     }
 
@@ -392,11 +386,11 @@ function promoteTrackToNextStack(trackMd5) {
     }
 
     if (!foundDirection || !foundTrack) {
-        console.error('❌ Track not found in any direction, cannot promote');
+        log.error('❌ Track not found in any direction, cannot promote');
         return;
     }
 
-    console.log(`🎯 Promoting track from ${foundDirection} to next track stack`);
+    log.info(`🎯 Promoting track from ${foundDirection} to next track stack`);
 
     if (typeof window.swapNextTrackDirection === 'function') {
         window.swapNextTrackDirection(foundDirection);
@@ -413,24 +407,24 @@ export function scheduleHeartbeat(delayMs = 60000) {
     }
 
     state.heartbeatTimeout = setTimeout(() => {
-        console.log('💓 Heartbeat triggered');
+        log.info('💓 Heartbeat triggered');
         sendNextTrack(null, null, 'heartbeat');
         window.state = window.state || {};
         const serverTrack = window.state?.lastHeartbeatResponse?.currentTrack;
         const localTrack = window.state?.latestCurrentTrack?.identifier || null;
         if (serverTrack && localTrack && serverTrack !== localTrack) {
-            console.error('🛰️ ACTION heartbeat-track-mismatch', { serverTrack, localTrack });
+            overrideLog.error('🛰️ ACTION heartbeat-track-mismatch', { serverTrack, localTrack });
             fullResync();
             return;
         }
 
     }, delayMs);
 
-    console.log(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
+    log.info(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
 }
 
 export async function fullResync() {
-    console.log('🔄 Full resync triggered - calling /refresh-sse');
+    log.info('🔄 Full resync triggered - calling /refresh-sse');
 
     try {
         const payload = {};
@@ -448,8 +442,8 @@ export async function fullResync() {
         });
 
         if (response.status === 404) {
-            console.error('🚨 Session not found on server - session was destroyed (likely server restart)');
-            console.log('🔄 Reloading page to get new session...');
+            log.error('🚨 Session not found on server - session was destroyed (likely server restart)');
+            log.info('🔄 Reloading page to get new session...');
             window.location.reload();
             return;
         }
@@ -458,13 +452,13 @@ export async function fullResync() {
 
         if (result.fingerprint) {
             if (state.streamFingerprint !== result.fingerprint) {
-                console.log(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
+                log.info(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
             }
             applyFingerprint(result.fingerprint);
         }
 
         if (result.ok) {
-            console.log('✅ Resync broadcast triggered, waiting for SSE update...');
+            log.info('✅ Resync broadcast triggered, waiting for SSE update...');
             scheduleHeartbeat(90000);
 
             if (state.pendingResyncCheckTimer) {
@@ -477,15 +471,15 @@ export async function fullResync() {
               const hasCurrent = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
 
               if (!hasCurrent || age > 5000) {
-                console.warn('🛰️ ACTION resync-followup: no track update after broadcast, requesting SSE refresh');
+                overrideLog.warn('🛰️ ACTION resync-followup: no track update after broadcast, requesting SSE refresh');
                 requestSSERefresh();
               }
             }, 5000);
         } else {
-            console.warn('⚠️ Resync failed:', result.reason);
+            log.warn('⚠️ Resync failed:', result.reason);
 
             if (result.error === 'Session not found' || result.error === 'Master session not found') {
-                console.log('🔄 Session lost, reloading page...');
+                log.info('🔄 Session lost, reloading page...');
                 window.location.reload();
                 return;
             }
@@ -493,27 +487,27 @@ export async function fullResync() {
             scheduleHeartbeat(10000);
         }
     } catch (error) {
-        console.error('❌ Resync error:', error);
+        log.error('❌ Resync error:', error);
         scheduleHeartbeat(10000);
     }
 }
 
 export async function createNewJourneySession(reason = 'unknown') {
     if (state.creatingNewSession) {
-        console.log(`🛰️ ACTION new-session-skip: already creating (${reason})`);
+        overrideLog.info(`🛰️ ACTION new-session-skip: already creating (${reason})`);
         return;
     }
 
     state.creatingNewSession = true;
     try {
-        console.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
+        overrideLog.warn(`🛰️ ACTION new-session (${reason}) - requesting fresh journey`);
 
         const streamElement = state.isStarted ? elements.audio : null;
         if (streamElement) {
             try {
                 streamElement.pause();
             } catch (err) {
-                console.warn('🎵 Pause before new session failed:', err);
+                log.warn('🎵 Pause before new session failed:', err);
             }
         }
 
@@ -547,7 +541,6 @@ export async function createNewJourneySession(reason = 'unknown') {
         }
         state.pendingExplorerNext = null;
 
-        clearPendingExplorerLookahead({ reason: 'session-reset' });
         setDeckStaleFlag(false, { reason: 'session-reset' });
 
         if (state.pendingInitialTrackTimer) {
@@ -580,13 +573,13 @@ export async function createNewJourneySession(reason = 'unknown') {
                 startAudioHealthMonitoring();
             }
             streamElement.play().catch(err => {
-                console.error('🎵 Audio play failed after new session:', err);
+                log.error('🎵 Audio play failed after new session:', err);
             });
         }
 
         scheduleHeartbeat(5000);
     } catch (error) {
-        console.error('❌ Failed to create new journey session:', error);
+        log.error('❌ Failed to create new journey session:', error);
         scheduleHeartbeat(10000);
     } finally {
         state.creatingNewSession = false;
@@ -608,7 +601,7 @@ export async function verifyExistingSessionOrRestart(reason = 'unknown', options
     try {
         const ok = await requestSSERefresh({ escalate: false });
         if (ok) {
-            console.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting');
+            overrideLog.warn('🛰️ ACTION session-rebind: stream still active, reconnecting SSE without resetting');
 
             if (connectionHealth.currentEventSource) {
                 connectionHealth.currentEventSource.close();
@@ -627,7 +620,7 @@ export async function verifyExistingSessionOrRestart(reason = 'unknown', options
             return true;
         }
     } catch (error) {
-        console.error('❌ verifyExistingSessionOrRestart failed:', error);
+        log.error('❌ verifyExistingSessionOrRestart failed:', error);
     }
 
     if (escalate) {
@@ -639,16 +632,16 @@ export async function verifyExistingSessionOrRestart(reason = 'unknown', options
 export async function requestSSERefresh(options = {}) {
     const { escalate = true, stage = 'rebroadcast' } = options;
     if (!state.streamFingerprint) {
-        console.warn('⚠️ requestSSERefresh: No fingerprint yet; waiting for SSE handshake');
+        log.warn('⚠️ requestSSERefresh: No fingerprint yet; waiting for SSE handshake');
         const ready = await waitForFingerprint(4000);
         if (!ready || !state.streamFingerprint) {
-            console.warn('⚠️ requestSSERefresh: Aborting refresh - fingerprint unavailable');
+            log.warn('⚠️ requestSSERefresh: Aborting refresh - fingerprint unavailable');
             return false;
         }
     }
 
     try {
-        console.log('🔄 Sending SSE refresh request to backend...');
+        log.info('🔄 Sending SSE refresh request to backend...');
         const requestBody = {
             reason: 'zombie_session_recovery',
             clientTime: Date.now(),
@@ -672,23 +665,23 @@ export async function requestSSERefresh(options = {}) {
 
         if (response.ok) {
             const result = await response.json();
-            console.log('✅ SSE refresh request successful:', result);
+            log.info('✅ SSE refresh request successful:', result);
 
             state.lastRefreshSummary = result;
 
             if (result.fingerprint) {
                 if (state.streamFingerprint !== result.fingerprint) {
-                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
+                    log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
                 }
                 applyFingerprint(result.fingerprint);
             }
 
             if (result.ok === false) {
                 const reason = result.reason || 'unknown';
-                console.warn(`🔄 SSE refresh reported issue: ${reason}`);
+                log.warn(`🔄 SSE refresh reported issue: ${reason}`);
 
                 if (reason === 'inactive') {
-                    console.warn('🔄 SSE refresh indicates inactive session; verifying stream state');
+                    log.warn('🔄 SSE refresh indicates inactive session; verifying stream state');
                     if (!escalate) {
                         return false;
                     }
@@ -699,21 +692,21 @@ export async function requestSSERefresh(options = {}) {
                     }
                 } else if (reason === 'no_track') {
                     state.noTrackRefreshCount = (state.noTrackRefreshCount || 0) + 1;
-                    console.warn('🔄 SSE refresh returned no track', {
+                    log.warn('🔄 SSE refresh returned no track', {
                         attempt: state.noTrackRefreshCount,
                         escalate
                     });
                     if (state.noTrackRefreshCount >= 3 && escalate) {
-                        console.warn('🛰️ No-track loop detected; creating new journey session');
+                        overrideLog.warn('🛰️ No-track loop detected; creating new journey session');
                         await createNewJourneySession('refresh_no_track_loop');
                     } else if (state.noTrackRefreshCount >= 2 && escalate) {
-                        console.warn('🛰️ Rebinding session after repeated no-track responses');
+                        overrideLog.warn('🛰️ Rebinding session after repeated no-track responses');
                         const rebound = await verifyExistingSessionOrRestart('refresh_no_track', { escalate: false });
                         if (!rebound) {
                             await createNewJourneySession('refresh_no_track_rebind_failed');
                         }
                     } else {
-                        console.warn('🔄 Scheduling quick heartbeat to re-request explorer snapshot');
+                        log.warn('🔄 Scheduling quick heartbeat to re-request explorer snapshot');
                         scheduleHeartbeat(5000);
                     }
                 }
@@ -722,11 +715,11 @@ export async function requestSSERefresh(options = {}) {
 
             state.noTrackRefreshCount = 0;
             if (result.currentTrack) {
-                console.log(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
-                console.log(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
+                log.info(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
+                log.info(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
 
                 if (result.fingerprint && state.streamFingerprint !== result.fingerprint) {
-                    console.log(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
+                    log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
                     applyFingerprint(result.fingerprint);
                 }
 
@@ -746,21 +739,21 @@ export async function requestSSERefresh(options = {}) {
                             state.selectedIdentifier = state.selectedIdentifier || nextTrackId;
                         }
                     } else {
-                        console.warn('⚠️ SSE refresh nextTrack present but missing identifier', result.nextTrack);
+                        log.warn('⚠️ SSE refresh nextTrack present but missing identifier', result.nextTrack);
                     }
                 }
 
                 if (result.explorerData) {
-                    console.log(`🔄 Backend provided exploration data, updating direction cards`);
+                    log.info(`🔄 Backend provided exploration data, updating direction cards`);
                     if (typeof window.createDimensionCards === 'function') {
                         window.createDimensionCards(result.explorerData);
                     }
                 } else {
-                    console.log(`🔄 No exploration data from backend - keeping existing cards`);
+                    log.info(`🔄 No exploration data from backend - keeping existing cards`);
                 }
 
                 if (!result.explorerData && (!state.latestExplorerData || !state.latestExplorerData.directions)) {
-                    console.warn('⚠️ Explorer data still missing after refresh; forcing follow-up request');
+                    log.warn('⚠️ Explorer data still missing after refresh; forcing follow-up request');
                     fullResync();
                 }
 
@@ -771,49 +764,51 @@ export async function requestSSERefresh(options = {}) {
                 }
 
             } else {
-                console.warn('🔄 SSE refresh completed but no current track reported');
+                log.warn('🔄 SSE refresh completed but no current track reported');
             }
 
             return true;
 
         } else {
-            console.error('❌ SSE refresh request failed:', response.status, response.statusText);
+            log.error('❌ SSE refresh request failed:', response.status, response.statusText);
             const errorText = await response.text();
-            console.error('❌ Error details:', errorText);
+            log.error('❌ Error details:', errorText);
         }
 
     } catch (error) {
-        console.error('❌ SSE refresh request error:', error);
+        log.error('❌ SSE refresh request error:', error);
     }
 
     return false;
 }
 
 export async function manualRefresh() {
-    console.log('🔄 Manual refresh requested');
+    log.info('🔄 Manual refresh requested');
 
     // First, try to fetch fresh explorer data for current track
     const currentTrackId = state.latestCurrentTrack?.identifier;
     if (currentTrackId) {
-        console.log('🔄 Fetching fresh explorer data for current track');
+        log.info('🔄 Fetching fresh explorer data for current track');
         const { fetchExplorerWithPlaylist } = await import('./explorer-fetch.js');
         const explorerData = await fetchExplorerWithPlaylist(currentTrackId, { forceFresh: true });
         if (explorerData && Object.keys(explorerData.directions || {}).length > 0) {
-            console.log('🔄 Explorer data refreshed successfully');
+            log.info('🔄 Explorer data refreshed successfully');
+            // Clear manual override so applyDeckRenderFrame doesn't block the render
+            state.manualNextTrackOverride = false;
             state.latestExplorerData = explorerData;
             if (typeof window.createDimensionCards === 'function') {
                 window.createDimensionCards(explorerData, { skipExitAnimation: false, forceRedraw: true });
             }
             return 'explorer_refresh';
         }
-        console.warn('🔄 Explorer refresh returned no directions');
+        log.warn('🔄 Explorer refresh returned no directions');
     }
 
     if (!state.streamFingerprint) {
-        console.warn('🛰️ Manual refresh: no fingerprint yet; waiting before attempting rebroadcast');
+        overrideLog.warn('🛰️ Manual refresh: no fingerprint yet; waiting before attempting rebroadcast');
         const ready = await waitForFingerprint(4000);
         if (!ready || !state.streamFingerprint) {
-            console.warn('🛰️ Manual refresh: fingerprint still missing; escalating to new session');
+            overrideLog.warn('🛰️ Manual refresh: fingerprint still missing; escalating to new session');
             await createNewJourneySession('manual_refresh_stage3_no_fingerprint');
             return 'new_session';
         }
@@ -821,18 +816,18 @@ export async function manualRefresh() {
 
     const rebroadcastOk = await requestSSERefresh({ escalate: false, stage: 'rebroadcast' });
     if (rebroadcastOk) {
-        console.log('🔄 Manual refresh: heartbeat rebroadcast succeeded');
+        log.info('🔄 Manual refresh: heartbeat rebroadcast succeeded');
         return 'rebroadcast';
     }
 
-    console.warn('🛰️ Manual refresh: rebroadcast did not recover; attempting session rebind');
+    overrideLog.warn('🛰️ Manual refresh: rebroadcast did not recover; attempting session rebind');
     const rebindOk = await verifyExistingSessionOrRestart('manual_refresh_stage2', { escalate: false });
     if (rebindOk) {
-        console.log('🔄 Manual refresh: session rebind succeeded');
+        log.info('🔄 Manual refresh: session rebind succeeded');
         return 'session_rebind';
     }
 
-    console.warn('🛰️ Manual refresh: session rebind failed; creating new journey session');
+    overrideLog.warn('🛰️ Manual refresh: session rebind failed; creating new journey session');
     await createNewJourneySession('manual_refresh_stage3');
     return 'new_session';
 }
@@ -841,7 +836,7 @@ export function setupManualRefreshButton() {
     const refreshButton = document.getElementById('refreshButton');
 
     if (!refreshButton) {
-        console.warn('🔄 Manual refresh button not found in DOM');
+        log.warn('🔄 Manual refresh button not found in DOM');
         return;
     }
 
@@ -864,32 +859,32 @@ export function setupManualRefreshButton() {
     });
 
     async function handleRefresh() {
-        console.log('🔄 Manual refresh button clicked');
+        log.info('🔄 Manual refresh button clicked');
         refreshButton.classList.add('refreshing');
 
         try {
             const outcome = await manualRefresh();
-            console.log(`🔄 Manual refresh completed via ${outcome}`);
+            log.info(`🔄 Manual refresh completed via ${outcome}`);
             setTimeout(() => refreshButton.classList.remove('refreshing'), 1200);
         } catch (error) {
-            console.error('❌ Manual refresh failed:', error);
+            log.error('❌ Manual refresh failed:', error);
             refreshButton.classList.remove('refreshing');
         }
     }
 
     async function handleHardReset() {
-        console.warn('🛑 Hard reset requested by user (double-click)');
+        log.warn('🛑 Hard reset requested by user (double-click)');
         refreshButton.classList.add('refreshing');
         try {
             await createNewJourneySession('manual_hard_reset');
         } catch (error) {
-            console.error('❌ Hard reset failed:', error);
+            log.error('❌ Hard reset failed:', error);
         } finally {
             setTimeout(() => refreshButton.classList.remove('refreshing'), 1500);
         }
     }
 
-    console.log('🔄 Manual refresh button set up (single-click: refresh, double-click: new session)');
+    log.info('🔄 Manual refresh button set up (single-click: refresh, double-click: new session)');
 }
 
 // Expose globally for backward compatibility and console debugging

@@ -37,11 +37,11 @@ const DirectionPolarity = z.enum([
 const DirectionType = z.enum([
   'rhythmic_core',    // Core rhythmic features
   'rhythmic_pca',     // Rhythmic PCA directions
-  'tonal_core',       // Core tonal features  
+  'tonal_core',       // Core tonal features
   'tonal_pca',        // Tonal PCA directions
   'spectral_core',    // Core spectral features
   'spectral_pca',     // Spectral PCA directions
-  'outlier',          // Miscellaneous/low-sample directions
+  'latent',           // VAE latent dimensions, beat_punch, entropy, crest
 ]);
 
 // ==================== DIRECTION KEY PATTERNS ====================
@@ -117,7 +117,7 @@ const ExplorerDirections = z.object({
     track: AnyTrack,                        // The recommended track
   }).optional(),
   diversityMetrics: z.record(z.any()).optional(), // Overall diversity statistics
-  resolution: z.enum(['microscope', 'magnifying_glass', 'binoculars']).optional(),
+  resolution: z.enum(['adaptive', 'microscope', 'magnifying_glass', 'binoculars']).optional(),
 });
 
 // ==================== DIRECTION KEY UTILITIES ====================
@@ -139,7 +139,7 @@ const DirectionKeyUtilities = {
     } else if (directionKey.includes('spectral') || directionKey.includes('centroid') || directionKey.includes('rolloff') || directionKey.includes('flatness')) {
       return 'spectral_core';
     } else {
-      return 'outlier';
+      return 'latent';
     }
   },
   

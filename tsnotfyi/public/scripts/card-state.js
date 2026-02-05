@@ -3,6 +3,8 @@
 // Dependencies: globals.js (state, elements)
 
 import { state, elements } from './globals.js';
+import { createLogger } from './log.js';
+const log = createLogger('deck');
 
 // No-op stub for backward compatibility - danger zone visual state no longer exists
 
@@ -28,13 +30,18 @@ export function safelyExitCardsDormantState(options = {}) {
 
 // Ensure deck is hydrated after track change
 export function ensureDeckHydratedAfterTrackChange(reason = 'unknown') {
+    // Don't re-render from stale data while a fresh explorer fetch is in flight.
+    // The fetch callback will render the new data when it arrives.
+    if (state.pendingExplorerSnapshot) {
+        return;
+    }
     const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
     if (deckContainer && deckContainer.querySelector('.dimension-card')) {
         return;
     }
     const payload = state.latestExplorerData;
     if (payload && typeof window.createDimensionCards === 'function') {
-        console.log(`🔄 Hydrating deck after track change (reason: ${reason})`);
+        log.info(`🔄 Hydrating deck after track change (reason: ${reason})`);
         window.createDimensionCards(payload, { skipExitAnimation: true, forceRedraw: true });
     }
 }

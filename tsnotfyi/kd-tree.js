@@ -1070,7 +1070,7 @@ class MusicalKDTree {
         candidates.sort((a, b) => a.similarity - b.similarity);
 
         return {
-            candidates: candidates.slice(0, 20),
+            candidates: candidates.slice(0, 50),
             totalAvailable: directionalCandidates.length,
             dimension: directionDim,
             currentValue: currentValue,
@@ -1147,17 +1147,39 @@ class MusicalKDTree {
             'less_air_sizzle': 'air_sizzle'
         };
 
-        return directionMap[direction] || 'bpm';
+        if (directionMap[direction]) return directionMap[direction];
+        // Handle raw dimension names with _up/_down suffix (e.g. pulse_cohesion_up)
+        if (direction.endsWith('_up') || direction.endsWith('_down')) {
+            const dimName = direction.replace(/_(up|down)$/, '');
+            if (this.dimensions.includes(dimName)) return dimName;
+        }
+        // If the direction is itself a valid dimension name, use it directly
+        if (this.dimensions.includes(direction)) return direction;
+        console.warn(`⚠️ getDirectionDimension: unknown direction "${direction}", falling back to bpm`);
+        return 'bpm';
     }
 
     isInDirection(currentValue, candidateValue, direction) {
         const positiveDirections = [
             'faster', 'brighter', 'more_energetic', 'more_danceable', 'more_tonal', 'more_complex',
-            'more_punchy', 'denser_onsets', 'purer_tuning', 'stronger_chords', 'more_air_sizzle'
+            'more_punchy', 'denser_onsets', 'purer_tuning', 'stronger_chords', 'more_air_sizzle',
+            'busier_onsets', 'punchier_beats', 'stronger_fifths', 'faster_changes',
+            'peakier_spectrum', 'fuller_spectrum', 'noisier', 'more_bass', 'more_air'
         ];
-        const isPositive = positiveDirections.includes(direction);
+        const negativeDirections = [
+            'slower', 'darker', 'calmer', 'less_danceable', 'more_atonal', 'simpler',
+            'smoother', 'sparser_onsets', 'smoother_beats', 'weaker_fifths', 'weaker_chords',
+            'slower_changes', 'flatter_spectrum', 'narrower_spectrum', 'more_tonal_spectrum',
+            'less_bass', 'less_air', 'less_punchy', 'less_air_sizzle', 'looser_tuning', 'impurer_tuning'
+        ];
 
-        return isPositive ? candidateValue > currentValue : candidateValue < currentValue;
+        if (positiveDirections.includes(direction)) return candidateValue > currentValue;
+        if (negativeDirections.includes(direction)) return candidateValue < currentValue;
+        // Handle _up/_down suffix convention for raw dimensions
+        if (direction.endsWith('_up')) return candidateValue > currentValue;
+        if (direction.endsWith('_down')) return candidateValue < currentValue;
+        // Unknown — assume positive
+        return candidateValue > currentValue;
     }
 
     // Get track by identifier

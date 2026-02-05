@@ -1,9 +1,11 @@
 // Deck rendering - worker management, color assignment, frame building
-// Dependencies: globals.js (state, DEBUG_FLAGS, getCardBackgroundColor)
+// Dependencies: globals.js (state, getCardBackgroundColor)
 // Dependencies: explorer-utils.js (deckFrameBuilderApi, deckRenderWorker*, fallbackNormalizeDirectionSamples, fallbackEnsureSyntheticOpposites, fallbackFrameMeta, pickPanelVariant, colorsForVariant, findTrackInExplorer)
 // Dependencies: tools.js (getDirectionType, getDirectionColor, variantFromDirectionType)
 
-import { state, DEBUG_FLAGS, getCardBackgroundColor } from './globals.js';
+import { state, getCardBackgroundColor } from './globals.js';
+import { createLogger } from './log.js';
+const log = createLogger('deck');
 import {
   deckFrameBuilderApi,
   deckRenderWorker,
@@ -65,7 +67,7 @@ export function runDeckFrameBuild(payload = {}) {
     }
     return builder.buildDeckRenderFrame(payload);
   } catch (error) {
-    console.error('🛠️ Deck frame builder failed:', error);
+    log.error('🛠️ Deck frame builder failed:', error);
     const fallbackExplorer = payload?.explorerData || null;
     if (fallbackExplorer && fallbackExplorer.directions) {
       Object.values(fallbackExplorer.directions).forEach(fallbackNormalizeDirectionSamples);
@@ -104,7 +106,7 @@ function teardownDeckRenderWorker(error) {
     try {
       localDeckRenderWorker.terminate();
     } catch (terminateError) {
-      console.warn('🛠️ Deck worker termination warning:', terminateError);
+      log.warn('🛠️ Deck worker termination warning:', terminateError);
     }
   }
   localDeckRenderWorker = null;
@@ -128,11 +130,11 @@ export function initDeckRenderWorker() {
     localDeckRenderWorker = new Worker('scripts/render-frame.worker.js');
     localDeckRenderWorker.addEventListener('message', handleDeckRenderWorkerMessage);
     localDeckRenderWorker.addEventListener('error', (event) => {
-      console.error('🛠️ Deck render worker error:', event);
+      log.error('🛠️ Deck render worker error:', event);
       teardownDeckRenderWorker(new Error('Deck render worker crashed'));
     });
   } catch (error) {
-    console.warn('🛠️ Deck render worker unavailable; falling back to main thread', error);
+    log.warn('🛠️ Deck render worker unavailable; falling back to main thread', error);
     localDeckRenderWorker = null;
   }
 
@@ -162,32 +164,6 @@ export function requestDeckRenderFrame(payload = {}) {
       clearTimeout(timeout);
       deckRenderWorkerRequests.delete(requestId);
       reject(error);
-    }
-  });
-}
-
-export function scheduleDeckDomMutation(work) {
-  if (typeof work !== 'function') {
-    return;
-  }
-  if (typeof window === 'undefined') {
-    work();
-    return;
-  }
-  if (window.__deckTestHooks && window.__deckTestHooks.forceImmediateRender) {
-    work();
-    return;
-  }
-  const raf = window.requestAnimationFrame || function fallbackRaf(cb) {
-    return setTimeout(cb, 16);
-  };
-  const ric = window.requestIdleCallback;
-
-  raf(() => {
-    if (typeof ric === 'function') {
-      ric(() => work(), { timeout: 120 });
-    } else {
-      work();
     }
   });
 }
@@ -299,35 +275,13 @@ export function computeDirectionSignature(explorerData) {
   return `${nextDirection}::${nextIdentifier}::${entries.join('||')}`;
 }
 
-export function deckLog(...args) {
-  if (DEBUG_FLAGS.deck) {
-    console.log(...args);
-  }
-}
-
-export function duplicateLog(...args) {
-  if (DEBUG_FLAGS.duplicates) {
-    console.log(...args);
-  }
-}
-
-export function colorLog(...args) {
-  if (DEBUG_FLAGS.colors) {
-    console.log(...args);
-  }
-}
-
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
   window.setCardVariant = setCardVariant;
   window.getCardBackgroundColor = getCardBackgroundColor;
   window.runDeckFrameBuild = runDeckFrameBuild;
   window.requestDeckRenderFrame = requestDeckRenderFrame;
-  window.scheduleDeckDomMutation = scheduleDeckDomMutation;
   window.cacheTrackColorAssignment = cacheTrackColorAssignment;
   window.resolveTrackColorAssignment = resolveTrackColorAssignment;
   window.computeDirectionSignature = computeDirectionSignature;
-  window.deckLog = deckLog;
-  window.duplicateLog = duplicateLog;
-  window.colorLog = colorLog;
 }

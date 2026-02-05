@@ -55,13 +55,12 @@ body {
 
 #volumeControl {
     position: fixed;
-    bottom: 60px;
+    bottom: 20px;
     right: 20px;
     width: 32px;
     height: 140px;
     background: rgba(17, 17, 17, 0.9);
     border: 1px solid #0a0;
-    border-radius: 18px;
     cursor: grab;
     display: none;
     z-index: 2000;
@@ -75,7 +74,6 @@ body {
     background: #0a0;
     height: 100%;
     transition: height 0.1s;
-    border-radius: 0 0 18px 18px;
 }
 
 .diagnostic-bar {
@@ -103,6 +101,14 @@ body {
     text-align: right;
     padding-right: 1em;
     margin-top: 5px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+
+/* Show clock when hovering volume control or the clock itself */
+#volumeControl:hover + .diagnostic-bar .playback-clock,
+.diagnostic-bar:hover .playback-clock {
+    opacity: 1;
 }
 
 .playback-clock.is-hidden {
@@ -212,45 +218,6 @@ body {
     color: #0f0;
 }
 
-/* JSON metadata overlay with terminal styling and 3D depth */
-#directionKeyOverlay {
-    position: fixed;
-    left: 0;
-    top: 0;
-    width: 100%;
-    height: 100%;
-    transform: translateX(13%) translateY(-42%) rotateX(23deg) rotateZ(23deg) translateZ(-666px);
-    z-index: 1; /* Behind cards but above background */
-    pointer-events: none;
-    transition: opacity 0.5s ease, transform 0.5s ease;
-    perspective: 1000px;
-}
-
-#directionKeyOverlay.hidden {
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(-50%) rotateY(-8deg) rotateX(2deg) translateZ(-400px);
-}
-
-/* Custom scrollbar for JSON metadata overlay */
-#directionKeyText::-webkit-scrollbar {
-    width: 8px;
-}
-
-#directionKeyText::-webkit-scrollbar-track {
-    background: rgba(0, 170, 0, 0.05);
-    border-radius: 4px;
-}
-
-#directionKeyText::-webkit-scrollbar-thumb {
-    background: rgba(0, 170, 0, 0.2);
-    border-radius: 4px;
-}
-
-#directionKeyText::-webkit-scrollbar-thumb:hover {
-    background: rgba(0, 170, 0, 0.3);
-}
-
 /* Manual refresh button */
 #refreshButton {
     position: fixed;
@@ -308,93 +275,6 @@ body {
 @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
-}
-
-/* Connection health indicator */
-#connectionHealth {
-    position: fixed;
-    top: 20px;
-    left: 20px;
-    width: 40px;
-    height: 40px;
-    background: rgba(17, 17, 17, 0.9);
-    border: 1px solid #0a0;
-    border-radius: 20px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    opacity: 0.4;
-    transition: all 0.3s ease;
-    z-index: 2000;
-    user-select: none;
-    backdrop-filter: blur(4px);
-}
-
-#connectionHealth:hover {
-    opacity: 0.8;
-    background: rgba(17, 17, 17, 1.0);
-    transform: scale(1.1);
-}
-
-#connectionHealth.healthy {
-    border-color: #0a0;
-}
-
-#connectionHealth.degraded {
-    border-color: #ff0;
-    opacity: 0.6;
-}
-
-#connectionHealth.error {
-    border-color: #f00;
-    opacity: 0.8;
-    animation: pulse 1s ease-in-out infinite;
-}
-
-.health-dot {
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: #0a0;
-    transition: background 0.3s ease;
-}
-
-#connectionHealth.degraded .health-dot {
-    background: #ff0;
-}
-
-#connectionHealth.error .health-dot {
-    background: #f00;
-}
-
-@keyframes pulse {
-    0%, 100% { opacity: 0.8; }
-    50% { opacity: 1.0; }
-}
-
-/* Connection status tooltip */
-.connection-tooltip {
-    position: absolute;
-    top: 50px;
-    left: 0;
-    background: rgba(17, 17, 17, 0.95);
-    border: 1px solid #0a0;
-    padding: 8px 12px;
-    border-radius: 4px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    color: #0a0;
-    white-space: nowrap;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.2s ease;
-    z-index: 2001;
-    backdrop-filter: blur(4px);
-}
-
-#connectionHealth:hover .connection-tooltip {
-    opacity: 1;
 }
 
 /* Fuzzy search interface */
@@ -571,14 +451,6 @@ body {
     transition: none; /* Animation will be handled by JavaScript */
 }
 
-#progressFill {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(69deg, #093, #1c5);
-    border-radius: 9px;
-    transition: width 0.1s linear;
-}
-
 audio {
     display: none;
 }
@@ -714,12 +586,22 @@ audio {
 .label h5 { margin: 0 0 .4rem 0; font-size: 0.8rem; font-weight: 400; opacity: 0.8; }
 .label p { margin: 0; opacity: .9; font-size: .75rem; }
 
+/* Now-playing card departure: label blurs, photo fades before track change.
+   Base transition on the elements so removal also animates (blur-out then sharp-in). */
+#nowPlayingCard .label {
+    filter: blur(0px);
+    transition: filter 0.4s ease-in;
+}
+#nowPlayingCard .photo {
+    transition: opacity 0.4s ease-in;
+}
+
 /* Dimension Cards Container */
 #dimensionCards {
     position: fixed;
     right: 0;
     top: 50%;
-    width: 90vw;
+    width: 75vw;
     height: 60vw;
     max-width: 900px;
     max-height: 700px;
@@ -797,14 +679,6 @@ audio {
 }
 
 
-
-
-
-/* Danger Zone tilt state for direction cards inside the final lockout window */
-.dimension-card:not(.track-detail-card).danger-zone-tilt {
-    transform: translate(-50%, -50%) translateZ(-1200px) scale(0.5) rotateX(45deg);
-    transition: transform 1s ease-out;
-}
 
 /* Playlist Tray - Queue with left/right stacks */
 #nextTrackTray {
@@ -931,11 +805,6 @@ audio {
 }
 
 
-/* Legacy support - keep old class for backward compatibility */
-.next-track-tray-preview {
-    display: none; /* Hidden - replaced by playlist tray */
-}
-
 @keyframes dimensionCardExitCurve {
     0% {
         opacity: 1;
@@ -981,26 +850,6 @@ audio {
     will-change: transform, opacity;
 }
 
-/* Pack-away trigger zone indicator (optional visual feedback) */
-.pack-away-indicator {
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    padding: 8px 16px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-    font-size: 12px;
-    color: rgba(255, 255, 255, 0.6);
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.3s ease;
-}
-
-.pack-away-indicator.visible {
-    opacity: 1;
-}
-
 #dimensionCards.cards-dormant .dimension-card {
     opacity: 1;
     filter: none;
@@ -1033,10 +882,6 @@ audio {
 
 :root.deck-stale #dimensionCards .dimension-card .label {
     opacity: 0.85;
-}
-
-.dimension-card.danger-zone-locked {
-    pointer-events: none;
 }
 
 .stacked-preview-layer {
@@ -1139,12 +984,6 @@ audio {
 
 .beets-chip .chip-bracket {
     color: rgba(255, 255, 255, 0.25);
-}
-
-/* Interaction locked state */
-.dimension-card.interaction-locked {
-    cursor: not-allowed;
-    filter: saturate(0.3);
 }
 
 /* Heavily stacked inactive cards should be more transparent */
@@ -1555,111 +1394,4 @@ audio {
     box-shadow: 0 12px 48px rgba(52, 152, 219, 0.4), inset 0 1px 0 rgba(52, 152, 219, 0.3);
 }
 
-/* ARROWS (each arrow is: circular arc (::before) + triangle head (::after)) */
-.arrow {
-    position: absolute;
-    inset: 0;
-    display: block;
-    z-index: 1;
-    transform: rotate(25deg);
-    pointer-events: none;
-}
 
-/* common arc */
-.arrow::before {
-    content: "";
-    position: absolute;
-    width: 68%;
-    height: 68%;
-    left: 16%;
-    top: 16%;
-    border: 1px solid #fff;
-    border-right-color: transparent;
-    border-bottom-color: transparent;
-    border-radius: 50%;
-}
-
-/* common head */
-.arrow::after {
-    content: "";
-    position: absolute;
-    width: 0;
-    height: 0;
-    border: 1px solid transparent;
-    border-left-color: #fff;
-}
-
-/* top-right pointing arrow */
-.arrow.a::before {
-    transform: rotate(-8deg);
-}
-.arrow.a::after {
-    left: 66%;
-    top: 6%;
-    transform: rotate(12deg);
-}
-
-/* bottom-left pointing arrow (mirror/offset) */
-.arrow.b {
-    transform: rotate(205deg);
-}
-.arrow.b::before {
-    transform: rotate(-8deg);
-}
-.arrow.b::after {
-    left: 66%;
-    top: 6%;
-    transform: rotate(12deg);
-}
-
-/* Card flip animation */
-.dimension-card.flipping {
-    animation: cardFlip 0.6s ease-in-out;
-}
-
-@keyframes cardFlip {
-    0% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
-    50% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(90deg); }
-    100% { transform: translate(-50%, -50%) translateZ(-1500px) scale(0.4) rotateY(0deg); }
-}
-
-
-#hardResetButton {
-    position: fixed;
-    top: 20px;
-    right: 70px;
-    width: 36px;
-    height: 36px;
-    background: rgba(17, 17, 17, 0.75);
-    border: 1px solid rgba(255, 0, 0, 0.5);
-    border-radius: 18px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    opacity: 0.35;
-    transition: all 0.3s ease;
-    z-index: 1995;
-    user-select: none;
-    backdrop-filter: blur(4px);
-}
-
-#hardResetButton:hover {
-    opacity: 0.8;
-    background: rgba(17, 17, 17, 0.95);
-    border-color: #f44;
-    transform: scale(1.05);
-}
-
-#hardResetButton.refreshing {
-    opacity: 1;
-    border-color: #ff8080;
-    background: rgba(255, 0, 0, 0.2);
-    animation: spin 1.5s linear infinite;
-}
-
-#hardResetButton .refresh-icon {
-    font-size: 16px;
-    font-weight: bold;
-    color: #f55;
-}

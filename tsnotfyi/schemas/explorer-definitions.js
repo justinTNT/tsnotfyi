@@ -28,7 +28,7 @@ const ExplorerDataCore = z.object({
   }).optional(),
   
   // Context information
-  resolution: z.enum(['microscope', 'magnifying_glass', 'binoculars']), // Current zoom level
+  resolution: z.enum(['adaptive', 'microscope', 'magnifying_glass', 'binoculars']), // Current zoom level
   centerTrack: AnyTrack.optional(),         // Track at center of exploration
   generatedAt: z.date(),                    // When this data was generated
   cacheKey: z.string().optional(),          // Cache identifier (trackId_resolution)

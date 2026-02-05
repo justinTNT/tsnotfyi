@@ -1,10 +1,12 @@
 // Deck state management - staleness flags, explorer snapshot timing, backup restoration
-// Dependencies: globals.js (state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS, debugLog)
+// Dependencies: globals.js (state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS)
 // Dependencies: explorer-utils.js (cloneExplorerData)
 // Dependencies: explorer-fetch.js (fetchExplorerWithPlaylist) - loaded dynamically to avoid circular imports
 
-import { state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS, debugLog } from './globals.js';
+import { state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS } from './globals.js';
 import { cloneExplorerData } from './explorer-utils.js';
+import { createLogger } from './log.js';
+const log = createLogger('deck');
 
 // Dynamic import to avoid potential circular dependency issues
 async function loadExplorerFetch() {
@@ -16,7 +18,7 @@ export function setDeckStaleFlag(active, context = {}) {
   if (state.staleExplorerDeck === active) {
     if (active && context.reason && context.reason !== state.deckStaleContext) {
       state.deckStaleContext = context.reason;
-      debugLog('deck', `🧭 Deck stale context updated → ${context.reason}`);
+      log.debug(`🧭 Deck stale context updated → ${context.reason}`);
     }
     return;
   }
@@ -26,7 +28,7 @@ export function setDeckStaleFlag(active, context = {}) {
     rootElement.classList.toggle('deck-stale', Boolean(active));
   }
   if (active) {
-    debugLog('deck', '🧭 Deck marked stale; waiting for explorer payload', context);
+    log.debug('🧭 Deck marked stale; waiting for explorer payload', context);
     if (state.deckStaleFailsafeTimer) {
       clearTimeout(state.deckStaleFailsafeTimer);
     }
@@ -38,7 +40,7 @@ export function setDeckStaleFlag(active, context = {}) {
       const deckContainer = elements.dimensionCards || document.getElementById('dimensionCards');
       const hasCards = Boolean(deckContainer && deckContainer.children && deckContainer.children.length > 0);
       if (hasCards) {
-        console.warn('🛟 Deck stale failsafe clearing overlay after timeout', {
+        log.warn('🛟 Deck stale failsafe clearing overlay after timeout', {
           reason: state.deckStaleContext
         });
         setDeckStaleFlag(false, { reason: 'failsafe-timeout' });
@@ -49,7 +51,7 @@ export function setDeckStaleFlag(active, context = {}) {
       clearTimeout(state.deckStaleFailsafeTimer);
       state.deckStaleFailsafeTimer = null;
     }
-    debugLog('deck', '🧭 Deck stale cleared', context);
+    log.debug('🧭 Deck stale cleared', context);
   }
 }
 
@@ -85,7 +87,7 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
   });
 
   // Fetch explorer data via POST /explorer (replaces SSE-based explorer snapshots)
-  console.log(`🎯 Fetching explorer for track ${trackId.substring(0, 8)}...`);
+  log.info(`🎯 Fetching explorer for track ${trackId.substring(0, 8)}...`);
 
   // Use async wrapper to handle dynamic import
   (async () => {
@@ -94,19 +96,32 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
       const data = await fetchExplorerWithPlaylist(trackId);
 
       if (!data) {
-        console.warn('🧭 Explorer fetch returned no data');
+        log.warn('🧭 Explorer fetch returned no data');
         handleExplorerSnapshotTimeout();
         return;
       }
 
       // Check if we're still waiting for this track's data
       if (state.pendingExplorerSnapshot?.trackId !== trackId) {
-        console.log('🧭 Explorer data arrived for stale track, ignoring');
+        log.info('🧭 Explorer data arrived for stale track, ignoring');
         return;
       }
 
+      // Verify explorer data is for the track we should be exploring from
+      const expectedTrackId = (state.playlist?.length > 0)
+          ? state.playlist[state.playlist.length - 1].trackId
+          : state.latestCurrentTrack?.identifier;
+      const explorerSourceId = data.currentTrack?.identifier;
+      if (expectedTrackId && explorerSourceId && explorerSourceId !== expectedTrackId) {
+          log.warn('🧭 Explorer data source mismatch — expected exploration from', {
+              expected: expectedTrackId.substring(0, 8),
+              got: explorerSourceId.substring(0, 8)
+          });
+          return;
+      }
+
       // Apply the explorer data
-      console.log(`🎯 Explorer data received for ${trackId.substring(0, 8)}: ${Object.keys(data.directions || {}).length} directions, nextTrack: ${data.nextTrack?.track?.title || 'none'}`);
+      log.info(`🎯 Explorer data received for ${trackId.substring(0, 8)}: ${Object.keys(data.directions || {}).length} directions, nextTrack: ${data.nextTrack?.track?.title || 'none'}`);
       state.pendingExplorerSnapshot = null;
       state.latestExplorerData = {
         ...data,
@@ -119,15 +134,22 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
 
       // Render the dimension cards
       if (typeof window.createDimensionCards === 'function') {
-        window.createDimensionCards(state.latestExplorerData, { skipExitAnimation: false, forceRedraw: true });
+        window.createDimensionCards(state.latestExplorerData, { skipExitAnimation: false });
       }
 
-      // Update now-playing card with explorer's album cover (fixes first track cover delay)
-      if (data.currentTrack?.albumCover && typeof window.updateNowPlayingCard === 'function') {
-        window.updateNowPlayingCard(state.latestCurrentTrack || data.currentTrack, null);
+      // Update now-playing card with explorer's album cover
+      // On initial load this is the first time the card gets fully rendered (deferred from heartbeat)
+      if (typeof window.updateNowPlayingCard === 'function') {
+        if (state.awaitingInitialExplorer) {
+          log.info(`🎯 Initial explorer arrived — presenting now-playing card with full data`);
+          state.awaitingInitialExplorer = false;
+          window.updateNowPlayingCard(state.latestCurrentTrack || data.currentTrack, null);
+        } else if (data.currentTrack?.albumCover) {
+          window.updateNowPlayingCard(state.latestCurrentTrack || data.currentTrack, null);
+        }
       }
     } catch (error) {
-      console.error('🧭 Explorer fetch failed:', error);
+      log.error('🧭 Explorer fetch failed:', error);
       handleExplorerSnapshotTimeout();
     }
   })();
@@ -136,7 +158,7 @@ export function armExplorerSnapshotTimer(trackId, context = {}) {
   const timeoutMs = context.timeoutMs || state.explorerSnapshotTimeoutMs || PENDING_EXPLORER_FORCE_MS;
   state.pendingExplorerTimer = setTimeout(() => {
     if (state.pendingExplorerSnapshot?.trackId === trackId) {
-      console.warn('🧭 Explorer fetch timed out');
+      log.warn('🧭 Explorer fetch timed out');
       handleExplorerSnapshotTimeout();
     }
   }, timeoutMs);
@@ -152,7 +174,7 @@ function handleExplorerSnapshotTimeout() {
   const retryCount = pending.retryCount || 0;
   const maxRetries = 3;
 
-  console.warn('🧭 Explorer fetch timeout; retrying', {
+  log.warn('🧭 Explorer fetch timeout; retrying', {
     trackId: pending.trackId?.substring(0, 8),
     waitedMs: Date.now() - pending.queuedAt,
     reason: pending.reason,
@@ -163,17 +185,20 @@ function handleExplorerSnapshotTimeout() {
 
   // Retry immediately rather than using stale backup
   if (retryCount < maxRetries && pending.trackId) {
-    // Verify this is still the current track before retrying
+    // Verify this is still the expected track before retrying
     const currentTrackId = state.latestCurrentTrack?.identifier;
-    if (pending.trackId === currentTrackId) {
-      console.log(`🧭 Retrying explorer fetch (attempt ${retryCount + 1}/${maxRetries})`);
+    const expectedRetryTarget = (state.playlist?.length > 0)
+        ? state.playlist[state.playlist.length - 1].trackId
+        : currentTrackId;
+    if (pending.trackId === expectedRetryTarget) {
+      log.info(`🧭 Retrying explorer fetch (attempt ${retryCount + 1}/${maxRetries})`);
       armExplorerSnapshotTimer(pending.trackId, {
         reason: 'retry-after-timeout',
         retryCount: retryCount + 1
       });
       return;
     } else {
-      console.log('🧭 Skipping retry - track has changed', {
+      log.info('🧭 Skipping retry - track has changed', {
         pendingTrackId: pending.trackId.substring(0, 8),
         currentTrackId: currentTrackId?.substring(0, 8)
       });
@@ -183,12 +208,18 @@ function handleExplorerSnapshotTimeout() {
   // After max retries, try backup only if it matches current track
   if (!useExplorerBackupDeck(pending)) {
     // Backup rejected (wrong track) - schedule another retry with backoff
-    const currentTrackId = state.latestCurrentTrack?.identifier;
-    if (pending.trackId === currentTrackId) {
-      console.log('🧭 Backup rejected; scheduling delayed retry');
+    const backupCurrentTrackId = state.latestCurrentTrack?.identifier;
+    const expectedBackupTarget = (state.playlist?.length > 0)
+        ? state.playlist[state.playlist.length - 1].trackId
+        : backupCurrentTrackId;
+    if (pending.trackId === expectedBackupTarget) {
+      log.info('🧭 Backup rejected; scheduling delayed retry');
       setTimeout(() => {
         // Re-check track hasn't changed
-        if (state.latestCurrentTrack?.identifier === pending.trackId && !state.pendingExplorerSnapshot) {
+        const delayedExpectedTarget = (state.playlist?.length > 0)
+            ? state.playlist[state.playlist.length - 1].trackId
+            : state.latestCurrentTrack?.identifier;
+        if (delayedExpectedTarget === pending.trackId && !state.pendingExplorerSnapshot) {
           armExplorerSnapshotTimer(pending.trackId, {
             reason: 'retry-after-backup-rejected',
             retryCount: 0  // Reset retry count for new attempt cycle
@@ -203,7 +234,7 @@ function handleExplorerSnapshotTimeout() {
 function useExplorerBackupDeck(pendingContext = {}) {
   const backup = state.lastExplorerPayload ? cloneExplorerData(state.lastExplorerPayload) : null;
   if (!backup || !backup.directions) {
-    console.warn('⚠️ Explorer backup unavailable; no directions to display');
+    log.warn('⚠️ Explorer backup unavailable; no directions to display');
     return false;
   }
 
@@ -211,7 +242,7 @@ function useExplorerBackupDeck(pendingContext = {}) {
   const backupTrackId = backup.currentTrack?.identifier || null;
   const wantedTrackId = pendingContext.trackId || state.latestCurrentTrack?.identifier || null;
   if (backupTrackId && wantedTrackId && backupTrackId !== wantedTrackId) {
-    console.warn('⚠️ Explorer backup is for wrong track; ignoring stale data', {
+    log.warn('⚠️ Explorer backup is for wrong track; ignoring stale data', {
       backupTrackId: backupTrackId.substring(0, 8),
       wantedTrackId: wantedTrackId.substring(0, 8)
     });
@@ -225,53 +256,20 @@ function useExplorerBackupDeck(pendingContext = {}) {
       window.createDimensionCards(backup, { skipExitAnimation: true, forceRedraw: true });
     }
     state.lastExplorerPayload = cloneExplorerData(backup) || backup;
-    console.log('🧭 Restored deck from explorer backup', {
+    log.info('🧭 Restored deck from explorer backup', {
       trackId: pendingContext.trackId || null
     });
     return true;
   } catch (error) {
-    console.error('❌ Failed to render explorer backup deck', error);
+    log.error('❌ Failed to render explorer backup deck', error);
     return false;
   }
 }
 
-export function clearPendingExplorerLookahead(context = {}) {
-  if (state.pendingExplorerLookaheadTimer) {
-    clearTimeout(state.pendingExplorerLookaheadTimer);
-    state.pendingExplorerLookaheadTimer = null;
-  }
-  if (state.pendingExplorerLookaheadTrackId && context.reason) {
-    debugLog('deck', '🧭 Clearing pending explorer lookahead', {
-      trackId: state.pendingExplorerLookaheadTrackId,
-      reason: context.reason
-    });
-  }
-  state.pendingExplorerLookaheadTrackId = null;
-  state.pendingExplorerLookaheadSnapshot = null;
-}
-
-export function forceApplyPendingExplorerSnapshot(reason = 'forced') {
-  const pending = state.pendingExplorerLookaheadSnapshot;
-  const trackId = state.pendingExplorerLookaheadTrackId || pending?.currentTrack?.identifier || null;
-  clearPendingExplorerLookahead({ reason: `force-${reason}` });
-  if (!pending) {
-    return;
-  }
-  debugLog('deck', '🧭 Force-applying pending explorer snapshot', { trackId, reason });
-  setTimeout(() => {
-    if (typeof window.__handleExplorerSnapshot === 'function') {
-      window.__handleExplorerSnapshot(pending, { forced: true });
-    } else {
-      console.warn('🧭 handleExplorerSnapshot not yet available, snapshot discarded');
-    }
-  }, 0);
-}
 
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
   window.setDeckStaleFlag = setDeckStaleFlag;
   window.clearExplorerSnapshotTimer = clearExplorerSnapshotTimer;
   window.armExplorerSnapshotTimer = armExplorerSnapshotTimer;
-  window.clearPendingExplorerLookahead = clearPendingExplorerLookahead;
-  window.forceApplyPendingExplorerSnapshot = forceApplyPendingExplorerSnapshot;
 }

@@ -4,7 +4,10 @@
 
 import { state, elements } from './globals.js';
 import { fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
+import { findTrackInExplorer } from './explorer-utils.js';
 import { packUpStackCards, clearStackedPreviewLayer } from './helpers.js';
+import { createLogger } from './log.js';
+const log = createLogger('tray');
 
 /**
  * Add a track to the playlist queue
@@ -18,7 +21,7 @@ import { packUpStackCards, clearStackedPreviewLayer } from './helpers.js';
  */
 export function addToPlaylist(item) {
     if (!item || !item.trackId) {
-        console.warn('addToPlaylist: Invalid item', item);
+        log.warn('addToPlaylist: Invalid item', item);
         return;
     }
 
@@ -30,7 +33,7 @@ export function addToPlaylist(item) {
     // Don't add duplicates
     const exists = state.playlist.some(p => p.trackId === item.trackId);
     if (exists) {
-        console.log(`addToPlaylist: Track ${item.trackId.substring(0, 8)} already in playlist`);
+        log.info(`addToPlaylist: Track ${item.trackId.substring(0, 8)} already in playlist`);
         return;
     }
 
@@ -45,7 +48,7 @@ export function addToPlaylist(item) {
     };
 
     state.playlist.push(playlistItem);
-    console.log(`addToPlaylist: Added ${item.trackId.substring(0, 8)} (${state.playlist.length} in queue)`);
+    log.info(`addToPlaylist: Added ${item.trackId.substring(0, 8)} (${state.playlist.length} in queue)`);
 
     // Update tray UI
     renderPlaylistTray();
@@ -60,12 +63,12 @@ export function addToPlaylist(item) {
  */
 export function unwindPlaylist() {
     if (!Array.isArray(state.playlist) || state.playlist.length === 0) {
-        console.log('unwindPlaylist: Playlist is empty');
+        log.info('unwindPlaylist: Playlist is empty');
         return null;
     }
 
     const removed = state.playlist.pop();
-    console.log(`unwindPlaylist: Removed ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
+    log.info(`unwindPlaylist: Removed ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
 
     // Update tray UI
     renderPlaylistTray();
@@ -83,7 +86,7 @@ export function popPlaylistHead() {
     }
 
     const removed = state.playlist.shift();
-    console.log(`popPlaylistHead: Popped ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
+    log.info(`popPlaylistHead: Popped ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
 
     // Update tray UI
     renderPlaylistTray();
@@ -115,8 +118,7 @@ export function playlistHasItems() {
  */
 export function clearPlaylist() {
     state.playlist = [];
-    state.playlistCursor = 0;
-    console.log('clearPlaylist: Queue cleared');
+    log.info('clearPlaylist: Queue cleared');
     renderPlaylistTray();
 }
 
@@ -128,7 +130,7 @@ export function clearPlaylist() {
  */
 export async function refreshExplorerForPlaylist(trackId) {
     if (!trackId) {
-        console.warn('refreshExplorerForPlaylist: No trackId');
+        log.warn('refreshExplorerForPlaylist: No trackId');
         return null;
     }
 
@@ -205,6 +207,9 @@ export function renderPlaylistTray() {
     // Update tray visibility
     const hasItems = playlistHasItems();
     trayRoot.classList.toggle('has-items', hasItems);
+
+    const ids = (state.playlist || []).map(p => p.trackId.substring(0, 8));
+    log.info(`renderPlaylistTray: ${ids.length} items [${ids.join(', ')}] visible=${hasItems}`);
 }
 
 /**
@@ -212,42 +217,52 @@ export function renderPlaylistTray() {
  * Animates the card to the tray, then fetches explorer for that track
  */
 export async function promoteCenterCardToTray() {
-    // Find the current center card (next-track)
-    const centerCard = document.querySelector('.dimension-card.next-track');
-    console.log('🎯 promoteCenterCardToTray: Looking for center card', {
-        found: !!centerCard,
-        allCards: document.querySelectorAll('.dimension-card').length,
-        nextTrackCards: document.querySelectorAll('.dimension-card.next-track').length
-    });
-    if (!centerCard) {
-        console.log('promoteCenterCardToTray: No center card found');
-        return null;
+    // Resolve the next track from the user's selection (selectedIdentifier),
+    // falling back to the server's recommendation (latestExplorerData.nextTrack).
+    let nextTrackObj = null;
+    let resolvedDirection = null;
+
+    if (state.selectedIdentifier && state.latestExplorerData) {
+        const match = findTrackInExplorer(state.latestExplorerData, state.selectedIdentifier);
+        if (match) {
+            nextTrackObj = match.track;
+            resolvedDirection = match.directionKey;
+            log.info(`🎯 Resolved from selectedIdentifier: ${state.selectedIdentifier.substring(0, 8)} dir=${resolvedDirection}`);
+        }
     }
 
-    // Extract track info from the center card
-    const directionKey = centerCard.dataset.directionKey;
-    const trackIndex = parseInt(centerCard.dataset.trackIndex, 10) || 0;
+    if (!nextTrackObj) {
+        const nextTrackEntry = state.latestExplorerData?.nextTrack;
+        nextTrackObj = nextTrackEntry?.track || nextTrackEntry;
+        resolvedDirection = nextTrackEntry?.directionKey || null;
+        if (nextTrackObj) {
+            log.info(`🎯 Falling back to server nextTrack recommendation`);
+        }
+    }
 
-    // Get track from explorer data for reliability (dataset may be stale)
-    const direction = state.latestExplorerData?.directions?.[directionKey];
-    const sampleTracks = direction?.sampleTracks || [];
-    const currentSample = sampleTracks[trackIndex] || sampleTracks[0];
-    const currentTrack = currentSample?.track || currentSample;
-
-    // Use explorer data if available, fall back to dataset/state
-    const trackId = currentTrack?.identifier || centerCard.dataset.trackMd5 || state.selectedIdentifier;
-    const albumCover = currentTrack?.albumCover || '';
-    const title = currentTrack?.title || centerCard.dataset.trackTitle || 'Unknown';
-    const artist = currentTrack?.artist || centerCard.dataset.trackArtist || 'Unknown Artist';
-
-    console.log(`🎯 Promote: direction=${directionKey}, trackIndex=${trackIndex}, trackId=${trackId?.substring(0,8)}, title=${title}`);
+    const trackId = nextTrackObj?.identifier;
 
     if (!trackId) {
-        console.warn('promoteCenterCardToTray: No trackId found on center card');
+        log.warn('promoteCenterCardToTray: no next track in explorer data');
         return null;
     }
 
-    console.log(`🎯 Promoting center card to tray: ${trackId.substring(0, 8)} (${title})`);
+    // Never promote the currently-playing track.
+    if (trackId === state.latestCurrentTrack?.identifier) {
+        log.warn(`⚠️ promoteCenterCardToTray: refusing to promote current track ${trackId.substring(0, 8)}`);
+        return null;
+    }
+
+    const albumCover = nextTrackObj?.albumCover || '';
+    const title = nextTrackObj?.title || 'Unknown';
+    const artist = nextTrackObj?.artist || 'Unknown Artist';
+
+    log.info(`🎯 Promote: ${trackId.substring(0, 8)} (${title}) direction=${resolvedDirection}`);
+
+    // We still need the DOM card for the fly-to-tray animation
+    const centerCard = document.querySelector('.dimension-card.next-track');
+
+    log.info(`🎯 Promoting center card to tray: ${trackId.substring(0, 8)} (${title})`);
 
     // Check if playlist is empty BEFORE adding (first item needs server notification)
     const wasEmpty = !playlistHasItems();
@@ -256,33 +271,33 @@ export async function promoteCenterCardToTray() {
     const explorerData = state.latestExplorerData ? JSON.parse(JSON.stringify(state.latestExplorerData)) : null;
 
     // Add to playlist
-    console.log(`🎯 Adding to playlist: ${trackId?.substring(0, 8)} (${title})`);
+    log.info(`🎯 Adding to playlist: ${trackId?.substring(0, 8)} (${title})`);
     const item = addToPlaylist({
         trackId,
         albumCover,
-        directionKey,
+        directionKey: resolvedDirection,
         explorerData,
         title,
         artist
     });
 
     if (!item) {
-        console.log('🎯 addToPlaylist returned falsy - track may be duplicate or invalid');
+        log.info('🎯 addToPlaylist returned falsy - track may be duplicate or invalid');
         return null;
     }
-    console.log(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
+    log.info(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
 
     // Only tell server if this is the first item (immediate next track needed)
     if (wasEmpty && typeof window.sendNextTrack === 'function') {
-        console.log(`🎯 First playlist item - notifying server: ${trackId.substring(0, 8)}`);
-        window.sendNextTrack(trackId, directionKey, 'user');
+        log.info(`🎯 First playlist item - notifying server: ${trackId.substring(0, 8)}`);
+        window.sendNextTrack(trackId, resolvedDirection, 'user');
     }
 
     // Step 1: Pack up stack cards first
     await packUpStackCards();
 
     // Step 2: Start fetching explorer data (don't await yet)
-    console.log(`🎯 Fetching explorer for promoted track: ${trackId.substring(0, 8)}`);
+    log.info(`🎯 Fetching explorer for promoted track: ${trackId.substring(0, 8)}`);
     const explorerPromise = fetchExplorerWithPlaylist(trackId, { forceFresh: true });
 
     // Step 3: Start the deck exit animation (cards zoom away)
@@ -318,7 +333,7 @@ export async function promoteCenterCardToTray() {
     // Step 5: Wait for explorer data and render new cards
     try {
         const newExplorerData = await explorerPromise;
-        console.log('🎯 Explorer data received:', {
+        log.info('🎯 Explorer data received:', {
             hasData: !!newExplorerData,
             directionCount: Object.keys(newExplorerData?.directions || {}).length,
             nextTrack: newExplorerData?.nextTrack?.directionKey || 'none',
@@ -329,7 +344,7 @@ export async function promoteCenterCardToTray() {
             if (typeof window.createDimensionCards === 'function') {
                 // isPlaylistExploration: true prevents polluting now-playing state
                 // skipExitAnimation: true since we already triggered exit above
-                console.log('🎯 Calling createDimensionCards with new explorer data');
+                log.info('🎯 Calling createDimensionCards with new explorer data');
                 window.createDimensionCards(newExplorerData, {
                     skipExitAnimation: true,
                     forceRedraw: true,
@@ -338,7 +353,7 @@ export async function promoteCenterCardToTray() {
             }
         }
     } catch (error) {
-        console.error('promoteCenterCardToTray: Explorer fetch failed', error);
+        log.error('promoteCenterCardToTray: Explorer fetch failed', error);
     }
 
     return item;
@@ -415,29 +430,29 @@ export function initPlaylistTray() {
     // Initialize tray structure
     renderPlaylistTray();
 
+    // Right stack click — unwind queue
     trayRoot.addEventListener('click', (e) => {
-        // Handle left stack click - promote center card to tray
-        const leftStack = e.target.closest('.playlist-left-stack');
-        if (leftStack) {
-            console.log('Left stack clicked - promoting center card');
-            promoteCenterCardToTray();
-            return;
-        }
-
-        // Handle right stack click - unwind queue
         const rightItem = e.target.closest('.playlist-right-stack .stack-item');
         if (rightItem) {
-            console.log('Right stack item clicked - unwinding');
+            log.info('Right stack item clicked - unwinding');
             const unwound = unwindPlaylist();
             if (unwound && unwound.explorerData) {
-                // Display cached explorer data instantly (no fetch needed)
                 if (typeof window.createDimensionCards === 'function') {
                     window.createDimensionCards(unwound.explorerData, { skipExitAnimation: true });
                 }
             }
-            return;
         }
     });
+
+    // Clicking anywhere left of the clock promotes the center card to the tray.
+    // The right stack's top item is excluded (it unwinds instead).
+    // Clicking the now-playing card promotes the next track to the tray
+    const nowPlayingCard = document.getElementById('nowPlayingCard');
+    if (nowPlayingCard) {
+        nowPlayingCard.addEventListener('click', () => {
+            promoteCenterCardToTray();
+        });
+    }
 }
 
 // Expose globally for cross-module access

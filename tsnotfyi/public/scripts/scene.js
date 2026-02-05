@@ -1,3 +1,5 @@
+  const sceneLog = (typeof window.createLogger === 'function') ? window.createLogger('scene') : { info: console.log.bind(console), warn: console.warn.bind(console), error: console.error.bind(console), debug: () => {} };
+
   // ====== 3D Visualization Setup ======
 
   function rejig() {
@@ -62,7 +64,7 @@
               .alphaDecay(0.02) // Slow decay for smooth animation
               .on('tick', () => this.updateCardPositions());
 
-          console.log('🔬 Force simulation initialized');
+          sceneLog.info('🔬 Force simulation initialized');
       }
 
       addCard(cardElement, cardData) {
@@ -108,7 +110,7 @@
           cardElement.style.zIndex = isNextTrack ? '100' : '50';
           cardElement.style.willChange = 'transform'; // Optimize for transforms
 
-          console.log(`🔬 Added ${isNextTrack ? 'NEXT' : 'REG'} card: ${node.id}, radius: ${radius}`);
+          sceneLog.info(`🔬 Added ${isNextTrack ? 'NEXT' : 'REG'} card: ${node.id}, radius: ${radius}`);
           return node;
       }
 
@@ -127,7 +129,7 @@
       }
 
       selectCard(cardId) {
-          console.log(`🔬 Selecting card: ${cardId}`);
+          sceneLog.info(`🔬 Selecting card: ${cardId}`);
 
           this.nodes.forEach(node => {
               const wasSelected = node.isSelected;
