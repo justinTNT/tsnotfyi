@@ -155,6 +155,7 @@ class DriftAudioMixer {
     this.noArtist = true; // Default: prevent artist repeats in session
     this.seenArtists = new Set(); // Track artists from played tracks
     this.seenAlbums = new Set(); // Track albums from played tracks
+    this.failedTrackAttempts = new Map(); // trackId -> failure count (skip after 3)
 
     // Session-level explorer data cache for layered search
     this.explorerDataCache = new Map(); // key: 'trackMd5_resolution' -> explorerData
@@ -1132,9 +1133,9 @@ class DriftAudioMixer {
     const prepGeneration = ++this._nextPrepGeneration;
 
     const preparation = (async () => {
+      let hydratedNextTrack = null;
+      let preparationReason = reason;
       try {
-        let hydratedNextTrack = null;
-        let preparationReason = reason;
 
         if (overrideTrackId) {
           const annotations = {
@@ -1321,6 +1322,15 @@ class DriftAudioMixer {
       } catch (error) {
         console.error('❌ Failed to prepare next track:', error);
         console.error('❌ Error details:', error.stack);
+
+        // Track failures to skip persistently broken tracks
+        const failedId = hydratedNextTrack?.identifier || overrideTrackId;
+        if (failedId) {
+          const attempts = (this.failedTrackAttempts.get(failedId) || 0) + 1;
+          this.failedTrackAttempts.set(failedId, attempts);
+          console.warn(`⚠️ Track ${failedId.substring(0,8)} failed (attempt ${attempts}/3)`);
+        }
+
         if (overrideTrackId) {
           this.lockedNextTrackIdentifier = null;
           this.clearPendingUserSelection(manualGenerationAtStart);
@@ -1441,7 +1451,8 @@ class DriftAudioMixer {
         const recId = rec.trackId;
         const alreadyPlayed = this.sessionHistory.some(h => h.identifier === recId);
         const isCurrent = this.currentTrack?.identifier === recId;
-        if (!alreadyPlayed && !isCurrent) {
+        const isPendingNext = this.nextTrack?.identifier === recId;
+        if (!alreadyPlayed && !isCurrent && !isPendingNext) {
           const hydrated = this.hydrateTrackRecord(recId, {
             transitionReason: 'explorer',
             direction: rec.direction,
@@ -1453,7 +1464,7 @@ class DriftAudioMixer {
             return hydrated;
           }
         }
-        console.log(`📌 Stored explorer recommendation ${recId?.substring(0,8)} no longer valid (played=${alreadyPlayed}, current=${isCurrent}); falling through to fresh selection`);
+        console.log(`📌 Stored explorer recommendation ${recId?.substring(0,8)} no longer valid (played=${alreadyPlayed}, current=${isCurrent}, pendingNext=${isPendingNext}); falling through to fresh selection`);
         this.explorerRecommendedNext = null;
       }
 
@@ -3473,12 +3484,14 @@ class DriftAudioMixer {
     ];
 
     // Explore each original feature direction using legacy directional search
-    console.log(`📊 Starting exploration of ${originalFeatures.length} original features...`);
-    console.log(`🔍 CORE SEARCH SETUP: RadialSearch object available methods:`, Object.getOwnPropertyNames(Object.getPrototypeOf(this.radialSearch)));
-    console.log(`🔍 CORE SEARCH SETUP: getDirectionalCandidates method exists:`, typeof this.radialSearch.getDirectionalCandidates);
+    if (VERBOSE_EXPLORER) {
+      console.log(`📊 Starting exploration of ${originalFeatures.length} original features...`);
+      console.log(`🔍 CORE SEARCH SETUP: RadialSearch object available methods:`, Object.getOwnPropertyNames(Object.getPrototypeOf(this.radialSearch)));
+      console.log(`🔍 CORE SEARCH SETUP: getDirectionalCandidates method exists:`, typeof this.radialSearch.getDirectionalCandidates);
+    }
 
     for (const feature of originalFeatures) {
-      console.log(`📊 Exploring original feature: ${feature.name} (${feature.description})`);
+      if (VERBOSE_EXPLORER) console.log(`📊 Exploring original feature: ${feature.name} (${feature.description})`);
       await this.exploreOriginalFeatureDirection(explorerData, feature, 'positive', totalNeighborhoodSize, targetTrack);
       await this.exploreOriginalFeatureDirection(explorerData, feature, 'negative', totalNeighborhoodSize, targetTrack);
     }
@@ -3874,9 +3887,11 @@ class DriftAudioMixer {
     const directionKey = `${feature.name}_${polarity}`;
 
     try {
-      console.log(`🔍 CORE SEARCH: Starting legacy search for '${direction}' (feature: ${feature.name})`);
-      console.log(`🔍 CORE SEARCH: Target track identifier: ${targetTrack.identifier}`);
-      console.log(`🔍 CORE SEARCH: Calling this.radialSearch.getDirectionalCandidates('${targetTrack.identifier}', '${direction}')`);
+      if (VERBOSE_EXPLORER) {
+        console.log(`🔍 CORE SEARCH: Starting legacy search for '${direction}' (feature: ${feature.name})`);
+        console.log(`🔍 CORE SEARCH: Target track identifier: ${targetTrack.identifier}`);
+        console.log(`🔍 CORE SEARCH: Calling this.radialSearch.getDirectionalCandidates('${targetTrack.identifier}', '${direction}')`);
+      }
 
       // Use legacy directional search for original features - get all candidates
       const candidates = await this.radialSearch.getDirectionalCandidates(
@@ -3885,41 +3900,49 @@ class DriftAudioMixer {
         // No limit - get all available candidates for strategic sampling
       );
 
-      console.log(`🔍 CORE SEARCH RESULT: candidates object:`, candidates);
-      console.log(`🔍 CORE SEARCH RESULT: candidates.totalAvailable = ${candidates.totalAvailable}`);
-      console.log(`🔍 CORE SEARCH RESULT: candidates.candidates.length = ${candidates.candidates?.length || 'undefined'}`);
+      if (VERBOSE_EXPLORER) {
+        console.log(`🔍 CORE SEARCH RESULT: candidates object:`, candidates);
+        console.log(`🔍 CORE SEARCH RESULT: candidates.totalAvailable = ${candidates.totalAvailable}`);
+        console.log(`🔍 CORE SEARCH RESULT: candidates.candidates.length = ${candidates.candidates?.length || 'undefined'}`);
 
-      if (candidates.candidates && candidates.candidates.length > 0) {
-        console.log(`🔍 CORE SEARCH RESULT: First 3 candidates:`, candidates.candidates.slice(0, 3));
-      } else {
-        console.log(`🚨 CORE SEARCH PROBLEM: No candidates returned for '${direction}' - this should not happen for core features!`);
+        if (candidates.candidates && candidates.candidates.length > 0) {
+          console.log(`🔍 CORE SEARCH RESULT: First 3 candidates:`, candidates.candidates.slice(0, 3));
+        } else {
+          console.log(`🚨 CORE SEARCH PROBLEM: No candidates returned for '${direction}' - this should not happen for core features!`);
+        }
       }
 
       const trackCount = candidates.totalAvailable || 0;
-      console.log(`🔍 CORE FILTERING: Before session filtering: ${candidates.candidates?.length || 0} candidates`);
-      console.log(`🔍 CORE FILTERING: Session state - seenArtists: ${this.seenArtists.size}, seenAlbums: ${this.seenAlbums.size}, noArtist: ${this.noArtist}, noAlbum: ${this.noAlbum}`);
+      if (VERBOSE_EXPLORER) {
+        console.log(`🔍 CORE FILTERING: Before session filtering: ${candidates.candidates?.length || 0} candidates`);
+        console.log(`🔍 CORE FILTERING: Session state - seenArtists: ${this.seenArtists.size}, seenAlbums: ${this.seenAlbums.size}, noArtist: ${this.noArtist}, noAlbum: ${this.noAlbum}`);
+      }
 
       const filteredCandidates = this.filterSessionRepeats(candidates.candidates || []);
-      console.log(`🔍 CORE FILTERING: After session filtering: ${filteredCandidates.length} candidates`);
+      if (VERBOSE_EXPLORER) {
+        console.log(`🔍 CORE FILTERING: After session filtering: ${filteredCandidates.length} candidates`);
 
-      if (candidates.candidates && candidates.candidates.length > 0 && filteredCandidates.length === 0) {
-        console.log(`🚨 CORE FILTERING PROBLEM: Session filtering removed ALL candidates for '${direction}'!`);
-        console.log(`🚨 This suggests too aggressive artist/album filtering or session history is too large`);
+        if (candidates.candidates && candidates.candidates.length > 0 && filteredCandidates.length === 0) {
+          console.log(`🚨 CORE FILTERING PROBLEM: Session filtering removed ALL candidates for '${direction}'!`);
+          console.log(`🚨 This suggests too aggressive artist/album filtering or session history is too large`);
+        }
       }
 
       const strategicSamples = this.selectStrategicSamples(filteredCandidates, targetTrack, 50);
-      console.log(`🔍 CORE SAMPLING: Selected ${strategicSamples.length} sample tracks from ${filteredCandidates.length} filtered candidates`);
+      if (VERBOSE_EXPLORER) console.log(`🔍 CORE SAMPLING: Selected ${strategicSamples.length} sample tracks from ${filteredCandidates.length} filtered candidates`);
 
       // Skip directions with 0 tracks (completely ignore them)
       if (trackCount === 0) {
-        console.log(`🚫 CORE REJECTION: ${directionKey} selects ZERO tracks (${trackCount}/${totalNeighborhoodSize}) - [${feature.name}]`);
-        console.log(`🔍 CORE DEBUG: candidates.totalAvailable=${candidates.totalAvailable}, candidates.candidates.length=${candidates.candidates?.length || 0}`);
+        if (VERBOSE_EXPLORER) {
+          console.log(`🚫 CORE REJECTION: ${directionKey} selects ZERO tracks (${trackCount}/${totalNeighborhoodSize}) - [${feature.name}]`);
+          console.log(`🔍 CORE DEBUG: candidates.totalAvailable=${candidates.totalAvailable}, candidates.candidates.length=${candidates.candidates?.length || 0}`);
+        }
         return;
       }
 
       // Skip directions that select nearly everything (useless)
       if (totalNeighborhoodSize > 10 && trackCount > totalNeighborhoodSize - 10) {
-        console.log(`🚫 CORE REJECTION: ${directionKey} selects TOO MANY tracks (${trackCount}/${totalNeighborhoodSize}) - [${feature.name}]`);
+        if (VERBOSE_EXPLORER) console.log(`🚫 CORE REJECTION: ${directionKey} selects TOO MANY tracks (${trackCount}/${totalNeighborhoodSize}) - [${feature.name}]`);
         return;
       }
 
@@ -3949,6 +3972,7 @@ class DriftAudioMixer {
           identifier: track.identifier || track.track?.identifier,
           title: track.title || track.track?.title,
           artist: track.artist || track.track?.artist,
+          album: track.album || track.track?.album,
           duration: track.length || track.track?.length,
           distance: sample.distance || sample.similarity,
           features: track.features || track.track?.features,
@@ -6063,8 +6087,10 @@ class DriftAudioMixer {
     }
 
     // Debug: log session history for filtering
-    console.log(`🔍 Session history for filtering: ${playedTrackIds.size} tracks`,
-      [...playedTrackIds].map(id => id.substring(0, 8)).join(', '));
+    if (VERBOSE_EXPLORER) {
+      console.log(`🔍 Session history for filtering: ${playedTrackIds.size} tracks`,
+        [...playedTrackIds].map(id => id.substring(0, 8)).join(', '));
+    }
 
     let selectedDirectionKey = null;
     let selectedDirection = null;
@@ -6078,7 +6104,10 @@ class DriftAudioMixer {
 
       const candidateIndex = directionData.sampleTracks.findIndex(candidate => {
         const candidateId = candidate?.identifier || candidate?.track?.identifier;
-        return candidateId && !playedTrackIds.has(candidateId);
+        if (!candidateId || playedTrackIds.has(candidateId)) return false;
+        // Skip tracks that have failed 3+ times this session
+        if ((this.failedTrackAttempts.get(candidateId) || 0) >= 3) return false;
+        return true;
       });
 
       if (candidateIndex === -1) {

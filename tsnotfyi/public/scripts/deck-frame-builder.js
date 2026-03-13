@@ -225,11 +225,21 @@
                 delete directionsMap[oppositeKey];
             }
 
-            // Server filtered out the opposite (too weak) - respect that decision
-            // Don't create synthetic opposites with copied tracks
-            direction.hasOpposite = false;
-            if (direction.oppositeDirection) {
-                delete direction.oppositeDirection;
+            // Check if the server already embedded opposite data inline
+            const hasInlineOpposite = direction.oppositeDirection &&
+                Array.isArray(direction.oppositeDirection.sampleTracks) &&
+                direction.oppositeDirection.sampleTracks.length > 0;
+
+            if (hasInlineOpposite) {
+                // Server embedded the opposite — preserve it
+                direction.hasOpposite = true;
+                normalizeDirectionSamples(direction.oppositeDirection);
+            } else {
+                // Server filtered out the opposite (too weak) - respect that decision
+                direction.hasOpposite = false;
+                if (direction.oppositeDirection) {
+                    delete direction.oppositeDirection;
+                }
             }
 
             processedPairs.add(pairKey);

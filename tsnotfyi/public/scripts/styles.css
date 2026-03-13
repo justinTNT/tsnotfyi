@@ -600,7 +600,7 @@ audio {
 #dimensionCards {
     position: fixed;
     right: 0;
-    top: 50%;
+    top: 40%;
     width: 75vw;
     height: 60vw;
     max-width: 900px;
@@ -683,83 +683,79 @@ audio {
 /* Playlist Tray - Queue with left/right stacks */
 #nextTrackTray {
     position: fixed;
-    top: calc(50% + 220px);
+    bottom: 2em;
     left: 15%;
-    transform: translate(-50%, 0);
-    width: 300px;
-    display: flex;
-    flex-direction: row;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 10px;
+    width: 70%;
+    height: 120px;
     z-index: 120;
     pointer-events: none;
-    padding: 10px 0;
 }
 
 #nextTrackTray.has-items {
     pointer-events: auto;
 }
 
-/* Left stack - confirm/advance queue */
-.playlist-left-stack {
+/* Strip container — covers overlap within tray bounds */
+.playlist-strip {
     position: relative;
-    width: 120px;
+    width: 100%;
     height: 120px;
-    cursor: pointer;
-    pointer-events: auto;
 }
 
-/* Right stack - unwind queue */
-.playlist-right-stack {
-    position: relative;
-    width: 120px;
-    height: 120px;
-    cursor: pointer;
-    pointer-events: auto;
-}
-
-/* Stack items (album thumbnails) - z-stacked piles */
-.playlist-left-stack .stack-item,
-.playlist-right-stack .stack-item {
+/* Single cover — absolutely positioned, spaced by JS */
+.playlist-cover {
     position: absolute;
+    top: 0;
     width: 120px;
     height: 120px;
     border-radius: 8px;
     overflow: hidden;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
     cursor: pointer;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, z-index 0s;
     pointer-events: auto;
 }
 
-/* Left stack: offset toward center (right) */
-.playlist-left-stack .stack-item:nth-child(1) { z-index: 4; top: 0; left: 0; }
-.playlist-left-stack .stack-item:nth-child(2) { z-index: 3; top: 3px; left: 6px; }
-.playlist-left-stack .stack-item:nth-child(3) { z-index: 2; top: 6px; left: 12px; }
-.playlist-left-stack .stack-item:nth-child(4) { z-index: 1; top: 9px; left: 18px; }
-
-/* Right stack: offset toward center (left) */
-.playlist-right-stack .stack-item:nth-child(1) { z-index: 4; top: 0; right: 0; }
-.playlist-right-stack .stack-item:nth-child(2) { z-index: 3; top: 3px; right: 6px; }
-.playlist-right-stack .stack-item:nth-child(3) { z-index: 2; top: 6px; right: 12px; }
-.playlist-right-stack .stack-item:nth-child(4) { z-index: 1; top: 9px; right: 18px; }
-
-.playlist-left-stack .stack-item:hover,
-.playlist-right-stack .stack-item:hover {
-    transform: scale(1.1);
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
-    z-index: 10;
+.playlist-cover:hover {
+    transform: scale(1.15);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
+    z-index: 100 !important;
 }
 
-.stack-item img {
+.playlist-cover img {
     width: 100%;
     height: 100%;
     object-fit: cover;
 }
 
-/* Shrinkwrap overlay on stack items */
-.stack-item::after {
+/* Track info tooltip — shared across tray, direction cards, stacked cards */
+.track-hover-tooltip {
+    position: fixed;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 6px 16px;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(0, 0, 0, 0.6);
+    border-radius: 4px 4px 0 0;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    pointer-events: none;
+    max-width: 90vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    z-index: 200;
+    text-align: center;
+}
+
+.track-hover-tooltip.visible {
+    opacity: 1;
+}
+
+/* Shrinkwrap overlay on playlist covers */
+.playlist-cover::after {
     content: '';
     position: absolute;
     top: 0;
@@ -900,7 +896,7 @@ audio {
     overflow: hidden;
     background: rgba(20, 20, 20, 0.65);
     box-shadow: 0 16px 32px rgba(0, 0, 0, 0.45);
-    pointer-events: none;
+    pointer-events: auto;
 }
 
 .stacked-preview-layer-card .preview-panel {

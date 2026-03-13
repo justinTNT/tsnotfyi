@@ -56,7 +56,7 @@ function getLogStream(type) {
   if (logStreams.has(streamKey)) {
     return logStreams.get(streamKey);
   }
-  const filePath = path.join(dirPath, `${dateKey}_${RESTART_SUFFIX}.log`);
+  const filePath = path.join(dirPath, `${type}_${dateKey}_${RESTART_SUFFIX}.log`);
   const stream = fs.createWriteStream(filePath, { flags: 'a' });
   logStreams.set(streamKey, stream);
   return stream;

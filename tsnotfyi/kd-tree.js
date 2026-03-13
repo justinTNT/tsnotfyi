@@ -6,6 +6,8 @@ const fs = require('fs');
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
+const VERBOSE_KD_TREE = process.env.LOG_KD_TREE === '1';
+
 // Module-level pool (shared across instances)
 let globalPool = null;
 
@@ -318,10 +320,13 @@ class MusicalKDTree {
 
             const artPath = meta?.album?.artpath?.length > 0 ? meta.album.artpath : '/images/albumcover.png';
 
+            const albumName = meta?.album?.album || meta?.item?.album || '';
+
             const track = {
                 identifier: row.identifier,
                 title: row.title,
                 artist: row.artist,
+                album: albumName,
                 path: decodePath(row.path),
                 length: row.length,
                 features: {},
@@ -1367,7 +1372,7 @@ class MusicalKDTree {
                 const delta = candidateValue - currentValue;
                 const relative = referenceDistance > this.epsilon ? 1 : null;
 
-                console.log(`📐 Feature contribution ${labelPrefix}.${referenceDimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+                if (VERBOSE_KD_TREE) console.log(`📐 Feature contribution ${labelPrefix}.${referenceDimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
 
                 slices.push({
                     key: referenceDimension,
@@ -1404,7 +1409,7 @@ class MusicalKDTree {
                 ? sliceDistance / referenceDistance
                 : null;
 
-            console.log(`📐 Feature contribution ${labelPrefix}.${dimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+            if (VERBOSE_KD_TREE) console.log(`📐 Feature contribution ${labelPrefix}.${dimension}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
 
             slices.push({
                 key: dimension,

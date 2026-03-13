@@ -393,6 +393,10 @@ import { playlistHasItems } from './playlist-tray.js';
       const inlineIds = extractSampleIdentifiers(inlineSamples);
       const externalIds = extractSampleIdentifiers(externalSamples);
       const oppositeIds = [...new Set([...inlineIds, ...externalIds])];
+
+      // TEMP DIAGNOSTIC
+      console.log(`🔄 hasActualOpposite(${resolvedKey}): inline=${inlineSamples.length}, external=${externalSamples.length}, oppositeIds=${oppositeIds.length}, hasInlineOpp=${!!inlineOpposite}, oppKey=${oppositeKey}`);
+
       if (oppositeIds.length === 0) {
           return false;
       }
@@ -402,7 +406,10 @@ import { playlistHasItems } from './playlist-tray.js';
       if (primaryIds.size === 0) {
           return true; // No primary tracks, any opposite tracks are "distinct"
       }
-      return oppositeIds.some(id => !primaryIds.has(id));
+      const result = oppositeIds.some(id => !primaryIds.has(id));
+      // TEMP DIAGNOSTIC
+      console.log(`🔄 hasActualOpposite(${resolvedKey}): primaryIds=${primaryIds.size}, result=${result}`);
+      return result;
   }
 
   function applyReverseBadge(card, direction, context, { interactive = false, extraClasses = '', highlightOverride = null } = {}) {
@@ -689,15 +696,15 @@ import { playlistHasItems } from './playlist-tray.js';
   }
 
   // Cycle through stack contents for back card clicks
-  function cycleStackContents(directionKey, currentTrackIndex) {
+  function cycleStackContents(directionKey, currentTrackIndex, step = 1) {
       const stack = state.latestExplorerData.directions[directionKey];
       if (!stack) return;
 
       const sampleTracks = stack.sampleTracks || [];
       if (sampleTracks.length <= 1) return;
 
-      // Move to next track in stack, wrapping around
-      const nextIndex = (currentTrackIndex + 1) % sampleTracks.length;
+      // Move to next/previous track in stack, wrapping around
+      const nextIndex = ((currentTrackIndex + step) % sampleTracks.length + sampleTracks.length) % sampleTracks.length;
       const nextTrack = sampleTracks[nextIndex].track || sampleTracks[nextIndex];
 
       // Update global track index
@@ -1084,6 +1091,24 @@ import { playlistHasItems } from './playlist-tray.js';
           panel.appendChild(rim);
           panel.appendChild(label);
           preview.appendChild(panel);
+
+          // Hover tooltip for stacked preview cards
+          const trackData = sample.track || sample;
+          preview.addEventListener('mouseenter', () => {
+              if (typeof window.showTrackTooltip === 'function') {
+                  window.showTrackTooltip(
+                      getDisplayTitle(trackData),
+                      trackData.artist || '',
+                      trackData.album || ''
+                  );
+              }
+          });
+          preview.addEventListener('mouseleave', () => {
+              if (typeof window.hideTrackTooltip === 'function') {
+                  window.hideTrackTooltip();
+              }
+          });
+
           layer.appendChild(preview);
       });
   }

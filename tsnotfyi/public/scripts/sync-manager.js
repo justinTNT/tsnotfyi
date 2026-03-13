@@ -48,7 +48,14 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         if (queuedNext) {
             md5ToSend = queuedNext.trackId;
             dirToSend = dirToSend || queuedNext.directionKey || null;
-            log.info(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist`);
+            // Playlist picks must reach the server as 'user' so it actually prepares them.
+            // Heartbeat source is read-only on the server — it logs mismatches but never acts.
+            if (source !== 'user') {
+                source = 'user';
+                log.info(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist (promoted to user source)`);
+            } else {
+                log.info(`📤 sendNextTrack: Using queued track ${md5ToSend.substring(0,8)} from playlist`);
+            }
         }
     }
 
@@ -407,7 +414,7 @@ export function scheduleHeartbeat(delayMs = 60000) {
     }
 
     state.heartbeatTimeout = setTimeout(() => {
-        log.info('💓 Heartbeat triggered');
+        log.debug('💓 Heartbeat triggered');
         sendNextTrack(null, null, 'heartbeat');
         window.state = window.state || {};
         const serverTrack = window.state?.lastHeartbeatResponse?.currentTrack;
@@ -420,7 +427,7 @@ export function scheduleHeartbeat(delayMs = 60000) {
 
     }, delayMs);
 
-    log.info(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
+    log.debug(`💓 Heartbeat scheduled in ${delayMs/1000}s`);
 }
 
 export async function fullResync() {

@@ -11,7 +11,7 @@ import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, f
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
 import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
-import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray } from './playlist-tray.js';
+import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray } from './playlist-tray.js';
 import { cancelPackAwayAnimation } from './clock-animation.js';
 import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
 import { createLogger } from './log.js';
@@ -528,8 +528,14 @@ async function initializeApp() {
           pendingPlaylistPop = true;
         } else if (queueHead) {
           audioLog.info(`🎵 Track change mismatch — server played ${currentTrackId.substring(0, 8)}, queue expected ${queueHead.trackId.substring(0, 8)}`);
-          if (typeof window.sendNextTrack === 'function') {
-            window.sendNextTrack(queueHead.trackId, queueHead.directionKey, 'user');
+
+          // Don't resend if this track already played in the session
+          if (!state.sessionTrackHistory?.includes(queueHead.trackId)) {
+            if (typeof window.sendNextTrack === 'function') {
+              window.sendNextTrack(queueHead.trackId, queueHead.directionKey, 'user');
+            }
+          } else {
+            audioLog.warn(`🚫 Skipping resend — ${queueHead.trackId.substring(0, 8)} already played this session`);
           }
         }
       }
@@ -1639,25 +1645,30 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       if (!state.isStarted) return;
       if (!state.journeyMode) return;
 
-      const directionKey = state.latestExplorerData?.nextTrack?.directionKey;
-      if (!directionKey) return;
-
-      const clockCards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
-          .map(c => ({
-              element: c,
-              key: c.dataset.directionKey,
-              position: parseInt(c.dataset.clockPosition) || 12
-          }))
-          .sort((a, b) => a.position - b.position);
-
-      const occupiedPositions = new Set(clockCards.map(c => c.position));
-
-      const nextTrackCard = document.querySelector(`.dimension-card.next-track[data-direction-key="${directionKey}"]`);
-      if (!nextTrackCard) return;
-
-      let nextPosition = nextTrackCard.dataset.originalClockPosition
-          ? parseInt(nextTrackCard.dataset.originalClockPosition)
-          : 1;
+      // Direction-dependent state — only needed for arrow key navigation
+      const resolveClockState = () => {
+          let dk = state.latestExplorerData?.nextTrack?.directionKey;
+          let ntCard = dk ? document.querySelector(`.dimension-card.next-track[data-direction-key="${dk}"]`) : null;
+          // Fallback: sniff the DOM if state has no nextTrack
+          if (!ntCard) {
+              ntCard = document.querySelector('.dimension-card.next-track');
+              dk = ntCard?.dataset?.directionKey || dk;
+          }
+          if (!dk || !ntCard) return null;
+          const cards = Array.from(document.querySelectorAll('[data-direction-key]:not(.next-track)'))
+              .map(c => ({
+                  element: c,
+                  key: c.dataset.directionKey,
+                  position: parseInt(c.dataset.clockPosition) || 12
+              }))
+              .sort((a, b) => a.position - b.position);
+          if (!cards.length) return null;
+          const occupied = new Set(cards.map(c => c.position));
+          const pos = ntCard.dataset.originalClockPosition
+              ? parseInt(ntCard.dataset.originalClockPosition)
+              : 1;
+          return { directionKey: dk, clockCards: cards, occupiedPositions: occupied, nextPosition: pos };
+      };
 
       switch (e.key) {
           case '+':
@@ -1672,61 +1683,81 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               e.preventDefault();
               break;
 
-          case 'ArrowRight': // rotate the wheel clockwise
-              for (let i = nextPosition + 1; i <= nextPosition + 12; i++) {
+          case 'ArrowRight': { // rotate the wheel clockwise
+              const cs = resolveClockState();
+              if (!cs) break;
+              let pos = cs.nextPosition;
+              for (let i = pos + 1; i <= pos + 12; i++) {
                   const posFromIndex = (i+11)%12+1;
-                  if (occupiedPositions.has(posFromIndex)) {
-                      nextPosition = posFromIndex;
+                  if (cs.occupiedPositions.has(posFromIndex)) {
+                      pos = posFromIndex;
                       break;
                   }
 	      }
-
-              swapNextTrackDirection(clockCards[nextPosition - 1].key);
+              navigateDirectionToCenter(cs.clockCards[pos - 1].key);
               e.preventDefault();
               break;
+          }
 
-          case 'ArrowLeft': // rotate the wheel counter-clockwise
-              for (let i = nextPosition-1; i >= nextPosition - 12; i--) {
+          case 'ArrowLeft': { // rotate the wheel counter-clockwise
+              const cs = resolveClockState();
+              if (!cs) break;
+              let pos = cs.nextPosition;
+              for (let i = pos-1; i >= pos - 12; i--) {
                   const posFromIndex = (i-1)%12 + 1;
-                  if (occupiedPositions.has(posFromIndex)) {
-                      nextPosition = posFromIndex;
+                  if (cs.occupiedPositions.has(posFromIndex)) {
+                      pos = posFromIndex;
                       break;
                   }
               }
-
-              swapNextTrackDirection(clockCards[nextPosition - 1].key);
+              navigateDirectionToCenter(cs.clockCards[pos - 1].key);
               e.preventDefault();
               break;
+          }
 
-          case 'ArrowDown':
-              // deal another card from the pack
-              const directionKey =  state.latestExplorerData.nextTrack.directionKey;
-              cycleStackContents(directionKey, state.stackIndex);
+          case 'ArrowDown': {
+              // deal next card from the pack
+              const centerCard = document.querySelector('.dimension-card.next-track');
+              const dk = centerCard?.dataset?.directionKey
+                  || state.latestExplorerData?.nextTrack?.directionKey;
+              if (dk) cycleStackContents(dk, state.stackIndex);
               e.preventDefault();
               break;
+          }
 
-          case 'ArrowUp':
-              // flip a reversable next track stack
+          case 'ArrowUp': {
+              // deal previous card from the pack (reverse of ArrowDown)
+              const centerCard = document.querySelector('.dimension-card.next-track');
+              const dk = centerCard?.dataset?.directionKey
+                  || state.latestExplorerData?.nextTrack?.directionKey;
+              if (dk) cycleStackContents(dk, state.stackIndex, -1);
+              e.preventDefault();
+              break;
+          }
 
-                  const key =  state.latestExplorerData.nextTrack.directionKey;
-                  const currentDirection = state.latestExplorerData.directions[key];
-                  if (currentDirection && currentDirection.oppositeDirection) {
-                      // Temporarily add the opposite direction to SSE data for swapping
-                      const oppositeKey = getOppositeDirection(key);
-                      if (oppositeKey) {
-                          state.latestExplorerData.directions[oppositeKey] = {
-                              ...currentDirection.oppositeDirection,
-                              key: oppositeKey
-                          };
-
-                          // Swap stack contents immediately without animation
-                          swapStackContents(key, oppositeKey);
-                      }
-                  } else {
-                      deckLog2.warn(`Opposite direction not available for ${direction.key}`);
+          case ' ': {
+              // spacebar: flip to opposite direction
+              const centerCard = document.querySelector('.dimension-card.next-track');
+              const dk = centerCard?.dataset?.directionKey
+                  || state.latestExplorerData?.nextTrack?.directionKey;
+              if (!dk) break;
+              const currentDirection = state.latestExplorerData.directions[dk];
+              if (currentDirection && currentDirection.oppositeDirection) {
+                  const oppositeKey = getOppositeDirection(dk);
+                  if (oppositeKey) {
+                      state.latestExplorerData.directions[oppositeKey] = {
+                          ...currentDirection.oppositeDirection,
+                          hasOpposite: true,
+                          key: oppositeKey
+                      };
+                      swapStackContents(dk, oppositeKey);
                   }
+              } else {
+                  deckLog2.warn(`Opposite direction not available for ${dk}`);
+              }
               e.preventDefault();
               break;
+          }
 
           case 'Escape':
               // Unwind playlist (same as clicking right pile in tray)
@@ -2553,6 +2584,22 @@ if (typeof window !== 'undefined') {
                   }
           });
       }
+
+      // Store track info for hover tooltip
+      card.dataset.trackTitle = selectedTrack?.title || '';
+      card.dataset.trackArtist = selectedTrack?.artist || '';
+      card.dataset.trackAlbum = selectedTrack?.album || '';
+
+      card.addEventListener('mouseenter', () => {
+          if (typeof window.showTrackTooltip === 'function') {
+              window.showTrackTooltip(card.dataset.trackTitle, card.dataset.trackArtist, card.dataset.trackAlbum);
+          }
+      });
+      card.addEventListener('mouseleave', () => {
+          if (typeof window.hideTrackTooltip === 'function') {
+              window.hideTrackTooltip();
+          }
+      });
 
       return card;
   }

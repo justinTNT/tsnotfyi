@@ -44,6 +44,7 @@ export function addToPlaylist(item) {
         explorerData: item.explorerData || null,
         title: item.title || 'Unknown',
         artist: item.artist || 'Unknown Artist',
+        album: item.album || '',
         addedAt: Date.now()
     };
 
@@ -164,7 +165,7 @@ export function getRightStack() {
 
 /**
  * Render the playlist tray UI
- * Left stack: first items (queue head on top), Right stack: last items (for unwind)
+ * Covers spread evenly left-to-right; hover shows track info below tray
  */
 export function renderPlaylistTray() {
     const trayRoot = elements.nextTrackTray || document.getElementById('nextTrackTray');
@@ -172,43 +173,65 @@ export function renderPlaylistTray() {
         return;
     }
 
-    // Get or create tray containers
-    let leftStack = trayRoot.querySelector('.playlist-left-stack');
-    let rightStack = trayRoot.querySelector('.playlist-right-stack');
+    // Get or create tray strip
+    let strip = trayRoot.querySelector('.playlist-strip');
 
-    if (!leftStack || !rightStack) {
-        // Initialize tray structure if not present
-        trayRoot.innerHTML = `
-            <div class="playlist-left-stack"></div>
-            <div class="playlist-right-stack"></div>
-        `;
-        leftStack = trayRoot.querySelector('.playlist-left-stack');
-        rightStack = trayRoot.querySelector('.playlist-right-stack');
+    if (!strip) {
+        trayRoot.innerHTML = `<div class="playlist-strip"></div>`;
+        strip = trayRoot.querySelector('.playlist-strip');
     }
 
-    // Render left stack (first half of queue, next track on top)
-    const leftItems = getLeftStack();
-    leftStack.innerHTML = leftItems.map((item, i) => `
-        <div class="stack-item" data-track-id="${item.trackId}" data-index="${i}">
-            <img src="${item.albumCover || ''}" alt="${item.title}" />
-        </div>
-    `).join('');
+    const items = Array.isArray(state.playlist) ? state.playlist : [];
 
-    // Render right stack (second half of queue, last track on top for unwind)
-    const rightItems = getRightStack();
-    // Reverse so most recent (last added) is on top
-    const rightItemsReversed = [...rightItems].reverse();
-    rightStack.innerHTML = rightItemsReversed.map((item, i) => `
-        <div class="stack-item" data-track-id="${item.trackId}" data-index="${i}">
-            <img src="${item.albumCover || ''}" alt="${item.title}" />
-        </div>
-    `).join('');
+    const COVER_SIZE = 120;
+
+    strip.innerHTML = items.map((item, i) => {
+        const title = (item.title || '').replace(/"/g, '&quot;');
+        const artist = (item.artist || '').replace(/"/g, '&quot;');
+        const album = (item.album || '').replace(/"/g, '&quot;');
+        return `<div class="playlist-cover" data-track-id="${item.trackId}" data-index="${i}"
+                     data-title="${title}" data-artist="${artist}" data-album="${album}">
+            <img src="${item.albumCover || ''}" alt="${title}" draggable="false" />
+        </div>`;
+    }).join('');
+
+    // Position covers: fill the tray width, only overlapping when they don't fit
+    const covers = strip.querySelectorAll('.playlist-cover');
+    const n = covers.length;
+    const trayWidth = strip.offsetWidth || trayRoot.offsetWidth || 300;
+
+    if (n === 1) {
+        covers[0].style.left = '0px';
+        covers[0].style.zIndex = '1';
+    } else if (n > 1) {
+        // Ideal step = COVER_SIZE (no overlap). Cap at what fits.
+        const maxLeft = trayWidth - COVER_SIZE;
+        const idealStep = COVER_SIZE;
+        const step = Math.min(idealStep, maxLeft / (n - 1));
+        covers.forEach((el, i) => {
+            el.style.left = `${Math.round(step * i)}px`;
+            el.style.zIndex = String(i + 1);
+        });
+    }
+
+    // Hover handlers
+    strip.querySelectorAll('.playlist-cover').forEach(el => {
+        el.addEventListener('mouseenter', () => {
+            const t = el.dataset.title || '';
+            const a = el.dataset.artist || '';
+            const al = el.dataset.album || '';
+            showTrackTooltip(t, a, al);
+        });
+        el.addEventListener('mouseleave', () => {
+            hideTrackTooltip();
+        });
+    });
 
     // Update tray visibility
-    const hasItems = playlistHasItems();
+    const hasItems = items.length > 0;
     trayRoot.classList.toggle('has-items', hasItems);
 
-    const ids = (state.playlist || []).map(p => p.trackId.substring(0, 8));
+    const ids = items.map(p => p.trackId.substring(0, 8));
     log.info(`renderPlaylistTray: ${ids.length} items [${ids.join(', ')}] visible=${hasItems}`);
 }
 
@@ -253,14 +276,26 @@ export async function promoteCenterCardToTray() {
         return null;
     }
 
-    const albumCover = nextTrackObj?.albumCover || '';
-    const title = nextTrackObj?.title || 'Unknown';
-    const artist = nextTrackObj?.artist || 'Unknown Artist';
-
-    log.info(`🎯 Promote: ${trackId.substring(0, 8)} (${title}) direction=${resolvedDirection}`);
-
     // We still need the DOM card for the fly-to-tray animation
     const centerCard = document.querySelector('.dimension-card.next-track');
+
+    // Resolve album cover with DOM fallback — the card renderer has a richer
+    // fallback chain than the data object, so the .photo div may have a cover
+    // even when nextTrackObj.albumCover is empty.
+    let albumCover = nextTrackObj?.albumCover || '';
+    if (!albumCover && centerCard) {
+        const photoEl = centerCard.querySelector('.photo');
+        if (photoEl) {
+            const bg = photoEl.style.backgroundImage || window.getComputedStyle(photoEl).backgroundImage;
+            const urlMatch = bg && bg.match(/url\(['"]?(.*?)['"]?\)/);
+            if (urlMatch && urlMatch[1]) {
+                albumCover = urlMatch[1];
+            }
+        }
+    }
+    const title = nextTrackObj?.title || 'Unknown';
+    const artist = nextTrackObj?.artist || 'Unknown Artist';
+    const album = nextTrackObj?.album || '';
 
     log.info(`🎯 Promoting center card to tray: ${trackId.substring(0, 8)} (${title})`);
 
@@ -278,7 +313,8 @@ export async function promoteCenterCardToTray() {
         directionKey: resolvedDirection,
         explorerData,
         title,
-        artist
+        artist,
+        album
     });
 
     if (!item) {
@@ -326,9 +362,8 @@ export async function promoteCenterCardToTray() {
         }
     }
 
-    // Step 4: After a brief delay, animate the cover to tray
+    // Step 4: Brief pause for exit animation to register, then proceed
     await new Promise(resolve => setTimeout(resolve, 150));
-    await animateCardToTray(centerCard, albumCover);
 
     // Step 5: Wait for explorer data and render new cards
     try {
@@ -362,62 +397,6 @@ export async function promoteCenterCardToTray() {
 /**
  * Animate a card sliding to the tray
  */
-function animateCardToTray(card, albumCover) {
-    return new Promise((resolve) => {
-        const trayRoot = elements.nextTrackTray || document.getElementById('nextTrackTray');
-        const leftStack = trayRoot?.querySelector('.playlist-left-stack');
-
-        if (!leftStack || !albumCover) {
-            resolve();
-            return;
-        }
-
-        // Create a clone that will animate to the tray
-        const clone = document.createElement('div');
-        clone.className = 'stack-item animating-to-tray';
-        clone.innerHTML = `<img src="${albumCover}" alt="Album cover" />`;
-
-        // Get positions
-        const cardRect = card.getBoundingClientRect();
-        const trayRect = leftStack.getBoundingClientRect();
-
-        // Start at card position
-        clone.style.cssText = `
-            position: fixed;
-            left: ${cardRect.left}px;
-            top: ${cardRect.top}px;
-            width: ${cardRect.width}px;
-            height: ${cardRect.height}px;
-            border-radius: 8px;
-            overflow: hidden;
-            z-index: 1000;
-            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
-            pointer-events: none;
-        `;
-        document.body.appendChild(clone);
-
-        // Trigger animation on next frame
-        requestAnimationFrame(() => {
-            clone.style.left = `${trayRect.left}px`;
-            clone.style.top = `${trayRect.top}px`;
-            clone.style.width = '80px';
-            clone.style.height = '80px';
-
-            // Fade in shrinkwrap overlay midway through animation
-            setTimeout(() => {
-                clone.classList.add('shrinkwrap-visible');
-            }, 150);
-        });
-
-        // Clean up after animation
-        setTimeout(() => {
-            clone.remove();
-            renderPlaylistTray();
-            resolve();
-        }, 450);
-    });
-}
-
 /**
  * Initialize playlist tray event handlers
  */
@@ -430,15 +409,21 @@ export function initPlaylistTray() {
     // Initialize tray structure
     renderPlaylistTray();
 
-    // Right stack click — unwind queue
+    // Cover click — unwind back to that position
     trayRoot.addEventListener('click', (e) => {
-        const rightItem = e.target.closest('.playlist-right-stack .stack-item');
-        if (rightItem) {
-            log.info('Right stack item clicked - unwinding');
-            const unwound = unwindPlaylist();
-            if (unwound && unwound.explorerData) {
-                if (typeof window.createDimensionCards === 'function') {
-                    window.createDimensionCards(unwound.explorerData, { skipExitAnimation: true });
+        const cover = e.target.closest('.playlist-cover');
+        if (cover) {
+            const idx = parseInt(cover.dataset.index, 10);
+            if (Number.isFinite(idx)) {
+                // Unwind from the end back to this item
+                while (Array.isArray(state.playlist) && state.playlist.length > idx + 1) {
+                    unwindPlaylist();
+                }
+                const unwound = unwindPlaylist();
+                if (unwound && unwound.explorerData) {
+                    if (typeof window.createDimensionCards === 'function') {
+                        window.createDimensionCards(unwound.explorerData, { skipExitAnimation: true });
+                    }
                 }
             }
         }
@@ -455,6 +440,33 @@ export function initPlaylistTray() {
     }
 }
 
+/**
+ * Shared track hover tooltip — fixed at bottom center of viewport
+ */
+let _tooltip = null;
+function getTooltip() {
+    if (_tooltip && _tooltip.isConnected) return _tooltip;
+    _tooltip = document.querySelector('.track-hover-tooltip');
+    if (!_tooltip) {
+        _tooltip = document.createElement('div');
+        _tooltip.className = 'track-hover-tooltip';
+        document.body.appendChild(_tooltip);
+    }
+    return _tooltip;
+}
+
+export function showTrackTooltip(title, artist, album) {
+    const tip = getTooltip();
+    const parts = [title, artist, album].filter(Boolean);
+    tip.textContent = parts.join(' \u2014 ');
+    tip.classList.add('visible');
+}
+
+export function hideTrackTooltip() {
+    const tip = getTooltip();
+    tip.classList.remove('visible');
+}
+
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
     window.addToPlaylist = addToPlaylist;
@@ -469,4 +481,6 @@ if (typeof window !== 'undefined') {
     window.renderPlaylistTray = renderPlaylistTray;
     window.initPlaylistTray = initPlaylistTray;
     window.promoteCenterCardToTray = promoteCenterCardToTray;
+    window.showTrackTooltip = showTrackTooltip;
+    window.hideTrackTooltip = hideTrackTooltip;
 }
