@@ -31,7 +31,7 @@ async function loadNamedSessionFromDatabase(sessionName) {
 }
 
 const RESERVED_SESSION_PREFIXES = new Set([
-  'api', 'sessions', 'playlist', 'stream', 'events', 'status',
+  'api', 'sessions', 'playlist', 'playlists', 'stream', 'events', 'status',
   'search', 'track', 'vae', 'current-track', 'favicon.ico', 'health',
   'similar', 'reverse', 'reverse_similar', 'scaled'
 ]);

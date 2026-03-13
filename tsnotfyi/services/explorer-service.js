@@ -115,12 +115,17 @@ function selectStrategicSamples(candidates, currentTrack) {
   if (!candidates || candidates.length === 0) return [];
   if (candidates.length === 1) return candidates;
 
-  const withMetrics = candidates.map(c => ({
-    ...c,
-    track: c.track || c,
-    dirDist: c.distance || c.similarity || 0,
-    priDist: Math.abs((c.track || c).pca?.primary_d || 0)
-  }));
+  const withMetrics = candidates.map(c => {
+    const track = c.track || c;
+    const playCount = track.playCount || 0;
+    const playPenalty = 1 + 0.03 * playCount;
+    return {
+      ...c,
+      track,
+      dirDist: (c.distance || c.similarity || 0) * playPenalty,
+      priDist: Math.abs((track).pca?.primary_d || 0)
+    };
+  });
 
   const byDir = [...withMetrics].sort((a, b) => a.dirDist - b.dirDist);
   const byPri = [...withMetrics].sort((a, b) => a.priDist - b.priDist);
@@ -140,6 +145,12 @@ function selectStrategicSamples(candidates, currentTrack) {
     result.push(c);
     return true;
   };
+
+  // Deal loved tracks first — they float to top of the stack
+  const lovedCandidates = withMetrics.filter(c => (c.track || c).loved);
+  for (const c of lovedCandidates) {
+    tryDeal([c], 0);
+  }
 
   for (let i = 0; result.length < candidates.length && i < Math.max(byDir.length, byPri.length); i++) {
     tryDeal(byDir, i);
@@ -218,6 +229,7 @@ async function exploreDirection(explorerData, radialSearch, domain, component, d
       return {
         identifier: track.identifier, title: track.title, artist: track.artist,
         album: track.album, albumCover: track.albumCover, duration: track.length,
+        loved: track.loved || false, playCount: track.playCount || 0,
         distance: sample.distance, pca: track.pca, features: track.features,
         distanceSlices,
         pcaDistanceSlices: {
@@ -287,6 +299,8 @@ async function exploreOriginalFeatureDirection(explorerData, radialSearch, featu
         artist: track.artist || track.track?.artist,
         album: track.album || track.track?.album,
         duration: track.length || track.track?.length,
+        loved: track.loved || track.track?.loved || false,
+        playCount: track.playCount || track.track?.playCount || 0,
         distance: sample.distance || sample.similarity,
         features: track.features || track.track?.features,
         albumCover: track.albumCover || track.track?.albumCover,
@@ -368,6 +382,7 @@ async function exploreVaeDirection(explorerData, radialSearch, latentIndex, pola
       return {
         identifier: track.identifier, title: track.title, artist: track.artist,
         album: track.album, albumCover: track.albumCover, duration: track.length,
+        loved: track.loved || false, playCount: track.playCount || 0,
         distance: candidate.distance, latentValue: candidate.latentValue,
         latentDelta: candidate.delta, vae: track.vae, features: track.features
       };

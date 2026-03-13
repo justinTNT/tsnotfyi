@@ -420,6 +420,22 @@ async function createSession(options = {}) {
   const mixer = new DriftAudioMixer(sessionId, radialSearch);
   mixer.pendingClientBootstrap = true;
 
+  // Increment play_count in ratings table at the halfway point of each track
+  mixer.onHalfwayReached = async (identifier) => {
+    try {
+      await pool.query(`
+        INSERT INTO play_stats (identifier, completion_count, last_completed)
+        VALUES ($1, 1, CURRENT_TIMESTAMP)
+        ON CONFLICT (identifier)
+        DO UPDATE SET completion_count = play_stats.completion_count + 1,
+                      last_completed = CURRENT_TIMESTAMP
+      `, [identifier]);
+      sessionLog.info(`🎵 Halfway reached for ${identifier.substring(0, 8)} — recorded completion`);
+    } catch (err) {
+      sessionLog.error(`Failed to record halfway completion for ${identifier}:`, err.message);
+    }
+  };
+
   if (autoStart) {
     try {
       await mixer.startDriftPlayback();
@@ -1597,6 +1613,11 @@ app.get('/track/:identifier/meta', async (req, res) => {
   }
 });
 
+
+// Playlist management page
+app.get('/playlists', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'playlists.html'));
+});
 
 // Main page - serves a UI with 3D visualization
 app.get('/', async (req, res) => {

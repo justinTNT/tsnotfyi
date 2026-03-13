@@ -126,6 +126,8 @@ class DriftAudioMixer {
     this.currentProcess = null;
     this.driftPlayer = new DirectionalDriftPlayer(radialSearch);
     this.currentTrack = null;
+    this.halfwayFiredForTrack = null; // Track ID for which halfway was already fired
+    this.onHalfwayReached = null;     // Callback: (identifier) => void
     this.pendingCurrentTrack = null;
     this.currentTrackDirection = null;
     this.nextTrack = null;
@@ -2903,6 +2905,7 @@ class DriftAudioMixer {
       title: displayTrack.title,
       artist: displayTrack.artist,
       albumCover: displayTrack.albumCover || this.lookupTrackAlbumCover(displayTrack.identifier) || null,
+      loved: displayTrack.loved || false,
       startTime: canonicalStartTime,
       durationMs
     };
@@ -2963,6 +2966,19 @@ class DriftAudioMixer {
     this.lastHeartbeatPayload = payload;
     this.lastHeartbeatSerialized = serialized;
     this.lastHeartbeatTimestamp = payload.timestamp;
+
+    // Check for halfway point — fire playcount callback once per track
+    const hbTrackId = payload.currentTrack?.identifier;
+    if (hbTrackId && hbTrackId !== this.halfwayFiredForTrack && payload.timing) {
+      const { elapsedMs } = payload.timing;
+      const durationMs = payload.currentTrack.durationMs;
+      if (durationMs > 0 && elapsedMs >= durationMs * 0.5) {
+        this.halfwayFiredForTrack = hbTrackId;
+        if (typeof this.onHalfwayReached === 'function') {
+          this.onHalfwayReached(hbTrackId);
+        }
+      }
+    }
 
     if (this.eventClients.size === 0) {
       return;
@@ -4804,7 +4820,7 @@ class DriftAudioMixer {
       path: track.path,
       length: track.length,
       duration: track.duration !== undefined ? track.duration : track.length,
-      love: track.love,
+      loved: track.loved,
       bpm: track.bpm,
       key: track.key
     };

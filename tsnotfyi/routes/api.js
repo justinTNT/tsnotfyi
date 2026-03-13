@@ -56,7 +56,6 @@ function setupApiRoutes(app, { pool, radialSearch }) {
   // Mark track as completed (successful crossfade)
   app.post('/api/track/:id/complete', async (req, res) => {
     const { id } = req.params;
-    const { playTime } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: 'Missing track identifier' });
@@ -76,15 +75,18 @@ function setupApiRoutes(app, { pool, radialSearch }) {
         }
 
         const result = await client.query(`
-          INSERT INTO completions (identifier, completed_at, play_time)
-          VALUES ($1, CURRENT_TIMESTAMP, $2)
+          INSERT INTO play_stats (identifier, completion_count, last_completed)
+          VALUES ($1, 1, CURRENT_TIMESTAMP)
+          ON CONFLICT (identifier)
+          DO UPDATE SET completion_count = play_stats.completion_count + 1,
+                        last_completed = CURRENT_TIMESTAMP
           RETURNING *
-        `, [id, playTime || null]);
+        `, [id]);
 
         res.json({
           identifier: id,
-          completed_at: result.rows[0].completed_at,
-          play_time: result.rows[0].play_time
+          completed_at: result.rows[0].last_completed,
+          completions: result.rows[0].completion_count
         });
       } finally {
         client.release();
@@ -112,8 +114,8 @@ function setupApiRoutes(app, { pool, radialSearch }) {
           [id]
         );
 
-        const completionsResult = await client.query(
-          'SELECT COUNT(*) as count, MAX(completed_at) as last_completed FROM completions WHERE identifier = $1',
+        const statsResult = await client.query(
+          'SELECT completion_count, last_completed FROM play_stats WHERE identifier = $1',
           [id]
         );
 
@@ -121,8 +123,8 @@ function setupApiRoutes(app, { pool, radialSearch }) {
           identifier: id,
           rating: ratingResult.rows[0]?.rating ?? null,
           rated_at: ratingResult.rows[0]?.rated_at ?? null,
-          completions: parseInt(completionsResult.rows[0]?.count) || 0,
-          last_completed: completionsResult.rows[0]?.last_completed ?? null
+          completions: parseInt(statsResult.rows[0]?.completion_count) || 0,
+          last_completed: statsResult.rows[0]?.last_completed ?? null
         });
       } finally {
         client.release();
@@ -205,16 +207,45 @@ function setupApiRoutes(app, { pool, radialSearch }) {
         }
 
         const tracksResult = await client.query(`
-          SELECT pi.*, ma.bt_title, ma.bt_artist, ma.bt_album
+          SELECT pi.*, ma.bt_title, ma.bt_artist, ma.bt_album, ma.bt_path, ma.beets_meta
           FROM playlist_items pi
           LEFT JOIN music_analysis ma ON pi.identifier = ma.identifier
           WHERE pi.playlist_id = $1
           ORDER BY pi.position ASC
         `, [id]);
 
+        const tracks = tracksResult.rows.map(row => {
+          let albumCover = '/images/albumcover.png';
+          try {
+            const meta = row.beets_meta ? JSON.parse(row.beets_meta) : null;
+            if (meta?.album?.artpath?.length > 0) albumCover = meta.album.artpath;
+          } catch (_) { /* ignore parse errors */ }
+          // Decode bt_path (may be bytea)
+          let trackPath = null;
+          if (Buffer.isBuffer(row.bt_path)) {
+            trackPath = row.bt_path.toString('utf8');
+          } else if (typeof row.bt_path === 'string' && row.bt_path.startsWith('\\x')) {
+            try { trackPath = Buffer.from(row.bt_path.slice(2), 'hex').toString('utf8'); } catch (_) {}
+          } else if (row.bt_path) {
+            trackPath = String(row.bt_path);
+          }
+
+          return {
+            identifier: row.identifier,
+            position: row.position,
+            direction: row.direction,
+            scope: row.scope,
+            title: row.bt_title,
+            artist: row.bt_artist,
+            album: row.bt_album,
+            albumCover,
+            path: trackPath
+          };
+        });
+
         res.json({
           ...playlistResult.rows[0],
-          tracks: tracksResult.rows
+          tracks
         });
       } finally {
         client.release();
@@ -269,6 +300,196 @@ function setupApiRoutes(app, { pool, radialSearch }) {
     } catch (error) {
       console.error('Error adding track to playlist:', error);
       res.status(500).json({ error: 'Failed to add track to playlist' });
+    }
+  });
+
+  // ==================== PLAYLIST TREE ====================
+
+  // Get full tree: folders + playlists with cover art
+  app.get('/api/playlist-tree', async (req, res) => {
+    try {
+      const client = await pool.connect();
+      try {
+        const foldersResult = await client.query(
+          'SELECT * FROM playlist_folders ORDER BY position, name'
+        );
+        const playlistsResult = await client.query(`
+          SELECT p.id, p.name, p.description, p.folder_id, p.position, p.cursor_position,
+                 p.created_at, p.updated_at,
+                 COUNT(pi.id)::int as track_count
+          FROM playlists p
+          LEFT JOIN playlist_items pi ON p.id = pi.playlist_id
+          GROUP BY p.id
+          ORDER BY p.position, p.name
+        `);
+
+        // Get first 4 covers per playlist
+        const playlistIds = playlistsResult.rows.map(p => p.id);
+        let coverMap = {};
+        if (playlistIds.length > 0) {
+          const coversResult = await client.query(`
+            SELECT DISTINCT ON (sub.playlist_id, sub.position)
+              sub.playlist_id, sub.artpath
+            FROM (
+              SELECT pi.playlist_id, pi.position,
+                COALESCE(
+                  (ma.beets_meta::json->'album'->>'artpath'),
+                  '/images/albumcover.png'
+                ) as artpath
+              FROM playlist_items pi
+              JOIN music_analysis ma ON pi.identifier = ma.identifier
+              WHERE pi.playlist_id = ANY($1) AND pi.position < 4
+              ORDER BY pi.playlist_id, pi.position
+            ) sub
+          `, [playlistIds]);
+          for (const row of coversResult.rows) {
+            if (!coverMap[row.playlist_id]) coverMap[row.playlist_id] = [];
+            coverMap[row.playlist_id].push(row.artpath);
+          }
+        }
+
+        const playlists = playlistsResult.rows.map(p => ({
+          ...p,
+          covers: coverMap[p.id] || []
+        }));
+
+        res.json({ folders: foldersResult.rows, playlists });
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      console.error('Error getting playlist tree:', error);
+      res.status(500).json({ error: 'Failed to get playlist tree' });
+    }
+  });
+
+  // ==================== FOLDERS ====================
+
+  app.post('/api/folders', async (req, res) => {
+    const { name, parent_id, position } = req.body;
+    if (!name) return res.status(400).json({ error: 'Folder name is required' });
+    try {
+      const result = await pool.query(
+        `INSERT INTO playlist_folders (name, parent_id, position)
+         VALUES ($1, $2, $3) RETURNING *`,
+        [name, parent_id || null, position || 0]
+      );
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error('Error creating folder:', error);
+      res.status(500).json({ error: 'Failed to create folder' });
+    }
+  });
+
+  app.patch('/api/folders/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, parent_id, position } = req.body;
+    try {
+      const sets = [];
+      const vals = [];
+      let n = 1;
+      if (name !== undefined) { sets.push(`name = $${n++}`); vals.push(name); }
+      if (parent_id !== undefined) { sets.push(`parent_id = $${n++}`); vals.push(parent_id); }
+      if (position !== undefined) { sets.push(`position = $${n++}`); vals.push(position); }
+      if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+      vals.push(id);
+      const result = await pool.query(
+        `UPDATE playlist_folders SET ${sets.join(', ')} WHERE id = $${n} RETURNING *`,
+        vals
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Folder not found' });
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error('Error updating folder:', error);
+      res.status(500).json({ error: 'Failed to update folder' });
+    }
+  });
+
+  app.delete('/api/folders/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+      const result = await pool.query(
+        'DELETE FROM playlist_folders WHERE id = $1 RETURNING *', [id]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Folder not found' });
+      res.json({ deleted: true });
+    } catch (error) {
+      console.error('Error deleting folder:', error);
+      res.status(500).json({ error: 'Failed to delete folder' });
+    }
+  });
+
+  // ==================== PLAYLIST MANAGEMENT ====================
+
+  app.patch('/api/playlists/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, folder_id, position, description } = req.body;
+    try {
+      const sets = [];
+      const vals = [];
+      let n = 1;
+      if (name !== undefined) { sets.push(`name = $${n++}`); vals.push(name); }
+      if (folder_id !== undefined) { sets.push(`folder_id = $${n++}`); vals.push(folder_id); }
+      if (position !== undefined) { sets.push(`position = $${n++}`); vals.push(position); }
+      if (description !== undefined) { sets.push(`description = $${n++}`); vals.push(description); }
+      if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+      vals.push(id);
+      const result = await pool.query(
+        `UPDATE playlists SET ${sets.join(', ')} WHERE id = $${n} RETURNING *`,
+        vals
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Playlist not found' });
+      res.json(result.rows[0]);
+    } catch (error) {
+      console.error('Error updating playlist:', error);
+      res.status(500).json({ error: 'Failed to update playlist' });
+    }
+  });
+
+  app.delete('/api/playlists/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+      const result = await pool.query(
+        'DELETE FROM playlists WHERE id = $1 RETURNING *', [id]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Playlist not found' });
+      res.json({ deleted: true });
+    } catch (error) {
+      console.error('Error deleting playlist:', error);
+      res.status(500).json({ error: 'Failed to delete playlist' });
+    }
+  });
+
+  // Batch reorder folders and playlists
+  app.post('/api/reorder', async (req, res) => {
+    const { folders, playlists } = req.body;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (Array.isArray(folders)) {
+        for (const f of folders) {
+          await client.query(
+            'UPDATE playlist_folders SET parent_id = $1, position = $2 WHERE id = $3',
+            [f.parent_id ?? null, f.position, f.id]
+          );
+        }
+      }
+      if (Array.isArray(playlists)) {
+        for (const p of playlists) {
+          await client.query(
+            'UPDATE playlists SET folder_id = $1, position = $2 WHERE id = $3',
+            [p.folder_id ?? null, p.position, p.id]
+          );
+        }
+      }
+      await client.query('COMMIT');
+      res.json({ ok: true });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Error reordering:', error);
+      res.status(500).json({ error: 'Failed to reorder' });
+    } finally {
+      client.release();
     }
   });
 

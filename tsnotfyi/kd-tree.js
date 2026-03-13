@@ -254,28 +254,33 @@ class MusicalKDTree {
 
     async loadTracks() {
         // Load all tracks with their audio features and PCA values
-        //  -- TODO(play-history-db): reintroduce love/hate join once migrated
+        // Joins ratings table to exclude hated tracks (rating = -1) and stamp loved status
         const query = `
             SELECT
-                identifier,
-                bt_title as title,
-                bt_artist as artist,
-                bt_path as path,
-                bt_length as length,
-                ${this.dimensions.join(', ')},
-                primary_d,
-                tonal_pc1, tonal_pc2, tonal_pc3,
-                spectral_pc1, spectral_pc2, spectral_pc3,
-                rhythmic_pc1, rhythmic_pc2, rhythmic_pc3,
-                vae_latent_0, vae_latent_1, vae_latent_2, vae_latent_3,
-                vae_latent_4, vae_latent_5, vae_latent_6, vae_latent_7,
-                vae_model_version, vae_computed_at,
-                beets_meta
-            FROM music_analysis
-            WHERE bpm IS NOT NULL
-            AND spectral_centroid IS NOT NULL
-            AND primary_d IS NOT NULL
-            ORDER BY identifier
+                ma.identifier,
+                ma.bt_title as title,
+                ma.bt_artist as artist,
+                ma.bt_path as path,
+                ma.bt_length as length,
+                ${this.dimensions.map(d => 'ma.' + d).join(', ')},
+                ma.primary_d,
+                ma.tonal_pc1, ma.tonal_pc2, ma.tonal_pc3,
+                ma.spectral_pc1, ma.spectral_pc2, ma.spectral_pc3,
+                ma.rhythmic_pc1, ma.rhythmic_pc2, ma.rhythmic_pc3,
+                ma.vae_latent_0, ma.vae_latent_1, ma.vae_latent_2, ma.vae_latent_3,
+                ma.vae_latent_4, ma.vae_latent_5, ma.vae_latent_6, ma.vae_latent_7,
+                ma.vae_model_version, ma.vae_computed_at,
+                ma.beets_meta,
+                r.rating as love_rating,
+                ps.completion_count as play_count
+            FROM music_analysis ma
+            LEFT JOIN ratings r ON ma.identifier = r.identifier
+            LEFT JOIN play_stats ps ON ma.identifier = ps.identifier
+            WHERE ma.bpm IS NOT NULL
+            AND ma.spectral_centroid IS NOT NULL
+            AND ma.primary_d IS NOT NULL
+            AND (r.rating IS NULL OR r.rating != -1)
+            ORDER BY ma.identifier
         `;
 
         const rows = await runAll(this.db, query);
@@ -331,8 +336,8 @@ class MusicalKDTree {
                 length: row.length,
                 features: {},
                 albumCover: artPath,
-                // TODO(play-history-db): hydrate love once migrated to dedicated table
-                love: undefined,
+                loved: row.love_rating === 1,
+                playCount: row.play_count || 0,
                 pca: {
                     primary_d: row.primary_d,
                     tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],

@@ -9,6 +9,31 @@ import { packUpStackCards, clearStackedPreviewLayer } from './helpers.js';
 import { createLogger } from './log.js';
 const log = createLogger('tray');
 
+const PASTEL_COLORS = [
+    '#ffaaaa', // light red
+    '#aaffaa', // light green
+    '#aaaaff', // light blue
+    '#ffffaa', // light yellow (rg)
+    '#aaffff', // light cyan
+    '#ffaaff', // light magenta
+    '#cccccc', // light grey
+];
+
+function pastelFromString(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) {
+        h = (h * 31 + s.charCodeAt(i)) | 0;
+    }
+    return PASTEL_COLORS[((h % PASTEL_COLORS.length) + PASTEL_COLORS.length) % PASTEL_COLORS.length];
+}
+
+function monthFromPath(path) {
+    if (!path) return '';
+    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+    // volume/year/month/artist/album/track.mp3 → month is parts[-4]
+    return parts.length >= 4 ? parts[parts.length - 4] : '';
+}
+
 /**
  * Add a track to the playlist queue
  * @param {Object} item - Playlist item
@@ -45,6 +70,7 @@ export function addToPlaylist(item) {
         title: item.title || 'Unknown',
         artist: item.artist || 'Unknown Artist',
         album: item.album || '',
+        path: item.path || null,
         addedAt: Date.now()
     };
 
@@ -88,6 +114,11 @@ export function popPlaylistHead() {
 
     const removed = state.playlist.shift();
     log.info(`popPlaylistHead: Popped ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
+
+    // Show playlist name label when first track from a named playlist starts
+    if (state.activePlaylistName) {
+        setPlaylistNameLabel(state.activePlaylistName);
+    }
 
     // Update tray UI
     renderPlaylistTray();
@@ -189,9 +220,15 @@ export function renderPlaylistTray() {
         const title = (item.title || '').replace(/"/g, '&quot;');
         const artist = (item.artist || '').replace(/"/g, '&quot;');
         const album = (item.album || '').replace(/"/g, '&quot;');
+        const isDefault = !item.albumCover || item.albumCover === '/images/albumcover.png';
+        const label = isDefault ? monthFromPath(item.path) : '';
+        const labelHtml = label
+            ? `<span class="playlist-cover-label" style="color:${pastelFromString(label)}">${label.replace(/</g, '&lt;')}</span>`
+            : '';
         return `<div class="playlist-cover" data-track-id="${item.trackId}" data-index="${i}"
                      data-title="${title}" data-artist="${artist}" data-album="${album}">
             <img src="${item.albumCover || ''}" alt="${title}" draggable="false" />
+            ${labelHtml}
         </div>`;
     }).join('');
 
@@ -230,6 +267,13 @@ export function renderPlaylistTray() {
     // Update tray visibility
     const hasItems = items.length > 0;
     trayRoot.classList.toggle('has-items', hasItems);
+
+    // Clear playlist name and re-enable save when tray empties
+    if (!hasItems) {
+        state.activePlaylistName = null;
+        setPlaylistNameLabel('');
+        updateSaveButtonState();
+    }
 
     const ids = items.map(p => p.trackId.substring(0, 8));
     log.info(`renderPlaylistTray: ${ids.length} items [${ids.join(', ')}] visible=${hasItems}`);
@@ -409,6 +453,38 @@ export function initPlaylistTray() {
     // Initialize tray structure
     renderPlaylistTray();
 
+    // Playlist control buttons
+    const btnLoad = document.getElementById('btnLoadPlaylist');
+    const btnSave = document.getElementById('btnSaveSession');
+    if (btnLoad) btnLoad.addEventListener('click', () => showPlaylistPicker());
+    if (btnSave) btnSave.addEventListener('click', () => {
+        // Build track list: history + current + tray
+        const tracks = [];
+        const seen = new Set();
+        // History (identifiers only — playlists page fetches metadata after save)
+        for (const id of (state.sessionTrackHistory || [])) {
+            if (!seen.has(id)) {
+                seen.add(id);
+                tracks.push({ identifier: id });
+            }
+        }
+        // Current track
+        const cur = state.latestCurrentTrack;
+        if (cur?.identifier && !seen.has(cur.identifier)) {
+            seen.add(cur.identifier);
+            tracks.push({ identifier: cur.identifier });
+        }
+        // Tray items
+        for (const item of (state.playlist || [])) {
+            if (!seen.has(item.trackId)) {
+                seen.add(item.trackId);
+                tracks.push({ identifier: item.trackId, direction: item.directionKey });
+            }
+        }
+        const payload = btoa(JSON.stringify({ tracks }));
+        window.open(`/playlists?session=${encodeURIComponent(payload)}`, '_blank');
+    });
+
     // Cover click — unwind back to that position
     trayRoot.addEventListener('click', (e) => {
         const cover = e.target.closest('.playlist-cover');
@@ -441,6 +517,32 @@ export function initPlaylistTray() {
 }
 
 /**
+ * Disable save-session button while a named playlist is active
+ */
+function updateSaveButtonState() {
+    const btn = document.getElementById('btnSaveSession');
+    if (!btn) return;
+    const disabled = !!state.activePlaylistName;
+    btn.disabled = disabled;
+    btn.style.opacity = disabled ? '0.3' : '';
+    btn.style.pointerEvents = disabled ? 'none' : '';
+}
+
+/**
+ * Show or hide the playlist name label above the now-playing card
+ */
+function setPlaylistNameLabel(name) {
+    const el = document.getElementById('playlistNameLabel');
+    if (!el) return;
+    if (name) {
+        el.textContent = name;
+        el.classList.add('visible');
+    } else {
+        el.classList.remove('visible');
+    }
+}
+
+/**
  * Shared track hover tooltip — fixed at bottom center of viewport
  */
 let _tooltip = null;
@@ -467,6 +569,146 @@ export function hideTrackTooltip() {
     tip.classList.remove('visible');
 }
 
+/**
+ * Load a playlist from the database into the tray
+ * @param {number} playlistId - Database playlist ID
+ * @returns {Promise<number>} Number of tracks loaded
+ */
+export async function loadPlaylistIntoTray(playlistId) {
+    log.info(`loadPlaylistIntoTray: loading playlist ${playlistId}`);
+
+    const res = await fetch(`/api/playlists/${playlistId}`);
+    if (!res.ok) {
+        log.error(`loadPlaylistIntoTray: fetch failed ${res.status}`);
+        return 0;
+    }
+
+    const playlist = await res.json();
+    if (!playlist.tracks || playlist.tracks.length === 0) {
+        log.info('loadPlaylistIntoTray: playlist has no tracks');
+        return 0;
+    }
+
+    // Clear existing tray
+    clearPlaylist();
+
+    // Add each track to the tray (skip duplicates of current track)
+    const currentId = state.latestCurrentTrack?.identifier;
+    let loaded = 0;
+    for (const track of playlist.tracks) {
+        if (track.identifier === currentId) continue;
+        addToPlaylist({
+            trackId: track.identifier,
+            albumCover: track.albumCover || '/images/albumcover.png',
+            directionKey: track.direction || null,
+            explorerData: null,
+            title: track.title || 'Unknown',
+            artist: track.artist || 'Unknown Artist',
+            album: track.album || '',
+            path: track.path || null
+        });
+        loaded++;
+    }
+
+    log.info(`loadPlaylistIntoTray: loaded ${loaded} tracks from "${playlist.name}"`);
+
+    // Store name — label shown when first track starts playing (popPlaylistHead)
+    state.activePlaylistName = playlist.name || '';
+    updateSaveButtonState();
+
+    // Tell the server the first tray item is the next track
+    const head = getPlaylistNext();
+    if (head && typeof window.sendNextTrack === 'function') {
+        log.info(`loadPlaylistIntoTray: notifying server of next track ${head.trackId.substring(0, 8)}`);
+        window.sendNextTrack(head.trackId, head.directionKey, 'user');
+    }
+
+    // Refresh the clock with explorer data for the last playlist item
+    const tail = state.playlist[state.playlist.length - 1];
+    if (tail) {
+        log.info(`loadPlaylistIntoTray: fetching explorer for tail ${tail.trackId.substring(0, 8)}`);
+        fetchExplorerWithPlaylist(tail.trackId, { forceFresh: true }).then(explorerData => {
+            if (explorerData) {
+                state.latestExplorerData = explorerData;
+                if (typeof window.createDimensionCards === 'function') {
+                    window.createDimensionCards(explorerData, { skipExitAnimation: true, isPlaylistExploration: true });
+                }
+            }
+        }).catch(err => log.error('loadPlaylistIntoTray: explorer fetch failed', err));
+    }
+
+    return loaded;
+}
+
+/**
+ * Show playlist picker overlay
+ */
+let _pickerEl = null;
+export async function showPlaylistPicker() {
+    // Close if already open
+    if (_pickerEl && _pickerEl.isConnected) {
+        _pickerEl.remove();
+        _pickerEl = null;
+        return;
+    }
+
+    const res = await fetch('/api/playlists');
+    if (!res.ok) {
+        log.error('showPlaylistPicker: failed to fetch playlists');
+        return;
+    }
+
+    const playlists = await res.json();
+    if (playlists.length === 0) {
+        log.info('showPlaylistPicker: no playlists');
+        return;
+    }
+
+    _pickerEl = document.createElement('div');
+    _pickerEl.className = 'playlist-picker';
+    _pickerEl.innerHTML = `
+        <div class="playlist-picker-list">
+            ${playlists.map(p => `
+                <div class="playlist-picker-item" data-id="${p.id}">
+                    <span class="playlist-picker-name">${(p.name || '').replace(/</g, '&lt;')}</span>
+                    <span class="playlist-picker-count">${p.track_count}</span>
+                </div>
+            `).join('')}
+        </div>
+    `;
+
+    _pickerEl.addEventListener('click', async (e) => {
+        const item = e.target.closest('.playlist-picker-item');
+        if (item) {
+            const id = parseInt(item.dataset.id, 10);
+            _pickerEl.remove();
+            _pickerEl = null;
+            await loadPlaylistIntoTray(id);
+        }
+    });
+
+    // Close on click outside list
+    _pickerEl.addEventListener('click', (e) => {
+        if (e.target === _pickerEl) {
+            _pickerEl.remove();
+            _pickerEl = null;
+        }
+    });
+
+    // Close on Escape
+    const onKey = (e) => {
+        if (e.key === 'Escape' && _pickerEl?.isConnected) {
+            _pickerEl.remove();
+            _pickerEl = null;
+            document.removeEventListener('keydown', onKey, true);
+            e.stopPropagation();
+        }
+    };
+    document.addEventListener('keydown', onKey, true);
+
+    document.body.appendChild(_pickerEl);
+}
+
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {
     window.addToPlaylist = addToPlaylist;
@@ -483,4 +725,6 @@ if (typeof window !== 'undefined') {
     window.promoteCenterCardToTray = promoteCenterCardToTray;
     window.showTrackTooltip = showTrackTooltip;
     window.hideTrackTooltip = hideTrackTooltip;
+    window.loadPlaylistIntoTray = loadPlaylistIntoTray;
+    window.showPlaylistPicker = showPlaylistPicker;
 }

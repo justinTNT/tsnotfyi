@@ -462,6 +462,28 @@ audio {
     text-shadow: 0 0 10px #0a0;
 }
 
+/* Playlist name label — above the now-playing card */
+.playlist-name-label {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 8px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 2rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: #0a0;
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+    text-align: center;
+    width: 100%;
+}
+.playlist-name-label.visible {
+    opacity: 1;
+}
+
 /* Now Playing Card - positioned left side in 3D space */
 #nowPlayingCard {
     position: fixed;
@@ -476,6 +498,95 @@ audio {
 #nowPlayingCard.visible {
     transform: translateY(-50%) perspective(1000px) rotateY(15deg) rotateX(-5deg) scale(1);
     opacity: 1;
+}
+
+/* Love/Hate buttons — hover above card shoulders */
+.love-btn, .hate-btn {
+    position: absolute;
+    top: 8px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(4px);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.15s;
+    z-index: 10;
+    padding: 0;
+}
+
+#nowPlayingCard:hover .love-btn,
+#nowPlayingCard:hover .hate-btn {
+    opacity: 0.6;
+}
+
+.love-btn:hover, .hate-btn:hover {
+    opacity: 1 !important;
+    transform: scale(1.15);
+}
+
+.love-btn {
+    left: 0px;
+}
+
+.hate-btn {
+    right: 0px;
+}
+
+/* Love button states */
+.love-btn svg {
+    fill: #555;
+    stroke: none;
+    transition: fill 0.2s;
+}
+
+.love-btn.active,
+.hate-btn.active {
+    opacity: 1 !important;
+}
+
+.love-btn.active svg {
+    fill: #e33;
+}
+
+.love-btn:not(.active):hover svg {
+    fill: #888;
+}
+
+/* Hate button states */
+.hate-btn svg {
+    fill: #555;
+    stroke: none;
+    transition: fill 0.2s;
+}
+
+.hate-btn.active svg {
+    fill: #e33;
+}
+
+.hate-btn:not(.active):hover svg {
+    fill: #888;
+}
+
+/* Heart on next-track center card */
+.next-track-heart {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 5;
+    pointer-events: none;
+}
+
+.next-track-heart svg {
+    width: 16px;
+    height: 16px;
+    fill: #e33;
+    filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5));
 }
 
 #nowPlayingCard.flip {
@@ -680,6 +791,45 @@ audio {
 
 
 
+/* Playlist controls — load/save buttons left of tray */
+.playlist-controls {
+    position: fixed;
+    bottom: 2em;
+    left: calc(15% - 56px);
+    z-index: 121;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    opacity: 0.4;
+    transition: opacity 0.3s;
+}
+
+.playlist-controls:hover {
+    opacity: 1;
+}
+
+.playlist-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(26, 26, 46, 0.8);
+    color: #888;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+    backdrop-filter: blur(4px);
+    padding: 0;
+}
+
+.playlist-btn:hover {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.3);
+    background: rgba(26, 26, 46, 0.95);
+}
+
 /* Playlist Tray - Queue with left/right stacks */
 #nextTrackTray {
     position: fixed;
@@ -726,6 +876,21 @@ audio {
     width: 100%;
     height: 100%;
     object-fit: cover;
+}
+
+.playlist-cover-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: end;
+    justify-content: center;
+    font-size: 24px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 10%;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+    pointer-events: none;
+    z-index: 1;
 }
 
 /* Track info tooltip — shared across tray, direction cards, stacked cards */
@@ -1390,4 +1555,57 @@ audio {
     box-shadow: 0 12px 48px rgba(52, 152, 219, 0.4), inset 0 1px 0 rgba(52, 152, 219, 0.3);
 }
 
+/* Playlist picker overlay */
+.playlist-picker {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+}
 
+.playlist-picker-list {
+    max-height: 70vh;
+    overflow-y: auto;
+    min-width: 280px;
+    max-width: 400px;
+    background: #1a1a2e;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 8px 0;
+    box-shadow: 0 16px 64px rgba(0, 0, 0, 0.6);
+}
+
+.playlist-picker-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    cursor: pointer;
+    color: #ccc;
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    transition: background 0.15s;
+}
+
+.playlist-picker-item:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+}
+
+.playlist-picker-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.playlist-picker-count {
+    margin-left: 12px;
+    color: #666;
+    font-size: 11px;
+    flex-shrink: 0;
+}

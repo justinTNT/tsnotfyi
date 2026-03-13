@@ -204,6 +204,16 @@ let nextTrackPreviewFadeTimer = null;
           });
       }
 
+      // Update love button state — prefer client-side state for the current track
+      // (SSE trackData.loved is stale from KD-tree load; the click handler updates state)
+      const btnLove = document.getElementById('btnLove');
+      if (btnLove) {
+          const lovedState = (state.latestCurrentTrack?.identifier === trackId && state.latestCurrentTrack?.loved !== undefined)
+              ? state.latestCurrentTrack.loved
+              : trackData.loved;
+          btnLove.classList.toggle('active', !!lovedState);
+      }
+
       // Resolve panel color variant based on track + direction (deterministic per track)
       const panel = document.querySelector('#nowPlayingCard .panel');
       const cardFrame = document.querySelector('#nowPlayingCard .card');
@@ -1781,7 +1791,30 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               e.preventDefault();
               break;
 
-          case '\t':
+          case 'l':
+              // Load a playlist into the tray
+              if (typeof window.showPlaylistPicker === 'function') {
+                  window.showPlaylistPicker();
+              }
+              e.preventDefault();
+              break;
+
+          case 'Tab':
+              // Shift playlist: drop the head, advance the tray
+              if (typeof window.popPlaylistHead === 'function' && typeof window.playlistHasItems === 'function' && window.playlistHasItems()) {
+                  const popped = window.popPlaylistHead();
+                  if (popped) {
+                      deckLog2.info(`🎵 Tab: dropped tray head ${popped.trackId.substring(0, 8)}`);
+                      const newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
+                      if (newHead && typeof window.sendNextTrack === 'function') {
+                          window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+                      }
+                  }
+              }
+              e.preventDefault();
+              break;
+
+          case 't':
               // Seek behavior: halfway in first wipe, 5 secs before crossfade in second wipe
               // Since audio is streamed, requires server-side cooperation
               if (!elements.audio || !elements.audio.duration) {
@@ -3187,6 +3220,50 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Initialize playlist tray
     initPlaylistTray();
+
+    // Love/Hate buttons
+    const btnLove = document.getElementById('btnLove');
+    const btnHate = document.getElementById('btnHate');
+    if (btnLove) {
+        btnLove.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const id = state.latestCurrentTrack?.identifier;
+            if (!id) return;
+            const isLoved = btnLove.classList.contains('active');
+            const newRating = isLoved ? 0 : 1;
+            btnLove.classList.toggle('active', !isLoved);
+            try {
+                await fetch(`/api/track/${id}/rate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rating: newRating })
+                });
+                if (state.latestCurrentTrack) state.latestCurrentTrack.loved = !isLoved;
+            } catch (err) { console.error('Love toggle failed:', err); }
+        });
+    }
+    if (btnHate) {
+        btnHate.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const id = state.latestCurrentTrack?.identifier;
+            if (!id) return;
+            const isHated = btnHate.classList.contains('active');
+            const newRating = isHated ? 0 : -1;
+            btnHate.classList.toggle('active', !isHated);
+            if (btnLove) btnLove.classList.remove('active');
+            try {
+                await fetch(`/api/track/${id}/rate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rating: newRating })
+                });
+                if (state.latestCurrentTrack) {
+                    state.latestCurrentTrack.loved = false;
+                    state.latestCurrentTrack.hated = !isHated;
+                }
+            } catch (err) { console.error('Hate toggle failed:', err); }
+        });
+    }
 
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
