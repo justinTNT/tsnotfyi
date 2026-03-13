@@ -5,6 +5,7 @@ const https = require('https');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
+const { Worker } = require('worker_threads');
 const DriftAudioMixer = require('./drift-audio-mixer');
 const RadialSearchService = require('./radial-search');
 const VAEService = require('./services/vaeService');
@@ -312,6 +313,100 @@ async function initializeServices() {
   }
 }
 
+// ─── Explorer Worker Management ─────────────────────────────────────────────
+
+let explorerWorker = null;
+let explorerWorkerReady = false;
+const pendingExplorerRequests = new Map(); // requestId -> { resolve, reject, timer }
+let explorerRequestCounter = 0;
+
+function spawnExplorerWorker() {
+  const workerPath = path.join(__dirname, 'explorer-worker.js');
+  if (!fs.existsSync(workerPath)) {
+    startupLog.warn('⚠️ explorer-worker.js not found — explorer will run on main thread');
+    return;
+  }
+
+  explorerWorker = new Worker(workerPath);
+  explorerWorkerReady = false;
+
+  explorerWorker.on('message', (msg) => {
+    switch (msg.type) {
+      case 'ready':
+        explorerWorkerReady = true;
+        startupLog.info(`✅ Explorer worker ready (KD-tree loaded in ${msg.loadTimeMs}ms)`);
+        break;
+
+      case 'explore_result': {
+        const pending = pendingExplorerRequests.get(msg.requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingExplorerRequests.delete(msg.requestId);
+          if (msg.error) {
+            pending.reject(new Error(msg.error));
+          } else {
+            pending.resolve(msg);
+          }
+        }
+        break;
+      }
+
+      case 'error':
+        startupLog.error('Explorer worker initialization error:', msg.error);
+        break;
+    }
+  });
+
+  explorerWorker.on('error', (err) => {
+    startupLog.error('Explorer worker error:', err);
+    explorerWorkerReady = false;
+  });
+
+  explorerWorker.on('exit', (code) => {
+    startupLog.warn(`Explorer worker exited with code ${code}`);
+    explorerWorkerReady = false;
+    explorerWorker = null;
+    // Reject all pending requests
+    for (const [requestId, pending] of pendingExplorerRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Explorer worker exited'));
+    }
+    pendingExplorerRequests.clear();
+  });
+
+  // Tell worker to initialize (sequenced after main thread's KD-tree is ready)
+  explorerWorker.postMessage({ type: 'init' });
+}
+
+/**
+ * Send an explorer request to the worker thread.
+ * Returns a Promise that resolves with the explorer result.
+ */
+function requestExplorerFromWorker(trackId, sessionContext, config, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    if (!explorerWorker || !explorerWorkerReady) {
+      reject(new Error('explorer_not_ready'));
+      return;
+    }
+
+    const requestId = `req_${++explorerRequestCounter}_${Date.now()}`;
+    const timer = setTimeout(() => {
+      pendingExplorerRequests.delete(requestId);
+      reject(new Error('Explorer request timed out'));
+    }, timeoutMs);
+
+    pendingExplorerRequests.set(requestId, { resolve, reject, timer });
+
+    explorerWorker.postMessage({
+      type: 'explore',
+      requestId,
+      trackId,
+      sessionContext,
+      config
+    });
+  });
+}
+
 async function createSession(options = {}) {
   const {
     sessionId = `session_${crypto.randomBytes(4).toString('hex')}`,
@@ -390,6 +485,8 @@ function findTrackInExplorerSnapshot(explorer, trackId) {
 
 const servicesReady = initializeServices();
 servicesReady.then(() => {
+  // Spawn explorer worker AFTER main KD-tree is loaded (sequenced, not parallel)
+  spawnExplorerWorker();
   schedulePrimedSessions('startup');
 }).catch(err => {
   serverLog.error('🔥 Failed to schedule startup primed sessions:', err);
@@ -1247,8 +1344,7 @@ app.get('/:md5', async (req, res, next) => {
     }
 
     // Seed the session with this track (streaming starts when client connects)
-    session.mixer.currentTrack = track;
-    session.mixer.trackStartTime = Date.now();
+    session.mixer.seedCurrentTrack(track);
 
     console.log(`🎯 Session seeded with: ${track.title} by ${track.artist}`);
 
@@ -1312,8 +1408,7 @@ app.get('/:md51/:md52', async (req, res, next) => {
     }
 
     // Seed session with track1 and preload track2 (streaming starts when client connects)
-    session.mixer.currentTrack = track1;
-    session.mixer.trackStartTime = Date.now();
+    session.mixer.seedCurrentTrack(track1);
     if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
       session.mixer.handleUserSelectedNextTrack(md52, { debounceMs: 0 });
     } else if (typeof session.mixer.prepareNextTrackForCrossfade === 'function') {
@@ -1777,11 +1872,84 @@ app.post('/explorer', async (req, res) => {
     }
     serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
 
-    // Build explorer data — always use the mixer's comprehensive pipeline
+    // Build explorer data — prefer worker thread, fall back to mixer's main-thread pipeline
     let explorerData;
     const isSameTrack = session?.mixer?.currentTrack?.identifier === sourceTrack?.identifier;
-    if (session?.mixer) {
-      serverLog.info(`🎯 Using session mixer for explorer data (trackId=${trackId.substring(0,8)}, isSameTrack=${isSameTrack})`);
+    if (session?.mixer && explorerWorkerReady) {
+      // Check session-level cache first (on main thread, cheap)
+      const mixer = session.mixer;
+      const resolution = mixer.explorerResolution || 'adaptive';
+      const cacheKey = `${sourceTrack.identifier}_${resolution}`;
+
+      if (!isSameTrack || !mixer.explorerDataCache?.has(cacheKey)) {
+        // Route to worker thread — no main-thread blocking
+        serverLog.info(`🎯 Routing explorer to worker thread (trackId=${trackId.substring(0,8)})`);
+        try {
+          const sessionContext = {
+            seenArtists: Array.from(mixer.seenArtists || []),
+            seenAlbums: Array.from(mixer.seenAlbums || []),
+            sessionHistoryIds: (mixer.sessionHistory || []).map(e => e.identifier),
+            currentTrackId: mixer.currentTrack?.identifier || null,
+            noArtist: mixer.noArtist,
+            noAlbum: mixer.noAlbum,
+            failedTrackIds: Array.from(mixer.failedTrackAttempts || new Map())
+              .filter(([_, count]) => count >= 3).map(([id]) => id)
+          };
+
+          const workerConfig = {
+            explorerResolution: resolution,
+            stackTotalCount: mixer.stackTotalCount || 0,
+            stackRandomCount: mixer.stackRandomCount || 0,
+            cachedRadius: mixer.adaptiveRadiusCache?.get(sourceTrack.identifier)?.radius ?? null,
+            dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
+              ? mixer.dynamicRadiusState.currentRadius : null
+          };
+
+          const result = await requestExplorerFromWorker(sourceTrack.identifier, sessionContext, workerConfig);
+
+          explorerData = result.explorerData;
+
+          // Update main-thread bookkeeping from worker results
+          if (result.radiusUsed != null) {
+            mixer.adaptiveRadiusCache.set(sourceTrack.identifier, {
+              radius: result.radiusUsed,
+              count: result.neighborhoodSize,
+              updatedAt: Date.now()
+            });
+            mixer.currentAdaptiveRadius = {
+              radius: result.radiusUsed,
+              count: result.neighborhoodSize,
+              cachedRadiusReused: false
+            };
+          }
+          if (result.dynamicRadiusState && Number.isFinite(result.dynamicRadiusState.currentRadius)) {
+            mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
+          }
+          if (explorerData) {
+            mixer.explorerDataCache.set(cacheKey, explorerData);
+            mixer.recordExplorerSummary(explorerData,
+              explorerData.diagnostics?.radius || null,
+              result.neighborhoodSize || 0);
+          }
+          serverLog.info(`🎯 Worker explorer complete (${result.computeTimeMs}ms)`);
+        } catch (workerErr) {
+          serverLog.warn(`⚠️ Worker explorer failed, falling back to main thread: ${workerErr.message}`);
+          explorerData = await session.mixer.getComprehensiveExplorerData({
+            trackId: sourceTrack.identifier,
+            forceFresh: !isSameTrack
+          });
+        }
+      } else {
+        // Cache hit — use mixer's cached data (cheap main-thread read)
+        serverLog.info(`🎯 Explorer cache hit (trackId=${trackId.substring(0,8)})`);
+        explorerData = await session.mixer.getComprehensiveExplorerData({
+          trackId: sourceTrack.identifier,
+          forceFresh: false
+        });
+      }
+    } else if (session?.mixer) {
+      // Worker not ready yet — use main-thread computation
+      serverLog.info(`🎯 Using session mixer for explorer data (trackId=${trackId.substring(0,8)}, isSameTrack=${isSameTrack}, workerReady=${explorerWorkerReady})`);
       explorerData = await session.mixer.getComprehensiveExplorerData({
         trackId: sourceTrack.identifier,
         forceFresh: !isSameTrack
@@ -2597,7 +2765,14 @@ function startServer() {
       }
 
       radialSearch.close();
-      
+
+      // Terminate explorer worker
+      if (explorerWorker) {
+        explorerWorker.terminate().catch(() => {});
+        explorerWorker = null;
+        explorerWorkerReady = false;
+      }
+
       // Cleanup VAE service
       if (vaeService && typeof vaeService.shutdown === 'function') {
         vaeService.shutdown().catch(console.error);

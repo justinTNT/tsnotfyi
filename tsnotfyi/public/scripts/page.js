@@ -2562,6 +2562,7 @@ if (typeof window !== 'undefined') {
                          // Cycle the appropriate tracks
                          tracksToUse.push(tracksToUse.shift());
                          const track = tracksToUse[0].track || tracksToUse[0];
+                         state.selectedIdentifier = track.identifier;
                          updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           // Pack up stack cards first, then rotate and animate

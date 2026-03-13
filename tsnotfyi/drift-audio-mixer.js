@@ -507,6 +507,19 @@ class DriftAudioMixer {
     return oppositeDirections[directionKey];
   }
 
+  // ─── Setter methods (Tier 3: formalize web-layer → mixer mutations) ─────
+
+  seedCurrentTrack(track) {
+    this.currentTrack = track;
+    this.trackStartTime = Date.now();
+  }
+
+  resetStack() {
+    this.stack = [];
+    this.stackIndex = 0;
+    this.positionSeconds = 0;
+  }
+
   getDisplayCurrentTrack() {
     return this.currentTrack || null;
   }
@@ -2889,6 +2902,7 @@ class DriftAudioMixer {
       identifier: displayTrack.identifier,
       title: displayTrack.title,
       artist: displayTrack.artist,
+      albumCover: displayTrack.albumCover || this.lookupTrackAlbumCover(displayTrack.identifier) || null,
       startTime: canonicalStartTime,
       durationMs
     };
@@ -3436,6 +3450,7 @@ class DriftAudioMixer {
     const pcaDirections = this.radialSearch.getPCADirections();
 
     // Explore PCA directions first (skip primary_d - internal only)
+    let pcaPairCount = 0;
     for (const [domain, domainInfo] of Object.entries(pcaDirections)) {
       if (domain === 'primary_d') {
         // Skip primary discriminator - used internally, not exposed to UI
@@ -3447,6 +3462,11 @@ class DriftAudioMixer {
           const directionKey = `${domain}_${component}`;
           await this.exploreDirection(explorerData, domain, component, componentInfo.positive, componentInfo.description, 'positive', totalNeighborhoodSize, targetTrack);
           await this.exploreDirection(explorerData, domain, component, componentInfo.negative, componentInfo.description, 'negative', totalNeighborhoodSize, targetTrack);
+          pcaPairCount++;
+          // Yield to event loop every 2 direction pairs so audio streaming keeps flowing
+          if (pcaPairCount % 2 === 0) {
+            await setImmediatePromise();
+          }
         }
       }
     }
@@ -3490,10 +3510,15 @@ class DriftAudioMixer {
       console.log(`🔍 CORE SEARCH SETUP: getDirectionalCandidates method exists:`, typeof this.radialSearch.getDirectionalCandidates);
     }
 
-    for (const feature of originalFeatures) {
+    for (let featureIdx = 0; featureIdx < originalFeatures.length; featureIdx++) {
+      const feature = originalFeatures[featureIdx];
       if (VERBOSE_EXPLORER) console.log(`📊 Exploring original feature: ${feature.name} (${feature.description})`);
       await this.exploreOriginalFeatureDirection(explorerData, feature, 'positive', totalNeighborhoodSize, targetTrack);
       await this.exploreOriginalFeatureDirection(explorerData, feature, 'negative', totalNeighborhoodSize, targetTrack);
+      // Yield to event loop every 3 features (6 KD-tree searches) so audio streaming keeps flowing
+      if ((featureIdx + 1) % 3 === 0) {
+        await setImmediatePromise();
+      }
     }
 
     if (currentTrackData.vae?.latent && Array.isArray(currentTrackData.vae.latent)) {

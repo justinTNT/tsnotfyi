@@ -72,9 +72,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     try {
       const session = getSessionById(sessionName);
       if (session) {
-        session.mixer.stack = [];
-        session.mixer.stackIndex = 0;
-        session.mixer.positionSeconds = 0;
+        session.mixer.resetStack();
         session.mixer.ephemeral = false;
         console.log(`🔄 Reset named session: ${sessionName}`);
       }
