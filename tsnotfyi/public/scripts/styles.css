@@ -1609,3 +1609,17 @@ audio {
     font-size: 11px;
     flex-shrink: 0;
 }
+
+.playlist-picker-folder .playlist-picker-name {
+    color: #888;
+}
+
+.playlist-picker-folder .playlist-picker-count::after {
+    content: ' \25B6';
+    font-size: 8px;
+    margin-left: 4px;
+}
+
+.playlist-picker-back {
+    color: #666;
+}

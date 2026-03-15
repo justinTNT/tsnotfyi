@@ -1688,6 +1688,14 @@ class DriftAudioMixer {
       'pipe:1'
     ];
 
+    // Kill any existing noise process before spawning a new one
+    if (this.currentProcess) {
+      try {
+        this.currentProcess.kill('SIGKILL');
+      } catch (_) {}
+      this.currentProcess = null;
+    }
+
     this.currentProcess = spawn('ffmpeg', ffmpegArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -1721,6 +1729,12 @@ class DriftAudioMixer {
     try {
       if (this.audioMixer?.engine?.isStreaming) {
         console.log('🔄 Drift already active; skipping auto-resume');
+        return;
+      }
+
+      if (!this.radialSearch?.kdTree?.tracks?.length) {
+        console.log('🔄 KD-tree not ready yet; will retry in 3s');
+        setTimeout(() => this.attemptDriftResumption(), 3000);
         return;
       }
 

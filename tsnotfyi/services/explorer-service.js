@@ -18,6 +18,13 @@ function explorerLog(...args) {
   }
 }
 
+/** Extract great-grandparent folder segment from a track path (month level). */
+function folderLabel(path) {
+  if (!path) return '';
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts.length >= 4 ? parts[parts.length - 4] : '';
+}
+
 const VAE_LATENT_LABELS = [
   'Hidden Doorway',
   'Clandestine Passage',
@@ -228,8 +235,8 @@ async function exploreDirection(explorerData, radialSearch, domain, component, d
       };
       return {
         identifier: track.identifier, title: track.title, artist: track.artist,
-        album: track.album, albumCover: track.albumCover, duration: track.length,
-        loved: track.loved || false, playCount: track.playCount || 0,
+        album: track.album, albumCover: track.albumCover, folderLabel: folderLabel(track.path),
+        duration: track.length, loved: track.loved || false, playCount: track.playCount || 0,
         distance: sample.distance, pca: track.pca, features: track.features,
         distanceSlices,
         pcaDistanceSlices: {
@@ -304,6 +311,7 @@ async function exploreOriginalFeatureDirection(explorerData, radialSearch, featu
         distance: sample.distance || sample.similarity,
         features: track.features || track.track?.features,
         albumCover: track.albumCover || track.track?.albumCover,
+        folderLabel: folderLabel((track.path || track.track?.path)),
         distanceSlices,
         featureDistanceSlices: {
           referenceKey: directionDim, referenceDistance: featureSlices.referenceDistance,
@@ -381,8 +389,8 @@ async function exploreVaeDirection(explorerData, radialSearch, latentIndex, pola
       const track = candidate.track || {};
       return {
         identifier: track.identifier, title: track.title, artist: track.artist,
-        album: track.album, albumCover: track.albumCover, duration: track.length,
-        loved: track.loved || false, playCount: track.playCount || 0,
+        album: track.album, albumCover: track.albumCover, folderLabel: folderLabel(track.path),
+        duration: track.length, loved: track.loved || false, playCount: track.playCount || 0,
         distance: candidate.distance, latentValue: candidate.latentValue,
         latentDelta: candidate.delta, vae: track.vae, features: track.features
       };

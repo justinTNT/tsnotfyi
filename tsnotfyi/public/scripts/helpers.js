@@ -697,6 +697,10 @@ import { playlistHasItems } from './playlist-tray.js';
 
   // Cycle through stack contents for back card clicks
   function cycleStackContents(directionKey, currentTrackIndex, step = 1) {
+      if (!state.latestExplorerData?.directions) {
+          console.warn('[deck] cycleStackContents: explorer data not yet available');
+          return;
+      }
       const stack = state.latestExplorerData.directions[directionKey];
       if (!stack) return;
 

@@ -1704,7 +1704,8 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                       break;
                   }
 	      }
-              navigateDirectionToCenter(cs.clockCards[pos - 1].key);
+              const targetRight = cs.clockCards.find(c => c.position === pos);
+              if (targetRight) navigateDirectionToCenter(targetRight.key);
               e.preventDefault();
               break;
           }
@@ -1714,13 +1715,14 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               if (!cs) break;
               let pos = cs.nextPosition;
               for (let i = pos-1; i >= pos - 12; i--) {
-                  const posFromIndex = (i-1)%12 + 1;
+                  const posFromIndex = ((i - 1) % 12 + 12) % 12 + 1;
                   if (cs.occupiedPositions.has(posFromIndex)) {
                       pos = posFromIndex;
                       break;
                   }
               }
-              navigateDirectionToCenter(cs.clockCards[pos - 1].key);
+              const targetLeft = cs.clockCards.find(c => c.position === pos);
+              if (targetLeft) navigateDirectionToCenter(targetLeft.key);
               e.preventDefault();
               break;
           }
@@ -2339,6 +2341,33 @@ if (typeof window !== 'undefined') {
           return;
       }
 
+      // Demote old center card back to its original clock position,
+      // or to the spot being vacated by the incoming card if original is occupied.
+      const oldCenter = document.querySelector('.dimension-card.next-track');
+      if (oldCenter && oldCenter !== card) {
+          const originalPos = parseInt(oldCenter.dataset.originalClockPosition, 10) || null;
+          const incomingPos = parseInt(card.dataset.clockPosition, 10) || null;
+          // Check if original position is free (no other non-center card sitting there)
+          const originalOccupied = originalPos && Array.from(document.querySelectorAll('.dimension-card:not(.next-track)'))
+              .some(c => c !== oldCenter && parseInt(c.dataset.clockPosition, 10) === originalPos);
+          const pos = (originalPos && !originalOccupied) ? originalPos : incomingPos;
+          if (pos) {
+              const angle = (pos / 12) * Math.PI * 2 - Math.PI / 2;
+              const x = 50 + 38 * Math.cos(angle);
+              const y = 50 + 42 * Math.sin(angle);
+              oldCenter.dataset.clockPosition = String(pos);
+              oldCenter.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
+              oldCenter.style.left = `${x}%`;
+              oldCenter.style.top = `${y}%`;
+              oldCenter.style.transform = 'translate(-50%, -50%) translateZ(-800px) scale(0.5)';
+              oldCenter.style.zIndex = '20';
+              setTimeout(() => {
+                  oldCenter.classList.remove('next-track', 'track-detail-card', 'animating-to-center');
+                  oldCenter.style.transition = '';
+              }, 800);
+          }
+      }
+
       // Transform this direction card into a next-track stack
       card.classList.add('next-track', 'track-detail-card', 'animating-to-center');
       if (!card.dataset.originalDirectionKey) {
@@ -2678,7 +2707,7 @@ if (typeof window !== 'undefined') {
       }
 
       // Calculate position coordinates
-      const angle = ((nextPosition - 1) / 12) * Math.PI * 2 - Math.PI / 2;
+      const angle = (nextPosition / 12) * Math.PI * 2 - Math.PI / 2;
       const radiusX = 38;
       const radiusY = 42;
       const centerX = 50;

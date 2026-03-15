@@ -71,6 +71,7 @@ export function addToPlaylist(item) {
         artist: item.artist || 'Unknown Artist',
         album: item.album || '',
         path: item.path || null,
+        folderLabel: item.folderLabel || '',
         addedAt: Date.now()
     };
 
@@ -221,7 +222,7 @@ export function renderPlaylistTray() {
         const artist = (item.artist || '').replace(/"/g, '&quot;');
         const album = (item.album || '').replace(/"/g, '&quot;');
         const isDefault = !item.albumCover || item.albumCover === '/images/albumcover.png';
-        const label = isDefault ? monthFromPath(item.path) : '';
+        const label = isDefault ? (item.folderLabel || monthFromPath(item.path)) : '';
         const labelHtml = label
             ? `<span class="playlist-cover-label" style="color:${pastelFromString(label)}">${label.replace(/</g, '&lt;')}</span>`
             : '';
@@ -354,6 +355,7 @@ export async function promoteCenterCardToTray() {
     const item = addToPlaylist({
         trackId,
         albumCover,
+        folderLabel: nextTrackObj?.folderLabel || '',
         directionKey: resolvedDirection,
         explorerData,
         title,
@@ -644,67 +646,135 @@ export async function loadPlaylistIntoTray(playlistId) {
  * Show playlist picker overlay
  */
 let _pickerEl = null;
+let _pickerTree = null; // cached { folders, playlists }
+let _pickerOnKey = null;
+
+function esc(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderPickerFolder(folderId) {
+    if (!_pickerTree || !_pickerEl) return;
+
+    const { folders, playlists } = _pickerTree;
+
+    // Items in this folder
+    const childFolders = folders.filter(f =>
+        folderId === null ? !f.parent_id : f.parent_id === folderId
+    );
+    const childPlaylists = playlists.filter(p =>
+        folderId === null ? !p.folder_id : p.folder_id === folderId
+    );
+
+    let html = '';
+
+    // Parent navigation
+    if (folderId !== null) {
+        const current = folders.find(f => f.id === folderId);
+        const parentId = current?.parent_id || null;
+        html += `<div class="playlist-picker-item playlist-picker-back" data-folder-id="${parentId === null ? 'root' : parentId}">
+            <span class="playlist-picker-name">..</span>
+        </div>`;
+    }
+
+    // Folders
+    for (const f of childFolders) {
+        const count = playlists.filter(p => p.folder_id === f.id).length;
+        html += `<div class="playlist-picker-item playlist-picker-folder" data-folder-nav="${f.id}">
+            <span class="playlist-picker-name">${esc(f.name)}</span>
+            <span class="playlist-picker-count">${count}</span>
+        </div>`;
+    }
+
+    // Playlists
+    for (const p of childPlaylists) {
+        html += `<div class="playlist-picker-item" data-id="${p.id}">
+            <span class="playlist-picker-name">${esc(p.name)}</span>
+            <span class="playlist-picker-count">${p.track_count}</span>
+        </div>`;
+    }
+
+    const list = _pickerEl.querySelector('.playlist-picker-list');
+    if (list) list.innerHTML = html;
+}
+
+function closePicker() {
+    if (_pickerEl?.isConnected) _pickerEl.remove();
+    _pickerEl = null;
+    _pickerTree = null;
+    if (_pickerOnKey) {
+        document.removeEventListener('keydown', _pickerOnKey, true);
+        _pickerOnKey = null;
+    }
+}
+
 export async function showPlaylistPicker() {
     // Close if already open
     if (_pickerEl && _pickerEl.isConnected) {
-        _pickerEl.remove();
-        _pickerEl = null;
+        closePicker();
         return;
     }
 
-    const res = await fetch('/api/playlists');
+    const res = await fetch('/api/playlist-tree');
     if (!res.ok) {
-        log.error('showPlaylistPicker: failed to fetch playlists');
+        log.error('showPlaylistPicker: failed to fetch playlist tree');
         return;
     }
 
-    const playlists = await res.json();
-    if (playlists.length === 0) {
+    _pickerTree = await res.json();
+    if (_pickerTree.playlists.length === 0 && _pickerTree.folders.length === 0) {
         log.info('showPlaylistPicker: no playlists');
+        _pickerTree = null;
         return;
     }
 
     _pickerEl = document.createElement('div');
     _pickerEl.className = 'playlist-picker';
-    _pickerEl.innerHTML = `
-        <div class="playlist-picker-list">
-            ${playlists.map(p => `
-                <div class="playlist-picker-item" data-id="${p.id}">
-                    <span class="playlist-picker-name">${(p.name || '').replace(/</g, '&lt;')}</span>
-                    <span class="playlist-picker-count">${p.track_count}</span>
-                </div>
-            `).join('')}
-        </div>
-    `;
+    _pickerEl.innerHTML = `<div class="playlist-picker-list"></div>`;
 
+    // Render root level
+    renderPickerFolder(null);
+
+    // Click handler — folders navigate, playlists load, backdrop closes
     _pickerEl.addEventListener('click', async (e) => {
-        const item = e.target.closest('.playlist-picker-item');
+        // Navigate into folder
+        const folderNav = e.target.closest('[data-folder-nav]');
+        if (folderNav) {
+            renderPickerFolder(parseInt(folderNav.dataset.folderNav, 10));
+            return;
+        }
+
+        // Navigate back
+        const back = e.target.closest('.playlist-picker-back');
+        if (back) {
+            const parentId = back.dataset.folderId === 'root' ? null : parseInt(back.dataset.folderId, 10);
+            renderPickerFolder(parentId);
+            return;
+        }
+
+        // Select playlist
+        const item = e.target.closest('[data-id]');
         if (item) {
             const id = parseInt(item.dataset.id, 10);
-            _pickerEl.remove();
-            _pickerEl = null;
+            closePicker();
             await loadPlaylistIntoTray(id);
+            return;
         }
-    });
 
-    // Close on click outside list
-    _pickerEl.addEventListener('click', (e) => {
+        // Click on backdrop
         if (e.target === _pickerEl) {
-            _pickerEl.remove();
-            _pickerEl = null;
+            closePicker();
         }
     });
 
     // Close on Escape
-    const onKey = (e) => {
+    _pickerOnKey = (e) => {
         if (e.key === 'Escape' && _pickerEl?.isConnected) {
-            _pickerEl.remove();
-            _pickerEl = null;
-            document.removeEventListener('keydown', onKey, true);
+            closePicker();
             e.stopPropagation();
         }
     };
-    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('keydown', _pickerOnKey, true);
 
     document.body.appendChild(_pickerEl);
 }
