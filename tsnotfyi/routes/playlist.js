@@ -3,48 +3,6 @@
 
 const path = require('path');
 
-// Load playlist from database
-async function loadPlaylistFromDatabase(pool, playlistTitle) {
-  try {
-    const client = await pool.connect();
-
-    try {
-      // Get playlist info
-      const playlistResult = await client.query(
-        'SELECT * FROM playlists WHERE name = $1',
-        [playlistTitle]
-      );
-
-      if (playlistResult.rows.length === 0) {
-        return null; // Playlist not found
-      }
-
-      // Get playlist tracks
-      const tracksResult = await client.query(`
-        SELECT
-          pi.identifier,
-          pi.direction,
-          pi.scope,
-          pi.position
-        FROM playlist_items pi
-        WHERE pi.playlist_id = $1
-        ORDER BY pi.position ASC
-      `, [playlistResult.rows[0].id]);
-
-      const playlist = playlistResult.rows[0];
-      playlist.tracks = tracksResult.rows;
-
-      console.log(`📖 Loaded playlist ${playlistTitle}: ${playlist.tracks.length} tracks`);
-      return playlist;
-    } finally {
-      client.release();
-    }
-  } catch (error) {
-    console.error('Error loading playlist from database:', error);
-    throw error;
-  }
-}
-
 // Reverse direction name helper
 function reverseDirectionName(directionName) {
   if (!directionName) return null;
@@ -190,7 +148,7 @@ async function generateScaledPlaylist(originalTracks, scaleFactor) {
 
 // ==================== ROUTE SETUP ====================
 
-function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registerSession }) {
+function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerSession }) {
 
   // Playlist session: /playlist/title
   app.get('/playlist/:title', async (req, res) => {
@@ -198,7 +156,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
     const playlistTitle = decodeURIComponent(title);
 
     try {
-      const playlistData = await loadPlaylistFromDatabase(pool, playlistTitle);
+      const playlistData = await db.getPlaylistByName(playlistTitle);
       if (!playlistData) {
         return res.status(404).json({ error: 'Playlist not found' });
       }
@@ -251,7 +209,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
       let session = getSessionById(sessionId);
 
       if (!session) {
-        const playlistData = await loadPlaylistFromDatabase(pool, playlistTitle);
+        const playlistData = await db.getPlaylistByName(playlistTitle);
         if (!playlistData) {
           return res.status(404).json({ error: 'Playlist not found' });
         }
@@ -297,7 +255,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
       let session = getSessionById(sessionId);
 
       if (!session) {
-        const playlistData = await loadPlaylistFromDatabase(pool, playlistTitle);
+        const playlistData = await db.getPlaylistByName(playlistTitle);
         if (!playlistData) {
           return res.status(404).json({ error: 'Playlist not found' });
         }
@@ -336,7 +294,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
     const playlistTitle = decodeURIComponent(playlistName);
 
     try {
-      const originalPlaylist = await loadPlaylistFromDatabase(pool, playlistTitle);
+      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
       if (!originalPlaylist) {
         return res.status(404).json({ error: 'Original playlist not found' });
       }
@@ -367,7 +325,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
     const playlistTitle = decodeURIComponent(playlistName);
 
     try {
-      const originalPlaylist = await loadPlaylistFromDatabase(pool, playlistTitle);
+      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
       if (!originalPlaylist) {
         return res.status(404).json({ error: 'Original playlist not found' });
       }
@@ -398,7 +356,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
     const playlistTitle = decodeURIComponent(playlistName);
 
     try {
-      const originalPlaylist = await loadPlaylistFromDatabase(pool, playlistTitle);
+      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
       if (!originalPlaylist) {
         return res.status(404).json({ error: 'Original playlist not found' });
       }
@@ -435,7 +393,7 @@ function setupPlaylistRoutes(app, { pool, createSession, getSessionById, registe
     const scaleFactor = parseFloat(scaleMatch[1]);
 
     try {
-      const originalPlaylist = await loadPlaylistFromDatabase(pool, playlistTitle);
+      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
       if (!originalPlaylist) {
         return res.status(404).json({ error: 'Original playlist not found' });
       }

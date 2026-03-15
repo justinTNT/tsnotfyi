@@ -128,6 +128,7 @@ class DriftAudioMixer {
     this.currentTrack = null;
     this.halfwayFiredForTrack = null; // Track ID for which halfway was already fired
     this.onHalfwayReached = null;     // Callback: (identifier) => void
+    this.onExplorerNeeded = null;     // Callback: async (trackId, opts) => explorerData|null — defer to worker
     this.pendingCurrentTrack = null;
     this.currentTrackDirection = null;
     this.nextTrack = null;
@@ -3793,6 +3794,20 @@ class DriftAudioMixer {
     const isCurrentTrack = !options.trackId || options.trackId === this.currentTrack?.identifier;
     if (!options.forceFresh && isCurrentTrack && this.pendingExplorerPromise) {
       return this.pendingExplorerPromise;
+    }
+
+    // If an external explorer provider is available (e.g. worker thread),
+    // try it first to avoid blocking the main thread.
+    if (this.onExplorerNeeded) {
+      try {
+        const trackId = options.trackId || this.currentTrack?.identifier;
+        const delegated = await this.onExplorerNeeded(trackId, options);
+        if (delegated) {
+          return delegated;
+        }
+      } catch (delegateErr) {
+        console.warn('⚠️ onExplorerNeeded delegate failed, falling through to main thread:', delegateErr?.message || delegateErr);
+      }
     }
 
     const basePromise = this.runComprehensiveExplorerData(options);
