@@ -4,9 +4,9 @@
 class PCMWorkletProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Ring buffer: 8 seconds of stereo interleaved float32 at context sample rate
+    // Ring buffer: 16 seconds of stereo interleaved float32 at context sample rate
     // sampleRate is a global provided by the AudioWorklet scope
-    this._bufferSize = sampleRate * 2 * 8; // 8s × 2ch
+    this._bufferSize = sampleRate * 2 * 16; // 16s × 2ch
     this._bufferCapacity = this._bufferSize / 2; // max frames the buffer can hold
     this._buffer = new Float32Array(this._bufferSize);
     this._writePos = 0;
@@ -20,9 +20,9 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     this._overflowCount = 0;
     // Use half-second intervals for position reporting
     this._halfSecondFrames = Math.floor(sampleRate / 2);
-    // Buffer 3 seconds before reporting ready — gives headroom for main-thread
+    // Buffer 6 seconds before reporting ready — gives headroom for main-thread
     // SSE/explorer/render burst that happens immediately after ready fires
-    this._readyThresholdFrames = sampleRate * 3;
+    this._readyThresholdFrames = sampleRate * 6;
 
     this.port.onmessage = (e) => {
       if (e.data.type === 'pcm') {

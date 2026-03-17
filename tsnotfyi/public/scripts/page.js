@@ -119,6 +119,13 @@ let nextTrackPreviewFadeTimer = null;
       // Departure animation cleared after DOM updates below (so new content renders under the blur)
       const nowPlayingEl = document.getElementById('nowPlayingCard');
 
+      // Preserve client-side loved/hated state when heartbeat updates the same track
+      // (heartbeat loved comes from KD-tree which has no rating data)
+      const prev = state.latestCurrentTrack;
+      if (prev && prev.identifier === (trackData.identifier || trackData.trackMd5) && prev.loved !== undefined) {
+          trackData.loved = prev.loved;
+          trackData.hated = prev.hated;
+      }
       state.latestCurrentTrack = trackData;
       window.state = window.state || {};
       window.state.latestCurrentTrack = trackData;

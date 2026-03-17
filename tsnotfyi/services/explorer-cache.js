@@ -79,6 +79,15 @@ class ExplorerCache {
   get size() {
     return this._cache.size;
   }
+
+  // Iterable — yields [key, data] pairs (skipping expired), compatible with for..of
+  *[Symbol.iterator]() {
+    for (const [key, entry] of this._cache) {
+      if (!this._isExpired(entry)) {
+        yield [key, entry.data];
+      }
+    }
+  }
 }
 
 module.exports = ExplorerCache;

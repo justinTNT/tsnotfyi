@@ -210,8 +210,7 @@ const sessionManager = new SessionManager({
       mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
     }
     if (result.explorerData) {
-      const cacheKey = `${trackId}_${resolution}`;
-      mixer.explorerDataCache.set(cacheKey, result.explorerData);
+      mixer.explorerDataCache.set(trackId, resolution, result.explorerData);
       mixer.recordExplorerSummary(result.explorerData,
         result.explorerData.diagnostics?.radius || null,
         result.neighborhoodSize || 0);
@@ -692,25 +691,12 @@ app.get('/:md5', async (req, res, next) => {
       session.mixer.initializeSession('anonymous', sessionId);
     }
 
-    if (session.mixer.stopStreaming) {
-      session.mixer.stopStreaming();
-    }
-
-    session.mixer.isActive = false;
-    session.mixer.nextTrack = null;
-    if (typeof session.mixer.resetManualOverrideLock === 'function') {
-      session.mixer.resetManualOverrideLock();
-    } else {
-      session.mixer.lockedNextTrackIdentifier = null;
-      session.mixer.isUserSelectionPending = false;
-    }
-
     const track = session.mixer.radialSearch.kdTree.getTrack(md5);
     if (!track) {
       return res.status(404).json({ error: 'Track not found' });
     }
 
-    session.mixer.seedCurrentTrack(track);
+    session.mixer.resetForJourney(track);
 
     console.log(`🎯 Session seeded with: ${track.title} by ${track.artist}`);
 
@@ -746,19 +732,6 @@ app.get('/:md51/:md52', async (req, res, next) => {
       session.mixer.initializeSession('anonymous', sessionId, initialStack);
     }
 
-    if (session.mixer.stopStreaming) {
-      session.mixer.stopStreaming();
-    }
-
-    session.mixer.isActive = false;
-    session.mixer.nextTrack = null;
-    if (typeof session.mixer.resetManualOverrideLock === 'function') {
-      session.mixer.resetManualOverrideLock();
-    } else {
-      session.mixer.lockedNextTrackIdentifier = null;
-      session.mixer.isUserSelectionPending = false;
-    }
-
     const track1 = session.mixer.radialSearch.kdTree.getTrack(md51);
     const track2 = session.mixer.radialSearch.kdTree.getTrack(md52);
 
@@ -769,26 +742,10 @@ app.get('/:md51/:md52', async (req, res, next) => {
       return res.status(404).json({ error: `Second track not found: ${md52}` });
     }
 
-    session.mixer.seedCurrentTrack(track1);
-    if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
-      session.mixer.handleUserSelectedNextTrack(md52, { debounceMs: 0 });
-    } else if (typeof session.mixer.prepareNextTrackForCrossfade === 'function') {
-      try {
-        session.mixer.lockedNextTrackIdentifier = md52;
-        if ('pendingUserOverrideTrackId' in session.mixer) {
-          session.mixer.pendingUserOverrideTrackId = md52;
-        }
-        session.mixer.prepareNextTrackForCrossfade({
-          forceRefresh: true,
-          reason: 'user-selection',
-          overrideTrackId: md52
-        });
-      } catch (legacyError) {
-        console.warn('⚠️ Legacy mixer could not queue user-selected track:', legacyError?.message || legacyError);
-      }
-    } else {
-      console.warn('⚠️ Legacy mixer lacks user override support; manual next-track unavailable.');
-    }
+    session.mixer.resetForJourney(track1);
+    session.mixer.selectNextTrack(md52, { origin: 'contrived-journey' }).catch(err => {
+      console.warn('⚠️ Contrived journey next-track queue failed:', err?.message || err);
+    });
 
     console.log(`🎯 Contrived journey seeded: ${track1.title} → ${track2.title}`);
 
@@ -1213,10 +1170,9 @@ app.post('/explorer', async (req, res) => {
     if (session?.mixer) {
       const mixer = session.mixer;
       const resolution = mixer.explorerResolution || 'adaptive';
-      const cacheKey = `${sourceTrack.identifier}_${resolution}`;
 
       // Cache hit — reuse cached data (cheap)
-      if (isSameTrack && mixer.explorerDataCache?.has(cacheKey)) {
+      if (isSameTrack && mixer.explorerDataCache?.has(sourceTrack.identifier, resolution)) {
         serverLog.info(`🎯 Explorer cache hit (trackId=${trackId.substring(0,8)})`);
         explorerData = await mixer.getComprehensiveExplorerData({
           trackId: sourceTrack.identifier,
@@ -1273,7 +1229,7 @@ app.post('/explorer', async (req, res) => {
           mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
         }
         if (explorerData) {
-          mixer.explorerDataCache.set(cacheKey, explorerData);
+          mixer.explorerDataCache.set(sourceTrack.identifier, resolution, explorerData);
           mixer.recordExplorerSummary(explorerData,
             explorerData.diagnostics?.radius || null,
             result.neighborhoodSize || 0);
@@ -1780,25 +1736,7 @@ app.post('/next-track', async (req, res) => {
       const originLabel = normalizedOrigin ? `/${normalizedOrigin}` : '';
       console.log(`🎯 User selected specific track${originLabel}: ${trackMd5} (direction: ${direction})`);
 
-      if (typeof session.mixer.handleUserSelectedNextTrack === 'function') {
-        await session.mixer.handleUserSelectedNextTrack(trackMd5, { direction });
-      } else if (typeof session.mixer.setNextTrack === 'function') {
-        session.mixer.setNextTrack(trackMd5);
-      } else if (typeof session.mixer.prepareNextTrackForCrossfade === 'function') {
-        if (direction && session.mixer.driftPlayer) {
-          session.mixer.driftPlayer.currentDirection = direction;
-        }
-        if ('pendingUserOverrideTrackId' in session.mixer) {
-          session.mixer.pendingUserOverrideTrackId = trackMd5;
-        }
-        session.mixer.lockedNextTrackIdentifier = trackMd5;
-        await session.mixer.prepareNextTrackForCrossfade({
-          forceRefresh: true,
-          reason: 'user-selection',
-          overrideTrackId: trackMd5,
-          overrideDirection: direction || null
-        });
-      }
+      await session.mixer.selectNextTrack(trackMd5, { direction, origin: normalizedOrigin });
     } else {
       const serverNextTrack = session.mixer.nextTrack?.identifier || null;
 

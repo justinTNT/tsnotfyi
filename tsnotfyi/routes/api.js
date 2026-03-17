@@ -23,6 +23,9 @@ function setupApiRoutes(app, { db, radialSearch }) {
       if (!result) {
         return res.status(404).json({ error: 'Track not found' });
       }
+      // Update in-memory KD-tree so heartbeats carry the correct value
+      const inMemory = radialSearch.kdTree?.getTrack(id);
+      if (inMemory) inMemory.loved = rating === 1;
       res.json(result);
     } catch (error) {
       console.error('Error updating track rating:', error);

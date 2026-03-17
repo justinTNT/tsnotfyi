@@ -714,8 +714,9 @@ import { playlistHasItems } from './playlist-tray.js';
       // Update global track index
       state.stackIndex = nextIndex;
 
-      // Update selection
+      // Update selection and protect from heartbeat overwrite
       state.selectedIdentifier = nextTrack.identifier;
+      state.manualNextTrackOverride = true;
       if (!state.remainingCounts) {
           state.remainingCounts = {};
       }

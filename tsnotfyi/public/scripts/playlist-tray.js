@@ -369,6 +369,9 @@ export async function promoteCenterCardToTray() {
     }
     log.info(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
 
+    // Clear selection so next promote picks a fresh recommendation
+    state.selectedIdentifier = null;
+
     // Only tell server if this is the first item (immediate next track needed)
     if (wasEmpty && typeof window.sendNextTrack === 'function') {
         log.info(`🎯 First playlist item - notifying server: ${trackId.substring(0, 8)}`);
