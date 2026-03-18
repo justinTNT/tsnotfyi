@@ -1418,12 +1418,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       // Find the selected card first
       const allTrackCards = document.querySelectorAll('.dimension-card.next-track');
       if (allTrackCards.length === 0) {
-          if (isUserSelection()) {
-              overrideLog.warn(`${ICON} ACTION selection-cards-unavailable`, {
-                  selection: state.selection.trackId,
-                  reason: 'no next-track cards rendered'
-              });
-          }
           return;
       }
       let selectedCard = null;

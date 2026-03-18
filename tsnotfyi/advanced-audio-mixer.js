@@ -100,8 +100,9 @@ class AdvancedAudioMixer {
   calculateStreamingParams() {
     // Streaming raw PCM: sampleRate × channels × 2 bytes (16-bit)
     this.engine.bytesPerSecond = this.sampleRate * this.channels * 2;
-    this.engine.tickMs = 500; // 2 ticks/sec — large chunks, revisit when crossfade mixing is live
+    this.engine.tickMs = 200; // 5 ticks/sec nominal — actual pacing is clock-based, not interval-based
     this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond * this.engine.tickMs / 1000);
+    this.engine.aheadLimitMs = 8000; // max real-time lead over playback clock (burst ceiling)
 
     console.log(`📊 Streaming PCM: ${this.engine.chunkSize} bytes/chunk every ${this.engine.tickMs}ms (${this.sampleRate}Hz ${this.channels}ch 16-bit, ${Math.round(this.engine.bytesPerSecond / 1000)}kB/s)`);
   }
@@ -125,11 +126,9 @@ class AdvancedAudioMixer {
         track.analyzed = true;
         track.estimatedDuration = cached.analysis.actualDuration || cached.analysis.duration; // Use recalculated duration
 
-        // Set crossfade lead time for next track (use cached analysis or calculate default)
-        if (slot === 'next') {
-          track.crossfadeLeadTime = cached.analysis.crossfadeLeadTime || 8; // Default if not cached
-          console.log(`🎯 Next track (cached) crossfade lead time: ${track.crossfadeLeadTime}s`);
-        }
+        // Set crossfade lead time (use cached analysis or default)
+        track.crossfadeLeadTime = cached.analysis.crossfadeLeadTime || 8;
+        console.log(`🎯 ${slot} track (cached) crossfade lead time: ${track.crossfadeLeadTime}s`);
 
         this.setSlotMetadata(slot, metadata);
 
@@ -170,11 +169,9 @@ class AdvancedAudioMixer {
       track.analyzed = true;
       track.estimatedDuration = trimmedResult.actualDuration; // Use recalculated duration from trimming
 
-      // Analyze crossfade lead time for next track
-      if (slot === 'next') {
-        track.crossfadeLeadTime = this.analyzeCrossfadeLeadTime(trimmedResult);
-        console.log(`🎯 Next track crossfade lead time: ${track.crossfadeLeadTime}s`);
-      }
+      // Analyze quiet tail to determine when to start crossfading out of this track
+      track.crossfadeLeadTime = this.analyzeCrossfadeLeadTime(trimmedResult);
+      console.log(`🎯 ${slot} track crossfade lead time: ${track.crossfadeLeadTime}s`);
 
       console.log(`✅ Track processed and cached: BPM=${analysis.bpm}, Key=${analysis.key}, Size=${trimmedResult.buffer.length} bytes (PCM)`);
 
@@ -328,17 +325,9 @@ class AdvancedAudioMixer {
     return bestBPM;
   }
 
-  // Detect musical key (simplified)
+  // Key detection — noop for now, will implement chromagram analysis later
   detectKey(pcmBuffer) {
-    // Placeholder key detection - would use chromagram analysis in production
-    const keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-    const modes = ['maj', 'min'];
-
-    // For now, return a reasonable guess based on audio content
-    const keyIndex = Math.floor(Math.random() * keys.length);
-    const modeIndex = Math.floor(Math.random() * modes.length);
-
-    return `${keys[keyIndex]}${modes[modeIndex]}`;
+    return null;
   }
 
   // Calculate RMS energy
@@ -492,9 +481,29 @@ class AdvancedAudioMixer {
       this.onTrackStart();
     }
 
-    this.engine.streamTimer = setInterval(() => {
-      this.streamTick();
-    }, 40); // 25 ticks/sec for real-time streaming
+    // Clock-based streaming: burst to fill client buffer, then pace at 1x real-time.
+    // If a tick is late, the next fires immediately to catch up — no accumulating drift.
+    this.engine.bytesSent = 0;
+    this.engine.streamClockStart = Date.now();
+    const scheduleNext = () => {
+      if (!this.engine.isStreaming) return;
+      const elapsed = Date.now() - this.engine.streamClockStart;
+      const bytesOwed = Math.floor((elapsed / 1000) * this.engine.bytesPerSecond);
+      const ahead = this.engine.bytesSent - bytesOwed;
+      const aheadMs = (ahead / this.engine.bytesPerSecond) * 1000;
+
+      if (aheadMs < this.engine.aheadLimitMs) {
+        // Under the ceiling — send a chunk now
+        this.streamTick();
+        // If still under ceiling, schedule immediately (burst); otherwise wait
+        const newAheadMs = ((this.engine.bytesSent - bytesOwed) / this.engine.bytesPerSecond) * 1000;
+        this.engine.streamTimer = setTimeout(scheduleNext, newAheadMs >= this.engine.aheadLimitMs ? this.engine.tickMs : 0);
+      } else {
+        // At ceiling — wait for real-time to catch up
+        this.engine.streamTimer = setTimeout(scheduleNext, this.engine.tickMs);
+      }
+    };
+    scheduleNext();
 
     return true;
   }
@@ -502,7 +511,7 @@ class AdvancedAudioMixer {
   // Stop streaming
   stopStreaming() {
     if (this.engine.streamTimer) {
-      clearInterval(this.engine.streamTimer);
+      clearTimeout(this.engine.streamTimer);
       this.engine.streamTimer = null;
     }
 
@@ -550,41 +559,36 @@ class AdvancedAudioMixer {
       return;
     }
 
-    // Check if we should start crossfading (2.5s before end) - using wall-clock time with guardrails
-    const elapsedTime = (Date.now() - this.engine.streamingStartTime) / 1000;
-    const estimatedDuration = this.engine.currentTrack.estimatedDuration;
-    const remainingSeconds = estimatedDuration ? estimatedDuration - elapsedTime : 0;
-
-    // Calculate byte-based timing estimate for guardrails
+    // Important: DO NOT rely on streamingStartTime (wall-clock) to determine crossfade triggers.
+    // The server event loop and client buffer drains are too volatile.
+    // ALWAYS trigger crossfades based purely on how many raw PCM bytes remain in the buffer.
+    
+    // Calculate byte-based timing estimate for crossfade triggers
     const bytesRemaining = this.engine.currentTrack.buffer ?
       this.engine.currentTrack.buffer.length - this.engine.currentTrack.position : 0;
-    const estimatedBitrate = this.engine.currentTrack.buffer && estimatedDuration ?
-      this.engine.currentTrack.buffer.length / estimatedDuration : this.engine.bytesPerSecond;
-    const byteBasedRemaining = bytesRemaining / estimatedBitrate;
+      
+    const estimatedSequenceSeconds = bytesRemaining / this.engine.bytesPerSecond;
 
-    // Primary timing logic (wall-clock based) - use next track's optimal lead time
-    const crossfadeLeadTime = this.engine.nextTrack.crossfadeLeadTime || this.engine.crossfadeDuration;
+    // Primary timing logic MUST be byte-based
+    const crossfadeLeadTime = this.engine.currentTrack.crossfadeLeadTime || this.engine.crossfadeDuration;
 
-    const shouldStartCrossfade = remainingSeconds > 0 &&
-        remainingSeconds <= crossfadeLeadTime &&
+    const shouldStartCrossfade = estimatedSequenceSeconds > 0 &&
+        estimatedSequenceSeconds <= crossfadeLeadTime &&
         this.engine.nextTrack.buffer &&
         !this.engine.isCrossfading;
 
-    // Guardrail: Detect timing mismatch
-    if (shouldStartCrossfade && byteBasedRemaining > this.engine.crossfadeDuration * 2) {
-      console.error(`🚨 TIMING MISMATCH: Wall-clock wants crossfade but bytes suggest ${byteBasedRemaining.toFixed(1)}s remaining!`);
-      console.error(`🚨 Wall-clock: ${remainingSeconds.toFixed(1)}s, Bytes: ${bytesRemaining}/${this.engine.currentTrack.buffer?.length}, Est bitrate: ${estimatedBitrate.toFixed(0)}`);
-      // Still proceed with wall-clock timing, but we've logged the issue
-    }
-
-    // Guardrail: Log when byte-based estimate diverges from wall-clock (diagnostic only)
-    // Trust wall-clock timing — byte estimation is unreliable with VBR and tempo adjustment
-    if (!this.engine.isCrossfading && this.engine.nextTrack.buffer && byteBasedRemaining < 1.0 && remainingSeconds > 1.0) {
-      console.warn(`⚠️ Byte-based estimate (${byteBasedRemaining.toFixed(1)}s) diverges from wall-clock (${remainingSeconds.toFixed(1)}s) — trusting wall-clock`);
+    // Guardrail: Report if we are spinning without the next buffer ready
+    const isGettingLate = estimatedSequenceSeconds > 0 && 
+                          estimatedSequenceSeconds <= crossfadeLeadTime &&
+                          !this.engine.nextTrack.buffer &&
+                          !this.engine.isCrossfading;
+                          
+    if (isGettingLate && Math.random() < 0.1) {
+       console.warn(`⏳ Waiting for next track buffer! Only ${estimatedSequenceSeconds.toFixed(1)}s of PCM bytes left in current track.`);
     }
 
     if (shouldStartCrossfade) {
-      console.log(`🔄 Starting crossfade with ${remainingSeconds.toFixed(1)}s remaining (lead time: ${crossfadeLeadTime}s)`);
+      console.log(`🔄 Starting crossfade with ${estimatedSequenceSeconds.toFixed(1)}s remaining (lead time: ${crossfadeLeadTime}s)`);
       this.startCrossfade();
     }
 
@@ -612,10 +616,7 @@ class AdvancedAudioMixer {
     }
 
     if (chunk && chunk.length > 0) {
-      // Debug: log chunk info occasionally (more frequent for debugging)
-      if (Math.random() < 0.01) { // 1% chance for debugging
-        console.log(`🎵 Streaming chunk: ${chunk.length} bytes, crossfading: ${this.engine.isCrossfading}, position: ${this.engine.currentTrack.position}/${this.engine.currentTrack.buffer?.length}`);
-      }
+      this.engine.bytesSent = (this.engine.bytesSent || 0) + chunk.length;
       this.onData(chunk);
     }
   }
@@ -714,61 +715,16 @@ class AdvancedAudioMixer {
     }
   }
 
-  // Unified audio matching: tempo priority with pitch smoothing
+  // Audio matching — noop for now, will implement tempo/key matching later
   calculateAudioMatching() {
-    // Initialize to natural playback
     this.engine.tempoAdjustment = 1.0;
     this.engine.targetTrackTempo = 1.0;
     this.engine.pitchShiftRatio = 1.0;
     this.engine.enableTempoAdjustment = false;
 
-    if (!this.engine.currentTrack.bpm || !this.engine.nextTrack.bpm) {
-      return;
+    if (this.engine.currentTrack.bpm && this.engine.nextTrack.bpm) {
+      console.log(`🎵 Crossfading: ${this.engine.currentTrack.bpm} BPM → ${this.engine.nextTrack.bpm} BPM (tempo/key matching disabled)`);
     }
-
-    const currentBPM = this.engine.currentTrack.bpm;
-    const nextBPM = this.engine.nextTrack.bpm;
-    const TEMPO_TOLERANCE = 0.17; // 17% tolerance for beat matching
-
-    // Calculate tempo difference
-    const tempoRatio = nextBPM / currentBPM;
-    const tempoDifference = Math.abs(1 - tempoRatio);
-
-    let beatMatchingActive = false;
-
-    // Step 1: Check tempo matching (priority)
-    if (tempoDifference <= TEMPO_TOLERANCE) {
-      // Enable beat matching - adjust next track to match current
-      this.engine.targetTrackTempo = 1.0; // Current track locked at natural tempo
-      this.engine.tempoAdjustment = currentBPM / nextBPM; // Adjust next track
-      beatMatchingActive = true;
-      console.log(`🎛️ Beat matching enabled: ${nextBPM} → ${currentBPM} BPM (${(tempoDifference*100).toFixed(1)}% diff, tempo: ${this.engine.tempoAdjustment.toFixed(3)}x)`);
-    } else {
-      console.log(`🎵 No beat matching: ${currentBPM} → ${nextBPM} BPM (${(tempoDifference*100).toFixed(1)}% diff > ${TEMPO_TOLERANCE*100}% tolerance)`);
-    }
-
-    // Step 2: Pitch smoothing (only if beat matching is active)
-    if (beatMatchingActive && this.engine.currentTrack.key && this.engine.nextTrack.key) {
-      const semitonesDiff = this.calculateSemitonesDifference(this.engine.currentTrack.key, this.engine.nextTrack.key);
-
-      if (this.isJarringInterval(semitonesDiff)) {
-        const targetShift = this.findNearestCompatibleKey(semitonesDiff);
-        this.engine.pitchShiftRatio = Math.pow(2, targetShift / 12); // 12-tone equal temperament
-        console.log(`🎼 Pitch smoothing: ${this.engine.nextTrack.key} shifted ${targetShift} semitones (${semitonesDiff} was jarring)`);
-      } else {
-        console.log(`🎼 No pitch adjustment needed: ${semitonesDiff} semitones is not jarring`);
-      }
-    }
-
-    // Apply safety bounds
-    const MAX_ADJUSTMENT = 1 + TEMPO_TOLERANCE;
-    const MIN_ADJUSTMENT = 1 - TEMPO_TOLERANCE;
-
-    this.engine.targetTrackTempo = Math.max(MIN_ADJUSTMENT, Math.min(MAX_ADJUSTMENT, this.engine.targetTrackTempo));
-    this.engine.tempoAdjustment = Math.max(MIN_ADJUSTMENT, Math.min(MAX_ADJUSTMENT, this.engine.tempoAdjustment));
-
-    // Recalculate durations after tempo adjustments
-    this.recalculateTrackDurations();
   }
 
   // Calculate semitone difference between two keys
@@ -843,24 +799,21 @@ class AdvancedAudioMixer {
     }
   }
 
-  // Create crossfade chunk with proper cosine curve mixing
+  // Create crossfade chunk with per-sample cosine curve mixing.
+  // Every sample gets its own fade coefficient — the volume curve is continuous,
+  // not stepped at chunk boundaries.
   createCrossfadeChunk() {
-    const totalCrossfadeBytes = this.engine.crossfadeDuration * this.engine.bytesPerSecond;
-    const fadeProgress = this.engine.crossfadePosition / totalCrossfadeBytes;
+    const totalCrossfadeSamples = this.engine.crossfadeDuration * this.sampleRate;
+    const crossfadeSamplePos = this.engine.crossfadePosition; // in samples (not bytes)
 
-    if (fadeProgress >= 1.0) {
-      // Crossfade complete, finalize transition and keep streaming seamlessly
+    if (crossfadeSamplePos >= totalCrossfadeSamples) {
       this.completeCrossfade();
       if (this.onData) this.onData(SENTINEL_CROSSFADE_END);
-
       const chunk = this.getCurrentTrackChunk();
       return chunk && chunk.length > 0 ? chunk : null;
     }
 
-    // Calculate clean cosine curve volumes (smooth S-curve)
-    const { currentVolume, nextVolume } = this.calculateCosineFadeVolumes(fadeProgress);
-
-    // Get chunks from both tracks
+    // Get raw PCM chunks from both tracks
     const currentChunk = this.getCurrentTrackChunk();
     const nextChunk = this.getNextTrackChunk();
 
@@ -868,37 +821,44 @@ class AdvancedAudioMixer {
       return null;
     }
 
-    // Real PCM crossfade: mix both tracks at sample level using cosine volumes
-    let mixed;
-    if (currentChunk && nextChunk) {
-      mixed = this.mixPCMAudio(currentChunk, nextChunk, currentVolume, nextVolume);
-    } else if (currentChunk) {
-      mixed = this.applyVolume(currentChunk, currentVolume);
-    } else {
-      mixed = this.applyVolume(nextChunk, nextVolume);
+    // Per-sample mixing with continuous cosine curve
+    const frameSize = this.channels * 2; // bytes per frame (stereo 16-bit = 4)
+    const mixLength = currentChunk && nextChunk
+      ? Math.min(currentChunk.length, nextChunk.length)
+      : (currentChunk || nextChunk).length;
+    const alignedLength = mixLength & ~(frameSize - 1); // align to frame boundary
+    const mixed = Buffer.alloc(alignedLength);
+    const framesInChunk = alignedLength / frameSize;
+
+    for (let f = 0; f < framesInChunk; f++) {
+      // Per-sample fade position (continuous)
+      const sampleProgress = (crossfadeSamplePos + f) / totalCrossfadeSamples;
+      const clampedProgress = Math.min(sampleProgress, 1.0);
+
+      // Equal-power cosine crossfade: sum of squares ≈ 1.0 at all points
+      const outGain = Math.cos(clampedProgress * Math.PI * 0.5);
+      const inGain = Math.sin(clampedProgress * Math.PI * 0.5);
+
+      const byteOffset = f * frameSize;
+      for (let ch = 0; ch < this.channels; ch++) {
+        const sampleOffset = byteOffset + ch * 2;
+        const s1 = currentChunk ? currentChunk.readInt16LE(sampleOffset) : 0;
+        const s2 = nextChunk ? nextChunk.readInt16LE(sampleOffset) : 0;
+        const out = Math.round(s1 * outGain + s2 * inGain);
+        mixed.writeInt16LE(Math.max(-32768, Math.min(32767, out)), sampleOffset);
+      }
     }
 
-    // Update crossfade position
-    this.engine.crossfadePosition += (mixed ? mixed.length : this.engine.chunkSize);
+    // Advance crossfade position in samples
+    this.engine.crossfadePosition += framesInChunk;
 
-    // Log crossfade progress
-    if (Math.random() < 0.1) { // 10% chance to log
-      console.log(`🎵 Crossfade: ${(fadeProgress * 100).toFixed(1)}% (cosine volumes: ${currentVolume.toFixed(2)}/${nextVolume.toFixed(2)})`);
+    // Log crossfade progress occasionally
+    const pct = (crossfadeSamplePos / totalCrossfadeSamples) * 100;
+    if (Math.random() < 0.05) {
+      console.log(`🎵 Crossfade: ${pct.toFixed(1)}% (per-sample cosine, ${framesInChunk} frames)`);
     }
 
     return mixed;
-  }
-
-  // Calculate smooth cosine fade volumes
-  calculateCosineFadeVolumes(progress) {
-    // Clean cosine curve: smooth S-curve from 0 to 1
-    // cos curve provides smooth acceleration/deceleration
-    const cosProgress = (1 - Math.cos(progress * Math.PI)) / 2;
-
-    return {
-      currentVolume: Math.cos(cosProgress * Math.PI / 2), // Fade out
-      nextVolume: Math.sin(cosProgress * Math.PI / 2)     // Fade in
-    };
   }
 
   // Get current track audio chunk
@@ -919,27 +879,18 @@ class AdvancedAudioMixer {
     return chunk;
   }
 
-  // Get next track audio chunk (with tempo adjustment if needed)
+  // Get next track audio chunk
   getNextTrackChunk() {
     if (!this.engine.nextTrack.buffer) return null;
 
-    // Apply tempo adjustment for beat matching
-    let chunkSize = this.engine.chunkSize;
-    if (Math.abs(this.engine.tempoAdjustment - 1.0) > 0.001) {
-      chunkSize = Math.floor(chunkSize / this.engine.tempoAdjustment);
-    }
-
-    const remainingBytes = this.engine.nextTrack.buffer.length - this.engine.nextTrack.position;
-    const bytesToSend = Math.min(chunkSize, remainingBytes);
+    const position = this.engine.nextTrack.position || 0;
+    const remainingBytes = this.engine.nextTrack.buffer.length - position;
+    const bytesToSend = Math.min(this.engine.chunkSize, remainingBytes);
 
     if (bytesToSend <= 0) return null;
 
-    const chunk = this.engine.nextTrack.buffer.slice(
-      this.engine.nextTrack.position || 0,
-      (this.engine.nextTrack.position || 0) + bytesToSend
-    );
-
-    this.engine.nextTrack.position = (this.engine.nextTrack.position || 0) + bytesToSend;
+    const chunk = this.engine.nextTrack.buffer.slice(position, position + bytesToSend);
+    this.engine.nextTrack.position = position + bytesToSend;
     return chunk;
   }
 
@@ -982,18 +933,21 @@ class AdvancedAudioMixer {
   completeCrossfade() {
     console.log('✅ Crossfade complete, switching to next track');
 
-    // Move next track to current
+    // Move next track to current — preserve read position and lead time from crossfade
     this.engine.currentTrack = {
       buffer: this.engine.nextTrack.buffer,
-      position: 0,
+      position: this.engine.nextTrack.position || 0,
       bpm: this.engine.nextTrack.bpm,
       key: this.engine.nextTrack.key,
       analyzed: this.engine.nextTrack.analyzed,
-      estimatedDuration: this.engine.nextTrack.estimatedDuration
+      estimatedDuration: this.engine.nextTrack.estimatedDuration,
+      crossfadeLeadTime: this.engine.nextTrack.crossfadeLeadTime
     };
 
-    // Reset streaming start time for the new track
+    // Reset streaming clocks for the new track
     this.engine.streamingStartTime = Date.now();
+    this.engine.streamClockStart = Date.now();
+    this.engine.bytesSent = 0;
     console.log(`🕐 Reset streaming timer for new track (${this.engine.currentTrack.estimatedDuration?.toFixed(1)}s duration, ${this.engine.chunkSize} bytes/chunk)`);
 
     // Clear next track
