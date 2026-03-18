@@ -12,7 +12,7 @@ function isValidMD5(str) {
 async function saveNamedSessionToDatabase(session) {
   // For now, ensure it's persisted in memory registry
   session.mixer.persistSessionState();
-  console.log(`💾 Saved session ${session.mixer.sessionName} to memory registry`);
+  console.log(`💾 Saved session ${session.mixer.state.sessionName} to memory registry`);
 }
 
 // Load named session state from database (placeholder)
@@ -73,7 +73,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
       const session = getSessionById(sessionName);
       if (session) {
         session.mixer.resetStack();
-        session.mixer.ephemeral = false;
+        session.mixer.state.ephemeral = false;
         console.log(`🔄 Reset named session: ${sessionName}`);
       }
 

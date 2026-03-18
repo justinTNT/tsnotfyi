@@ -11,6 +11,7 @@ const ep = require('./services/explorer-pipeline');
 const mb = require('./services/mixer-broadcast');
 const tu = require('./services/track-utils');
 const ExplorerCache = require('./services/explorer-cache');
+const SessionState = require('./services/session-state');
 
 const VERBOSE_EXPLORER = process.env.LOG_EXPLORER === '1';
 const VERBOSE_CACHE = process.env.LOG_CACHE === '1';
@@ -42,55 +43,30 @@ const { cloneAndSanitizeBeetsMeta } = tu;
 
 class DriftAudioMixer {
   constructor(sessionId, radialSearch) {
-    this.sessionId = sessionId;
     this.radialSearch = radialSearch;
     this.clients = new Set();
     this.eventClients = new Set(); // SSE clients for real-time events
     this.isActive = false;
     this.currentProcess = null;
     this.driftPlayer = new DirectionalDriftPlayer(radialSearch);
-    this.currentTrack = null;
     this.halfwayFiredForTrack = null; // Track ID for which halfway was already fired
     this.onHalfwayReached = null;     // Callback: (identifier) => void
     this.onExplorerNeeded = null;     // Callback: async (trackId, opts) => explorerData|null — defer to worker
     this.pendingCurrentTrack = null;
-    this.currentTrackDirection = null;
     this.nextTrack = null;
     this.explorerRecommendedNext = null; // Sticky recommendation from explorer endpoint
-    this.trackStartTime = null;
     this.isTransitioning = false;
     this._lastBroadcastTrackId = null;
     this.lastTrackEventPayload = null;
     this.lastTrackEventTimestamp = 0;
 
-    // Session history and exploration data
-    this.sessionHistory = []; // Array of previous tracks with timestamps and metadata
+    // Exploration event data
     this.explorerEventHistory = [];
     this.maxExplorerEventHistory = 200;
-    this.maxHistorySize = 50; // Keep last 50 tracks in history
-
-    // Stack-based journey state (Named Sessions)
-    this.stack = []; // Journey as sequence of {identifier, direction, scope} objects
-    this.stackIndex = 0; // Current position in stack (0-indexed)
-    this.positionSeconds = 0; // Position within current track
-    this.ephemeral = false; // true = stop persisting changes (past end of stack)
-    this.sessionType = 'anonymous'; // 'anonymous', 'named', 'playlist'
-    this.sessionName = null; // Session identifier for named/playlist sessions
-
-    // Session-level filtering flags
-    this.noAlbum = true; // Default: prevent album repeats in session
-    this.noArtist = true; // Default: prevent artist repeats in session
-    this.seenArtists = new Set(); // Track artists from played tracks
-    this.seenAlbums = new Set(); // Track albums from played tracks
-    this.failedTrackAttempts = new Map(); // trackId -> failure count (skip after 3)
 
     // Session-level explorer data cache with TTL and eviction
     this.explorerDataCache = new ExplorerCache({ maxEntries: 50, ttlMs: 5 * 60 * 1000 });
 
-    // Track exposure: tracks the user has actually SEEN (displayed on top of stacks or selected)
-    this.seenTracks = new Set(); // Track IDs that were displayed (top of stack OR selected as next track)
-    this.seenTrackArtists = new Set(); // Artists from seen tracks
-    this.seenTrackAlbums = new Set(); // Albums from seen tracks
     this.pendingUserOverrideDirection = null; // Persist direction metadata until override hydrates
     this.pendingUserOverrideTrackId = null; // Track identifier awaiting override preparation
     this.pendingUserOverrideGeneration = null; // Generation id for the in-flight manual override
@@ -116,8 +92,7 @@ class DriftAudioMixer {
     this.streamingStopTimer = null;
     this.persistedOverrideState = null;
 
-    // Explorer configuration
-    this.explorerResolution = 'adaptive';
+    // Explorer configuration (non-session)
     this.adaptiveRadiusCache = new Map();
     this.currentAdaptiveRadius = null;
     this.currentNeighborhoodSnapshot = null;
@@ -151,20 +126,24 @@ class DriftAudioMixer {
       chunkBytes: 0
     };
 
+    // Session state (serializable)
+    const explorerConfig = config.explorer || {};
+    const totalCount = explorerConfig.stackTotalCount;
+    const randomCount = explorerConfig.stackRandomCount;
+    this.state = new SessionState({
+      sessionId,
+      stackTotalCount: Number.isFinite(totalCount) && totalCount > 0 ? Math.floor(totalCount) : 15,
+      stackRandomCount: Number.isFinite(randomCount) && randomCount >= 0
+        ? Math.min(Math.floor(randomCount), Number.isFinite(totalCount) && totalCount > 0 ? Math.floor(totalCount) : 15)
+        : Math.min(3, Number.isFinite(totalCount) && totalCount > 0 ? Math.floor(totalCount) : 15),
+    });
+
     // Initialize advanced audio mixer
     this.audioMixer = new AdvancedAudioMixer({
       sampleRate: this.sampleRate,
       channels: this.channels,
       bitRate: this.bitRate
     });
-
-    const explorerConfig = config.explorer || {};
-    const totalCount = explorerConfig.stackTotalCount;
-    const randomCount = explorerConfig.stackRandomCount;
-    this.stackTotalCount = Number.isFinite(totalCount) && totalCount > 0 ? Math.floor(totalCount) : 15;
-    this.stackRandomCount = Number.isFinite(randomCount) && randomCount >= 0
-      ? Math.min(Math.floor(randomCount), this.stackTotalCount)
-      : Math.min(3, this.stackTotalCount);
 
     // Set up mixer callbacks
     this.audioMixer.onData = (chunk) => {
@@ -195,9 +174,9 @@ class DriftAudioMixer {
         if (mixerTrackId && this.pendingCurrentTrack.identifier !== mixerTrackId) {
           console.warn(`⚠️ pendingCurrentTrack mismatch: expected ${this.pendingCurrentTrack.identifier?.substring(0,8)}, mixer has ${mixerTrackId.substring(0,8)}`);
           // Use mixer's track instead
-          this.currentTrack = this.hydrateTrackRecord(mixerMetadata) || mixerMetadata;
+          this.state.currentTrack = this.hydrateTrackRecord(mixerMetadata) || mixerMetadata;
         } else {
-          this.currentTrack = this.pendingCurrentTrack;
+          this.state.currentTrack = this.pendingCurrentTrack;
         }
         this.pendingCurrentTrack = null;
         promoted = true;
@@ -214,40 +193,40 @@ class DriftAudioMixer {
           // Use mixer's metadata as source of truth, hydrate with full track info
           const hydratedFromMixer = this.hydrateTrackRecord(mixerMetadata);
           if (hydratedFromMixer) {
-            this.currentTrack = hydratedFromMixer;
+            this.state.currentTrack = hydratedFromMixer;
           } else if (this.nextTrack?.identifier === mixerTrackId) {
             // Mixer matches our nextTrack, use the richer nextTrack data
-            this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
+            this.state.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
           } else {
             // Fallback to mixer metadata directly
             console.warn(`⚠️ nextTrack mismatch: expected ${this.nextTrack?.identifier?.substring(0,8)}, mixer has ${mixerTrackId.substring(0,8)}`);
-            this.currentTrack = mixerMetadata;
+            this.state.currentTrack = mixerMetadata;
           }
           this.nextTrack = null;
           promoted = true;
         } else if (this.nextTrack) {
           // No mixer metadata available, fall back to nextTrack
-          this.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
+          this.state.currentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
           this.nextTrack = null;
           promoted = true;
         }
       }
 
       // Handle stack initialization for first track
-      if (promoted && this.currentTrack && this.currentTrack.identifier) {
-        this.ensureTrackInStack(this.currentTrack.identifier);
+      if (promoted && this.state.currentTrack && this.state.currentTrack.identifier) {
+        this.ensureTrackInStack(this.state.currentTrack.identifier);
       }
 
-      if (promoted && this.currentTrack && this.lockedNextTrackIdentifier === this.currentTrack.identifier) {
+      if (promoted && this.state.currentTrack && this.lockedNextTrackIdentifier === this.state.currentTrack.identifier) {
         this.lockedNextTrackIdentifier = null;
       }
 
       // Clear stale cached nextTrack when track is promoted
-      if (promoted && this.lastExplorerSnapshotPayload?.nextTrack?.track?.identifier === this.currentTrack?.identifier) {
+      if (promoted && this.lastExplorerSnapshotPayload?.nextTrack?.track?.identifier === this.state.currentTrack?.identifier) {
         this.lastExplorerSnapshotPayload.nextTrack = null;
       }
       // Clear explorer recommendation only if the recommended track is now playing
-      if (promoted && this.explorerRecommendedNext?.trackId === this.currentTrack?.identifier) {
+      if (promoted && this.explorerRecommendedNext?.trackId === this.state.currentTrack?.identifier) {
         this.explorerRecommendedNext = null;
       }
 
@@ -256,12 +235,12 @@ class DriftAudioMixer {
 
         // Reset live stream state to match the newly promoted track
         // This prevents stale timing from propagating to heartbeats
-        const promotedTrackId = this.currentTrack?.identifier || null;
+        const promotedTrackId = this.state.currentTrack?.identifier || null;
         if (promotedTrackId) {
           this.liveStreamState = {
             trackId: promotedTrackId,
-            title: this.currentTrack?.title || null,
-            artist: this.currentTrack?.artist || null,
+            title: this.state.currentTrack?.title || null,
+            artist: this.state.currentTrack?.artist || null,
             startedAt: Date.now(),
             lastChunkAt: Date.now(),
             chunkBytes: 0
@@ -269,18 +248,18 @@ class DriftAudioMixer {
         }
 
         // Add track to session history for repeat prevention
-        if (this.currentTrack && this.currentTrack.identifier) {
-          const alreadyInHistory = this.sessionHistory.some(
-            entry => entry.identifier === this.currentTrack.identifier
+        if (this.state.currentTrack && this.state.currentTrack.identifier) {
+          const alreadyInHistory = this.state.sessionHistory.some(
+            entry => entry.identifier === this.state.currentTrack.identifier
           );
           if (!alreadyInHistory) {
             this.addToHistory(
-              this.currentTrack,
+              this.state.currentTrack,
               Date.now(),
               this.driftPlayer?.currentDirection || null,
               reason || 'promoted'
             );
-            console.log(`📝 Added to session history: ${this.currentTrack.title} (${this.sessionHistory.length} total)`);
+            console.log(`📝 Added to session history: ${this.state.currentTrack.title} (${this.state.sessionHistory.length} total)`);
           }
         }
       }
@@ -289,7 +268,7 @@ class DriftAudioMixer {
         this.crossfadeStartedAt = null;
         // Apply pending user override if one exists (either deferred during crossfade or set before)
         const shouldApplyOverride = this.pendingUserOverrideTrackId &&
-            (!this.currentTrack || this.currentTrack.identifier !== this.pendingUserOverrideTrackId);
+            (!this.state.currentTrack || this.state.currentTrack.identifier !== this.pendingUserOverrideTrackId);
         this.userSelectionDeferredForCrossfade = false;
         if (shouldApplyOverride) {
           console.log(`🎯 Applying pending user override after crossfade: ${this.pendingUserOverrideTrackId?.substring(0,8)}`);
@@ -311,54 +290,54 @@ class DriftAudioMixer {
 
       // Use engine time only if it's recent (within last 5 seconds) - otherwise it's stale
       const engineTimeIsRecent = engineStartTime && (now - engineStartTime) < 5000;
-      this.trackStartTime = (promoted && !engineTimeIsRecent) ? now : (engineStartTime || now);
+      this.state.trackStartTime = (promoted && !engineTimeIsRecent) ? now : (engineStartTime || now);
 
-      const playbackMetadataSeconds = Number.isFinite(this.currentTrack?.length)
-        ? this.currentTrack.length
-        : Number.isFinite(this.currentTrack?.duration)
-          ? this.currentTrack.duration
+      const playbackMetadataSeconds = Number.isFinite(this.state.currentTrack?.length)
+        ? this.state.currentTrack.length
+        : Number.isFinite(this.state.currentTrack?.duration)
+          ? this.state.currentTrack.duration
           : null;
       const playbackTrimmedSeconds = this.audioMixer?.engine?.currentTrack?.estimatedDuration || null;
       // Apply the promoted track's direction to drift state (deferred from user selection)
-      if (promoted && this.currentTrack?.direction && this.driftPlayer) {
-        this.driftPlayer.currentDirection = this.currentTrack.direction;
+      if (promoted && this.state.currentTrack?.direction && this.driftPlayer) {
+        this.driftPlayer.currentDirection = this.state.currentTrack.direction;
       }
-      this.currentTrackDirection = this.driftPlayer?.currentDirection || null;
+      this.state.currentTrackDirection = this.driftPlayer?.currentDirection || null;
       console.log('🕒 [timing] Track playback started', {
-        trackId: this.currentTrack?.identifier || null,
-        title: this.currentTrack?.title || null,
+        trackId: this.state.currentTrack?.identifier || null,
+        title: this.state.currentTrack?.title || null,
         metadataSeconds: playbackMetadataSeconds,
         trimmedSeconds: playbackTrimmedSeconds,
-        startTimestamp: this.trackStartTime
+        startTimestamp: this.state.trackStartTime
       });
-      if (!this.currentTrack) {
+      if (!this.state.currentTrack) {
         console.warn('📡 Track started but currentTrack is undefined; pending metadata may be missing');
         return;
       }
 
       // Rotate fingerprint FIRST so heartbeat has correct fingerprint
-      const identifier = this.currentTrack.identifier || null;
+      const identifier = this.state.currentTrack.identifier || null;
       if (identifier) {
         const fingerprint = fingerprintRegistry.rotateFingerprint(
-          this.sessionId,
+          this.state.sessionId,
           {
             trackId: identifier,
-            startTime: this.trackStartTime
+            startTime: this.state.trackStartTime
           }
         );
         this.currentFingerprint = fingerprint;
       }
 
-      console.log(`📡 Audio started - now broadcasting track event: ${this.currentTrack.title}`);
+      console.log(`📡 Audio started - now broadcasting track event: ${this.state.currentTrack.title}`);
       this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
         console.error('📡 Failed to broadcast track event:', err);
       });
       this.resolvePendingTrackReady(true);
       this.recordSessionEvent('track_started', {
-        trackId: this.currentTrack.identifier || null,
-        title: this.currentTrack.title || '',
+        trackId: this.state.currentTrack.identifier || null,
+        title: this.state.currentTrack.title || '',
         reason: reason || 'auto',
-        startTime: this.trackStartTime
+        startTime: this.state.trackStartTime
       });
 
       // Kick off next-track preparation after a short delay so audio can stabilize
@@ -412,8 +391,8 @@ class DriftAudioMixer {
   // ─── Setter methods (Tier 3: formalize web-layer → mixer mutations) ─────
 
   seedCurrentTrack(track) {
-    this.currentTrack = track;
-    this.trackStartTime = Date.now();
+    this.state.currentTrack = track;
+    this.state.trackStartTime = Date.now();
   }
 
   /**
@@ -458,17 +437,17 @@ class DriftAudioMixer {
   }
 
   resetStack() {
-    this.stack = [];
-    this.stackIndex = 0;
-    this.positionSeconds = 0;
+    this.state.stack = [];
+    this.state.stackIndex = 0;
+    this.state.positionSeconds = 0;
   }
 
   getDisplayCurrentTrack() {
-    return this.currentTrack || null;
+    return this.state.currentTrack || null;
   }
 
   getDisplayTrackStartTime() {
-    return this.trackStartTime || null;
+    return this.state.trackStartTime || null;
   }
 
   getDisplayTrackTiming() {
@@ -479,7 +458,7 @@ class DriftAudioMixer {
     }
 
     const durationSeconds = this.getAdjustedTrackDuration(
-      track.identifier && this.currentTrack?.identifier === track.identifier ? this.currentTrack : track,
+      track.identifier && this.state.currentTrack?.identifier === track.identifier ? this.state.currentTrack : track,
       { logging: false }
     ) || track.length || track.duration || null;
 
@@ -508,7 +487,7 @@ class DriftAudioMixer {
     if (
       this.lockedNextTrackIdentifier &&
       this.lockedNextTrackIdentifier !== candidateId &&
-      (!this.currentTrack || this.currentTrack.identifier !== this.lockedNextTrackIdentifier)
+      (!this.state.currentTrack || this.state.currentTrack.identifier !== this.lockedNextTrackIdentifier)
     ) {
       return true;
     }
@@ -520,7 +499,7 @@ class DriftAudioMixer {
       this.pendingUserOverrideTrackId ||
       (
         this.lockedNextTrackIdentifier &&
-        (!this.currentTrack || this.currentTrack.identifier !== this.lockedNextTrackIdentifier)
+        (!this.state.currentTrack || this.state.currentTrack.identifier !== this.lockedNextTrackIdentifier)
       )
     );
   }
@@ -571,7 +550,7 @@ class DriftAudioMixer {
   }
 
   awaitCurrentTrackReady(timeoutMs = 15000) {
-    if (this.currentTrack && this.trackStartTime) {
+    if (this.state.currentTrack && this.state.trackStartTime) {
       return Promise.resolve(true);
     }
 
@@ -627,7 +606,7 @@ class DriftAudioMixer {
   }
 
   async playCurrentTrack() {
-    const trackToPlay = this.pendingCurrentTrack || this.currentTrack;
+    const trackToPlay = this.pendingCurrentTrack || this.state.currentTrack;
 
     if (!trackToPlay || !trackToPlay.path) {
       console.error('No valid track to play');
@@ -666,7 +645,7 @@ class DriftAudioMixer {
     }
 
     console.log(`🎵 ${trackToPlay.title} by ${trackToPlay.artist}`);
-    this.trackStartTime = null;
+    this.state.trackStartTime = null;
 
     // DON'T broadcast yet - wait until track actually starts streaming
 
@@ -722,7 +701,7 @@ class DriftAudioMixer {
           const crossfadeStartTime = (trackToPlay.length - 2.5) * 1000; // Start crossfade 2.5s before end
 
           setTimeout(() => {
-            if (this.currentTrack && this.isActive) {
+            if (this.state.currentTrack && this.isActive) {
               this.prepareNextTrackForCrossfade();
             }
           }, Math.max(1000, crossfadeStartTime)); // At least 1s delay
@@ -785,10 +764,10 @@ class DriftAudioMixer {
     const selectionGeneration = this.manualSelectionGeneration;
 
     // Mark user-selected track as "seen"
-    this.seenTracks.add(trackMd5);
+    this.state.seenTracks.add(trackMd5);
     const selectedTrack = this.findTrackInCurrentExplorer(trackMd5);
-    if (selectedTrack?.artist) this.seenTrackArtists.add(selectedTrack.artist);
-    if (selectedTrack?.album) this.seenTrackAlbums.add(selectedTrack.album);
+    if (selectedTrack?.artist) this.state.seenTrackArtists.add(selectedTrack.artist);
+    if (selectedTrack?.album) this.state.seenTrackAlbums.add(selectedTrack.album);
 
     this.pendingUserOverrideDirection = direction || null;
     this.pendingUserOverrideTrackId = trackMd5;
@@ -1158,7 +1137,7 @@ class DriftAudioMixer {
         const manualConflict = !overrideTrackId && this.hasManualOverrideConflict(hydratedNextTrack.identifier);
         if (manualConflict) {
           console.warn('🛑 [override] Auto preparation skipped while manual override locked', {
-            sessionId: this.sessionId,
+            sessionId: this.state.sessionId,
             candidateId: hydratedNextTrack.identifier,
             lockedId: this.lockedNextTrackIdentifier || null,
             pendingOverrideId: this.pendingUserOverrideTrackId || null,
@@ -1226,12 +1205,12 @@ class DriftAudioMixer {
 
           this.lockedNextTrackIdentifier = hydratedNextTrack.identifier;
           console.log('🛰️ [override] Locked next track after user selection', {
-            sessionId: this.sessionId,
+            sessionId: this.state.sessionId,
             lockedId: this.lockedNextTrackIdentifier,
             preparedNextId: this.nextTrack?.identifier || null,
             pendingOverrideId: this.pendingUserOverrideTrackId || null,
             manualGenerationAtStart,
-            currentTrackId: this.currentTrack?.identifier || null
+            currentTrackId: this.state.currentTrack?.identifier || null
           });
           await this.broadcastHeartbeat('user-next-prepared', { force: true });
           this.recordSessionEvent('manual_override_prepared', {
@@ -1273,8 +1252,8 @@ class DriftAudioMixer {
         // Track failures to skip persistently broken tracks
         const failedId = hydratedNextTrack?.identifier || overrideTrackId;
         if (failedId) {
-          const attempts = (this.failedTrackAttempts.get(failedId) || 0) + 1;
-          this.failedTrackAttempts.set(failedId, attempts);
+          const attempts = (this.state.failedTrackAttempts.get(failedId) || 0) + 1;
+          this.state.failedTrackAttempts.set(failedId, attempts);
           console.warn(`⚠️ Track ${failedId.substring(0,8)} failed (attempt ${attempts}/3)`);
         }
 
@@ -1331,7 +1310,7 @@ class DriftAudioMixer {
       // Commit prepared track as pending until streaming actually starts
       this.pendingCurrentTrack = this.hydrateTrackRecord(this.nextTrack) || this.nextTrack;
       this.nextTrack = null;
-      this.trackStartTime = null;
+      this.state.trackStartTime = null;
 
       if (this.lockedNextTrackIdentifier && this.pendingCurrentTrack && this.lockedNextTrackIdentifier === this.pendingCurrentTrack.identifier) {
         this.lockedNextTrackIdentifier = null;
@@ -1377,10 +1356,10 @@ class DriftAudioMixer {
 
   // Get exploration data for current track (reuse existing logic)
   async getExplorerDataForCurrentTrack() {
-    if (!this.currentTrack) return null;
+    if (!this.state.currentTrack) return null;
 
     try {
-      return await this.radialSearch.exploreFromTrack(this.currentTrack.identifier);
+      return await this.radialSearch.exploreFromTrack(this.state.currentTrack.identifier);
     } catch (error) {
       console.warn(`Failed to get explorer data: ${error.message}`);
       return null;
@@ -1396,8 +1375,8 @@ class DriftAudioMixer {
       if (this.explorerRecommendedNext) {
         const rec = this.explorerRecommendedNext;
         const recId = rec.trackId;
-        const alreadyPlayed = this.sessionHistory.some(h => h.identifier === recId);
-        const isCurrent = this.currentTrack?.identifier === recId;
+        const alreadyPlayed = this.state.sessionHistory.some(h => h.identifier === recId);
+        const isCurrent = this.state.currentTrack?.identifier === recId;
         const isPendingNext = this.nextTrack?.identifier === recId;
         if (!alreadyPlayed && !isCurrent && !isPendingNext) {
           const hydrated = this.hydrateTrackRecord(recId, {
@@ -1517,12 +1496,12 @@ class DriftAudioMixer {
         this.pushToStack(
           this.pendingCurrentTrack.identifier,
           direction,
-          this.explorerResolution || 'adaptive'
+          this.state.explorerResolution || 'adaptive'
         );
         
         // Advance stack index to new track
-        this.stackIndex = this.stack.length - 1;
-        this.positionSeconds = 0;
+        this.state.stackIndex = this.state.stack.length - 1;
+        this.state.positionSeconds = 0;
       }
       
       await this.playCurrentTrack();
@@ -1602,8 +1581,8 @@ class DriftAudioMixer {
       console.warn('⚠️ Failed to stop advanced mixer before noise fallback:', err?.message || err);
     }
 
-    this.currentTrack = null;
-    this.trackStartTime = null;
+    this.state.currentTrack = null;
+    this.state.trackStartTime = null;
 
     if (this.nextTrackLoadPromise) {
       this.nextTrackLoadPromise = null;
@@ -1707,7 +1686,7 @@ class DriftAudioMixer {
 
   // Add a client to receive the stream
   addClient(response) {
-    console.log(`Adding client to drift session: ${this.sessionId}`);
+    console.log(`Adding client to drift session: ${this.state.sessionId}`);
 
     // Set proper headers for WAV/PCM streaming
     // Note: no Content-Length or Transfer-Encoding — Node handles chunked encoding
@@ -1746,7 +1725,7 @@ class DriftAudioMixer {
 
     // Handle client disconnect
     response.on('close', () => {
-      console.log(`Client disconnected from drift session: ${this.sessionId}`);
+      console.log(`Client disconnected from drift session: ${this.state.sessionId}`);
       this.clients.delete(response);
 
       // Stop streaming if no clients
@@ -1768,7 +1747,7 @@ class DriftAudioMixer {
   async startStreaming() {
     if (this.isActive) return;
 
-    console.log(`🎵 Starting drift streaming for session: ${this.sessionId}`);
+    console.log(`🎵 Starting drift streaming for session: ${this.state.sessionId}`);
     this.isActive = true;
     this.ensureHeartbeatLoop();
     const tryRestore = () => this.restorePersistedOverrideState('stream-start');
@@ -1790,8 +1769,8 @@ class DriftAudioMixer {
     }
 
     // Respect any pre-seeded track (e.g., contrived MD5 journey)
-    if (this.currentTrack && this.currentTrack.path) {
-      console.log(`🎵 Using pre-seeded track for session start: ${this.currentTrack.title || this.currentTrack.identifier}`);
+    if (this.state.currentTrack && this.state.currentTrack.path) {
+      console.log(`🎵 Using pre-seeded track for session start: ${this.state.currentTrack.title || this.state.currentTrack.identifier}`);
       await this.playCurrentTrack();
     } else {
       await this.startDriftPlayback();
@@ -1829,7 +1808,7 @@ class DriftAudioMixer {
       this.heartbeatInterval = null;
     }
 
-    console.log(`🕓 Scheduling drift shutdown for session ${this.sessionId} in ${delay}ms (${reason})`);
+    console.log(`🕓 Scheduling drift shutdown for session ${this.state.sessionId} in ${delay}ms (${reason})`);
 
     this.streamingStopTimer = setTimeout(() => {
       this.streamingStopTimer = null;
@@ -1847,7 +1826,7 @@ class DriftAudioMixer {
     }
     clearTimeout(this.streamingStopTimer);
     this.streamingStopTimer = null;
-    console.log(`🕓 Cancelled scheduled drift shutdown for session ${this.sessionId} (${reason})`);
+    console.log(`🕓 Cancelled scheduled drift shutdown for session ${this.state.sessionId} (${reason})`);
   }
 
   captureOverridePersistence(reason = 'idle-stop') {
@@ -1918,7 +1897,7 @@ class DriftAudioMixer {
     if (!this.isActive) return;
 
     const { reason = 'manual', preserveLockedOverride = false } = options || {};
-    console.log(`🛑 Stopping drift streaming for session: ${this.sessionId} (${reason})`);
+    console.log(`🛑 Stopping drift streaming for session: ${this.state.sessionId} (${reason})`);
 
     if (this.streamingStopTimer) {
       clearTimeout(this.streamingStopTimer);
@@ -1943,8 +1922,8 @@ class DriftAudioMixer {
     }
 
     // Clear playback state so monitoring endpoints stop reporting this session as active
-    this.trackStartTime = null;
-    this.currentTrack = null;
+    this.state.trackStartTime = null;
+    this.state.currentTrack = null;
     this.nextTrack = null;
     this.explorerRecommendedNext = null;
     this.pendingCurrentTrack = null;
@@ -1997,7 +1976,7 @@ class DriftAudioMixer {
   }
 
   async restartStream(reason = 'manual-restart') {
-    console.log(`🔄 Restarting stream for session ${this.sessionId} (${reason})`);
+    console.log(`🔄 Restarting stream for session ${this.state.sessionId} (${reason})`);
 
     try {
       this.stopStreaming();
@@ -2011,7 +1990,7 @@ class DriftAudioMixer {
     try {
       await this.startDriftPlayback();
       await this.broadcastTrackEvent(true, { reason: reason || 'manual-restart' });
-      console.log(`✅ Stream restarted for session ${this.sessionId}`);
+      console.log(`✅ Stream restarted for session ${this.state.sessionId}`);
     } catch (error) {
       console.error('❌ restartStream failed:', error);
       throw error;
@@ -2020,7 +1999,7 @@ class DriftAudioMixer {
 
   // Add event client for SSE
   addEventClient(eventClient) {
-    console.log(`📡 Event client connected to session: ${this.sessionId}`);
+    console.log(`📡 Event client connected to session: ${this.state.sessionId}`);
     this.eventClients.add(eventClient);
 
     if (this.cleanupTimer) {
@@ -2040,7 +2019,7 @@ class DriftAudioMixer {
 
   // Remove event client
   removeEventClient(eventClient) {
-    console.log(`📡 Event client disconnected from session: ${this.sessionId}`);
+    console.log(`📡 Event client disconnected from session: ${this.state.sessionId}`);
     this.eventClients.delete(eventClient);
 
     if (!this.pendingClientBootstrap && !this.isActive && this.clients.size === 0 && this.eventClients.size === 0 && typeof this.onIdle === 'function') {
@@ -2055,7 +2034,7 @@ class DriftAudioMixer {
     }
 
     if (this.clients.size > 0) {
-      if (this.currentTrack && this.trackStartTime) {
+      if (this.state.currentTrack && this.state.trackStartTime) {
         const now = Date.now();
         let nominalDurationMs = null;
 
@@ -2068,15 +2047,15 @@ class DriftAudioMixer {
           nominalDurationMs = null;
         }
 
-        if (!nominalDurationMs && this.currentTrack.length) {
-          nominalDurationMs = this.currentTrack.length * 1000;
+        if (!nominalDurationMs && this.state.currentTrack.length) {
+          nominalDurationMs = this.state.currentTrack.length * 1000;
         }
 
         if (!nominalDurationMs) {
           return true; // Cannot determine duration; assume alive while clients exist
         }
 
-        const elapsedMs = now - this.trackStartTime;
+        const elapsedMs = now - this.state.trackStartTime;
         if (elapsedMs >= 0 && elapsedMs <= nominalDurationMs + 15000) {
           return true;
         }
@@ -2111,12 +2090,12 @@ class DriftAudioMixer {
     }
 
     return {
-      sessionId: this.sessionId,
+      sessionId: this.state.sessionId,
       isStreaming: Boolean(this.audioMixer?.engine?.isStreaming),
       audioClientCount: this.clients.size,
       eventClientCount: this.eventClients.size,
-      trackStartTime: this.trackStartTime,
-      currentTrack: cloneTrack(this.currentTrack),
+      trackStartTime: this.state.trackStartTime,
+      currentTrack: cloneTrack(this.state.currentTrack),
       pendingTrack: cloneTrack(this.pendingCurrentTrack),
       nextTrack: summaryNextTrack,
       lastBroadcast: this.lastTrackEventPayload ? {
@@ -2128,12 +2107,12 @@ class DriftAudioMixer {
 
   // Broadcast event to all SSE clients
   broadcastEvent(eventData) {
-    console.log(`📡 Session ${this.sessionId} broadcasting to ${this.eventClients.size} clients`);
+    console.log(`📡 Session ${this.state.sessionId} broadcasting to ${this.eventClients.size} clients`);
     const eventJson = JSON.stringify(eventData);
     for (const client of this.eventClients) {
       try {
         if (!client.destroyed) {
-          console.log(`📡 → Sending to client for session ${this.sessionId}`);
+          console.log(`📡 → Sending to client for session ${this.state.sessionId}`);
           client.write(`data: ${eventJson}\n\n`);
         }
       } catch (err) {
@@ -2149,7 +2128,7 @@ class DriftAudioMixer {
     }
 
     const eventPayload = {
-      sessionId: this.sessionId,
+      sessionId: this.state.sessionId,
       timestamp: Date.now(),
       ...payload,
       type: eventType
@@ -2164,19 +2143,28 @@ class DriftAudioMixer {
     }
     const event = {
       type,
-      sessionId: this.sessionId,
+      sessionId: this.state.sessionId,
       timestamp: Date.now(),
       ...payload
     };
-    console.log(`📡 Session ${this.sessionId} selection event`, event);
+    console.log(`📡 Session ${this.state.sessionId} selection event`, event);
     this.broadcastEvent(event);
   }
 
   // Add track to session history
   addToHistory(track, startTimestamp, direction = null, transitionReason = 'natural') {
-    const result = mb.buildHistoryEntry(track, startTimestamp, direction, transitionReason, this);
-    if (result.seenArtist) this.seenArtists.add(result.seenArtist);
-    if (result.seenAlbum) this.seenAlbums.add(result.seenAlbum);
+    const historyState = {
+      sessionHistory: this.state.sessionHistory,
+      maxHistorySize: this.state.maxHistorySize,
+      sessionId: this.state.sessionId,
+      noArtist: this.state.noArtist,
+      noAlbum: this.state.noAlbum,
+      currentAdaptiveRadius: this.currentAdaptiveRadius,
+      adaptiveRadiusCache: this.adaptiveRadiusCache
+    };
+    const result = mb.buildHistoryEntry(track, startTimestamp, direction, transitionReason, historyState);
+    if (result.seenArtist) this.state.seenArtists.add(result.seenArtist);
+    if (result.seenAlbum) this.state.seenAlbums.add(result.seenAlbum);
   }
 
   // Delegated to explorer-pipeline
@@ -2284,8 +2272,8 @@ class DriftAudioMixer {
     const currentTrackId = displayTrack.identifier;
     const preparedNextId = this.nextTrack?.identifier || this.lockedNextTrackIdentifier || null;
 
-    const activeTrack = this.currentTrack && this.currentTrack.identifier === currentTrackId
-      ? this.currentTrack
+    const activeTrack = this.state.currentTrack && this.state.currentTrack.identifier === currentTrackId
+      ? this.state.currentTrack
       : null;
 
     const lastSnapshotMatches = this._lastBroadcastTrackId === currentTrackId
@@ -2304,10 +2292,10 @@ class DriftAudioMixer {
     try {
       console.log(`📡 Building explorer snapshot for: ${displayTrack.title} by ${displayTrack.artist}`);
 
-      if (this.sessionHistory.length === 0 ||
-          this.sessionHistory[this.sessionHistory.length - 1].identifier !== currentTrackId) {
+      if (this.state.sessionHistory.length === 0 ||
+          this.state.sessionHistory[this.state.sessionHistory.length - 1].identifier !== currentTrackId) {
         this.addToHistory(displayTrack, displayStartTime, this.driftPlayer.currentDirection);
-        console.log(`📡 Added track to history, total: ${this.sessionHistory.length}`);
+        console.log(`📡 Added track to history, total: ${this.state.sessionHistory.length}`);
       }
 
       let explorerData;
@@ -2369,7 +2357,7 @@ class DriftAudioMixer {
       if (nominatedDirectionKey && !(explorerData.directions || {}).hasOwnProperty(nominatedDirectionKey)) {
         const availableKeys = Object.keys(explorerData.directions || {});
         console.error('📉 Explorer snapshot missing direction payload for nominated nextTrack', {
-          sessionId: this.sessionId,
+          sessionId: this.state.sessionId,
           currentTrackId,
           nominatedDirectionKey,
           availableDirectionKeys: availableKeys.slice(0, 24),
@@ -2458,10 +2446,10 @@ class DriftAudioMixer {
         type: 'explorer_snapshot',
         timestamp: Date.now(),
         reason,
-        fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
+        fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.state.sessionId) || null,
         currentTrack: currentTrackPayload,
         nextTrack: sanitizedNextTrack || null,
-        sessionHistory: this.sessionHistory.slice(-10).map(entry => ({
+        sessionHistory: this.state.sessionHistory.slice(-10).map(entry => ({
           identifier: entry.identifier,
           title: entry.title,
           artist: entry.artist,
@@ -2472,19 +2460,19 @@ class DriftAudioMixer {
         driftState: {
           currentDirection: this.driftPlayer.currentDirection,
           stepCount: this.driftPlayer.stepCount,
-          sessionDuration: Date.now() - (this.sessionHistory[0]?.startTime || Date.now())
+          sessionDuration: Date.now() - (this.state.sessionHistory[0]?.startTime || Date.now())
         },
         explorer: sanitizedExplorer,
         session: {
-          id: this.sessionId,
+          id: this.state.sessionId,
           clients: this.clients.size,
-          totalTracksPlayed: this.sessionHistory.length,
+          totalTracksPlayed: this.state.sessionHistory.length,
           diversityScore: this.calculateSessionDiversity(),
           filtering: {
-            noArtist: this.noArtist,
-            noAlbum: this.noAlbum,
-            seenArtistsCount: this.seenArtists.size,
-            seenAlbumsCount: this.seenAlbums.size
+            noArtist: this.state.noArtist,
+            noAlbum: this.state.noAlbum,
+            seenArtistsCount: this.state.seenArtists.size,
+            seenAlbumsCount: this.state.seenAlbums.size
           }
         },
         explorerDiagnostics: explorerData.diagnostics || null,
@@ -2522,13 +2510,13 @@ class DriftAudioMixer {
           type: 'explorer_snapshot',
           timestamp: Date.now(),
           reason,
-          fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.sessionId) || null,
+          fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.state.sessionId) || null,
           currentTrack: fallbackCurrent,
           explorer: { error: true, message: error.message },
           session: {
-            id: this.sessionId,
+            id: this.state.sessionId,
             clients: this.clients.size,
-            totalTracksPlayed: this.sessionHistory.length
+            totalTracksPlayed: this.state.sessionHistory.length
           }
         };
       } catch (fallbackError) {
@@ -2589,14 +2577,14 @@ class DriftAudioMixer {
 
   // Get comprehensive explorer data with PCA-enhanced directions and diversity scoring
   async runComprehensiveExplorerData(options = {}) {
-    const targetTrackId = options.trackId || this.currentTrack?.identifier;
+    const targetTrackId = options.trackId || this.state.currentTrack?.identifier;
     if (!targetTrackId) {
       throw new Error('No target track for explorer data');
     }
     const retryDepth = Number.isFinite(options.retryDepth) ? options.retryDepth : 0;
 
     // Check session-level cache first
-    const resolution = this.explorerResolution || 'adaptive';
+    const resolution = this.state.explorerResolution || 'adaptive';
 
     if (this.explorerDataCache.has(targetTrackId, resolution)) {
       console.log(`🚀 Explorer cache HIT: ${targetTrackId.substring(0,8)} @ ${resolution} (${this.explorerDataCache.size} cached)`);
@@ -2614,7 +2602,7 @@ class DriftAudioMixer {
       // Fallback to legacy exploration if no PCA data
       const sessionFilterFn = (tracks) => ep.filterSessionRepeats(tracks, this);
       const strategicSamplesFn = (candidates, target) => ep.selectStrategicSamples(candidates, target);
-      return await ep.getLegacyExplorerData(this.radialSearch, this.currentTrack, sessionFilterFn, strategicSamplesFn);
+      return await ep.getLegacyExplorerData(this.radialSearch, this.state.currentTrack, sessionFilterFn, strategicSamplesFn);
     }
 
     const explorerData = {
@@ -2760,7 +2748,7 @@ class DriftAudioMixer {
         for (const [component, componentInfo] of Object.entries(domainInfo)) {
           const directionKey = `${domain}_${component}`;
           const searchContext = {
-            resolution: this.explorerResolution || 'adaptive',
+            resolution: this.state.explorerResolution || 'adaptive',
             adaptiveRadius: this.currentAdaptiveRadius,
             neighborhoodSnapshot: this.currentNeighborhoodSnapshot
           };
@@ -2900,7 +2888,7 @@ class DriftAudioMixer {
       if (direction.sampleTracks && direction.sampleTracks.length > 24) {
         direction.sampleTracks = this.selectStrategicSamples(
           direction.sampleTracks.map(track => ({ track })),
-          this.currentTrack
+          this.state.currentTrack
         ).map(sample => sample.track);
       }
     });
@@ -2936,8 +2924,8 @@ class DriftAudioMixer {
     directionDiagnostics.droppedOpposites = removalResult.stats.droppedOpposites;
 
     const stackBudgetResult = ep.applyStackBudget(explorerData.directions, {
-      stackTotalCount: this.stackTotalCount || 12,
-      stackRandomCount: this.stackRandomCount
+      stackTotalCount: this.state.stackTotalCount || 12,
+      stackRandomCount: this.state.stackRandomCount
     });
     explorerData.directions = stackBudgetResult.directions;
     directionDiagnostics.trimmedSamples = stackBudgetResult.stats.trimmedSamples;
@@ -2976,7 +2964,7 @@ class DriftAudioMixer {
       directionDiagnostics,
       retryDepth,
       this.dynamicRadiusState,
-      this.stackTotalCount,
+      this.state.stackTotalCount,
       (type, data) => this.recordSessionEvent(type, data)
     );
     if (radiusFeedback.action) {
@@ -3015,7 +3003,7 @@ class DriftAudioMixer {
     // Calculate diversity scores and select next track
     explorerData.diversityMetrics = ep.calculateExplorerDiversityMetrics(explorerData.directions);
     explorerData.nextTrack = await ep.selectNextTrackFromExplorer(explorerData, this._explorerSessionContext());
-    explorerData.resolution = this.explorerResolution;
+    explorerData.resolution = this.state.explorerResolution;
 
     this.recordExplorerSummary(explorerData, radiusDiagnostics, totalNeighborhoodSize);
 
@@ -3028,8 +3016,8 @@ class DriftAudioMixer {
 
   recordExplorerSummary(explorerData, radiusDiagnostics, totalNeighborhoodSize) {
     const mixerContext = {
-      currentTrackId: this.currentTrack?.identifier || null,
-      explorerResolution: this.explorerResolution,
+      currentTrackId: this.state.currentTrack?.identifier || null,
+      explorerResolution: this.state.explorerResolution,
       explorerHistory: this.explorerHistory,
       maxExplorerHistory: this.maxExplorerHistory,
       currentExplorerSummary: this.currentExplorerSummary,
@@ -3041,7 +3029,7 @@ class DriftAudioMixer {
   }
 
   async getComprehensiveExplorerData(options = {}) {
-    const isCurrentTrack = !options.trackId || options.trackId === this.currentTrack?.identifier;
+    const isCurrentTrack = !options.trackId || options.trackId === this.state.currentTrack?.identifier;
     if (!options.forceFresh && isCurrentTrack && this.pendingExplorerPromise) {
       return this.pendingExplorerPromise;
     }
@@ -3050,7 +3038,7 @@ class DriftAudioMixer {
     // try it first to avoid blocking the main thread.
     if (this.onExplorerNeeded) {
       try {
-        const trackId = options.trackId || this.currentTrack?.identifier;
+        const trackId = options.trackId || this.state.currentTrack?.identifier;
         const delegated = await this.onExplorerNeeded(trackId, options);
         if (delegated) {
           return delegated;
@@ -3077,32 +3065,32 @@ class DriftAudioMixer {
   }
 
   setExplorerResolution(resolution) {
-    const previous = this.explorerResolution || 'adaptive';
+    const previous = this.state.explorerResolution || 'adaptive';
     const normalized = (resolution || 'adaptive').toString().toLowerCase();
 
     if (normalized !== 'adaptive') {
       console.log(`🔍 Ignoring legacy explorer resolution request (${resolution}); adaptive tuning is always enabled.`);
     }
 
-    this.explorerResolution = 'adaptive';
-    return previous !== this.explorerResolution;
+    this.state.explorerResolution = 'adaptive';
+    return previous !== this.state.explorerResolution;
   }
 
   _explorerSessionContext() {
     return {
-      sessionHistory: this.sessionHistory,
-      currentTrackId: this.currentTrack?.identifier,
-      failedTrackAttempts: this.failedTrackAttempts,
+      sessionHistory: this.state.sessionHistory,
+      currentTrackId: this.state.currentTrack?.identifier,
+      failedTrackAttempts: this.state.failedTrackAttempts,
       recordSessionEvent: (type, data) => this.recordSessionEvent(type, data)
     };
   }
 
   // Calculate session diversity based on history
   calculateSessionDiversity() {
-    if (this.sessionHistory.length < 2) return 0;
+    if (this.state.sessionHistory.length < 2) return 0;
 
     // Measure diversity as variance in PCA space across session history
-    const recentTracks = this.sessionHistory.slice(-10); // Last 10 tracks
+    const recentTracks = this.state.sessionHistory.slice(-10); // Last 10 tracks
     let diversityScore = 0;
 
     // Calculate variance in primary discriminator
@@ -3155,14 +3143,14 @@ class DriftAudioMixer {
     const driftState = this.driftPlayer.getDriftState();
 
     return {
-      sessionId: this.sessionId,
+      sessionId: this.state.sessionId,
       clients: this.clients.size,
       isActive: this.isActive,
       isDriftMode: true,
-      currentTrack: this.currentTrack ? {
-        title: this.currentTrack.title,
-        artist: this.currentTrack.artist,
-        identifier: this.currentTrack.identifier
+      currentTrack: this.state.currentTrack ? {
+        title: this.state.currentTrack.title,
+        artist: this.state.currentTrack.artist,
+        identifier: this.state.currentTrack.identifier
       } : null,
       nextTrack: this.nextTrack ? {
         title: this.nextTrack.title,
@@ -3173,12 +3161,12 @@ class DriftAudioMixer {
       stepCount: driftState.stepCount,
       recentHistory: driftState.recentHistory,
       // Stack-based journey info
-      sessionType: this.sessionType,
-      sessionName: this.sessionName,
-      stackLength: this.stack.length,
-      stackIndex: this.stackIndex,
-      positionSeconds: this.positionSeconds,
-      ephemeral: this.ephemeral,
+      sessionType: this.state.sessionType,
+      sessionName: this.state.sessionName,
+      stackLength: this.state.stack.length,
+      stackIndex: this.state.stackIndex,
+      positionSeconds: this.state.positionSeconds,
+      ephemeral: this.state.ephemeral,
       canAdvance: !this.isAtStackEnd()
     };
   }
@@ -3187,55 +3175,55 @@ class DriftAudioMixer {
 
   // Initialize session as named or playlist session
   initializeSession(sessionType, sessionName, initialStack = null) {
-    this.sessionType = sessionType; // 'named', 'playlist', 'anonymous'
-    this.sessionName = sessionName;
+    this.state.sessionType = sessionType; // 'named', 'playlist', 'anonymous'
+    this.state.sessionName = sessionName;
     
     if (initialStack) {
-      this.stack = [...initialStack];
-      this.stackIndex = 0;
-      this.positionSeconds = 0;
+      this.state.stack = [...initialStack];
+      this.state.stackIndex = 0;
+      this.state.positionSeconds = 0;
     } else if (sessionType === 'anonymous') {
       // For anonymous sessions, build retroactive stack when tracks are available
       // This will be called again from ensureTrackInStack when first track loads
       this.buildRetroactiveStack();
     }
     
-    this.ephemeral = false;
+    this.state.ephemeral = false;
     console.log(`📚 Initialized session: ${sessionType} (${sessionName || 'anonymous'})`);
   }
 
   // Build stack from current session state (for anonymous sessions)
   buildRetroactiveStack() {
-    this.stack = [];
+    this.state.stack = [];
     
-    if (this.currentTrack) {
-      this.stack.push({
-        identifier: this.currentTrack.identifier,
+    if (this.state.currentTrack) {
+      this.state.stack.push({
+        identifier: this.state.currentTrack.identifier,
         direction: null, // First track has no incoming direction
-        scope: this.explorerResolution || 'adaptive'
+        scope: this.state.explorerResolution || 'adaptive'
       });
     }
     
     if (this.nextTrack) {
-      this.stack.push({
+      this.state.stack.push({
         identifier: this.nextTrack.identifier,
         direction: this.driftPlayer.getDriftState().currentDirection || null,
-        scope: this.explorerResolution || 'adaptive'
+        scope: this.state.explorerResolution || 'adaptive'
       });
-      this.stackIndex = 0; // Currently on first track
+      this.state.stackIndex = 0; // Currently on first track
     } else {
-      this.stackIndex = 0;
+      this.state.stackIndex = 0;
     }
   }
 
   // Add track to stack (organic exploration)
   pushToStack(identifier, direction = null, scope = 'adaptive') {
-    if (this.ephemeral) {
+    if (this.state.ephemeral) {
       console.log('📚 Session is ephemeral, not adding to stack');
       return;
     }
 
-    if (this.sessionType === 'playlist') {
+    if (this.state.sessionType === 'playlist') {
       console.log('📚 Playlist session is read-only, not adding to stack');
       return;
     }
@@ -3246,8 +3234,8 @@ class DriftAudioMixer {
       scope
     };
 
-    this.stack.push(stackItem);
-    console.log(`📚 Added to stack: ${identifier} (${this.stack.length} total)`);
+    this.state.stack.push(stackItem);
+    console.log(`📚 Added to stack: ${identifier} (${this.state.stack.length} total)`);
     
     // Notify of stack change
     this.broadcastStackUpdate();
@@ -3255,14 +3243,14 @@ class DriftAudioMixer {
 
   // Navigate to specific position in stack
   jumpToStackPosition(index, positionSeconds = 0) {
-    if (index < 0 || index >= this.stack.length) {
-      throw new Error(`Invalid stack index: ${index} (stack length: ${this.stack.length})`);
+    if (index < 0 || index >= this.state.stack.length) {
+      throw new Error(`Invalid stack index: ${index} (stack length: ${this.state.stack.length})`);
     }
 
-    this.stackIndex = index;
-    this.positionSeconds = positionSeconds;
+    this.state.stackIndex = index;
+    this.state.positionSeconds = positionSeconds;
     
-    const stackItem = this.stack[index];
+    const stackItem = this.state.stack[index];
     console.log(`📚 Jumping to stack position ${index}: ${stackItem.identifier} at ${positionSeconds}s`);
     
     // Load the track at this position
@@ -3280,36 +3268,36 @@ class DriftAudioMixer {
     }
 
     // Set the track as current
-    this.currentTrack = this.hydrateTrackRecord(track);
+    this.state.currentTrack = this.hydrateTrackRecord(track);
     this.pendingCurrentTrack = null;
     
     // Start playback at specified position
     await this.playCurrentTrack();
     
-    if (this.positionSeconds > 0) {
+    if (this.state.positionSeconds > 0) {
       // TODO: Implement seeking to positionSeconds
-      console.log(`🎵 Would seek to ${this.positionSeconds}s in track`);
+      console.log(`🎵 Would seek to ${this.state.positionSeconds}s in track`);
     }
   }
 
   // Check if we're at the end of the stack
   isAtStackEnd() {
-    return this.stackIndex >= this.stack.length - 1;
+    return this.state.stackIndex >= this.state.stack.length - 1;
   }
 
   // Move to next track in stack
   advanceInStack() {
     if (this.isAtStackEnd()) {
       console.log('📚 Reached end of stack, entering ephemeral mode');
-      this.ephemeral = true;
+      this.state.ephemeral = true;
       return false;
     }
 
-    this.stackIndex++;
-    this.positionSeconds = 0;
+    this.state.stackIndex++;
+    this.state.positionSeconds = 0;
     
-    const stackItem = this.stack[this.stackIndex];
-    console.log(`📚 Advancing to stack position ${this.stackIndex}: ${stackItem.identifier}`);
+    const stackItem = this.state.stack[this.state.stackIndex];
+    console.log(`📚 Advancing to stack position ${this.state.stackIndex}: ${stackItem.identifier}`);
     
     this.loadTrackFromStack(stackItem);
     this.broadcastStackUpdate();
@@ -3318,81 +3306,16 @@ class DriftAudioMixer {
 
   // Get current stack state for export/serialization
   getStackState() {
-    return {
-      // Journey
-      sessionType: this.sessionType,
-      sessionName: this.sessionName,
-      stack: [...this.stack],
-      stackIndex: this.stackIndex,
-      positionSeconds: this.positionSeconds,
-      ephemeral: this.ephemeral,
-
-      // Negative state — what NOT to repeat
-      seenArtists: [...this.seenArtists],
-      seenAlbums: [...this.seenAlbums],
-      seenTracks: [...this.seenTracks],
-      seenTrackArtists: [...this.seenTrackArtists],
-      seenTrackAlbums: [...this.seenTrackAlbums],
-      sessionHistory: (this.sessionHistory || []).map(h => ({
-        identifier: h.identifier,
-        title: h.title,
-        artist: h.artist,
-        direction: h.direction,
-        timestamp: h.timestamp || h.startTime
-      })),
-      failedTrackAttempts: [...(this.failedTrackAttempts || new Map())],
-
-      // Config
-      noArtist: this.noArtist,
-      noAlbum: this.noAlbum,
-      stackTotalCount: this.stackTotalCount,
-      stackRandomCount: this.stackRandomCount,
-
-      // Current track pointer
-      currentTrackId: this.currentTrack?.identifier || null,
-      currentTrackDirection: this.currentTrackDirection || null,
-
-      // Metadata
-      created: this.created || new Date().toISOString(),
-      lastAccess: new Date().toISOString()
-    };
+    return this.state.serialize();
   }
 
   // Load state from serialized stack
-  loadStackState(state) {
-    // Journey
-    this.sessionType = state.sessionType || 'anonymous';
-    this.sessionName = state.sessionName || null;
-    this.stack = [...(state.stack || [])];
-    this.stackIndex = state.stackIndex || 0;
-    this.positionSeconds = state.positionSeconds || 0;
-    this.ephemeral = state.ephemeral || false;
-    this.created = state.created || new Date().toISOString();
-
-    // Negative state — restore what NOT to repeat
-    if (Array.isArray(state.seenArtists)) this.seenArtists = new Set(state.seenArtists);
-    if (Array.isArray(state.seenAlbums)) this.seenAlbums = new Set(state.seenAlbums);
-    if (Array.isArray(state.seenTracks)) this.seenTracks = new Set(state.seenTracks);
-    if (Array.isArray(state.seenTrackArtists)) this.seenTrackArtists = new Set(state.seenTrackArtists);
-    if (Array.isArray(state.seenTrackAlbums)) this.seenTrackAlbums = new Set(state.seenTrackAlbums);
-    if (Array.isArray(state.sessionHistory)) this.sessionHistory = state.sessionHistory;
-    if (Array.isArray(state.failedTrackAttempts)) this.failedTrackAttempts = new Map(state.failedTrackAttempts);
-
-    // Config
-    if (state.noArtist !== undefined) this.noArtist = state.noArtist;
-    if (state.noAlbum !== undefined) this.noAlbum = state.noAlbum;
-    if (state.stackTotalCount !== undefined) this.stackTotalCount = state.stackTotalCount;
-    if (state.stackRandomCount !== undefined) this.stackRandomCount = state.stackRandomCount;
-
-    // Current track pointer
-    if (state.currentTrackDirection) this.currentTrackDirection = state.currentTrackDirection;
-
-    console.log(`📚 Loaded stack state: ${this.stack.length} tracks, position ${this.stackIndex}, ` +
-      `${this.seenArtists.size} seen artists, ${this.sessionHistory.length} history entries`);
-
-    // Load current track if stack is not empty
-    if (this.stack.length > 0 && this.stackIndex < this.stack.length) {
-      const currentStackItem = this.stack[this.stackIndex];
+  loadStackState(data) {
+    this.state = SessionState.fromSerialized(data);
+    console.log(`📚 Loaded stack state: ${this.state.stack.length} tracks, position ${this.state.stackIndex}, ` +
+      `${this.state.seenArtists.size} seen artists, ${this.state.sessionHistory.length} history entries`);
+    if (this.state.stack.length > 0 && this.state.stackIndex < this.state.stack.length) {
+      const currentStackItem = this.state.stack[this.state.stackIndex];
       this.loadTrackFromStack(currentStackItem);
     }
   }
@@ -3400,12 +3323,12 @@ class DriftAudioMixer {
   // Broadcast stack update to SSE clients
   broadcastStackUpdate() {
     const stackInfo = {
-      stackLength: this.stack.length,
-      stackIndex: this.stackIndex,
-      positionSeconds: this.positionSeconds,
-      ephemeral: this.ephemeral,
+      stackLength: this.state.stack.length,
+      stackIndex: this.state.stackIndex,
+      positionSeconds: this.state.positionSeconds,
+      ephemeral: this.state.ephemeral,
       canAdvance: !this.isAtStackEnd(),
-      currentStackItem: this.stack[this.stackIndex] || null
+      currentStackItem: this.state.stack[this.state.stackIndex] || null
     };
 
     this.broadcastToEventClients('stack_update', stackInfo);
@@ -3416,15 +3339,15 @@ class DriftAudioMixer {
 
   // Persist session state (event-driven)
   persistSessionState() {
-    if (this.sessionType === 'named' && !this.ephemeral) {
+    if (this.state.sessionType === 'named' && !this.state.ephemeral) {
       // Store in memory for now (in-memory session registry)
       const stackState = this.getStackState();
-      console.log(`💾 Persisting named session state: ${this.sessionName} (${this.stack.length} tracks)`);
+      console.log(`💾 Persisting named session state: ${this.state.sessionName} (${this.state.stack.length} tracks)`);
       
       // Store in global memory registry
       if (typeof global !== 'undefined') {
         global.namedSessionRegistry = global.namedSessionRegistry || new Map();
-        global.namedSessionRegistry.set(this.sessionName, stackState);
+        global.namedSessionRegistry.set(this.state.sessionName, stackState);
       }
     }
   }
@@ -3432,21 +3355,21 @@ class DriftAudioMixer {
   // Ensure track is in stack (for initial track or stack gaps)
   ensureTrackInStack(identifier) {
     // Check if stack is empty or track is not at current position
-    if (this.stack.length === 0) {
+    if (this.state.stack.length === 0) {
       // First track - add as seed with no direction
-      this.pushToStack(identifier, null, this.explorerResolution || 'adaptive');
-      this.stackIndex = 0;
-      this.positionSeconds = 0;
+      this.pushToStack(identifier, null, this.state.explorerResolution || 'adaptive');
+      this.state.stackIndex = 0;
+      this.state.positionSeconds = 0;
       console.log(`📚 Added seed track to stack: ${identifier}`);
-    } else if (this.stackIndex < this.stack.length && 
-               this.stack[this.stackIndex].identifier !== identifier) {
+    } else if (this.state.stackIndex < this.state.stack.length && 
+               this.state.stack[this.state.stackIndex].identifier !== identifier) {
       // Track mismatch - this shouldn't happen in normal flow but handle gracefully
-      console.warn(`📚 Track mismatch in stack at position ${this.stackIndex}: expected ${this.stack[this.stackIndex].identifier}, got ${identifier}`);
+      console.warn(`📚 Track mismatch in stack at position ${this.state.stackIndex}: expected ${this.state.stack[this.state.stackIndex].identifier}, got ${identifier}`);
       // Could either fix the stack or log for debugging
     }
     
     // Update position tracking
-    this.positionSeconds = 0;
+    this.state.positionSeconds = 0;
   }
 
   // ==================== END STACK MANAGEMENT ====================
@@ -3490,16 +3413,16 @@ class DriftAudioMixer {
   }
 
   // Get the adjusted track duration from advanced audio mixer
-  getAdjustedTrackDuration(track = this.currentTrack, { logging = true } = {}) {
-    return tu.getAdjustedTrackDuration(this.currentTrack, this.audioMixer, track, { logging });
+  getAdjustedTrackDuration(track = this.state.currentTrack, { logging = true } = {}) {
+    return tu.getAdjustedTrackDuration(this.state.currentTrack, this.audioMixer, track, { logging });
   }
 
   // Clean up
   destroy() {
-    console.log(`🧹 Destroying drift mixer for session: ${this.sessionId}`);
+    console.log(`🧹 Destroying drift mixer for session: ${this.state.sessionId}`);
     this.stopStreaming();
 
-    fingerprintRegistry.removeBySession(this.sessionId);
+    fingerprintRegistry.removeBySession(this.state.sessionId);
 
     if (this.pendingUserSelectionTimer) {
       clearTimeout(this.pendingUserSelectionTimer);

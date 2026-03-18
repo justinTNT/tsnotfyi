@@ -18,6 +18,7 @@ import {
   AUDIO_DEAD_REBUILD_WINDOW_MS,
   AUDIO_DEAD_REBUILD_THRESHOLD
 } from './globals.js';
+import { clearSelection } from './selection.js';
 import { createLogger } from './log.js';
 const log = createLogger('audio');
 const sentinelLog = createLogger('sentinel');
@@ -515,11 +516,8 @@ function handlePipelineEvent(msg) {
         state.pendingInitialTrackTimer = setTimeout(() => {
           const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
           if (!hasTrack) {
-            state.manualNextTrackOverride = false;
+            clearSelection('audio_restart');
             state.skipTrayDemotionForTrack = null;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            state.selectedIdentifier = null;
             state.stackIndex = 0;
             log.warn('ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
             if (audioCallbacks.fullResync) {

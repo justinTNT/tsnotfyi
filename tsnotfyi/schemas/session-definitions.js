@@ -219,7 +219,7 @@ const SessionUtilities = {
   
   // Get current track from any session type
   getCurrentTrack: (session) => {
-    if (session.mixer?.currentTrack) return session.mixer.currentTrack;
+    if (session.mixer?.state?.currentTrack) return session.mixer.state.currentTrack;
     if (session.audioState?.currentTrack) return session.audioState.currentTrack;
     return null;
   },

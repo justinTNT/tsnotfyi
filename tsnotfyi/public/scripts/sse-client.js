@@ -9,6 +9,7 @@ import { cloneExplorerData, explorerContainsTrack, findTrackInExplorer, shouldIg
 import { startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
 import { updateConnectionHealthUI, handleDeadAudioSession } from './audio-manager.js';
 import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray } from './playlist-tray.js';
+import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
 const sseLog = createLogger('sse');
 const syncLog = createLogger('sync');
@@ -213,9 +214,9 @@ export function connectSSE() {
     if (nextTrackValid) {
       state.serverNextTrack = nextTrackId;
       state.serverNextDirection = heartbeat.nextTrack?.direction || heartbeat.nextTrack?.directionKey || null;
-      if (!state.manualNextTrackOverride) {
-        const alreadySelected = state.selectedIdentifier === nextTrackId;
-        state.selectedIdentifier = nextTrackId;
+      if (!isUserSelection()) {
+        const alreadySelected = state.selection.trackId === nextTrackId;
+        setSelection(nextTrackId, 'server');
 
         if (!alreadySelected) {
           const match = findTrackInExplorer(state.latestExplorerData, nextTrackId);
@@ -242,11 +243,9 @@ export function connectSSE() {
     if (overrideInfo && overrideInfo.identifier) {
       const overrideId = overrideInfo.identifier;
       if (overrideInfo.status === 'pending' || overrideInfo.status === 'prepared' || overrideInfo.status === 'locked') {
-        state.manualNextTrackOverride = true;
-        state.pendingManualTrackId = overrideId;
-        if (!state.selectedIdentifier || state.selectedIdentifier === state.serverNextTrack) {
-          const alreadySelected = state.selectedIdentifier === overrideId;
-          state.selectedIdentifier = overrideId;
+        if (!state.selection.trackId || state.selection.trackId === state.serverNextTrack) {
+          const alreadySelected = state.selection.trackId === overrideId;
+          setSelection(overrideId, 'ack');
 
           if (!alreadySelected) {
             const match = findTrackInExplorer(state.latestExplorerData, overrideId);
@@ -284,12 +283,7 @@ export function connectSSE() {
 
     sseLog.info('🛰️ selection_ack', event);
 
-    state.manualNextTrackOverride = true;
-    state.pendingManualTrackId = trackId;
-    if (event.direction) {
-      state.manualNextDirectionKey = event.direction;
-    }
-    state.selectedIdentifier = trackId;
+    setSelection(trackId, 'ack', event.direction || null);
 
     const match = findTrackInExplorer(state.latestExplorerData, trackId);
 
@@ -317,8 +311,8 @@ export function connectSSE() {
     if (trackId) {
       findTrackInExplorer(state.latestExplorerData, trackId);
 
-      if (state.pendingManualTrackId === trackId) {
-        state.manualNextTrackOverride = true;
+      if (state.selection.pendingTrackId === trackId) {
+        setSelection(trackId, 'ack');
       }
     }
   };
@@ -327,10 +321,8 @@ export function connectSSE() {
     sseLog.warn('🛰️ selection_failed', event);
     const failedTrack = event.trackId || null;
 
-    if (!failedTrack || state.pendingManualTrackId === failedTrack) {
-      state.manualNextTrackOverride = false;
-      state.manualNextDirectionKey = null;
-      state.pendingManualTrackId = null;
+    if (!failedTrack || state.selection.pendingTrackId === failedTrack) {
+      clearSelection('selection_failed');
     }
 
     requestSSERefresh({ escalate: false });
@@ -425,7 +417,7 @@ export function connectSSE() {
       previousNextTrackId &&
       explorerNextTrackId !== previousNextTrackId &&
       !trackChanged &&
-      !state.manualNextTrackOverride &&
+      !isUserSelection() &&
       progressFraction !== null &&
       progressFraction < TRACK_SWITCH_PROGRESS_THRESHOLD
     ) {
@@ -441,12 +433,12 @@ export function connectSSE() {
 
     const allowSelectionUpdate = !shouldDeferExplorerNext;
 
-    const manualSelectionId = state.manualNextTrackOverride ? state.selectedIdentifier : null;
-    if (trackChanged && state.manualNextTrackOverride && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId) {
+    const manualSelectionId = isUserSelection() ? state.selection.trackId : null;
+    if (trackChanged && isUserSelection() && manualSelectionId && currentTrackId && currentTrackId !== manualSelectionId) {
       sseLog.warn('🛰️ ACTION override-diverged', {
         manualSelection: manualSelectionId,
         playing: currentTrackId,
-        manualDirection: state.manualNextDirectionKey,
+        manualDirection: state.selection.directionKey,
         serverSuggestedNext: inferredTrack || null
       });
         scheduleHeartbeat(10000);
@@ -454,31 +446,27 @@ export function connectSSE() {
     if (trackChanged) {
       // Track changed — always clear manual override. Its purpose is to protect
       // user selections *during* a track, not to persist across track boundaries.
-      if (state.manualNextTrackOverride) {
-        sseLog.info(`🎯 Track changed → clearing manualNextTrackOverride (was selecting ${state.selectedIdentifier?.substring(0,8)})`);
-        state.manualNextTrackOverride = false;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
+      if (isUserSelection()) {
+        sseLog.info(`🎯 Track changed → clearing user selection (was selecting ${state.selection.trackId?.substring(0,8)})`);
+        clearSelection('track_change');
       }
       if (inferredTrack && allowSelectionUpdate) {
-        state.selectedIdentifier = inferredTrack;
+        setSelection(inferredTrack, 'server');
       }
       if (typeof window.updateRadiusControlsUI === 'function') {
         window.updateRadiusControlsUI();
       }
     } else {
       if (resolutionChanged) {
-        state.manualNextTrackOverride = false;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
+        clearSelection('resolution_change');
         if (inferredTrack && allowSelectionUpdate) {
-          state.selectedIdentifier = inferredTrack;
+          setSelection(inferredTrack, 'server');
         }
         if (typeof window.updateRadiusControlsUI === 'function') {
           window.updateRadiusControlsUI();
         }
-      } else if (!state.manualNextTrackOverride && inferredTrack && allowSelectionUpdate) {
-        state.selectedIdentifier = inferredTrack;
+      } else if (!isUserSelection() && inferredTrack && allowSelectionUpdate) {
+        setSelection(inferredTrack, 'server');
       }
     }
 

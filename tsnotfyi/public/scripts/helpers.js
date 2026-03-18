@@ -10,6 +10,7 @@ import { getDirectionType, formatDirectionName, isNegativeDirection, getOpposite
 import { findTrackInExplorer, hydrateTrackDetails } from './explorer-utils.js';
 import { setCardVariant } from './deck-render.js';
 import { playlistHasItems } from './playlist-tray.js';
+import { setSelection } from './selection.js';
 
 
   // create all the styling for album covers
@@ -496,7 +497,7 @@ import { playlistHasItems } from './playlist-tray.js';
       const totalTracksFromDataset = Number(nextTrackCard.dataset.totalTracks);
       const currentTrack = state?.latestCurrentTrack;
       const sampleTracks = direction.sampleTracks || [];
-      const activeIdentifier = state?.selectedIdentifier || md5;
+      const activeIdentifier = state?.selection?.trackId || md5;
       const matchedTrack = sampleTracks.find(sample => {
           const track = sample.track || sample;
           return track.identifier === activeIdentifier;
@@ -715,8 +716,7 @@ import { playlistHasItems } from './playlist-tray.js';
       state.stackIndex = nextIndex;
 
       // Update selection and protect from heartbeat overwrite
-      state.selectedIdentifier = nextTrack.identifier;
-      state.manualNextTrackOverride = true;
+      setSelection(nextTrack.identifier, 'user', directionKey);
       if (!state.remainingCounts) {
           state.remainingCounts = {};
       }
@@ -1142,14 +1142,14 @@ import { playlistHasItems } from './playlist-tray.js';
           return;
       }
 
-      const selectedTrackIndex = state.selectedIdentifier
-          ? sampleTracks.findIndex(track => track.identifier === state.selectedIdentifier)
+      const selectedTrackIndex = state.selection.trackId
+          ? sampleTracks.findIndex(track => track.identifier === state.selection.trackId)
           : 0;
       const finalSelectedIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;
       const selectedTrack = sampleTracks[finalSelectedIndex] || sampleTracks[0];
 
       state.stackIndex = finalSelectedIndex;
-      state.selectedIdentifier = selectedTrack?.identifier || state.selectedIdentifier;
+      if (selectedTrack?.identifier) setSelection(selectedTrack.identifier, 'server');
       if (!state.remainingCounts) {
           state.remainingCounts = {};
       }
@@ -1208,10 +1208,10 @@ import { playlistHasItems } from './playlist-tray.js';
       direction.sampleTracks = (direction.sampleTracks || []).map(entry => entry.track || entry);
       const sampleTracks = direction.sampleTracks;
       // Use global selection state, default to first track if none selected
-      const selectedTrackIndex = state.selectedIdentifier
+      const selectedTrackIndex = state.selection.trackId
           ? sampleTracks.findIndex(trackObj => {
               const track = trackObj.track || trackObj;
-              return track.identifier === state.selectedIdentifier;
+              return track.identifier === state.selection.trackId;
             })
           : 0;
       const finalSelectedTrackIndex = selectedTrackIndex >= 0 ? selectedTrackIndex : 0;

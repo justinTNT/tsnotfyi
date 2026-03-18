@@ -21,7 +21,7 @@ function buildNowPlayingSessions(audioSessions = new Map(), ephemeralSessions = 
           : null;
 
       const durationMs = durationSeconds != null ? Math.max(Math.round(durationSeconds * 1000), 0) : null;
-      const elapsedMs = mixer.trackStartTime ? Math.max(now - mixer.trackStartTime, 0) : null;
+      const elapsedMs = mixer.state.trackStartTime ? Math.max(now - mixer.state.trackStartTime, 0) : null;
       const liveState = typeof mixer.getLiveStreamState === 'function'
         ? mixer.getLiveStreamState()
         : null;

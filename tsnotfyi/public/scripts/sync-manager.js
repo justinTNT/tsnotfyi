@@ -7,6 +7,7 @@ import { extractNextTrackIdentifier, extractNextTrackDirection } from './explore
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
 import { getPlaylistNext, popPlaylistHead, playlistHasItems } from './playlist-tray.js';
+import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
 const log = createLogger('sync');
 const overrideLog = createLogger('override');
@@ -36,7 +37,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         }
     }
 
-    const manualOverrideActive = state.manualNextTrackOverride && state.selectedIdentifier;
+    const manualOverrideActive = isUserSelection() && state.selection.trackId;
     const allowFallback = source !== 'manual_refresh';
 
     let md5ToSend = trackMd5;
@@ -60,9 +61,9 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     }
 
     if (!md5ToSend && allowFallback) {
-        if (manualOverrideActive && state.selectedIdentifier) {
-            md5ToSend = state.selectedIdentifier;
-            dirToSend = dirToSend || state.manualNextDirectionKey || null;
+        if (manualOverrideActive && state.selection.trackId) {
+            md5ToSend = state.selection.trackId;
+            dirToSend = dirToSend || state.selection.directionKey || null;
         }
 
         if (!md5ToSend) {
@@ -88,7 +89,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         }
 
         if (!md5ToSend) {
-            md5ToSend = state.selectedIdentifier || null;
+            md5ToSend = state.selection.trackId || null;
         }
 
         if (!md5ToSend && state.previousNextTrack?.identifier) {
@@ -119,15 +120,12 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     }
 
     if (manualOverrideActive && !dirToSend) {
-        dirToSend = state.manualNextDirectionKey;
+        dirToSend = state.selection.directionKey;
     }
 
     if (!md5ToSend) {
         log.warn('⚠️ sendNextTrack: No track MD5 available; requesting fresh guidance from server');
-        state.manualNextTrackOverride = false;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = null;
+        clearSelection('error');
         state.stackIndex = 0;
 
         if (source === 'heartbeat') {
@@ -142,9 +140,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     log.info(`📤 sendNextTrack (${source}): ${md5ToSend.substring(0,8)}... via ${dirToSend || 'unknown'}`);
 
     if (source === 'user') {
-        state.manualNextTrackOverride = true;
-        state.manualNextDirectionKey = dirToSend;
-        state.pendingManualTrackId = md5ToSend;
+        setSelection(md5ToSend, 'user', dirToSend);
         if (state.nextTrackAnimationTimer) {
             clearTimeout(state.nextTrackAnimationTimer);
             state.nextTrackAnimationTimer = null;
@@ -186,7 +182,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         }
 
         if (source === 'user' && md5ToSend) {
-            state.selectedIdentifier = md5ToSend;
+            setSelection(md5ToSend, 'user');
         }
 
         const serverTrack = data.currentTrack;
@@ -233,7 +229,7 @@ function analyzeAndAct(data, source, sentMd5) {
 
     const clientNextTrack = state.latestExplorerData?.nextTrack?.track?.identifier
         || state.latestExplorerData?.nextTrack?.identifier
-        || state.selectedIdentifier
+        || state.selection.trackId
         || null;
 
     overrideLog.debug(`${ICON} Sync snapshot (${source})`, {
@@ -248,7 +244,7 @@ function analyzeAndAct(data, source, sentMd5) {
             elapsedSeconds: clientElapsedSeconds,
             durationSeconds: clientDurationSeconds,
             nextTrack: clientNextTrack || null,
-            pendingSelection: state.selectedIdentifier || null
+            pendingSelection: state.selection.trackId || null
         },
         sentOverride: sentMd5 || null
     });
@@ -266,7 +262,7 @@ function analyzeAndAct(data, source, sentMd5) {
         return;
     }
 
-    const expectedNextMd5 = state.latestExplorerData?.nextTrack?.track?.identifier || state.selectedIdentifier;
+    const expectedNextMd5 = state.latestExplorerData?.nextTrack?.track?.identifier || state.selection.trackId;
     const hasServerNext = Boolean(nextTrack);
     const nextTrackMismatch = Boolean(expectedNextMd5 && hasServerNext && nextTrack !== expectedNextMd5);
 
@@ -276,19 +272,19 @@ function analyzeAndAct(data, source, sentMd5) {
             source,
             sentMd5
         });
-        if (state.manualNextTrackOverride) {
+        if (isUserSelection()) {
             scheduleHeartbeat(10000);
         }
     }
 
     if (nextTrackMismatch) {
-        if (state.manualNextTrackOverride || state.pendingManualTrackId) {
+        if (isUserSelection() || state.selection.pendingTrackId) {
             overrideLog.info(`${ICON} ACTION server-next-ignored`, {
                 expected: expectedNextMd5,
                 received: nextTrack,
                 source,
-                overrideActive: state.manualNextTrackOverride,
-                pendingManualTrackId: state.pendingManualTrackId,
+                overrideActive: isUserSelection(),
+                pendingManualTrackId: state.selection.pendingTrackId,
                 sentMd5
             });
             scheduleHeartbeat(20000);
@@ -403,7 +399,7 @@ function promoteTrackToNextStack(trackMd5) {
         window.swapNextTrackDirection(foundDirection);
     }
 
-    state.selectedIdentifier = trackMd5;
+    setSelection(trackMd5, 'user');
 }
 
 export function scheduleHeartbeat(delayMs = 60000) {
@@ -534,10 +530,7 @@ export async function createNewJourneySession(reason = 'unknown') {
             state.awaitingSSE = true;
         }
 
-        state.manualNextTrackOverride = false;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
-        state.selectedIdentifier = null;
+        clearSelection('error');
         state.stackIndex = 0;
         state.latestExplorerData = null;
         state.remainingCounts = {};
@@ -742,8 +735,8 @@ export async function requestSSERefresh(options = {}) {
                         if (nextDirection) {
                             state.serverNextDirection = nextDirection;
                         }
-                        if (!state.manualNextTrackOverride) {
-                            state.selectedIdentifier = state.selectedIdentifier || nextTrackId;
+                        if (!isUserSelection() && !state.selection.trackId) {
+                            setSelection(nextTrackId, 'server');
                         }
                     } else {
                         log.warn('⚠️ SSE refresh nextTrack present but missing identifier', result.nextTrack);
@@ -801,7 +794,7 @@ export async function manualRefresh() {
         if (explorerData && Object.keys(explorerData.directions || {}).length > 0) {
             log.info('🔄 Explorer data refreshed successfully');
             // Clear manual override so applyDeckRenderFrame doesn't block the render
-            state.manualNextTrackOverride = false;
+            clearSelection('deck_render');
             state.latestExplorerData = explorerData;
             if (typeof window.createDimensionCards === 'function') {
                 window.createDimensionCards(explorerData, { skipExitAnimation: false, forceRedraw: true });

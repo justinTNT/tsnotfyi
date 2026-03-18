@@ -7,6 +7,7 @@ import { fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch
 import { findTrackInExplorer } from './explorer-utils.js';
 import { packUpStackCards, clearStackedPreviewLayer } from './helpers.js';
 import { createLogger } from './log.js';
+import { clearSelection } from './selection.js';
 const log = createLogger('tray');
 
 const PASTEL_COLORS = [
@@ -290,12 +291,12 @@ export async function promoteCenterCardToTray() {
     let nextTrackObj = null;
     let resolvedDirection = null;
 
-    if (state.selectedIdentifier && state.latestExplorerData) {
-        const match = findTrackInExplorer(state.latestExplorerData, state.selectedIdentifier);
+    if (state.selection.trackId && state.latestExplorerData) {
+        const match = findTrackInExplorer(state.latestExplorerData, state.selection.trackId);
         if (match) {
             nextTrackObj = match.track;
             resolvedDirection = match.directionKey;
-            log.info(`🎯 Resolved from selectedIdentifier: ${state.selectedIdentifier.substring(0, 8)} dir=${resolvedDirection}`);
+            log.info(`🎯 Resolved from selection.trackId: ${state.selection.trackId.substring(0, 8)} dir=${resolvedDirection}`);
         }
     }
 
@@ -370,7 +371,7 @@ export async function promoteCenterCardToTray() {
     log.info(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
 
     // Clear selection so next promote picks a fresh recommendation
-    state.selectedIdentifier = null;
+    clearSelection('promoted');
 
     // Only tell server if this is the first item (immediate next track needed)
     if (wasEmpty && typeof window.sendNextTrack === 'function') {

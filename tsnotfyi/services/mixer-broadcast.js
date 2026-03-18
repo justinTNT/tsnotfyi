@@ -393,8 +393,8 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
   const liveStartTime = Number.isFinite(liveState?.startedAt) ? liveState.startedAt : null;
 
   let durationSeconds = null;
-  if (displayTrack.identifier && mixer.currentTrack?.identifier === displayTrack.identifier) {
-    durationSeconds = mixer.getAdjustedTrackDuration(mixer.currentTrack, { logging: false });
+  if (displayTrack.identifier && mixer.state.currentTrack?.identifier === displayTrack.identifier) {
+    durationSeconds = mixer.getAdjustedTrackDuration(mixer.state.currentTrack, { logging: false });
   }
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
     durationSeconds = displayTrack.length || displayTrack.duration || null;
@@ -418,15 +418,15 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
     if (shouldUseLiveElapsed) {
       elapsedMs = liveElapsedMs;
       if (!trackMismatch && liveStartTime != null && displayTrack.identifier === liveTrackId) {
-        if (!Number.isFinite(mixer.trackStartTime) || mixer.trackStartTime !== liveStartTime) {
-          mixer.trackStartTime = liveStartTime;
+        if (!Number.isFinite(mixer.state.trackStartTime) || mixer.state.trackStartTime !== liveStartTime) {
+          mixer.state.trackStartTime = liveStartTime;
           rebasedVisualStart = true;
         }
       }
       const shouldLogRebase = trackMismatch || rebasedVisualStart || visualElapsedMs == null;
       if (shouldLogRebase) {
         console.warn('\u23F1\uFE0F [timing] Rebased heartbeat elapsed using live stream state', {
-          sessionId: mixer.sessionId,
+          sessionId: mixer.state.sessionId,
           trackId: displayTrack.identifier,
           liveTrackId,
           visualElapsedMs,
@@ -448,7 +448,7 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
     elapsedMs > durationMs + HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS
   ) {
     console.warn('\u23F1\uFE0F [timing] Heartbeat elapsed exceeds duration', {
-      sessionId: mixer.sessionId,
+      sessionId: mixer.state.sessionId,
       trackId: displayTrack.identifier,
       elapsedMs,
       durationMs,
@@ -465,7 +465,7 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
     elapsedMs > durationMs
   ) {
     console.warn('\u23F1\uFE0F [timing] Clamping heartbeat elapsed to track duration', {
-      sessionId: mixer.sessionId,
+      sessionId: mixer.state.sessionId,
       trackId: displayTrack.identifier,
       durationMs,
       originalElapsedMs: elapsedMs
@@ -508,7 +508,7 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
 
   const fingerprint = mixer.currentFingerprint
     || (fpRegistry && typeof fpRegistry.getFingerprintForSession === 'function'
-      ? fpRegistry.getFingerprintForSession(mixer.sessionId)
+      ? fpRegistry.getFingerprintForSession(mixer.state.sessionId)
       : null)
     || null;
 
@@ -529,14 +529,14 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
       direction: mixer.pendingUserOverrideDirection || nextSummary?.direction || null
     } : null,
     session: {
-      id: mixer.sessionId,
+      id: mixer.state.sessionId,
       audioClients: mixer.clients.size,
       eventClients: mixer.eventClients.size
     },
     drift: {
       currentDirection: mixer.driftPlayer.currentDirection
     },
-    currentTrackDirection: mixer.currentTrackDirection || mixer.driftPlayer.currentDirection || null
+    currentTrackDirection: mixer.state.currentTrackDirection || mixer.driftPlayer.currentDirection || null
   };
 }
 
@@ -624,7 +624,7 @@ function recordLivePlaybackChunk(chunk, mixer, contracts) {
     ? validate(MixerMetadata, rawMetadata)
     : null;
   const metadata = metadataResult?.success ? metadataResult.data : null;
-  const fallbackTrack = mixer.currentTrack || mixer.pendingCurrentTrack || null;
+  const fallbackTrack = mixer.state.currentTrack || mixer.pendingCurrentTrack || null;
   const trackId = metadata?.identifier || fallbackTrack?.identifier || null;
 
   if (!trackId) {
@@ -639,15 +639,15 @@ function recordLivePlaybackChunk(chunk, mixer, contracts) {
     console.log(`\uD83D\uDCE1 Live stream chunk now sourced from ${humanLabel}`);
 
     // Detect live stream vs session track mismatch (diagnostic only)
-    if (metadata?.identifier && mixer.currentTrack?.identifier &&
-        metadata.identifier !== mixer.currentTrack.identifier &&
+    if (metadata?.identifier && mixer.state.currentTrack?.identifier &&
+        metadata.identifier !== mixer.state.currentTrack.identifier &&
         metadata.identifier !== mixer.pendingCurrentTrack?.identifier) {
       console.warn('\u26A0\uFE0F Live playback identifier differs from session current track (diagnostic only)', {
-        sessionId: mixer.sessionId,
+        sessionId: mixer.state.sessionId,
         liveTrackId: metadata.identifier,
         liveTitle: metadata.title || null,
-        sessionTrackId: mixer.currentTrack.identifier,
-        sessionTitle: mixer.currentTrack.title || null
+        sessionTrackId: mixer.state.currentTrack.identifier,
+        sessionTitle: mixer.state.currentTrack.title || null
       });
     }
 

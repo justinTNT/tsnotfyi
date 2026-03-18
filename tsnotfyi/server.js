@@ -172,21 +172,21 @@ const sessionManager = new SessionManager({
       return null; // fall through to main-thread as last resort
     }
 
-    const resolution = mixer.explorerResolution || 'adaptive';
+    const resolution = mixer.state.explorerResolution || 'adaptive';
     const sessionContext = {
-      seenArtists: Array.from(mixer.seenArtists || []),
-      seenAlbums: Array.from(mixer.seenAlbums || []),
-      sessionHistoryIds: (mixer.sessionHistory || []).map(e => e.identifier),
-      currentTrackId: mixer.currentTrack?.identifier || null,
-      noArtist: mixer.noArtist,
-      noAlbum: mixer.noAlbum,
-      failedTrackIds: Array.from(mixer.failedTrackAttempts || new Map())
+      seenArtists: Array.from(mixer.state.seenArtists || []),
+      seenAlbums: Array.from(mixer.state.seenAlbums || []),
+      sessionHistoryIds: (mixer.state.sessionHistory || []).map(e => e.identifier),
+      currentTrackId: mixer.state.currentTrack?.identifier || null,
+      noArtist: mixer.state.noArtist,
+      noAlbum: mixer.state.noAlbum,
+      failedTrackIds: Array.from(mixer.state.failedTrackAttempts || new Map())
         .filter(([_, count]) => count >= 3).map(([id]) => id)
     };
     const workerConfig = {
       explorerResolution: resolution,
-      stackTotalCount: mixer.stackTotalCount || 0,
-      stackRandomCount: mixer.stackRandomCount || 0,
+      stackTotalCount: mixer.state.stackTotalCount || 0,
+      stackRandomCount: mixer.state.stackRandomCount || 0,
       cachedRadius: mixer.adaptiveRadiusCache?.get(trackId)?.radius ?? null,
       dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
         ? mixer.dynamicRadiusState.currentRadius : null
@@ -564,7 +564,7 @@ app.get('/stream', async (req, res) => {
     session.clientIp = clientIp;
     session.lastAudioConnect = Date.now();
 
-    const currentTrackId = session.mixer?.currentTrack?.identifier || null;
+    const currentTrackId = session.mixer?.state?.currentTrack?.identifier || null;
     const trackStartTime = session.mixer?.trackStartTime || Date.now();
     const fingerprint = fingerprintRegistry.ensureFingerprint(
       session.sessionId,
@@ -856,8 +856,8 @@ app.get('/track/:identifier/meta', async (req, res) => {
           if (!mixer) continue;
 
           try {
-            if (mixer.currentTrack?.identifier === identifier) {
-              track = mixer.hydrateTrackRecord(mixer.currentTrack);
+            if (mixer.state.currentTrack?.identifier === identifier) {
+              track = mixer.hydrateTrackRecord(mixer.state.currentTrack);
               if (track) break;
             }
 
@@ -1166,10 +1166,10 @@ app.post('/explorer', async (req, res) => {
     serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
 
     let explorerData;
-    const isSameTrack = session?.mixer?.currentTrack?.identifier === sourceTrack?.identifier;
+    const isSameTrack = session?.mixer?.state?.currentTrack?.identifier === sourceTrack?.identifier;
     if (session?.mixer) {
       const mixer = session.mixer;
-      const resolution = mixer.explorerResolution || 'adaptive';
+      const resolution = mixer.state.explorerResolution || 'adaptive';
 
       // Cache hit — reuse cached data (cheap)
       if (isSameTrack && mixer.explorerDataCache?.has(sourceTrack.identifier, resolution)) {
@@ -1191,20 +1191,20 @@ app.post('/explorer', async (req, res) => {
 
         serverLog.info(`🎯 Routing explorer to worker thread (trackId=${trackId.substring(0,8)})`);
         const sessionContext = {
-          seenArtists: Array.from(mixer.seenArtists || []),
-          seenAlbums: Array.from(mixer.seenAlbums || []),
-          sessionHistoryIds: (mixer.sessionHistory || []).map(e => e.identifier),
-          currentTrackId: mixer.currentTrack?.identifier || null,
-          noArtist: mixer.noArtist,
-          noAlbum: mixer.noAlbum,
-          failedTrackIds: Array.from(mixer.failedTrackAttempts || new Map())
+          seenArtists: Array.from(mixer.state.seenArtists || []),
+          seenAlbums: Array.from(mixer.state.seenAlbums || []),
+          sessionHistoryIds: (mixer.state.sessionHistory || []).map(e => e.identifier),
+          currentTrackId: mixer.state.currentTrack?.identifier || null,
+          noArtist: mixer.state.noArtist,
+          noAlbum: mixer.state.noAlbum,
+          failedTrackIds: Array.from(mixer.state.failedTrackAttempts || new Map())
             .filter(([_, count]) => count >= 3).map(([id]) => id)
         };
 
         const workerConfig = {
           explorerResolution: resolution,
-          stackTotalCount: mixer.stackTotalCount || 0,
-          stackRandomCount: mixer.stackRandomCount || 0,
+          stackTotalCount: mixer.state.stackTotalCount || 0,
+          stackRandomCount: mixer.state.stackRandomCount || 0,
           cachedRadius: mixer.adaptiveRadiusCache?.get(sourceTrack.identifier)?.radius ?? null,
           dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
             ? mixer.dynamicRadiusState.currentRadius : null
@@ -1595,7 +1595,7 @@ app.post('/session/zoom/:mode', async (req, res) => {
       mode: 'adaptive',
       requestedMode: mode,
       sessionId: session.sessionId,
-      resolution: session.mixer.explorerResolution,
+      resolution: session.mixer.state.explorerResolution,
       broadcast: changed,
       deprecated
     });
@@ -1701,10 +1701,10 @@ app.post('/next-track', async (req, res) => {
         }
 
         const durationMs = session.mixer.getAdjustedTrackDuration() * 1000;
-        const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
+        const elapsed = session.mixer.state.trackStartTime ? (Date.now() - session.mixer.state.trackStartTime) : 0;
         const remainingMs = Math.max(0, durationMs - elapsed);
 
-        const currentTrackId = session.mixer.currentTrack?.identifier || null;
+        const currentTrackId = session.mixer.state.currentTrack?.identifier || null;
         const preparedNextId = session.mixer.nextTrack?.identifier || null;
         const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
 
@@ -1752,10 +1752,10 @@ app.post('/next-track', async (req, res) => {
     }
 
     const duration = session.mixer.getAdjustedTrackDuration() * 1000;
-    const elapsed = session.mixer.trackStartTime ? (Date.now() - session.mixer.trackStartTime) : 0;
+    const elapsed = session.mixer.state.trackStartTime ? (Date.now() - session.mixer.state.trackStartTime) : 0;
     const remaining = Math.max(0, duration - elapsed);
 
-    const currentTrackId = session.mixer.currentTrack?.identifier || null;
+    const currentTrackId = session.mixer.state.currentTrack?.identifier || null;
     const preparedNextId = session.mixer.nextTrack?.identifier || null;
     const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
 
@@ -1804,11 +1804,11 @@ app.post('/session/random', async (req, res) => {
     const session = await sessionManager.createSession({ autoStart: true, ephemeral: true });
     const mixer = session.mixer;
 
-    const publicSessionId = mixer.currentTrack?.identifier || session.sessionId;
+    const publicSessionId = mixer.state.currentTrack?.identifier || session.sessionId;
     if (publicSessionId !== session.sessionId) {
       sessionManager.unregisterSession(session.sessionId);
       session.sessionId = publicSessionId;
-      session.mixer.sessionId = publicSessionId;
+      session.mixer.state.sessionId = publicSessionId;
       sessionManager.registerSession(publicSessionId, session, { ephemeral: true });
       sessionManager.attachEphemeralCleanup(publicSessionId, session);
     }
@@ -1820,10 +1820,10 @@ app.post('/session/random', async (req, res) => {
       streamUrl: '/stream',
       eventsUrl: '/events',
       webUrl: '/',
-      currentTrack: mixer.currentTrack ? {
-        identifier: mixer.currentTrack.identifier,
-        title: mixer.currentTrack.title,
-        artist: mixer.currentTrack.artist
+      currentTrack: mixer.state.currentTrack ? {
+        identifier: mixer.state.currentTrack.identifier,
+        title: mixer.state.currentTrack.title,
+        artist: mixer.state.currentTrack.artist
       } : null
     });
   } catch (error) {
@@ -1838,8 +1838,8 @@ app.get('/health', (req, res) => {
   const sessionDetails = {};
 
   for (const [sessionId, session] of audioSessions) {
-    const sessionHistory = session.mixer.sessionHistory || [];
-    const currentTrack = session.mixer.currentTrack;
+    const sessionHistory = session.mixer.state.sessionHistory || [];
+    const currentTrack = session.mixer.state.currentTrack;
     const nextTrack = session.mixer.nextTrack;
 
     sessionDetails[sessionId] = {
@@ -1853,7 +1853,7 @@ app.get('/health', (req, res) => {
         identifier: currentTrack.identifier,
         md5: currentTrack.md5,
         path: currentTrack.path,
-        startTime: session.mixer.trackStartTime
+        startTime: session.mixer.state.trackStartTime
       } : null,
       nextTrack: nextTrack ? {
         title: nextTrack.title,

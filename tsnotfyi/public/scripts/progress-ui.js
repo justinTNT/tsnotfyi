@@ -19,6 +19,7 @@ import { createLogger } from './log.js';
 const log = createLogger('progress');
 import { safelyExitCardsDormantState } from './card-state.js';
 import { playlistHasItems } from './playlist-tray.js';
+import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
 let playbackClockAnimationId = null;
 let lastProgressPhase = null;
@@ -154,9 +155,7 @@ export function updatePlaybackClockDisplay(forceSeconds = null) {
         if (!hasCards) {
             midpointWatchdogFired = true;
             log.warn('🐕 Midpoint watchdog: no cards at 50% — forcing refresh');
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
+            clearSelection('watchdog');
             if (typeof window.requestSSERefresh === 'function') {
                 window.requestSSERefresh({ escalate: false });
             }
@@ -230,7 +229,7 @@ export function maybeApplyDeferredNextTrack(trigger = 'progress', options = {}) 
     if (!pending || !state.latestExplorerData) {
         return false;
     }
-    if (state.manualNextTrackOverride && !options.force) {
+    if (isUserSelection() && !options.force) {
         return false;
     }
     if (!options.force) {
@@ -250,8 +249,8 @@ export function maybeApplyDeferredNextTrack(trigger = 'progress', options = {}) 
 
     if (nextTrackId) {
         state.serverNextTrack = nextTrackId;
-        if (!state.manualNextTrackOverride) {
-            state.selectedIdentifier = nextTrackId;
+        if (!isUserSelection()) {
+            setSelection(nextTrackId, 'server');
         }
     }
 
@@ -284,9 +283,7 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
         if (!hasCards && state.isStarted && !state._trackStartWatchdogFired) {
             state._trackStartWatchdogFired = true;
             log.warn('🐕 Track-start watchdog: no cards at track change — forcing refresh');
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
+            clearSelection('watchdog');
             if (typeof window.requestSSERefresh === 'function') {
                 window.requestSSERefresh({ escalate: false });
             }

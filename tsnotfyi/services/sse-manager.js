@@ -123,8 +123,8 @@ class SSEManager {
         session.awaitingAudioClient = true;
       }
 
-      const currentTrackId = session.mixer?.currentTrack?.identifier || null;
-      const trackStartTime = session.mixer?.trackStartTime || Date.now();
+      const currentTrackId = session.mixer?.state?.currentTrack?.identifier || null;
+      const trackStartTime = session.mixer?.state?.trackStartTime || Date.now();
       const activeFingerprint = this._fingerprintRegistry.ensureFingerprint(
         session.sessionId,
         {
@@ -156,17 +156,17 @@ class SSEManager {
 
       session.mixer.addEventClient(res);
 
-      if (session.mixer.currentTrack &&
+      if (session.mixer.state.currentTrack &&
           session.mixer.isActive &&
-          session.mixer.currentTrack.title &&
-          session.mixer.currentTrack.title.trim() !== '') {
+          session.mixer.state.currentTrack.title &&
+          session.mixer.state.currentTrack.title.trim() !== '') {
         sseLog.info('📡 Sending heartbeat to new SSE client (explorer via POST /explorer)');
         await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
       } else {
         sseLog.info('📡 No valid current track yet; awaiting bootstrap before first heartbeat');
         try {
           const ready = await session.mixer.awaitCurrentTrackReady?.(15000);
-          if (ready && session.mixer.currentTrack && session.mixer.isActive) {
+          if (ready && session.mixer.state.currentTrack && session.mixer.isActive) {
             sseLog.info('📡 Bootstrap complete; dispatching initial heartbeat after wait');
             await session.mixer.broadcastHeartbeat('sse-connected', { force: true });
           } else {
@@ -235,10 +235,10 @@ class SSEManager {
     try {
       if (stage === 'session') {
         const newSession = await sm.createSession({ autoStart: true });
-        const currentTrack = newSession.mixer.currentTrack || null;
+        const currentTrack = newSession.mixer.state.currentTrack || null;
         const fingerprint = this._fingerprintRegistry.ensureFingerprint(newSession.sessionId, {
           trackId: currentTrack?.identifier || null,
-          startTime: newSession.mixer.trackStartTime || Date.now(),
+          startTime: newSession.mixer.state.trackStartTime || Date.now(),
           streamIp: extractRequestIp(req)
         });
 
@@ -298,11 +298,11 @@ class SSEManager {
         return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
       }
 
-      if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
+      if (session.mixer.state.currentTrack && session.mixer.state.currentTrack.path) {
         console.log(`🔄 Triggering heartbeat for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
         await session.mixer.broadcastHeartbeat('manual-refresh', { force: true });
 
-        const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
+        const currentTrack = session.mixer.state.currentTrack || summary?.currentTrack || null;
         const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
         const nextTrack = session.mixer.nextTrack || summary?.nextTrack || null;
         const lastBroadcast = summary?.lastBroadcast || (session.mixer.lastTrackEventPayload ? {
@@ -392,11 +392,11 @@ class SSEManager {
         return res.status(200).json({ ok: false, reason: 'inactive', streamAlive: false });
       }
 
-      if (session.mixer.currentTrack && session.mixer.currentTrack.path) {
+      if (session.mixer.state.currentTrack && session.mixer.state.currentTrack.path) {
         console.log(`🔄 Triggering heartbeat for session ${session.sessionId} (${session.mixer.eventClients.size} clients)`);
         await session.mixer.broadcastHeartbeat('manual-refresh-simple', { force: true });
 
-        const currentTrack = session.mixer.currentTrack || summary?.currentTrack || null;
+        const currentTrack = session.mixer.state.currentTrack || summary?.currentTrack || null;
         const pendingTrack = session.mixer.pendingCurrentTrack || summary?.pendingTrack || null;
         const nextTrack = session.mixer.nextTrack || summary?.nextTrack || null;
         const lastBroadcast = summary?.lastBroadcast || (session.mixer.lastTrackEventPayload ? {

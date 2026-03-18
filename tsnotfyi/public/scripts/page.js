@@ -14,6 +14,7 @@ import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from '.
 import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray } from './playlist-tray.js';
 import { cancelPackAwayAnimation } from './clock-animation.js';
 import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
+import { setSelection, clearSelection, isUserSelection } from './selection.js';
 import { createLogger } from './log.js';
 const deckLog2 = createLogger('deck');
 const sentinelLog = createLogger('sentinel');
@@ -143,7 +144,7 @@ let nextTrackPreviewFadeTimer = null;
 
       // Update direction based on current drift direction
       // Fallback chain: driftState > state.currentTrackDirection > 'Journey'
-      // Note: manualNextDirectionKey is intentionally excluded — it describes the *next* track's direction
+      // Note: selection.directionKey is intentionally excluded — it describes the *next* track's direction
       const currentDirectionKey = (driftState && driftState.currentDirection)
           ? driftState.currentDirection
           : (state.currentTrackDirection || null);
@@ -384,9 +385,7 @@ function triggerZoomMode(mode) {
   }).then(result => {
     const returnedResolution = normalizeResolution(result.resolution) || normalizedMode;
     state.currentResolution = returnedResolution;
-    state.manualNextTrackOverride = false;
-    state.manualNextDirectionKey = null;
-    state.pendingManualTrackId = null;
+    clearSelection('init');
     updateRadiusControlsUI();
     if (typeof rejig === 'function') {
       rejig();
@@ -575,11 +574,9 @@ async function initializeApp() {
       state.currentTrackDirection = data.currentTrackDirection || null;
 
       // === Clear manual override unconditionally on track change ===
-      if (state.manualNextTrackOverride) {
-        sentinelLog.info(`🎯 Sentinel: track changed → clearing manualNextTrackOverride (was selecting ${state.selectedIdentifier?.substring(0,8)})`);
-        state.manualNextTrackOverride = false;
-        state.manualNextDirectionKey = null;
-        state.pendingManualTrackId = null;
+      if (isUserSelection()) {
+        sentinelLog.info(`🎯 Sentinel: track changed → clearing user selection (was selecting ${state.selection.trackId?.substring(0,8)})`);
+        clearSelection('track_change');
         if (typeof window.updateRadiusControlsUI === 'function') {
           window.updateRadiusControlsUI();
         }
@@ -932,12 +929,12 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       const currentTrackId = state.latestCurrentTrack?.identifier;
       const newCurrentTrackId = explorerData.currentTrack?.identifier || null;
       const currentTrackUnchanged = Boolean(currentTrackId && newCurrentTrackId && currentTrackId === newCurrentTrackId);
-      const manualOverrideActive = Boolean(state.manualNextTrackOverride && currentTrackUnchanged);
+      const manualOverrideActive = Boolean(isUserSelection() && currentTrackUnchanged);
 
-      if (state.manualNextTrackOverride) {
+      if (isUserSelection()) {
           deckLog2.debug('🛰️ Manual selection state', {
-              manualNextTrackOverride: state.manualNextTrackOverride,
-              selectedIdentifier: state.selectedIdentifier,
+              manualOverride: isUserSelection(),
+              selectionTrackId: state.selection.trackId,
               currentTrackId,
               newCurrentTrackId,
               currentTrackUnchanged,
@@ -947,12 +944,12 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       if (manualOverrideActive && previousNext && previousNextId) {
           deckLog2.debug('🎯 Manual override active; preserving prior next-track payload for heartbeat sync');
-          const manualSelection = state.selectedIdentifier
-            ? findTrackInExplorer(explorerData, state.selectedIdentifier)
-              || findTrackInExplorer(previousExplorerData, state.selectedIdentifier)
+          const manualSelection = state.selection.trackId
+            ? findTrackInExplorer(explorerData, state.selection.trackId)
+              || findTrackInExplorer(previousExplorerData, state.selection.trackId)
             : null;
 
-          const manualDirectionKey = state.manualNextDirectionKey
+          const manualDirectionKey = state.selection.directionKey
             || manualSelection?.directionKey
             || previousNext?.directionKey
             || explorerData.nextTrack?.directionKey
@@ -1001,11 +998,11 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
   state.latestExplorerData = explorerData;
 
-  // Sync selectedIdentifier with the new explorer data's nextTrack so that
+  // Sync selection with the new explorer data's nextTrack so that
   // auto-promote and heartbeats reference what's actually displayed in center.
   const freshNextId = explorerData.nextTrack?.track?.identifier || explorerData.nextTrack?.identifier || null;
-  if (freshNextId && !state.manualNextTrackOverride) {
-      state.selectedIdentifier = freshNextId;
+  if (freshNextId) {
+      setSelection(freshNextId, 'server');
   }
 
       // Reset reverse state when rendering fresh explorer data
@@ -1116,7 +1113,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       deckLog2.debug('🎯 CREATING CARDS from explorer data:', explorerData);
 
       // Don't auto-select globally - let each direction use its own first track by default
-      deckLog2.debug(`🎯 Not setting global selectedIdentifier - each direction will use its own first track`);
+      deckLog2.debug(`🎯 Not setting global selection - each direction will use its own first track`);
 
       deckLog2.debug(`🔍 Raw explorerData.directions:`, explorerData.directions);
 
@@ -1340,7 +1337,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       }
 
       // Update the global state
-      state.selectedIdentifier = firstTrack.identifier;
+      setSelection(firstTrack.identifier, 'server');
       state.stackIndex = 0;
       if (!state.remainingCounts) {
           state.remainingCounts = {};
@@ -1396,7 +1393,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
   // Refresh cards with new selection state (seamlessly, no blinking)
   function refreshCardsWithNewSelection() {
       const ICON = '🛰️';
-      if (!state.latestExplorerData || !state.selectedIdentifier) return;
+      if (!state.latestExplorerData || !state.selection.trackId) return;
 
       const extractStoredTrackFromCard = (cardEl) => {
           if (!cardEl) return null;
@@ -1421,9 +1418,9 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       // Find the selected card first
       const allTrackCards = document.querySelectorAll('.dimension-card.next-track');
       if (allTrackCards.length === 0) {
-          if (state.manualNextTrackOverride) {
+          if (isUserSelection()) {
               overrideLog.warn(`${ICON} ACTION selection-cards-unavailable`, {
-                  selection: state.selectedIdentifier,
+                  selection: state.selection.trackId,
                   reason: 'no next-track cards rendered'
               });
           }
@@ -1435,7 +1432,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       // First pass: identify the selected card
       allTrackCards.forEach(card => {
-          if (card.dataset.trackMd5 === state.selectedIdentifier) {
+          if (card.dataset.trackMd5 === state.selection.trackId) {
               selectedCard = card;
               selectedDimensionKey = card.dataset.directionKey;
           }
@@ -1443,7 +1440,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       if (!selectedCard) {
           overrideLog.error(`${ICON} ACTION selection-card-missing`, {
-              selection: state.selectedIdentifier,
+              selection: state.selection.trackId,
               availableCards: Array.from(allTrackCards).map(card => ({
                   direction: card.dataset.directionKey,
                   track: card.dataset.trackMd5
@@ -1456,7 +1453,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       allTrackCards.forEach(card => {
           const cardTrackMd5 = card.dataset.trackMd5;
           const directionKey = card.dataset.directionKey;
-          const isSelectedCard = (cardTrackMd5 === state.selectedIdentifier);
+          const isSelectedCard = (cardTrackMd5 === state.selection.trackId);
           const isSameDimension = (directionKey === selectedDimensionKey);
 
           const labelDiv = card.querySelector('.label');
@@ -1471,7 +1468,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               if (directionData && Array.isArray(directionData.sampleTracks)) {
                   selectedIdx = directionData.sampleTracks.findIndex(sample => {
                       const sampleTrack = sample.track || sample;
-                      return sampleTrack?.identifier === state.selectedIdentifier;
+                      return sampleTrack?.identifier === state.selection.trackId;
                   });
                   if (selectedIdx >= 0) {
                       card.dataset.trackIndex = String(selectedIdx);
@@ -1507,7 +1504,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
               if (!track) {
                   overrideLog.warn(`${ICON} ACTION selection-track-missing`, {
-                      selection: state.selectedIdentifier,
+                      selection: state.selection.trackId,
                       cardDirection: directionKey,
                       cardTrack: cardTrackMd5
                   });
@@ -1935,10 +1932,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       state.pendingInitialTrackTimer = setTimeout(() => {
           const hasTrack = state.latestCurrentTrack && state.latestCurrentTrack.identifier;
         if (!hasTrack) {
-            state.manualNextTrackOverride = false;
-            state.manualNextDirectionKey = null;
-            state.pendingManualTrackId = null;
-            state.selectedIdentifier = null;
+            clearSelection('no_track');
             state.stackIndex = 0;
             overrideLog.warn('🛰️ ACTION initial-track-missing: no SSE track after 10s, requesting refresh');
             fullResync();
@@ -2251,7 +2245,7 @@ if (typeof window !== 'undefined') {
       const trackToShow = displayTracks[0];
 
       state.stackIndex = 0;
-      state.selectedIdentifier = trackToShow.identifier;
+      setSelection(trackToShow.identifier, 'server');
 
       if (!playlistHasItems()) {
           sendNextTrack(trackToShow.identifier, displayDimensionKey, 'user');
@@ -2287,7 +2281,7 @@ if (typeof window !== 'undefined') {
           const candidateTrack = fallbackInfo?.track
               || nextTrackPayload?.track
               || nextTrackPayload
-              || (state.selectedIdentifier ? { identifier: state.selectedIdentifier } : null);
+              || (state.selection.trackId ? { identifier: state.selection.trackId } : null);
 
           const inferredKey = fallbackInfo?.directionKey
               || nextTrackPayload?.directionKey
@@ -2303,7 +2297,7 @@ if (typeof window !== 'undefined') {
                   setTimeout(() => {
                       state.__pendingCenterRetry = false;
                       const retryKey = state.latestExplorerData?.nextTrack?.directionKey
-                          || (state.selectedIdentifier ? findDirectionKeyContainingTrack(state.latestExplorerData, state.selectedIdentifier) : null);
+                          || (state.selection.trackId ? findDirectionKeyContainingTrack(state.latestExplorerData, state.selection.trackId) : null);
                       if (retryKey) {
                           animateDirectionToCenter(retryKey);
                       }
@@ -2391,7 +2385,7 @@ if (typeof window !== 'undefined') {
       const primaryTrack = primarySample?.track || primarySample;
       if (primaryTrack?.identifier) {
           card.dataset.trackMd5 = primaryTrack.identifier;
-          state.selectedIdentifier = primaryTrack.identifier;
+          setSelection(primaryTrack.identifier, 'server');
       }
 
       // Animate to center position
@@ -2631,7 +2625,7 @@ if (typeof window !== 'undefined') {
                          // Cycle the appropriate tracks
                          tracksToUse.push(tracksToUse.shift());
                          const track = tracksToUse[0].track || tracksToUse[0];
-                         state.selectedIdentifier = track.identifier;
+                         setSelection(track.identifier, 'server');
                          updateCardWithTrackDetails(card, track, dimensionToShow, true, swapStackContents);
                       } else {
                           // Pack up stack cards first, then rotate and animate
@@ -2892,8 +2886,8 @@ if (typeof window !== 'undefined') {
               }
           }
 
-          if (state.selectedIdentifier) {
-              const match = findTrackInExplorer(explorer, state.selectedIdentifier);
+          if (state.selection.trackId) {
+              const match = findTrackInExplorer(explorer, state.selection.trackId);
               if (match?.track) {
                   return { track: match.track, directionKey: match.directionKey || null };
               }
@@ -3099,12 +3093,10 @@ if (typeof window !== 'undefined') {
       }
 
       const performPromotion = () => {
-          state.selectedIdentifier = primaryTrack.identifier;
+          clearSelection('deck_render');
+          setSelection(primaryTrack.identifier, 'server', canonicalDirectionKey);
           state.stackIndex = 0;
-          state.pendingManualTrackId = primaryTrack.identifier;
-          state.manualNextTrackOverride = false;
           state.skipTrayDemotionForTrack = null;
-          state.manualNextDirectionKey = canonicalDirectionKey;
           state.pendingSnapshotTrackId = primaryTrack.identifier;
 
           if (!state.remainingCounts) {
