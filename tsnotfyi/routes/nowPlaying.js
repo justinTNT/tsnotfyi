@@ -8,7 +8,7 @@ function buildNowPlayingSessions(audioSessions = new Map(), ephemeralSessions = 
   const collectSessions = (collection, isEphemeral = false) => {
     for (const [sessionId, session] of collection) {
       const mixer = session?.mixer;
-      const currentTrack = mixer?.currentTrack;
+      const currentTrack = mixer?.state?.currentTrack;
       const clientCount = mixer?.clients instanceof Set || Array.isArray(mixer?.clients)
         ? mixer.clients.size ?? mixer.clients.length
         : Number(mixer?.clients) || 0;

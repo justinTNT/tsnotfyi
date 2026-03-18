@@ -25,13 +25,13 @@ describe('DriftAudioMixer heartbeat + snapshot contracts', () => {
     });
     mixer.clients = new Set(['client']);
     mixer.eventClients = new Set([new EventEmitter()]);
-    mixer.currentTrack = overrides.currentTrack || {
+    mixer.state.currentTrack = overrides.currentTrack || {
       identifier: 'aaaabbbbccccddddeeeeffff11112222',
       title: 'Test Track',
       artist: 'Test Artist',
       length: 180
     };
-    mixer.trackStartTime = overrides.trackStartTime || Date.now() - 30_000;
+    mixer.state.trackStartTime = overrides.trackStartTime || Date.now() - 30_000;
     mixer.nextTrack = overrides.nextTrack || {
       identifier: '9999aaaabbbbccccddddeeeeffff0000',
       title: 'Next Track',
@@ -42,7 +42,7 @@ describe('DriftAudioMixer heartbeat + snapshot contracts', () => {
     };
     mixer.nextTrackLoadPromise = null;
     mixer.isUserSelectionPending = false;
-    mixer.sessionHistory = [];
+    mixer.state.sessionHistory = [];
     mixer.broadcastEvent = jest.fn();
     return mixer;
   }

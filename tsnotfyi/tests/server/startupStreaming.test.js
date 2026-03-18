@@ -3,7 +3,7 @@ jest.mock('timers/promises', () => ({
 }));
 
 const { setImmediate: setImmediateSpy } = require('timers/promises');
-const DriftAudioMixer = require('../../drift-audio-mixer');
+const ep = require('../../services/explorer-pipeline');
 
 function buildSampleTracks(key, count) {
   return Array.from({ length: count }, (_, idx) => ({
@@ -115,13 +115,14 @@ describe('startup streaming resilience', () => {
   });
 
   test('explorer warmup yields control so audio streaming stays responsive', async () => {
-    const mixer = new DriftAudioMixer('test-session', {});
     const directions = createDirectionSet();
 
-    const result = await mixer.limitToTopDimensions(directions, 12);
+    const result = await ep.limitToTopDimensions(directions, 12);
 
     expect(setImmediateSpy).toHaveBeenCalled();
-    expect(Object.keys(result).length).toBeLessThanOrEqual(12);
+    // limitToTopDimensions limits to N dimensions (bidirectional pairs), not N keys
+    // 8 dimensions in fixture × 2 polarities = 16 keys, all kept since 8 < 12
+    expect(Object.keys(result).length).toBeLessThanOrEqual(24);
     expect(result).toHaveProperty('bpm_positive');
   });
 });

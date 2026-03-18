@@ -2,11 +2,14 @@ const { buildNowPlayingSessions } = require('../../routes/nowPlaying');
 
 function createMixer(overrides = {}) {
   return {
-    currentTrack: overrides.currentTrack || {
-      identifier: 'track-md5',
-      title: 'Mock Track',
-      artist: 'Mock Artist',
-      length: 200
+    state: {
+      currentTrack: overrides.currentTrack || {
+        identifier: 'track-md5',
+        title: 'Mock Track',
+        artist: 'Mock Artist',
+        length: 200
+      },
+      trackStartTime: overrides.trackStartTime || (Date.now() - 5000),
     },
     nextTrack: overrides.nextTrack || {
       identifier: 'next-track-md5',
@@ -15,14 +18,14 @@ function createMixer(overrides = {}) {
       direction: 'beat_punch_positive'
     },
     clients: overrides.clients || new Set(['client']),
-    trackStartTime: overrides.trackStartTime || (Date.now() - 5000),
-    getAdjustedTrackDuration: overrides.getAdjustedTrackDuration || (() => 180)
+    getAdjustedTrackDuration: overrides.getAdjustedTrackDuration || (() => 180),
+    getLiveStreamState: () => null
   };
 }
 
 function createSession(overrides = {}) {
   return {
-    mixer: createMixer(overrides.mixer || {}),
+    mixer: overrides.mixer || createMixer(),
     isEphemeral: Boolean(overrides.isEphemeral)
   };
 }

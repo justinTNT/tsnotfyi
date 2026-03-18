@@ -77,7 +77,7 @@ describe('direction reverse color synchronisation', () => {
     window.state.baseDirectionKey = direction.key;
     window.state.currentOppositeDirectionKey = direction.oppositeDirection.key;
     window.state.remainingCounts = {};
-    window.state.selectedIdentifier = null;
+    window.state.selection.trackId = null;
     window.state.stackIndex = 0;
 
     window.updateCardWithTrackDetails(card, baseTrack, direction, false, () => {});
@@ -91,7 +91,7 @@ describe('direction reverse color synchronisation', () => {
     expect(baseRim).toContain('from 180deg');
 
     window.state.usingOppositeDirection = true;
-    window.state.selectedIdentifier = oppositeTrack.identifier;
+    window.state.selection.trackId = oppositeTrack.identifier;
     window.state.latestExplorerData.nextTrack = {
       directionKey: direction.oppositeDirection.key,
       track: oppositeTrack
@@ -175,9 +175,9 @@ describe('direction reverse color synchronisation', () => {
     window.state.usingOppositeDirection = false;
     window.state.baseDirectionKey = baseEntry.key;
     window.state.currentOppositeDirectionKey = oppositeEntry.key;
-    window.state.selectedIdentifier = baseTrack.identifier;
+    window.state.selection.trackId = baseTrack.identifier;
     window.state.lastSelectionGeneration = 1;
-    window.state.pendingManualTrackId = null;
+    window.state.selection.pendingTrackId = null;
     window.state.serverNextTrack = null;
     window.state.stackIndex = 0;
 
