@@ -349,6 +349,12 @@ function buildNextTrackSummary(mixer) {
     return null;
   }
 
+  // Never report the current track as the next track
+  const currentId = mixer.state.currentTrack?.identifier;
+  if (currentId && candidate.identifier === currentId) {
+    return null;
+  }
+
   const summary = summarizeTrackMinimal(candidate);
   if (!summary) {
     return null;

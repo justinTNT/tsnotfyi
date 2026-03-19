@@ -514,6 +514,10 @@ class AdvancedAudioMixer {
       clearTimeout(this.engine.streamTimer);
       this.engine.streamTimer = null;
     }
+    if (this._deferredTrackStartTimer) {
+      clearTimeout(this._deferredTrackStartTimer);
+      this._deferredTrackStartTimer = null;
+    }
 
     this.engine.isStreaming = false;
     this.engine.isCrossfading = false;
@@ -944,10 +948,18 @@ class AdvancedAudioMixer {
       crossfadeLeadTime: this.engine.nextTrack.crossfadeLeadTime
     };
 
-    // Reset streaming clocks for the new track
+    // Capture buffer-ahead BEFORE resetting clocks
+    const preResetElapsed = Date.now() - (this.engine.streamClockStart || Date.now());
+    const preResetBytesOwed = Math.floor((preResetElapsed / 1000) * this.engine.bytesPerSecond);
+    const preResetAheadBytes = (this.engine.bytesSent || 0) - preResetBytesOwed;
+    const bufferAheadMs = Math.max(0, (preResetAheadBytes / this.engine.bytesPerSecond) * 1000);
+
+    // Reset streaming clocks for the new track.
+    // bytesSent must reflect how far into the buffer we already are (from crossfade reads),
+    // otherwise the burst scheduler sees 0 sent and races through the remaining buffer.
     this.engine.streamingStartTime = Date.now();
     this.engine.streamClockStart = Date.now();
-    this.engine.bytesSent = 0;
+    this.engine.bytesSent = this.engine.currentTrack.position || 0;
     console.log(`🕐 Reset streaming timer for new track (${this.engine.currentTrack.estimatedDuration?.toFixed(1)}s duration, ${this.engine.chunkSize} bytes/chunk)`);
 
     // Clear next track
@@ -965,8 +977,12 @@ class AdvancedAudioMixer {
     this.trackMetadata.current = this.trackMetadata.next || null;
     this.trackMetadata.next = null;
 
+    // Fire onTrackStart immediately for internal state management.
+    // The buffer-ahead amount is passed so the mixer can defer *external* metadata
+    // (heartbeats, SSE broadcasts) while handling internal state (currentTrack promotion,
+    // nextTrack clearing, history) right away.
     if (this.onTrackStart) {
-      this.onTrackStart('crossfade_complete');
+      this.onTrackStart('crossfade_complete', { bufferAheadMs });
     }
   }
 

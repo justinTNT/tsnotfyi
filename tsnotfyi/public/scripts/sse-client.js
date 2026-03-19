@@ -100,12 +100,19 @@ export function connectSSE() {
       newStartTimestamp = Date.now() - heartbeat.timing.elapsedMs;
     }
 
+    // Preserve client-side loved/hated state — heartbeat carries stale KD-tree values
+    const prevLoved = state.latestCurrentTrack?.loved;
+    const prevHated = state.latestCurrentTrack?.hated;
     const newTrackState = {
       ...state.latestCurrentTrack,
       ...currentTrack,
       duration: newDurationSeconds || currentTrack.duration || currentTrack.length || null,
       length: newDurationSeconds || currentTrack.duration || currentTrack.length || null
     };
+    if (prevLoved !== undefined && currentTrack.identifier === state.latestCurrentTrack?.identifier) {
+      newTrackState.loved = prevLoved;
+      newTrackState.hated = prevHated;
+    }
 
     // === STEADY-STATE: apply state for non-track-change heartbeats ===
     // Track changes are handled by the sentinel callback in page.js.
@@ -127,7 +134,9 @@ export function connectSSE() {
     if (trackChanged && currentTrackId) {
       // Stash the heartbeat's track data for deferred fallback.
       // The sentinel handler is the primary path for card update + tray pop.
-      // If it doesn't fire within 8s, this fallback promotes the track atomically.
+      // With server-delayed metadata (Option B), heartbeat and sentinel arrive together.
+      // 5s fallback catches missed sentinels — safe because the heartbeat now arrives
+      // at the correct audio moment, not minutes early.
       if (state._deferredPlaylistPopTimer) clearTimeout(state._deferredPlaylistPopTimer);
       const fallbackTrackState = newTrackState;
       const fallbackDriftState = heartbeat.driftState || heartbeat.drift || null;
@@ -135,27 +144,30 @@ export function connectSSE() {
       const fallbackStartTimestamp = newStartTimestamp;
       state._deferredPlaylistPopTimer = setTimeout(() => {
         state._deferredPlaylistPopTimer = null;
-        // Only act if the current card still shows the OLD track
-        if (state.latestCurrentTrack?.identifier === currentTrackId) return;
-        syncLog.info(`🎵 Heartbeat fallback: sentinel didn't handle track change to ${currentTrackId.substring(0, 8)} — promoting now`);
 
-        // Update state + card (same as sentinel would)
-        state.playbackDurationSeconds = fallbackDurationSeconds;
-        if (fallbackStartTimestamp) state.playbackStartTimestamp = fallbackStartTimestamp;
-        state.latestCurrentTrack = fallbackTrackState;
-        window.state.latestCurrentTrack = fallbackTrackState;
-        state.lastTrackUpdateTs = Date.now();
-        state.currentTrackDirection = heartbeat.currentTrackDirection || null;
+        const cardAlreadyUpdated = state.latestCurrentTrack?.identifier === currentTrackId;
 
-        if (typeof window.updateNowPlayingCard === 'function') {
-          window.updateNowPlayingCard(fallbackTrackState, fallbackDriftState);
+        // Update card if sentinel didn't handle it
+        if (!cardAlreadyUpdated) {
+          syncLog.info(`🎵 Heartbeat fallback: sentinel didn't handle track change to ${currentTrackId.substring(0, 8)} — promoting now`);
+          state.playbackDurationSeconds = fallbackDurationSeconds;
+          if (fallbackStartTimestamp) state.playbackStartTimestamp = fallbackStartTimestamp;
+          state.latestCurrentTrack = fallbackTrackState;
+          window.state.latestCurrentTrack = fallbackTrackState;
+          state.lastTrackUpdateTs = Date.now();
+          state.currentTrackDirection = heartbeat.currentTrackDirection || null;
+
+          if (typeof window.updateNowPlayingCard === 'function') {
+            window.updateNowPlayingCard(fallbackTrackState, fallbackDriftState);
+          }
         }
 
-        // Pop tray atomically with card update
+        // Pop playlist head if it matches — even if sentinel updated the card,
+        // the sentinel may have missed the pop (fragile sentinel detection)
         if (playlistHasItems()) {
           const head = getPlaylistNext();
           if (head && head.trackId === currentTrackId) {
-            syncLog.info(`🎵 Atomic tray→card (heartbeat fallback): popping ${currentTrackId.substring(0, 8)} from tray (card just painted)`);
+            syncLog.info(`🎵 ${cardAlreadyUpdated ? 'Playlist pop fallback' : 'Atomic tray→card (heartbeat fallback)'}: popping ${currentTrackId.substring(0, 8)} from tray`);
             popPlaylistHead();
             renderPlaylistTray();
             const newHead = getPlaylistNext();
@@ -170,7 +182,7 @@ export function connectSSE() {
         }
 
         armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
-      }, 8000);
+      }, 5000);
 
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
       if (!state.sessionTrackHistory.includes(currentTrackId)) {

@@ -156,8 +156,8 @@ class DriftAudioMixer {
       return this.clients.size > 0;
     };
 
-    this.audioMixer.onTrackStart = (reason) => {
-      console.log(`🎵 Advanced mixer: Track started (${reason || 'normal'})`);
+    this.audioMixer.onTrackStart = (reason, { bufferAheadMs = 0 } = {}) => {
+      console.log(`🎵 Advanced mixer: Track started (${reason || 'normal'}${bufferAheadMs > 500 ? `, deferred broadcast by ${(bufferAheadMs/1000).toFixed(1)}s` : ''})`);
 
       let promoted = false;
 
@@ -328,17 +328,27 @@ class DriftAudioMixer {
         this.currentFingerprint = fingerprint;
       }
 
-      console.log(`📡 Audio started - now broadcasting track event: ${this.state.currentTrack.title}`);
-      this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
-        console.error('📡 Failed to broadcast track event:', err);
-      });
-      this.resolvePendingTrackReady(true);
-      this.recordSessionEvent('track_started', {
-        trackId: this.state.currentTrack.identifier || null,
-        title: this.state.currentTrack.title || '',
-        reason: reason || 'auto',
-        startTime: this.state.trackStartTime
-      });
+      // Defer external broadcasts by buffer-ahead so metadata arrives when the client
+      // hears the transition, not when the server processes it.
+      const doBroadcast = () => {
+        console.log(`📡 Audio started - now broadcasting track event: ${this.state.currentTrack?.title}`);
+        this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
+          console.error('📡 Failed to broadcast track event:', err);
+        });
+        this.resolvePendingTrackReady(true);
+        this.recordSessionEvent('track_started', {
+          trackId: this.state.currentTrack?.identifier || null,
+          title: this.state.currentTrack?.title || '',
+          reason: reason || 'auto',
+          startTime: this.state.trackStartTime
+        });
+      };
+
+      if (bufferAheadMs > 500) {
+        this._deferredBroadcastTimer = setTimeout(doBroadcast, bufferAheadMs);
+      } else {
+        doBroadcast();
+      }
 
       // Kick off next-track preparation after a short delay so audio can stabilize
       this.scheduleAutoCrossfadePrep(reason || 'auto-initial');
@@ -3424,6 +3434,10 @@ class DriftAudioMixer {
 
     fingerprintRegistry.removeBySession(this.state.sessionId);
 
+    if (this._deferredBroadcastTimer) {
+      clearTimeout(this._deferredBroadcastTimer);
+      this._deferredBroadcastTimer = null;
+    }
     if (this.pendingUserSelectionTimer) {
       clearTimeout(this.pendingUserSelectionTimer);
       this.pendingUserSelectionTimer = null;

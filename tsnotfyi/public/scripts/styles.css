@@ -573,11 +573,11 @@ audio {
     fill: #888;
 }
 
-/* Heart on next-track center card */
+/* Heart on track cards (loved indicator) */
 .next-track-heart {
     position: absolute;
     top: 8px;
-    right: 8px;
+    left: 8px;
     z-index: 5;
     pointer-events: none;
 }
