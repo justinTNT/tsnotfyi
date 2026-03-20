@@ -1,5 +1,8 @@
 # sound explorer: data-informed library traversal or over-engineered auto-dj
 
+<img width="512" height="294" alt="tsnotfyi" src="https://github.com/user-attachments/assets/95e70e0d-f080-43c3-9019-319848d291d8" />
+
+
 ## Architecture
 
 - **Express.js**: Web server serving the client interface
