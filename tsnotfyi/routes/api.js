@@ -232,6 +232,47 @@ function setupApiRoutes(app, { db, radialSearch }) {
 
   // ==================== DIMENSION ANALYSIS ====================
 
+  // Get all tracks in the same folder as a given track
+  app.get('/api/folder-tracks/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+      const result = await db.getFolderTracks(id);
+      if (!result) {
+        return res.status(404).json({ error: 'Track not found' });
+      }
+
+      // Enrich with metadata from KD-tree (or DB for hated tracks excluded from KD-tree)
+      let folderCover = null;
+      for (const track of result.tracks) {
+        const kdTrack = radialSearch.kdTree?.getTrack(track.identifier);
+        if (kdTrack) {
+          track.albumCover = kdTrack.albumCover || null;
+          track.loved = kdTrack.loved || false;
+          track.hated = false;
+          track.duration = kdTrack.length || null;
+          if (!folderCover && track.albumCover) folderCover = track.albumCover;
+        } else {
+          const stats = await db.getRatingWithStats(track.identifier);
+          track.hated = stats?.rating === -1;
+          track.loved = stats?.rating === 1;
+          track.albumCover = null;
+          track.duration = null;
+        }
+      }
+      // Fill missing covers from siblings
+      if (folderCover) {
+        for (const track of result.tracks) {
+          if (!track.albumCover) track.albumCover = folderCover;
+        }
+      }
+
+      res.json(result);
+    } catch (error) {
+      console.error('Error getting folder tracks:', error);
+      res.status(500).json({ error: 'Failed to get folder tracks' });
+    }
+  });
+
   // Get dimension statistics and availability
   app.get('/api/dimensions/stats', async (req, res) => {
     try {

@@ -7,7 +7,7 @@ import { armExplorerSnapshotTimer, clearExplorerSnapshotTimer, setDeckStaleFlag 
 import { exitCardsDormantState, ensureDeckHydratedAfterTrackChange } from './card-state.js';
 import { cloneExplorerData, explorerContainsTrack, findTrackInExplorer, shouldIgnoreExplorerUpdate, summarizeExplorerSnapshot } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
-import { updateConnectionHealthUI, handleDeadAudioSession } from './audio-manager.js';
+import { updateConnectionHealthUI, handleDeadAudioSession, getBufferDelaySecs } from './audio-manager.js';
 import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray } from './playlist-tray.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
@@ -85,6 +85,11 @@ export function connectSSE() {
     const previousTrackId = state.latestCurrentTrack?.identifier || null;
     const trackChanged = Boolean(currentTrackId && previousTrackId && currentTrackId !== previousTrackId);
 
+    if (trackChanged) {
+      const clientBuffer = getBufferDelaySecs();
+      syncLog.info(`🔄 Heartbeat track change: ${previousTrackId?.substring(0, 8)} → ${currentTrackId?.substring(0, 8)} (clientBuffer: ${clientBuffer.toFixed(1)}s)`);
+    }
+
     // Compute duration and start time
     let newDurationSeconds = 0;
     if (Number.isFinite(currentTrack.durationMs)) {
@@ -134,9 +139,9 @@ export function connectSSE() {
     if (trackChanged && currentTrackId) {
       // Stash the heartbeat's track data for deferred fallback.
       // The sentinel handler is the primary path for card update + tray pop.
-      // With server-delayed metadata (Option B), heartbeat and sentinel arrive together.
-      // 5s fallback catches missed sentinels — safe because the heartbeat now arrives
-      // at the correct audio moment, not minutes early.
+      // The server broadcasts immediately; the client waits for the sentinel.
+      // Fallback timeout = client buffer depth + margin, so we wait long enough
+      // for the buffered audio to play through to the transition point.
       if (state._deferredPlaylistPopTimer) clearTimeout(state._deferredPlaylistPopTimer);
       const fallbackTrackState = newTrackState;
       const fallbackDriftState = heartbeat.driftState || heartbeat.drift || null;
@@ -182,7 +187,7 @@ export function connectSSE() {
         }
 
         armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
-      }, 5000);
+      }, Math.max(5000, Math.round(getBufferDelaySecs() * 1000) + 3000));
 
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
       if (!state.sessionTrackHistory.includes(currentTrackId)) {

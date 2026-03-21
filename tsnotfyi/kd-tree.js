@@ -271,6 +271,7 @@ class MusicalKDTree {
                 ma.vae_latent_4, ma.vae_latent_5, ma.vae_latent_6, ma.vae_latent_7,
                 ma.vae_model_version, ma.vae_computed_at,
                 ma.beets_meta,
+                ma.bt_track, ma.bt_disc,
                 r.rating as love_rating,
                 ps.completion_count as play_count
             FROM music_analysis ma
@@ -338,6 +339,8 @@ class MusicalKDTree {
                 albumCover: artPath,
                 loved: row.love_rating === 1,
                 playCount: row.play_count || 0,
+                track: row.bt_track ? parseInt(row.bt_track) : null,
+                disc: row.bt_disc ? parseInt(row.bt_disc) : null,
                 pca: {
                     primary_d: row.primary_d,
                     tonal: [row.tonal_pc1, row.tonal_pc2, row.tonal_pc3],

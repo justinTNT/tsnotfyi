@@ -164,6 +164,17 @@ class SessionManager {
       isEphemeral: ephemeral
     };
 
+    console.log(JSON.stringify({
+      _type: 'session_created',
+      ts: new Date().toISOString(),
+      sessionId,
+      trackId: mixer.state?.currentTrack?.identifier?.substring(0, 8) || null,
+      trackTitle: mixer.state?.currentTrack?.title || null,
+      autoStart,
+      ephemeral,
+      isPrimed: false
+    }));
+
     if (register) {
       this.registerSession(sessionId, session, { ephemeral });
       if (ephemeral) {
@@ -188,7 +199,15 @@ class SessionManager {
         session.isPrimed = true;
         session.primeReason = reason;
         this._primedSessionIds.add(session.sessionId);
-        sessionLog.info(`🔥 Primed drift session ready: ${session.sessionId} (${reason})`);
+        console.log(JSON.stringify({
+          _type: 'session_primed',
+          ts: new Date().toISOString(),
+          sessionId: session.sessionId,
+          trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
+          trackTitle: session.mixer?.state?.currentTrack?.title || null,
+          reason,
+          primedCount: this._primedSessionIds.size
+        }));
       }
     } catch (error) {
       sessionLog.error('🔥 Failed to prime drift session:', error);
@@ -235,7 +254,15 @@ class SessionManager {
     }
 
     session.isPrimed = false;
-    sessionLog.info(`🔥 Primed session ${sessionId} assigned (${resolution})`);
+    console.log(JSON.stringify({
+      _type: 'session_checkout',
+      ts: new Date().toISOString(),
+      sessionId,
+      trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
+      trackTitle: session.mixer?.state?.currentTrack?.title || null,
+      resolution,
+      remainingPrimed: this._primedSessionIds.size
+    }));
     setTimeout(() => this.schedulePrimedSessions('replenish'), 45000);
     return session;
   }
@@ -398,13 +425,42 @@ class SessionManager {
       return session;
     }
 
-    // Fallback
     if (!createIfMissing) {
       this.logSessionResolution(ctx, 'fallback', {
         sessionId: null,
         note: 'create_disabled'
       });
       return null;
+    }
+
+    // Before creating, check if an active session already exists.
+    // Prevents duplicate sessions from different network interfaces on the same machine.
+    // Prefer ephemeral sessions over named ones (ephemeral = current drift, named = saved journey).
+    let bestExisting = null;
+    for (const existing of this._audioSessions.values()) {
+      if (existing?.mixer?.isActive || (existing?.mixer?.clients?.size > 0)) {
+        if (!bestExisting || existing.isEphemeral) {
+          bestExisting = existing;
+        }
+      }
+    }
+    if (!bestExisting) {
+      for (const existing of this._ephemeralSessions.values()) {
+        if (existing?.mixer?.isActive || (existing?.mixer?.clients?.size > 0)) {
+          bestExisting = existing;
+          break;
+        }
+      }
+    }
+    if (bestExisting) {
+      this.logSessionResolution(ctx, 'existing_active', {
+        sessionId: bestExisting.sessionId,
+        created: false,
+        note: bestExisting.isEphemeral ? 'joined_existing_ephemeral' : 'joined_existing_named'
+      });
+      bestExisting.lastAccess = new Date();
+      if (ctx.persistBinding) await ctx.persistBinding(bestExisting.sessionId);
+      return bestExisting;
     }
 
     let session = this.checkoutPrimedSession('fallback');

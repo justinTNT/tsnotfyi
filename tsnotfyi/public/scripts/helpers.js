@@ -1104,10 +1104,13 @@ import { setSelection } from './selection.js';
           const trackData = sample.track || sample;
           preview.addEventListener('mouseenter', () => {
               if (typeof window.showTrackTooltip === 'function') {
+                  const dur = trackData.duration || trackData.length;
+                  const durStr = Number.isFinite(dur) ? `${Math.floor(dur / 60)}:${String(Math.floor(dur % 60)).padStart(2, '0')}` : '';
                   window.showTrackTooltip(
                       getDisplayTitle(trackData),
                       trackData.artist || '',
-                      trackData.album || ''
+                      trackData.album || '',
+                      durStr
                   );
               }
           });

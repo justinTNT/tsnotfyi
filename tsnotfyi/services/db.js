@@ -494,6 +494,75 @@ class DataAccess {
 
     return track;
   }
+
+  // ─── Folder tracks ──────────────────────────────────────────────────────────
+
+  async getFolderTracks(identifier) {
+    // Get the folder path for this track
+    const trackResult = await this._query(
+      `SELECT convert_from(bt_path::bytea, 'UTF8') as path FROM music_analysis WHERE identifier = $1`,
+      [identifier]
+    );
+    if (trackResult.rows.length === 0) return null;
+
+    const trackPath = trackResult.rows[0].path;
+    const folderPath = trackPath.replace(/\/[^/]+$/, '');
+
+    // Get all tracks in the same folder, ordered by disc then track number
+    const result = await this._query(`
+      SELECT identifier, bt_title, bt_artist, bt_album, bt_track, bt_disc,
+             convert_from(bt_path::bytea, 'UTF8') as path
+      FROM music_analysis
+      WHERE regexp_replace(convert_from(bt_path::bytea, 'UTF8'), '/[^/]+$', '') = $1
+      ORDER BY bt_disc::int NULLS FIRST, bt_track::int NULLS LAST, bt_title
+    `, [folderPath]);
+
+    return {
+      folder: folderPath,
+      tracks: result.rows.map(row => ({
+        identifier: row.identifier,
+        title: row.bt_title,
+        artist: row.bt_artist,
+        album: row.bt_album,
+        track: row.bt_track ? parseInt(row.bt_track) : null,
+        disc: row.bt_disc ? parseInt(row.bt_disc) : null,
+        path: row.path
+      }))
+    };
+  }
+
+  // ─── Named sessions ─────────────────────────────────────────────────────────
+
+  async saveNamedSession(name, state) {
+    await this._query(`
+      INSERT INTO named_sessions (name, state, updated_at)
+      VALUES ($1, $2, CURRENT_TIMESTAMP)
+      ON CONFLICT (name)
+      DO UPDATE SET state = EXCLUDED.state, updated_at = CURRENT_TIMESTAMP
+    `, [name, JSON.stringify(state)]);
+  }
+
+  async loadNamedSession(name) {
+    const result = await this._query(
+      'SELECT state FROM named_sessions WHERE name = $1', [name]
+    );
+    if (result.rows.length === 0) return null;
+    return result.rows[0].state;
+  }
+
+  async deleteNamedSession(name) {
+    const result = await this._query(
+      'DELETE FROM named_sessions WHERE name = $1 RETURNING name', [name]
+    );
+    return result.rows.length > 0;
+  }
+
+  async listNamedSessions() {
+    const result = await this._query(
+      'SELECT name, created_at, updated_at FROM named_sessions ORDER BY updated_at DESC'
+    );
+    return result.rows;
+  }
 }
 
 module.exports = DataAccess;

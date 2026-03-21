@@ -60,7 +60,9 @@ function buildTrackMetadata(track) {
     title: track.title || null,
     artist: track.artist || null,
     album: track.album || null,
-    path: track.path || null
+    path: track.path || null,
+    track: track.track || track.trackNumber || null,
+    disc: track.disc || track.discNumber || null
   };
 }
 

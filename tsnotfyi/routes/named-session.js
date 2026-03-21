@@ -1,73 +1,52 @@
 // Named session routes
-// Extracted from server.js for readability
+// Lifecycle: /name creates or resumes, auto-saves on disconnect, /name/forget deletes
 
 const path = require('path');
 
-// Validate MD5 format (32-character hex string)
 function isValidMD5(str) {
   return /^[a-f0-9]{32}$/.test(str);
-}
-
-// Save named session state to database (placeholder)
-async function saveNamedSessionToDatabase(session) {
-  // For now, ensure it's persisted in memory registry
-  session.mixer.persistSessionState();
-  console.log(`💾 Saved session ${session.mixer.state.sessionName} to memory registry`);
-}
-
-// Load named session state from database (placeholder)
-async function loadNamedSessionFromDatabase(sessionName) {
-  // Load from memory registry
-  global.namedSessionRegistry = global.namedSessionRegistry || new Map();
-  const savedState = global.namedSessionRegistry.get(sessionName);
-
-  if (savedState) {
-    console.log(`📖 Loaded session ${sessionName} from memory registry`);
-    return savedState;
-  }
-
-  console.log(`📖 No saved state found for session ${sessionName}`);
-  return null;
 }
 
 const RESERVED_SESSION_PREFIXES = new Set([
   'api', 'sessions', 'playlist', 'playlists', 'stream', 'events', 'status',
   'search', 'track', 'vae', 'current-track', 'favicon.ico', 'health',
-  'similar', 'reverse', 'reverse_similar', 'scaled'
+  'similar', 'reverse', 'reverse_similar', 'scaled', 'internal',
+  'radial-search', 'directional-search', 'pca', 'explorer',
+  'session', 'create-session', 'next-track', 'refresh-sse', 'refresh-sse-simple',
+  'client-logs'
 ]);
 
-function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, registerSession, createSession, calculateStackDuration }) {
+function isReservedName(name) {
+  return !name || RESERVED_SESSION_PREFIXES.has(name) || isValidMD5(name)
+    || name.startsWith('playlist/') || name.includes('/');
+}
 
-  // /:sessionName/forget - Delete named session
-  app.get('/:sessionName/forget', async (req, res) => {
+function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, registerSession, createSession, calculateStackDuration, db }) {
+
+  // /:sessionName/forget — delete named session from DB and memory
+  app.get('/:sessionName/forget', async (req, res, next) => {
     const { sessionName } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
-      return res.status(400).json({ error: 'Invalid session name' });
-    }
+    if (isReservedName(sessionName)) return next();
 
     try {
       const session = getSessionById(sessionName);
       if (session) {
-        await saveNamedSessionToDatabase(session);
         unregisterSession(sessionName);
-        console.log(`🗑️ Deleted named session: ${sessionName}`);
+        console.log(`🗑️ Unregistered named session: ${sessionName}`);
       }
-
-      res.json({ message: `Session ${sessionName} deleted` });
+      await db.deleteNamedSession(sessionName);
+      console.log(`🗑️ Deleted named session from DB: ${sessionName}`);
+      res.redirect('/');
     } catch (error) {
       console.error('Error deleting session:', error);
       res.status(500).json({ error: 'Failed to delete session' });
     }
   });
 
-  // /:sessionName/reset - Reset named session stack
-  app.get('/:sessionName/reset', async (req, res) => {
+  // /:sessionName/reset — clear stack but keep session alive
+  app.get('/:sessionName/reset', async (req, res, next) => {
     const { sessionName } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
-      return res.status(400).json({ error: 'Invalid session name' });
-    }
+    if (isReservedName(sessionName)) return next();
 
     try {
       const session = getSessionById(sessionName);
@@ -76,7 +55,6 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         session.mixer.state.ephemeral = false;
         console.log(`🔄 Reset named session: ${sessionName}`);
       }
-
       res.json({ message: `Session ${sessionName} reset` });
     } catch (error) {
       console.error('Error resetting session:', error);
@@ -84,13 +62,10 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     }
   });
 
-  // /:sessionName/export - Export session state
-  app.get('/:sessionName/export', async (req, res) => {
+  // /:sessionName/export — export session state as JSON
+  app.get('/:sessionName/export', async (req, res, next) => {
     const { sessionName } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/')) {
-      return res.status(400).json({ error: 'Invalid session name' });
-    }
+    if (isReservedName(sessionName)) return next();
 
     try {
       const session = getSessionById(sessionName);
@@ -99,31 +74,91 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
       }
 
       const stackState = session.mixer.getStackState();
-      const exportData = {
+      res.json({
         ...stackState,
         shareUrl: `/${sessionName}`,
         trackCount: stackState.stack.length,
         duration: calculateStackDuration(stackState.stack)
-      };
-
-      res.json(exportData);
+      });
     } catch (error) {
       console.error('Error exporting session:', error);
       res.status(500).json({ error: 'Failed to export session' });
     }
   });
 
-  // /:sessionName/:stackIndex/:positionSeconds - Jump to position
+  // /:sessionName/save — explicitly save current state to DB
+  app.get('/:sessionName/save', async (req, res, next) => {
+    const { sessionName } = req.params;
+    if (isReservedName(sessionName)) return next();
+
+    try {
+      const session = getSessionById(sessionName);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const state = session.mixer.getStackState();
+      await db.saveNamedSession(sessionName, state);
+      console.log(`💾 Saved named session: ${sessionName}`);
+      res.json({ message: `Session ${sessionName} saved` });
+    } catch (error) {
+      console.error('Error saving session:', error);
+      res.status(500).json({ error: 'Failed to save session' });
+    }
+  });
+
+  // /sessions/list — list all saved sessions
+  app.get('/sessions/list', async (req, res) => {
+    try {
+      const sessions = await db.listNamedSessions();
+      res.json({ sessions });
+    } catch (error) {
+      console.error('Error listing sessions:', error);
+      res.status(500).json({ error: 'Failed to list sessions' });
+    }
+  });
+
+  // /:sessionName/name — rename current session (give a name to an ephemeral session)
+  app.post('/:sessionName/name', async (req, res, next) => {
+    const { sessionName } = req.params;
+    if (isReservedName(sessionName)) return next();
+
+    const { currentSessionId } = req.body || {};
+    if (!currentSessionId) {
+      return res.status(400).json({ error: 'currentSessionId required' });
+    }
+
+    try {
+      const session = getSessionById(currentSessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Current session not found' });
+      }
+
+      // Unregister from old ID, re-register under new name
+      unregisterSession(currentSessionId);
+      session.sessionId = sessionName;
+      session.mixer.state.sessionId = sessionName;
+      session.mixer.state.sessionType = 'named';
+      session.mixer.state.sessionName = sessionName;
+      registerSession(sessionName, session);
+
+      // Auto-save to DB
+      const state = session.mixer.getStackState();
+      await db.saveNamedSession(sessionName, state);
+
+      console.log(`📛 Renamed session ${currentSessionId} → ${sessionName}`);
+      res.json({ sessionId: sessionName, message: `Session named: ${sessionName}` });
+    } catch (error) {
+      console.error('Error naming session:', error);
+      res.status(500).json({ error: 'Failed to name session' });
+    }
+  });
+
+  // /:sessionName/:stackIndex/:positionSeconds — jump to position
   app.get('/:sessionName/:stackIndex/:positionSeconds', async (req, res, next) => {
     const { sessionName, stackIndex, positionSeconds } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
-        RESERVED_SESSION_PREFIXES.has(sessionName) ||
-        ['forget', 'reset', 'export'].includes(stackIndex)) {
-      if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
-        return next();
-      }
-      return res.status(404).json({ error: 'Route not found' });
+    if (isReservedName(sessionName) || ['forget', 'reset', 'export', 'save', 'name'].includes(stackIndex)) {
+      return next();
     }
 
     const index = parseInt(stackIndex);
@@ -134,13 +169,11 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
 
     try {
       const session = getSessionById(sessionName);
-
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
       await session.mixer.jumpToStackPosition(index, position);
-
       console.log(`🎯 Named session ${sessionName} jumped to position ${index}/${position}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
@@ -149,33 +182,25 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     }
   });
 
-  // /:sessionName/:stackIndex - Jump to stack index
+  // /:sessionName/:stackIndex — jump to stack index
   app.get('/:sessionName/:stackIndex', async (req, res, next) => {
     const { sessionName, stackIndex } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
-        RESERVED_SESSION_PREFIXES.has(sessionName) ||
-        ['forget', 'reset', 'export'].includes(stackIndex)) {
-      if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
-        return next();
-      }
-      return res.status(404).json({ error: 'Route not found' });
+    if (isReservedName(sessionName) || ['forget', 'reset', 'export', 'save', 'name'].includes(stackIndex)) {
+      return next();
     }
 
     const index = parseInt(stackIndex);
     if (isNaN(index) || index < 0) {
-      return res.status(400).json({ error: 'Invalid stack index' });
+      return next();
     }
 
     try {
       const session = getSessionById(sessionName);
-
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
       await session.mixer.jumpToStackPosition(index, 0);
-
       console.log(`🎯 Named session ${sessionName} jumped to position ${index}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
@@ -184,15 +209,10 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     }
   });
 
-  // /:sessionName - Basic named session
+  // /:sessionName — create or resume named session
   app.get('/:sessionName', async (req, res, next) => {
     const { sessionName } = req.params;
-
-    if (isValidMD5(sessionName) || sessionName.startsWith('playlist/') ||
-        sessionName.includes('/') || RESERVED_SESSION_PREFIXES.has(sessionName)) {
-      if (RESERVED_SESSION_PREFIXES.has(sessionName)) {
-        return next();
-      }
+    if (isReservedName(sessionName)) {
       return next();
     }
 
@@ -206,16 +226,31 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
           sessionName: sessionName
         });
 
-        const savedState = await loadNamedSessionFromDatabase(sessionName);
+        // Try to restore from DB
+        const savedState = await db.loadNamedSession(sessionName);
         if (savedState) {
           session.mixer.loadStackState(savedState);
-          console.log(`📚 Loaded saved named session: ${sessionName}`);
+          console.log(`📚 Restored named session from DB: ${sessionName}`);
         } else {
           session.mixer.initializeSession('named', sessionName);
           console.log(`🆕 Created new named session: ${sessionName}`);
         }
 
         registerSession(sessionName, session);
+
+        // Auto-save on disconnect: when all clients leave, save state to DB
+        const originalOnIdle = session.mixer.onIdle;
+        session.mixer.onIdle = async () => {
+          try {
+            const state = session.mixer.getStackState();
+            await db.saveNamedSession(sessionName, state);
+            console.log(`💾 Auto-saved named session on disconnect: ${sessionName}`);
+          } catch (err) {
+            console.error(`Failed to auto-save session ${sessionName}:`, err);
+          }
+          // Don't unregister named sessions on idle — they persist
+          if (originalOnIdle) originalOnIdle();
+        };
       } else {
         console.log(`📚 Resuming existing named session: ${sessionName}`);
       }

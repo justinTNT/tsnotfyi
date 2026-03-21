@@ -500,6 +500,8 @@ audio {
     opacity: 1;
 }
 
+/* On-deck card — incoming track peeking behind now-playing during crossfade */
+
 /* Love/Hate buttons — hover above card shoulders */
 .love-btn, .hate-btn {
     position: absolute;
@@ -932,6 +934,48 @@ audio {
     background-position: center;
     pointer-events: none;
     opacity: 0.85;
+}
+
+/* Duplicate rejection feedback */
+.dimension-card.duplicate-flash {
+    animation: duplicate-shake 0.4s ease;
+}
+@keyframes duplicate-shake {
+    0%, 100% { transform: translate(-50%, -50%) scale(0.85); }
+    20% { transform: translate(-50%, -50%) scale(0.85) translateX(-8px); }
+    40% { transform: translate(-50%, -50%) scale(0.85) translateX(8px); }
+    60% { transform: translate(-50%, -50%) scale(0.85) translateX(-4px); }
+    80% { transform: translate(-50%, -50%) scale(0.85) translateX(4px); }
+}
+
+/* Album stack in tray */
+.playlist-slot {
+    position: absolute;
+    width: 120px;
+    height: 120px;
+}
+
+.playlist-slot.album-stack {
+    /* Stack peeks above */
+}
+
+.album-stack-count {
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 8px;
+    z-index: 100;
+    pointer-events: none;
+}
+
+.playlist-cover.album-stacked {
+    width: 120px;
+    height: 120px;
 }
 
 /* Animating card clone flying to tray */

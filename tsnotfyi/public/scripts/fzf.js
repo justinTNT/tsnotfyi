@@ -70,7 +70,8 @@ function setupFzfSearch(cleanupCallback) {
                 break;
             case 'Enter':
                 e.preventDefault();
-                selectFzfResult();
+                e.stopPropagation();
+                selectFzfResult({ album: e.shiftKey });
                 break;
             case 'Escape':
                 e.preventDefault();
@@ -197,7 +198,7 @@ function renderFzfResults() {
             <div class="fzf-result-item ${selectedClass}" data-index="${index}">
                 <div class="fzf-result-primary">${result.displayText || `${result.artist} - ${result.title}`}</div>
                 <div class="fzf-result-secondary">${result.album || ''} ${result.year ? `(${result.year})` : ''}</div>
-                <div class="fzf-result-meta">${result.identifier}</div>
+                <div class="fzf-result-meta">${result.directory || result.md5 || ''}</div>
             </div>
         `;
     }).join('');
@@ -206,9 +207,9 @@ function renderFzfResults() {
 
     // Add click handlers to results
     fzfResults.querySelectorAll('.fzf-result-item').forEach((item, index) => {
-        item.addEventListener('click', () => {
+        item.addEventListener('click', (e) => {
             fzfState.selectedIndex = index;
-            selectFzfResult();
+            selectFzfResult({ album: e.shiftKey });
         });
     });
 
@@ -249,7 +250,7 @@ function scrollSelectedIntoView() {
 }
 
 // Select current result and jump to track
-async function selectFzfResult() {
+async function selectFzfResult({ album = false } = {}) {
     if (fzfState.currentResults.length === 0 || fzfState.selectedIndex < 0) return;
 
     const selectedResult = fzfState.currentResults[fzfState.selectedIndex];
@@ -267,19 +268,96 @@ async function selectFzfResult() {
             return;
         }
 
-        fzfLog.info(`🔍 Selected track: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
+        if (album) {
+            // Shift+Enter / Shift+Click: load entire folder (album) to playlist
+            fzfLog.info(`📂 Loading album for: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
+            try {
+                const resp = await fetch(`/api/folder-tracks/${trackId}`);
+                if (!resp.ok) {
+                    showFzfError('Failed to load album tracks');
+                    return;
+                }
+                const data = await resp.json();
+                if (!data.tracks || data.tracks.length === 0) {
+                    showFzfError('No tracks found in folder');
+                    return;
+                }
 
-        // Jump to this track (use the SHA endpoint)
-        try {
-            await jumpToTrack(trackId, selectedResult);
-        } catch (error) {
-            fzfLog.error('🎯 Fuzzy jump failed:', error);
-            showFzfError('Failed to queue track – see console');
-            return;
+                // Add all folder tracks to playlist
+                const existingIds = window.playlistHasItems && typeof window.getPlaylistNext === 'function'
+                    ? new Set((state.playlist || []).map(p => p.trackId))
+                    : new Set();
+                let added = 0;
+                const wasEmpty = !window.playlistHasItems || !window.playlistHasItems();
+
+                const totalTracks = data.tracks.length;
+                for (const track of data.tracks) {
+                    if (existingIds.has(track.identifier)) continue;
+                    if (typeof window.addToPlaylist === 'function') {
+                        window.addToPlaylist({
+                            trackId: track.identifier,
+                            albumCover: track.albumCover || selectedResult.albumCover || null,
+                            directionKey: null,
+                            title: track.title || 'Unknown',
+                            artist: track.artist || selectedResult.artist || 'Unknown Artist',
+                            album: track.album || selectedResult.album || '',
+                            folderPath: data.folder,
+                            trackNumber: track.track,
+                            discNumber: track.disc,
+                            folderTrackTotal: totalTracks,
+                            duration: track.duration || null
+                        });
+                        added++;
+                    }
+                }
+
+                fzfLog.info(`📂 Added ${added} tracks from ${data.folder.split('/').pop()}`);
+                closeFzfSearch();
+
+                // Notify server of head if this was the first item
+                if (wasEmpty && added > 0 && typeof window.sendNextTrack === 'function') {
+                    const head = window.getPlaylistNext();
+                    if (head) {
+                        window.sendNextTrack(head.trackId, head.directionKey, 'user');
+                    }
+                }
+
+                // If album is at the tail, explore from the last track
+                if (added > 0) {
+                    const lastItem = (state.playlist || [])[state.playlist.length - 1];
+                    const lastAlbumTrack = data.tracks[data.tracks.length - 1];
+                    if (lastItem && lastAlbumTrack && lastItem.trackId === lastAlbumTrack.identifier) {
+                        if (typeof window.fetchExplorerWithPlaylist === 'function') {
+                            window.fetchExplorerWithPlaylist(lastAlbumTrack.identifier, { forceFresh: true }).then(explorerData => {
+                                if (explorerData && typeof window.createDimensionCards === 'function') {
+                                    state.latestExplorerData = explorerData;
+                                    window.createDimensionCards(explorerData, {
+                                        skipExitAnimation: true,
+                                        forceRedraw: true,
+                                        isPlaylistExploration: true
+                                    });
+                                }
+                            }).catch(() => {});
+                        }
+                    }
+                }
+            } catch (error) {
+                fzfLog.error('📂 Album load failed:', error);
+                showFzfError('Failed to load album – see console');
+                return;
+            }
+        } else {
+            // Normal Enter/Click: jump to single track
+            fzfLog.info(`🔍 Selected track: ${selectedResult.displayText || 'Unknown'} (${trackId})`);
+            try {
+                await jumpToTrack(trackId, selectedResult);
+            } catch (error) {
+                fzfLog.error('🎯 Fuzzy jump failed:', error);
+                showFzfError('Failed to queue track – see console');
+                return;
+            }
+            closeFzfSearch();
         }
-
-        // Close fzf interface
-        closeFzfSearch();
     }
 }
 

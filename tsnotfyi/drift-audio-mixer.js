@@ -156,8 +156,8 @@ class DriftAudioMixer {
       return this.clients.size > 0;
     };
 
-    this.audioMixer.onTrackStart = (reason, { bufferAheadMs = 0 } = {}) => {
-      console.log(`🎵 Advanced mixer: Track started (${reason || 'normal'}${bufferAheadMs > 500 ? `, deferred broadcast by ${(bufferAheadMs/1000).toFixed(1)}s` : ''})`);
+    this.audioMixer.onTrackStart = (reason) => {
+      console.log(`🎵 Advanced mixer: Track started (${reason || 'normal'})`);
 
       let promoted = false;
 
@@ -181,15 +181,9 @@ class DriftAudioMixer {
         this.pendingCurrentTrack = null;
         promoted = true;
       } else if (reason === 'crossfade_complete') {
-        // Check if user selected a different track during crossfade
-        const userOverrideActive = this.pendingUserOverrideTrackId &&
-            mixerTrackId && this.pendingUserOverrideTrackId !== mixerTrackId;
-
-        if (userOverrideActive) {
-          console.log(`🎯 Skipping promotion - user selected ${this.pendingUserOverrideTrackId?.substring(0,8)}, but mixer playing ${mixerTrackId?.substring(0,8)}`);
-          this.nextTrack = null;
-          // Don't set promoted = true - the deferred override will handle setting currentTrack
-        } else if (mixerTrackId) {
+        // The crossfade committed to a specific track — always promote it.
+        // Any pending user override is for the NEXT transition, not this one.
+        if (mixerTrackId) {
           // Use mixer's metadata as source of truth, hydrate with full track info
           const hydratedFromMixer = this.hydrateTrackRecord(mixerMetadata);
           if (hydratedFromMixer) {
@@ -328,27 +322,20 @@ class DriftAudioMixer {
         this.currentFingerprint = fingerprint;
       }
 
-      // Defer external broadcasts by buffer-ahead so metadata arrives when the client
-      // hears the transition, not when the server processes it.
-      const doBroadcast = () => {
-        console.log(`📡 Audio started - now broadcasting track event: ${this.state.currentTrack?.title}`);
-        this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
-          console.error('📡 Failed to broadcast track event:', err);
-        });
-        this.resolvePendingTrackReady(true);
-        this.recordSessionEvent('track_started', {
-          trackId: this.state.currentTrack?.identifier || null,
-          title: this.state.currentTrack?.title || '',
-          reason: reason || 'auto',
-          startTime: this.state.trackStartTime
-        });
-      };
-
-      if (bufferAheadMs > 500) {
-        this._deferredBroadcastTimer = setTimeout(doBroadcast, bufferAheadMs);
-      } else {
-        doBroadcast();
-      }
+      // Broadcast immediately — the client uses sentinels as the source of truth
+      // for visual track changes. The heartbeat arrives early but the client stashes
+      // it and waits for the sentinel (or a buffer-aware fallback timeout).
+      console.log(`📡 Audio started - now broadcasting track event: ${this.state.currentTrack?.title}`);
+      this.broadcastTrackEvent(true, { reason: reason || 'track-started' }).catch(err => {
+        console.error('📡 Failed to broadcast track event:', err);
+      });
+      this.resolvePendingTrackReady(true);
+      this.recordSessionEvent('track_started', {
+        trackId: this.state.currentTrack?.identifier || null,
+        title: this.state.currentTrack?.title || '',
+        reason: reason || 'auto',
+        startTime: this.state.trackStartTime
+      });
 
       // Kick off next-track preparation after a short delay so audio can stabilize
       this.scheduleAutoCrossfadePrep(reason || 'auto-initial');
@@ -1432,11 +1419,16 @@ class DriftAudioMixer {
 
         const track = this.hydrateTrackRecord(nextTrackFromExplorer, explorerAnnotations);
         if (track) {
-          if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== track.identifier) {
-            this.lockedNextTrackIdentifier = null;
+          // Never select the same track that's currently playing
+          if (track.identifier === this.state.currentTrack?.identifier) {
+            console.warn(`🔁 Rejecting next track — same as current (${track.identifier?.substring(0,8)})`);
+          } else {
+            if (this.lockedNextTrackIdentifier && this.lockedNextTrackIdentifier !== track.identifier) {
+              this.lockedNextTrackIdentifier = null;
+            }
+            console.log(`✅ Using explorer-selected track: ${track.title} by ${track.artist} via ${nextTrackFromExplorer.direction}`);
+            return track;
           }
-          console.log(`✅ Using explorer-selected track: ${track.title} by ${track.artist} via ${nextTrackFromExplorer.direction}`);
-          return track;
         }
       }
 

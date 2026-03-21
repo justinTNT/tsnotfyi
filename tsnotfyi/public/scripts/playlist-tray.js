@@ -73,6 +73,11 @@ export function addToPlaylist(item) {
         album: item.album || '',
         path: item.path || null,
         folderLabel: item.folderLabel || '',
+        folderPath: item.folderPath || null,
+        trackNumber: item.trackNumber || null,
+        discNumber: item.discNumber || null,
+        folderTrackTotal: item.folderTrackTotal || null,
+        duration: item.duration || null,
         addedAt: Date.now()
     };
 
@@ -83,6 +88,170 @@ export function addToPlaylist(item) {
     renderPlaylistTray();
 
     return playlistItem;
+}
+
+/**
+ * Load an entire album (folder tracks) to the playlist tray.
+ * Shift+Enter on center card or Shift+click/enter from fzf.
+ */
+async function loadAlbumToTray(trackId) {
+    log.info(`📂 Loading album to tray for track ${trackId.substring(0, 8)}`);
+    try {
+        const resp = await fetch(`/api/folder-tracks/${trackId}`);
+        if (!resp.ok) {
+            log.error(`📂 Folder tracks fetch failed: ${resp.status}`);
+            return;
+        }
+        const data = await resp.json();
+        if (!data.tracks || data.tracks.length === 0) {
+            log.info('📂 No tracks found in folder');
+            return;
+        }
+
+        const existingIds = new Set((state.playlist || []).map(p => p.trackId));
+        const wasEmpty = !Array.isArray(state.playlist) || state.playlist.length === 0;
+        let added = 0;
+
+        const totalTracks = data.tracks.length;
+        for (const track of data.tracks) {
+            if (existingIds.has(track.identifier)) continue;
+            addToPlaylist({
+                trackId: track.identifier,
+                albumCover: track.albumCover || '/images/albumcover.png',
+                directionKey: null,
+                title: track.title || 'Unknown',
+                artist: track.artist || 'Unknown Artist',
+                album: track.album || '',
+                folderLabel: '',
+                folderPath: data.folder,
+                trackNumber: track.track,
+                discNumber: track.disc,
+                folderTrackTotal: totalTracks,
+                duration: track.duration || null
+            });
+            added++;
+        }
+
+        log.info(`📂 Added ${added} tracks from ${data.folder.split('/').pop()}`);
+
+        if (wasEmpty && added > 0 && typeof window.sendNextTrack === 'function') {
+            const head = getPlaylistNext();
+            if (head) {
+                window.sendNextTrack(head.trackId, head.directionKey, 'user');
+            }
+        }
+
+        // If album is at the tail of the tray, fetch explorer for the last album track
+        // so the deck shows where to go after the album ends
+        if (added > 0 && typeof fetchExplorerWithPlaylist === 'function') {
+            const lastItem = state.playlist[state.playlist.length - 1];
+            const lastAlbumTrack = data.tracks[data.tracks.length - 1];
+            if (lastItem && lastAlbumTrack && lastItem.trackId === lastAlbumTrack.identifier) {
+                log.info(`📂 Fetching explorer for album tail: ${lastAlbumTrack.identifier.substring(0, 8)}`);
+                fetchExplorerWithPlaylist(lastAlbumTrack.identifier, { forceFresh: true }).then(explorerData => {
+                    if (explorerData && typeof window.createDimensionCards === 'function') {
+                        state.latestExplorerData = explorerData;
+                        window.createDimensionCards(explorerData, {
+                            skipExitAnimation: true,
+                            forceRedraw: true,
+                            isPlaylistExploration: true
+                        });
+                    }
+                }).catch(err => {
+                    log.warn('📂 Explorer fetch for album tail failed:', err?.message || err);
+                });
+            }
+        }
+    } catch (err) {
+        log.error('📂 Album load failed:', err);
+    }
+}
+
+/**
+ * Unfold album: replace a single playlist item with all tracks from its folder.
+ * Shift-click on a tray cover triggers this.
+ */
+async function unfoldAlbum(trackId, playlistIndex) {
+    log.info(`📂 Unfolding album for track ${trackId.substring(0, 8)} at index ${playlistIndex}`);
+    try {
+        const resp = await fetch(`/api/folder-tracks/${trackId}`);
+        if (!resp.ok) {
+            log.error(`📂 Folder tracks fetch failed: ${resp.status}`);
+            return;
+        }
+        const data = await resp.json();
+        if (!data.tracks || data.tracks.length <= 1) {
+            log.info('📂 Only one track in folder, nothing to unfold');
+            return;
+        }
+
+        // Find the clicked track's position in the folder
+        const clickedIndex = data.tracks.findIndex(t => t.identifier === trackId);
+        if (clickedIndex < 0) {
+            log.warn('📂 Clicked track not found in folder results');
+            return;
+        }
+
+        // Build playlist items for all folder tracks from clicked position onward
+        const original = state.playlist[playlistIndex];
+        const totalTracks = data.tracks.length;
+        const folderItems = data.tracks.slice(clickedIndex).map(track => ({
+            trackId: track.identifier,
+            albumCover: track.albumCover || original?.albumCover || '/images/albumcover.png',
+            directionKey: original?.directionKey || null,
+            explorerData: null,
+            title: track.title || 'Unknown',
+            artist: track.artist || original?.artist || 'Unknown Artist',
+            album: track.album || original?.album || '',
+            folderLabel: original?.folderLabel || '',
+            addedAt: Date.now(),
+            // Folder metadata for gapless detection
+            folderPath: data.folder,
+            trackNumber: track.track,
+            discNumber: track.disc,
+            folderTrackTotal: totalTracks
+        }));
+
+        // Remove duplicates (tracks already in playlist)
+        const existingIds = new Set(state.playlist.map(p => p.trackId));
+        const newItems = folderItems.filter(item => !existingIds.has(item.trackId) || item.trackId === trackId);
+
+        // Replace the clicked item with the unfolded tracks
+        state.playlist.splice(playlistIndex, 1, ...newItems);
+
+        log.info(`📂 Unfolded: ${newItems.length} tracks from ${data.folder.split('/').pop()}`);
+        renderPlaylistTray();
+
+        // If unfolded item is at the head, notify server of the (possibly new) head
+        if (playlistIndex === 0 && newItems.length > 0 && newItems[0].trackId !== trackId) {
+            if (typeof window.sendNextTrack === 'function') {
+                window.sendNextTrack(newItems[0].trackId, newItems[0].directionKey, 'user');
+            }
+        }
+
+        // If album is at the tail of the tray, fetch explorer for the last album track
+        if (newItems.length > 0 && typeof fetchExplorerWithPlaylist === 'function') {
+            const lastPlaylistItem = state.playlist[state.playlist.length - 1];
+            const lastNewItem = newItems[newItems.length - 1];
+            if (lastPlaylistItem && lastNewItem && lastPlaylistItem.trackId === lastNewItem.trackId) {
+                log.info(`📂 Fetching explorer for unfolded album tail: ${lastNewItem.trackId.substring(0, 8)}`);
+                fetchExplorerWithPlaylist(lastNewItem.trackId, { forceFresh: true }).then(explorerData => {
+                    if (explorerData && typeof window.createDimensionCards === 'function') {
+                        state.latestExplorerData = explorerData;
+                        window.createDimensionCards(explorerData, {
+                            skipExitAnimation: true,
+                            forceRedraw: true,
+                            isPlaylistExploration: true
+                        });
+                    }
+                }).catch(err => {
+                    log.warn('📂 Explorer fetch for unfolded album tail failed:', err?.message || err);
+                });
+            }
+        }
+    } catch (err) {
+        log.error('📂 Album unfold failed:', err);
+    }
 }
 
 /**
@@ -217,52 +386,112 @@ export function renderPlaylistTray() {
     const items = Array.isArray(state.playlist) ? state.playlist : [];
 
     const COVER_SIZE = 120;
+    const STACK_OFFSET = 6; // pixels each stacked album track peeks above
 
-    strip.innerHTML = items.map((item, i) => {
-        const title = (item.title || '').replace(/"/g, '&quot;');
-        const artist = (item.artist || '').replace(/"/g, '&quot;');
-        const album = (item.album || '').replace(/"/g, '&quot;');
-        const isDefault = !item.albumCover || item.albumCover === '/images/albumcover.png';
-        const label = isDefault ? (item.folderLabel || monthFromPath(item.path)) : '';
-        const labelHtml = label
-            ? `<span class="playlist-cover-label" style="color:${pastelFromString(label)}">${label.replace(/</g, '&lt;')}</span>`
-            : '';
-        return `<div class="playlist-cover" data-track-id="${item.trackId}" data-index="${i}"
-                     data-title="${title}" data-artist="${artist}" data-album="${album}">
-            <img src="${item.albumCover || ''}" alt="${title}" draggable="false" />
-            ${labelHtml}
-        </div>`;
+    // Group consecutive same-folder items into visual slots
+    const slots = [];
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const folder = item.folderPath || null;
+        const prevSlot = slots[slots.length - 1];
+        if (folder && prevSlot && prevSlot.folder === folder) {
+            prevSlot.items.push({ item, playlistIndex: i });
+        } else {
+            slots.push({ folder, items: [{ item, playlistIndex: i }] });
+        }
+    }
+
+    // Render each slot — single items render normally, album groups stack vertically
+    strip.innerHTML = slots.map((slot, slotIdx) => {
+        const first = slot.items[0].item;
+        const count = slot.items.length;
+        const isAlbumStack = count > 1;
+        const stackHeight = isAlbumStack ? STACK_OFFSET * (count - 1) : 0;
+
+        if (isAlbumStack) {
+            // Album stack: first cover is the front, subsequent peek above
+            const coversHtml = slot.items.map(({ item, playlistIndex }, j) => {
+                const title = (item.title || '').replace(/"/g, '&quot;');
+                const artist = (item.artist || '').replace(/"/g, '&quot;');
+                const album = (item.album || '').replace(/"/g, '&quot;');
+                const offsetY = -(count - 1 - j) * STACK_OFFSET;
+                const zIdx = j + 1;
+                const dur = item.duration || null;
+                return `<div class="playlist-cover album-stacked" data-track-id="${item.trackId}" data-index="${playlistIndex}"
+                             data-title="${title}" data-artist="${artist}" data-album="${album}" data-duration="${dur || ''}"
+                             style="position:absolute; top:${offsetY}px; left:0; z-index:${zIdx}">
+                    <img src="${item.albumCover || ''}" alt="${title}" draggable="false" />
+                </div>`;
+            }).join('');
+
+            return `<div class="playlist-slot album-stack" data-slot="${slotIdx}" data-count="${count}"
+                         style="height:${COVER_SIZE}px">
+                ${coversHtml}
+                <span class="album-stack-count">${first.trackNumber || 1}/${first.folderTrackTotal || count}</span>
+            </div>`;
+        } else {
+            const item = first;
+            const playlistIndex = slot.items[0].playlistIndex;
+            const title = (item.title || '').replace(/"/g, '&quot;');
+            const artist = (item.artist || '').replace(/"/g, '&quot;');
+            const album = (item.album || '').replace(/"/g, '&quot;');
+            const isDefault = !item.albumCover || item.albumCover === '/images/albumcover.png';
+            const label = isDefault ? (item.folderLabel || monthFromPath(item.path)) : '';
+            const labelHtml = label
+                ? `<span class="playlist-cover-label" style="color:${pastelFromString(label)}">${label.replace(/</g, '&lt;')}</span>`
+                : '';
+            const dur = item.duration || null;
+            return `<div class="playlist-slot">
+                <div class="playlist-cover" data-track-id="${item.trackId}" data-index="${playlistIndex}"
+                         data-title="${title}" data-artist="${artist}" data-album="${album}" data-duration="${dur || ''}">
+                    <img src="${item.albumCover || ''}" alt="${title}" draggable="false" />
+                    ${labelHtml}
+                </div>
+            </div>`;
+        }
     }).join('');
 
-    // Position covers: fill the tray width, only overlapping when they don't fit
-    const covers = strip.querySelectorAll('.playlist-cover');
-    const n = covers.length;
+    // Position slots horizontally
+    const slotEls = strip.querySelectorAll('.playlist-slot');
+    const numSlots = slotEls.length;
     const trayWidth = strip.offsetWidth || trayRoot.offsetWidth || 300;
 
-    if (n === 1) {
-        covers[0].style.left = '0px';
-        covers[0].style.zIndex = '1';
-    } else if (n > 1) {
-        // Ideal step = COVER_SIZE (no overlap). Cap at what fits.
+    if (numSlots === 1) {
+        slotEls[0].style.left = '0px';
+        slotEls[0].style.zIndex = '1';
+    } else if (numSlots > 1) {
         const maxLeft = trayWidth - COVER_SIZE;
         const idealStep = COVER_SIZE;
-        const step = Math.min(idealStep, maxLeft / (n - 1));
-        covers.forEach((el, i) => {
+        const step = Math.min(idealStep, maxLeft / (numSlots - 1));
+        slotEls.forEach((el, i) => {
             el.style.left = `${Math.round(step * i)}px`;
             el.style.zIndex = String(i + 1);
         });
     }
 
-    // Hover handlers
+    // Hover + click handlers on all covers
     strip.querySelectorAll('.playlist-cover').forEach(el => {
         el.addEventListener('mouseenter', () => {
             const t = el.dataset.title || '';
             const a = el.dataset.artist || '';
             const al = el.dataset.album || '';
-            showTrackTooltip(t, a, al);
+            const dur = parseFloat(el.dataset.duration);
+            const durStr = Number.isFinite(dur) ? `${Math.floor(dur / 60)}:${String(Math.floor(dur % 60)).padStart(2, '0')}` : '';
+            showTrackTooltip(t, a, al, durStr);
         });
         el.addEventListener('mouseleave', () => {
             hideTrackTooltip();
+        });
+        // Shift-click: unfold album (all tracks from same folder)
+        el.addEventListener('click', async (e) => {
+            if (!e.shiftKey) return;
+            e.preventDefault();
+            e.stopPropagation();
+            window.getSelection()?.removeAllRanges();
+            const trackId = el.dataset.trackId;
+            const index = parseInt(el.dataset.index);
+            if (!trackId || isNaN(index)) return;
+            await unfoldAlbum(trackId, index);
         });
     });
 
@@ -270,12 +499,14 @@ export function renderPlaylistTray() {
     const hasItems = items.length > 0;
     trayRoot.classList.toggle('has-items', hasItems);
 
-    // Clear playlist name and re-enable save when tray empties
+    // Clear playlist name when tray empties
     if (!hasItems) {
         state.activePlaylistName = null;
         setPlaylistNameLabel('');
-        updateSaveButtonState();
     }
+
+    // Always update save/load button visibility
+    updateSaveButtonState();
 
     const ids = items.map(p => p.trackId.substring(0, 8));
     log.info(`renderPlaylistTray: ${ids.length} items [${ids.join(', ')}] visible=${hasItems}`);
@@ -286,12 +517,40 @@ export function renderPlaylistTray() {
  * Animates the card to the tray, then fetches explorer for that track
  */
 export async function promoteCenterCardToTray() {
-    // Resolve the next track from the user's selection (selectedIdentifier),
-    // falling back to the server's recommendation (latestExplorerData.nextTrack).
+    // Primary source: the center card's DOM state (what the user is looking at).
+    // Fallback: state.selection.trackId matched against explorer data.
+    // Last resort: server's nextTrack recommendation.
     let nextTrackObj = null;
     let resolvedDirection = null;
 
-    if (state.selection.trackId && state.latestExplorerData) {
+    // 1. Read directly from the center card DOM — this is what the user sees
+    const centerCard = document.querySelector('.dimension-card.next-track');
+    const centerTrackId = centerCard?.dataset?.trackMd5;
+    const centerDirectionKey = centerCard?.dataset?.directionKey;
+
+    if (centerTrackId) {
+        // Try to enrich from explorer data, but use DOM data regardless
+        const match = state.latestExplorerData ? findTrackInExplorer(state.latestExplorerData, centerTrackId) : null;
+        if (match) {
+            nextTrackObj = match.track;
+            resolvedDirection = match.directionKey || centerDirectionKey;
+        } else {
+            // Explorer data doesn't contain this track (refreshed since cycle) — use card data
+            nextTrackObj = {
+                identifier: centerTrackId,
+                title: centerCard.dataset.trackTitle || '',
+                artist: centerCard.dataset.trackArtist || '',
+                album: centerCard.dataset.trackAlbum || '',
+                albumCover: centerCard.dataset.trackAlbumCover || '',
+                duration: parseFloat(centerCard.dataset.trackDurationSeconds) || null
+            };
+            resolvedDirection = centerDirectionKey;
+        }
+        log.info(`🎯 Resolved from center card DOM: ${centerTrackId.substring(0, 8)} dir=${resolvedDirection} (explorer match: ${!!match})`);
+    }
+
+    // 2. Fall back to selection state (may differ from DOM if explorer refreshed)
+    if (!nextTrackObj && state.selection.trackId && state.latestExplorerData) {
         const match = findTrackInExplorer(state.latestExplorerData, state.selection.trackId);
         if (match) {
             nextTrackObj = match.track;
@@ -300,13 +559,18 @@ export async function promoteCenterCardToTray() {
         }
     }
 
+    // 3. Fall back to server recommendation
     if (!nextTrackObj) {
         const nextTrackEntry = state.latestExplorerData?.nextTrack;
         nextTrackObj = nextTrackEntry?.track || nextTrackEntry;
         resolvedDirection = nextTrackEntry?.directionKey || null;
-        if (nextTrackObj) {
-            log.info(`🎯 Falling back to server nextTrack recommendation`);
-        }
+        log.warn(`🎯 Falling back to server nextTrack recommendation`, {
+            centerCardExists: !!centerCard,
+            centerTrackId: centerTrackId?.substring(0, 8) || null,
+            selectionTrackId: state.selection.trackId?.substring(0, 8) || null,
+            selectionSource: state.selection.source,
+            serverNextId: nextTrackObj?.identifier?.substring(0, 8) || null
+        });
     }
 
     const trackId = nextTrackObj?.identifier;
@@ -323,7 +587,7 @@ export async function promoteCenterCardToTray() {
     }
 
     // We still need the DOM card for the fly-to-tray animation
-    const centerCard = document.querySelector('.dimension-card.next-track');
+    // (centerCard already resolved above)
 
     // Resolve album cover with DOM fallback — the card renderer has a richer
     // fallback chain than the data object, so the .photo div may have a cover
@@ -361,11 +625,17 @@ export async function promoteCenterCardToTray() {
         explorerData,
         title,
         artist,
-        album
+        album,
+        duration: nextTrackObj?.duration || nextTrackObj?.length || null
     });
 
     if (!item) {
         log.info('🎯 addToPlaylist returned falsy - track may be duplicate or invalid');
+        // Visual feedback: briefly flash the existing item in the tray
+        if (centerCard) {
+            centerCard.classList.add('duplicate-flash');
+            setTimeout(() => centerCard.classList.remove('duplicate-flash'), 400);
+        }
         return null;
     }
     log.info(`🎯 Added to playlist successfully, playlist length: ${state.playlist?.length}`);
@@ -464,29 +734,18 @@ export function initPlaylistTray() {
     const btnSave = document.getElementById('btnSaveSession');
     if (btnLoad) btnLoad.addEventListener('click', () => showPlaylistPicker());
     if (btnSave) btnSave.addEventListener('click', () => {
-        // Build track list: history + current + tray
+        // Save tray contents only (not session history)
         const tracks = [];
-        const seen = new Set();
-        // History (identifiers only — playlists page fetches metadata after save)
-        for (const id of (state.sessionTrackHistory || [])) {
-            if (!seen.has(id)) {
-                seen.add(id);
-                tracks.push({ identifier: id });
-            }
-        }
-        // Current track
-        const cur = state.latestCurrentTrack;
-        if (cur?.identifier && !seen.has(cur.identifier)) {
-            seen.add(cur.identifier);
-            tracks.push({ identifier: cur.identifier });
-        }
-        // Tray items
         for (const item of (state.playlist || [])) {
-            if (!seen.has(item.trackId)) {
-                seen.add(item.trackId);
-                tracks.push({ identifier: item.trackId, direction: item.directionKey });
-            }
+            tracks.push({
+                identifier: item.trackId,
+                direction: item.directionKey || null,
+                folderPath: item.folderPath || null,
+                trackNumber: item.trackNumber || null,
+                discNumber: item.discNumber || null
+            });
         }
+        if (tracks.length === 0) return;
         const payload = btoa(JSON.stringify({ tracks }));
         window.open(`/playlists?session=${encodeURIComponent(payload)}`, '_blank');
     });
@@ -523,15 +782,23 @@ export function initPlaylistTray() {
 }
 
 /**
- * Disable save-session button while a named playlist is active
+ * Show/hide save and load buttons based on tray state.
+ * Save: visible when tray has items (and no active named playlist).
+ * Load: visible when tray is empty.
  */
 function updateSaveButtonState() {
-    const btn = document.getElementById('btnSaveSession');
-    if (!btn) return;
-    const disabled = !!state.activePlaylistName;
-    btn.disabled = disabled;
-    btn.style.opacity = disabled ? '0.3' : '';
-    btn.style.pointerEvents = disabled ? 'none' : '';
+    const btnSave = document.getElementById('btnSaveSession');
+    const btnLoad = document.getElementById('btnLoadPlaylist');
+    const hasItems = Array.isArray(state.playlist) && state.playlist.length > 0;
+    const namedActive = !!state.activePlaylistName;
+
+    if (btnSave) {
+        const showSave = hasItems && !namedActive;
+        btnSave.style.display = showSave ? '' : 'none';
+    }
+    if (btnLoad) {
+        btnLoad.style.display = hasItems ? 'none' : '';
+    }
 }
 
 /**
@@ -563,9 +830,9 @@ function getTooltip() {
     return _tooltip;
 }
 
-export function showTrackTooltip(title, artist, album) {
+export function showTrackTooltip(title, artist, album, duration) {
     const tip = getTooltip();
-    const parts = [title, artist, album].filter(Boolean);
+    const parts = [title, artist, album, duration].filter(Boolean);
     tip.textContent = parts.join(' \u2014 ');
     tip.classList.add('visible');
 }
@@ -799,6 +1066,7 @@ if (typeof window !== 'undefined') {
     window.promoteCenterCardToTray = promoteCenterCardToTray;
     window.showTrackTooltip = showTrackTooltip;
     window.hideTrackTooltip = hideTrackTooltip;
+    window.loadAlbumToTray = loadAlbumToTray;
     window.loadPlaylistIntoTray = loadPlaylistIntoTray;
     window.showPlaylistPicker = showPlaylistPicker;
 }

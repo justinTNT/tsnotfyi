@@ -564,8 +564,17 @@ app.get('/stream', async (req, res) => {
     session.clientIp = clientIp;
     session.lastAudioConnect = Date.now();
 
+    console.log(JSON.stringify({
+      _type: 'stream_connect',
+      ts: new Date().toISOString(),
+      sessionId: session.sessionId,
+      trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
+      trackTitle: session.mixer?.state?.currentTrack?.title || null,
+      ip: clientIp
+    }));
+
     const currentTrackId = session.mixer?.state?.currentTrack?.identifier || null;
-    const trackStartTime = session.mixer?.trackStartTime || Date.now();
+    const trackStartTime = session.mixer?.state?.trackStartTime || Date.now();
     const fingerprint = fingerprintRegistry.ensureFingerprint(
       session.sessionId,
       {
@@ -663,7 +672,8 @@ setupNamedSessionRoutes(app, {
   unregisterSession: (id) => sessionManager.unregisterSession(id),
   registerSession: (id, s, opts) => sessionManager.registerSession(id, s, opts),
   createSession: (opts) => sessionManager.createSession(opts),
-  calculateStackDuration
+  calculateStackDuration,
+  db
 });
 
 setupApiRoutes(app, { db, radialSearch });
@@ -1619,7 +1629,8 @@ app.post('/next-track', async (req, res) => {
     source = 'user',
     origin = null,
     explorerSignature = null,
-    fingerprint: requestFingerprint
+    fingerprint: requestFingerprint,
+    clientBufferSecs
   } = req.body;
   const normalizedSource = typeof source === 'string' ? source.toLowerCase() : 'user';
   const normalizedOrigin = typeof origin === 'string' ? origin.toLowerCase() : null;
@@ -1646,6 +1657,14 @@ app.post('/next-track', async (req, res) => {
 
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
+  }
+
+  // Store client buffer depth for deferred broadcast timing
+  if (Number.isFinite(clientBufferSecs) && clientBufferSecs >= 0) {
+    session.clientBufferSecs = clientBufferSecs;
+    if (session.mixer) {
+      session.mixer.clientBufferSecs = clientBufferSecs;
+    }
   }
 
   try {

@@ -98,7 +98,29 @@ class SSEManager {
 
       let createdViaFallback = false;
       if (!session) {
-        session = await sm.getSessionForContext(ctx, { createIfMissing: true });
+        // Before creating a new session, check if any active session exists.
+        // Multiple connections from different network interfaces on the same machine
+        // should join the existing session, not spawn new ones with expensive ffmpeg decodes.
+        for (const existing of sm.allSessions()) {
+          if (existing?.mixer?.isActive || (existing?.mixer?.clients?.size > 0)) {
+            session = existing;
+            resolution = 'existing_active';
+            sm.logSessionEvent('sse_joined_existing', {
+              sessionId: existing.sessionId,
+              ip: clientIp
+            });
+            break;
+          }
+        }
+      }
+      if (!session) {
+        session = await sm.getSessionForContext(ctx, { createIfMissing: false });
+        if (!session) {
+          // No active session found — create one but don't start playback.
+          // Playback begins when an audio client connects to /stream.
+          session = await sm.createSession({ autoStart: false });
+          sm.registerSession(session.sessionId, session);
+        }
         resolution = resolution || 'fallback_create';
         createdViaFallback = true;
       }
@@ -137,6 +159,17 @@ class SSEManager {
       if (clientIp && session.mixer?.clients && session.mixer.clients.size > 0) {
         sm.lastHealthySessionByIp.set(clientIp, session.sessionId);
       }
+
+      console.log(JSON.stringify({
+        _type: 'sse_connect',
+        ts: new Date().toISOString(),
+        sessionId: session.sessionId,
+        trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
+        trackTitle: session.mixer?.state?.currentTrack?.title || null,
+        resolution,
+        ip: clientIp,
+        audioClients: session.mixer?.clients?.size || 0
+      }));
 
       sm.logSessionEvent('sse_client_connected', {
         sessionId: session.sessionId,

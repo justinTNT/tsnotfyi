@@ -1,7 +1,7 @@
 // Main page orchestrator - imports from all other modules
 import { state, elements, connectionHealth, audioHealth, rootElement, PANEL_VARIANTS, getCardBackgroundColor, initializeElements } from './globals.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
-import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI, initPCMPipeline } from './audio-manager.js';
+import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI, initPCMPipeline, getBufferDelaySecs } from './audio-manager.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
 import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, resolveCanonicalDirectionKey } from './explorer-utils.js';
 import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer } from './deck-state.js';
@@ -436,7 +436,35 @@ async function initializeApp() {
     fullResync,
     onSentinel: async (type, { bufferDelaySecs = 0 } = {}) => {
       if (type === 'crossfade-start') {
-        sentinelLog.info('🔔 Sentinel: crossfade-start (logged only)');
+        // Crossfade start: pop the tray and update the now-playing card immediately.
+        // The incoming track is audibly arriving — show it now.
+        if (playlistHasItems()) {
+          const head = getPlaylistNext();
+          if (head) {
+            sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing`);
+            popPlaylistHead();
+            renderPlaylistTray();
+
+            // Update now-playing card with the incoming track
+            const trackState = {
+              identifier: head.trackId,
+              title: head.title || '',
+              artist: head.artist || '',
+              album: head.album || '',
+              albumCover: head.albumCover || ''
+            };
+            state.latestCurrentTrack = trackState;
+            window.state.latestCurrentTrack = trackState;
+            if (typeof window.updateNowPlayingCard === 'function') {
+              window.updateNowPlayingCard(trackState, null);
+            }
+
+            const newHead = getPlaylistNext();
+            if (newHead && typeof window.sendNextTrack === 'function') {
+              window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+            }
+          }
+        }
         return;
       }
       if (type !== 'track-boundary' && type !== 'crossfade-end') return;
@@ -502,7 +530,8 @@ async function initializeApp() {
         await new Promise(r => setTimeout(r, remainingDelayMs));
       }
 
-      sentinelLog.info(`🔔 Sentinel track change: ${previousTrackId?.substring(0, 8) || 'none'} → ${currentTrackId?.substring(0, 8)}`);
+      const clientBufferAtSentinel = typeof getBufferDelaySecs === 'function' ? getBufferDelaySecs() : null;
+      sentinelLog.info(`🔔 Sentinel track change: ${previousTrackId?.substring(0, 8) || 'none'} → ${currentTrackId?.substring(0, 8)} (clientBuffer: ${clientBufferAtSentinel?.toFixed(1) ?? '?'}s)`);
 
       cancelPackAwayAnimation();
 
@@ -605,8 +634,14 @@ async function initializeApp() {
         }
       }
 
-      const explorerAlreadyCurrent = state.latestExplorerData?.currentTrack?.identifier === currentTrackId
-          && state.latestExplorerData?.directions;
+      // Skip deck redraw if explorer is already showing data for either:
+      // - the new current track (direct match), or
+      // - a playlist exploration track (cards were drawn for the playlist tail — still valid)
+      const explorerSourceId = state.latestExplorerData?.currentTrack?.identifier;
+      const explorerAlreadyCurrent = state.latestExplorerData?.directions && (
+          explorerSourceId === currentTrackId ||
+          (playlistHasItems() && explorerSourceId)  // playlist mode: deck shows tail exploration, don't redraw
+      );
 
       const driftStateForCard = data.driftState || null;
 
@@ -1730,7 +1765,15 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               const centerCard = document.querySelector('.dimension-card.next-track');
               const dk = centerCard?.dataset?.directionKey
                   || state.latestExplorerData?.nextTrack?.directionKey;
-              if (dk) cycleStackContents(dk, state.stackIndex);
+              if (dk) {
+                  cycleStackContents(dk, state.stackIndex);
+              } else {
+                  deckLog2.warn('ArrowDown: no direction key found', {
+                      hasCenterCard: !!centerCard,
+                      centerCardDk: centerCard?.dataset?.directionKey || null,
+                      explorerNextDk: state.latestExplorerData?.nextTrack?.directionKey || null
+                  });
+              }
               e.preventDefault();
               break;
           }
@@ -1784,9 +1827,18 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               break;
 
           case 'Enter':
-              // Promote center card to playlist (same as clicking left pile in tray)
-              if (typeof window.promoteCenterCardToTray === 'function') {
-                  window.promoteCenterCardToTray();
+              if (e.shiftKey) {
+                  // Shift+Enter: load album (folder tracks) for the center card
+                  const centerCard = document.querySelector('.dimension-card.next-track');
+                  const centerTrackId = centerCard?.dataset?.trackMd5 || state.selection?.trackId;
+                  if (centerTrackId && typeof window.loadAlbumToTray === 'function') {
+                      window.loadAlbumToTray(centerTrackId);
+                  }
+              } else {
+                  // Promote center card to playlist (same as clicking left pile in tray)
+                  if (typeof window.promoteCenterCardToTray === 'function') {
+                      window.promoteCenterCardToTray();
+                  }
               }
               e.preventDefault();
               break;
@@ -1800,14 +1852,114 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               break;
 
           case 'Tab':
-              // Shift playlist: drop the head, advance the tray
-              if (typeof window.popPlaylistHead === 'function' && typeof window.playlistHasItems === 'function' && window.playlistHasItems()) {
-                  const popped = window.popPlaylistHead();
-                  if (popped) {
-                      deckLog2.info(`🎵 Tab: dropped tray head ${popped.trackId.substring(0, 8)}`);
-                      const newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
-                      if (newHead && typeof window.sendNextTrack === 'function') {
-                          window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+              if (e.shiftKey) {
+                  // Shift+Tab: recover tracks. First from tray history (Tab-shifted, never played),
+                  // then from session history (actually played — requires inserting current track as bridge).
+                  const currentId = state.latestCurrentTrack?.identifier;
+                  const trayIds = new Set((state.playlist || []).map(p => p.trackId));
+                  if (!Array.isArray(state.playlist)) state.playlist = [];
+
+                  // Try tray history first (shifted off but never played)
+                  const trayHistory = state._trayShiftHistory || [];
+                  let rewoundTrackId = null;
+                  let fromPlaybackHistory = false;
+
+                  for (let i = trayHistory.length - 1; i >= 0; i--) {
+                      const hid = trayHistory[i];
+                      if (hid !== currentId && !trayIds.has(hid)) {
+                          rewoundTrackId = hid;
+                          trayHistory.splice(i, 1);
+                          break;
+                      }
+                  }
+
+                  // Fall through to session history (actually played tracks)
+                  if (!rewoundTrackId) {
+                      const history = state.sessionTrackHistory || [];
+                      for (let i = history.length - 1; i >= 0; i--) {
+                          const hid = history[i];
+                          if (hid !== currentId && !trayIds.has(hid)) {
+                              rewoundTrackId = hid;
+                              history.splice(i, 1);
+                              fromPlaybackHistory = true;
+                              break;
+                          }
+                      }
+                  }
+
+                  if (rewoundTrackId) {
+                      // Only insert current track as bridge when rewinding into played history
+                      if (fromPlaybackHistory && currentId && !trayIds.has(currentId)) {
+                          const curTrack = state.latestCurrentTrack;
+                          const curCached = state.trackMetadataCache?.[currentId];
+                          state.playlist.unshift({
+                              trackId: currentId,
+                              albumCover: curTrack?.albumCover || curCached?.albumCover || '/images/albumcover.png',
+                              directionKey: null,
+                              title: curTrack?.title || curCached?.title || '',
+                              artist: curTrack?.artist || curCached?.artist || '',
+                              album: curTrack?.album || curCached?.album || '',
+                              folderLabel: '',
+                              addedAt: Date.now()
+                          });
+                          deckLog2.info(`⏪ Shift+Tab: included current track ${currentId.substring(0, 8)} as bridge (rewinding into played history)`);
+                      }
+
+                      const cached = state.trackMetadataCache?.[rewoundTrackId];
+                      deckLog2.info(`⏪ Shift+Tab: recovering ${rewoundTrackId.substring(0, 8)} (${fromPlaybackHistory ? 'played' : 'shifted'})`);
+                      state.playlist.unshift({
+                          trackId: rewoundTrackId,
+                          albumCover: cached?.albumCover || '/images/albumcover.png',
+                          directionKey: null,
+                          title: cached?.title || '',
+                          artist: cached?.artist || '',
+                          album: cached?.album || '',
+                          folderLabel: '',
+                          addedAt: Date.now()
+                      });
+
+                      if (typeof window.renderPlaylistTray === 'function') {
+                          window.renderPlaylistTray();
+                      }
+                      if (typeof window.sendNextTrack === 'function') {
+                          window.sendNextTrack(rewoundTrackId, null, 'user');
+                      }
+                  } else {
+                      deckLog2.info('⏪ Shift+Tab: no more history to rewind');
+                  }
+              } else {
+                  // Tab: drop the head, stash in history, advance the tray
+                  if (typeof window.popPlaylistHead === 'function' && typeof window.playlistHasItems === 'function' && window.playlistHasItems()) {
+                      const popped = window.popPlaylistHead();
+                      if (popped) {
+                          deckLog2.info(`🎵 Tab: dropped tray head ${popped.trackId.substring(0, 8)}`);
+                          // Stash in tray shift history (never-played, recoverable via Shift+Tab)
+                          if (!state._trayShiftHistory) state._trayShiftHistory = [];
+                          if (!state._trayShiftHistory.includes(popped.trackId)) {
+                              state._trayShiftHistory.push(popped.trackId);
+                          }
+                          // Cache metadata for hydration on Shift+Tab
+                          if (!state.trackMetadataCache) state.trackMetadataCache = {};
+                          state.trackMetadataCache[popped.trackId] = {
+                              title: popped.title,
+                              artist: popped.artist,
+                              album: popped.album,
+                              albumCover: popped.albumCover
+                          };
+                          // If the new head is the current track, auto-skip it
+                          let newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
+                          const currentId = state.latestCurrentTrack?.identifier;
+                          if (newHead && currentId && newHead.trackId === currentId) {
+                              deckLog2.info(`🎵 Tab: auto-skipping current track ${currentId.substring(0, 8)} at head`);
+                              const skipped = window.popPlaylistHead();
+                              if (skipped && typeof window.renderPlaylistTray === 'function') {
+                                  window.renderPlaylistTray();
+                              }
+                              newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
+                          }
+                          if (newHead && typeof window.sendNextTrack === 'function') {
+                              window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+                          }
                       }
                   }
               }
@@ -2647,10 +2799,14 @@ if (typeof window !== 'undefined') {
       card.dataset.trackTitle = selectedTrack?.title || '';
       card.dataset.trackArtist = selectedTrack?.artist || '';
       card.dataset.trackAlbum = selectedTrack?.album || '';
+      const trackDur = selectedTrack?.duration || selectedTrack?.length;
+      card.dataset.trackDuration = Number.isFinite(trackDur) ? String(trackDur) : '';
 
       card.addEventListener('mouseenter', () => {
           if (typeof window.showTrackTooltip === 'function') {
-              window.showTrackTooltip(card.dataset.trackTitle, card.dataset.trackArtist, card.dataset.trackAlbum);
+              const d = parseFloat(card.dataset.trackDuration);
+              const ds = Number.isFinite(d) ? `${Math.floor(d / 60)}:${String(Math.floor(d % 60)).padStart(2, '0')}` : '';
+              window.showTrackTooltip(card.dataset.trackTitle, card.dataset.trackArtist, card.dataset.trackAlbum, ds);
           }
       });
       card.addEventListener('mouseleave', () => {
@@ -3087,9 +3243,8 @@ if (typeof window !== 'undefined') {
       }
 
       const performPromotion = () => {
-          clearSelection('deck_render');
-          setSelection(primaryTrack.identifier, 'server', canonicalDirectionKey);
-          state.stackIndex = 0;
+          // Don't overwrite selection or stackIndex — they were set immediately
+          // on navigation, and the user may have cycled the stack since then.
           state.skipTrayDemotionForTrack = null;
           state.pendingSnapshotTrackId = primaryTrack.identifier;
 
@@ -3124,6 +3279,15 @@ if (typeof window !== 'undefined') {
                   explorerSignature: state.lastDirectionSignature
               });
           }
+      };
+
+      // Set selection immediately so Enter works even during animation
+      clearSelection('deck_render');
+      setSelection(primaryTrack.identifier, 'user', canonicalDirectionKey);
+      state.latestExplorerData.nextTrack = {
+          directionKey: canonicalDirectionKey,
+          direction: direction.direction,
+          track: primaryTrack
       };
 
       // Pack up stack cards, then rotate existing center out, then promote new one

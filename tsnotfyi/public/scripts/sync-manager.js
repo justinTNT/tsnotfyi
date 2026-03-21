@@ -5,7 +5,7 @@ import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEn
 import { setDeckStaleFlag } from './deck-state.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
-import { startAudioHealthMonitoring, updateConnectionHealthUI } from './audio-manager.js';
+import { startAudioHealthMonitoring, updateConnectionHealthUI, getBufferDelaySecs } from './audio-manager.js';
 import { getPlaylistNext, popPlaylistHead, playlistHasItems } from './playlist-tray.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
@@ -164,7 +164,8 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
                 direction: dirToSend,
                 source,
                 fingerprint: state.streamFingerprint,
-                sessionId: state.sessionId
+                sessionId: state.sessionId,
+                clientBufferSecs: getBufferDelaySecs()
             })
         });
 

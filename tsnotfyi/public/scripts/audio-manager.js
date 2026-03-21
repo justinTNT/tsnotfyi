@@ -189,7 +189,8 @@ async function fetchAndPump(streamUrl) {
       throw new Error(`Stream fetch failed: ${response.status}`);
     }
     const reader = response.body.getReader();
-    log.info('Fetch pump started');
+    const pumpStartedAt = Date.now();
+    log.info(`Fetch pump started (streamUrl: ${streamUrl}, sessionId: ${state.sessionId || '?'})`);
 
     while (true) {
       const readStart = Date.now();
@@ -210,6 +211,7 @@ async function fetchAndPump(streamUrl) {
       // Strip 44-byte WAV header from first chunk
       if (isFirstChunk) {
         isFirstChunk = false;
+        log.info(`First audio chunk received: ${value.byteLength} bytes after ${Date.now() - pumpStartedAt}ms`);
         if (pcmBytes.byteLength > 44) {
           pcmBytes = pcmBytes.subarray(44);
         } else {
@@ -476,7 +478,8 @@ function handlePipelineEvent(msg) {
 
     case 'ready': {
       // Same as 'playing' handler
-      log.info('Audio pipeline ready');
+      const bufferAtReady = getBufferDelaySecs();
+      log.info(`Audio pipeline ready (buffer: ${bufferAtReady.toFixed(1)}s, sessionId: ${state.sessionId || '?'})`);
       clearAudioLoadPending('playing');
       audioHealth.bufferingStarted = null;
       audioHealth.lastTimeUpdate = Date.now();

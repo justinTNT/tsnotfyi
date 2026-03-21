@@ -102,7 +102,7 @@ class AdvancedAudioMixer {
     this.engine.bytesPerSecond = this.sampleRate * this.channels * 2;
     this.engine.tickMs = 200; // 5 ticks/sec nominal — actual pacing is clock-based, not interval-based
     this.engine.chunkSize = Math.floor(this.engine.bytesPerSecond * this.engine.tickMs / 1000);
-    this.engine.aheadLimitMs = 8000; // max real-time lead over playback clock (burst ceiling)
+    this.engine.aheadLimitMs = 12000; // max real-time lead over playback clock (burst ceiling)
 
     console.log(`📊 Streaming PCM: ${this.engine.chunkSize} bytes/chunk every ${this.engine.tickMs}ms (${this.sampleRate}Hz ${this.channels}ch 16-bit, ${Math.round(this.engine.bytesPerSecond / 1000)}kB/s)`);
   }
@@ -494,7 +494,19 @@ class AdvancedAudioMixer {
 
       if (aheadMs < this.engine.aheadLimitMs) {
         // Under the ceiling — send a chunk now
+        if (aheadMs < -5000 && Math.random() < 0.01) {
+          console.warn(`⚠️ Stream clock drift: aheadMs=${aheadMs.toFixed(0)}, bytesSent=${this.engine.bytesSent}, bytesOwed=${bytesOwed}, elapsed=${elapsed}ms`);
+        }
+        const bytesBefore = this.engine.bytesSent;
         this.streamTick();
+
+        // Safety: if streamTick didn't advance bytesSent, don't burst —
+        // prevents tight spin loop when buffer is empty or chunk is null
+        if (this.engine.bytesSent === bytesBefore) {
+          this.engine.streamTimer = setTimeout(scheduleNext, this.engine.tickMs);
+          return;
+        }
+
         // If still under ceiling, schedule immediately (burst); otherwise wait
         const newAheadMs = ((this.engine.bytesSent - bytesOwed) / this.engine.bytesPerSecond) * 1000;
         this.engine.streamTimer = setTimeout(scheduleNext, newAheadMs >= this.engine.aheadLimitMs ? this.engine.tickMs : 0);
@@ -591,7 +603,7 @@ class AdvancedAudioMixer {
        console.warn(`⏳ Waiting for next track buffer! Only ${estimatedSequenceSeconds.toFixed(1)}s of PCM bytes left in current track.`);
     }
 
-    if (shouldStartCrossfade) {
+    if (shouldStartCrossfade && !this.isConsecutiveFolderTrack()) {
       console.log(`🔄 Starting crossfade with ${estimatedSequenceSeconds.toFixed(1)}s remaining (lead time: ${crossfadeLeadTime}s)`);
       this.startCrossfade();
     }
@@ -622,6 +634,31 @@ class AdvancedAudioMixer {
     if (chunk && chunk.length > 0) {
       this.engine.bytesSent = (this.engine.bytesSent || 0) + chunk.length;
       this.onData(chunk);
+    }
+
+    // Periodic stream health log (every ~30s)
+    const now = Date.now();
+    if (!this._lastStreamHealthLog || (now - this._lastStreamHealthLog) > 30000) {
+      this._lastStreamHealthLog = now;
+      const elapsed = now - (this.engine.streamClockStart || now);
+      const bytesOwed = Math.floor((elapsed / 1000) * this.engine.bytesPerSecond);
+      const ahead = (this.engine.bytesSent || 0) - bytesOwed;
+      const aheadSecs = ahead / this.engine.bytesPerSecond;
+      const bufferPosition = this.engine.currentTrack.position || 0;
+      const bufferTotal = this.engine.currentTrack.buffer?.length || 0;
+      const bufferRemainingSecs = (bufferTotal - bufferPosition) / this.engine.bytesPerSecond;
+      console.log(JSON.stringify({
+        _type: 'stream_health',
+        ts: new Date().toISOString(),
+        elapsedMs: elapsed,
+        bytesSent: this.engine.bytesSent,
+        bytesOwed,
+        aheadSecs: +aheadSecs.toFixed(1),
+        bufferPositionPct: bufferTotal > 0 ? +((bufferPosition / bufferTotal) * 100).toFixed(1) : 0,
+        bufferRemainingSecs: +bufferRemainingSecs.toFixed(1),
+        clientBufferSecs: this.clientBufferSecs ?? null,
+        isCrossfading: this.engine.isCrossfading
+      }));
     }
   }
 
@@ -690,6 +727,25 @@ class AdvancedAudioMixer {
   // Estimate remaining playback time
   estimateRemainingTime(remainingBytes) {
     return remainingBytes / this.engine.bytesPerSecond;
+  }
+
+  // Check if current and next tracks are consecutive in the same folder (album continuity)
+  isConsecutiveFolderTrack() {
+    const current = this.trackMetadata.current;
+    const next = this.trackMetadata.next;
+    if (!current?.path || !next?.path) return false;
+
+    const currentFolder = current.path.replace(/\/[^/]+$/, '');
+    const nextFolder = next.path.replace(/\/[^/]+$/, '');
+    if (currentFolder !== nextFolder) return false;
+
+    const currentTrackNum = parseInt(current.track);
+    const nextTrackNum = parseInt(next.track);
+    if (!Number.isFinite(currentTrackNum) || !Number.isFinite(nextTrackNum)) return false;
+
+    // Same disc (or both null) and consecutive track numbers
+    const samedisc = (current.disc || 1) === (next.disc || 1);
+    return samedisc && nextTrackNum === currentTrackNum + 1;
   }
 
   // Start crossfade transition
@@ -948,19 +1004,38 @@ class AdvancedAudioMixer {
       crossfadeLeadTime: this.engine.nextTrack.crossfadeLeadTime
     };
 
-    // Capture buffer-ahead BEFORE resetting clocks
+    // Capture buffer-ahead BEFORE resetting clocks.
+    // Use the smaller of server estimate and client-reported buffer depth —
+    // prevents the broadcast from arriving after the audio transition.
     const preResetElapsed = Date.now() - (this.engine.streamClockStart || Date.now());
     const preResetBytesOwed = Math.floor((preResetElapsed / 1000) * this.engine.bytesPerSecond);
     const preResetAheadBytes = (this.engine.bytesSent || 0) - preResetBytesOwed;
-    const bufferAheadMs = Math.max(0, (preResetAheadBytes / this.engine.bytesPerSecond) * 1000);
+    const serverAheadMs = Math.max(0, (preResetAheadBytes / this.engine.bytesPerSecond) * 1000);
+    const clientAheadMs = Number.isFinite(this.clientBufferSecs) ? this.clientBufferSecs * 1000 : Infinity;
+    const bufferAheadMs = Math.min(serverAheadMs, clientAheadMs);
 
     // Reset streaming clocks for the new track.
-    // bytesSent must reflect how far into the buffer we already are (from crossfade reads),
-    // otherwise the burst scheduler sees 0 sent and races through the remaining buffer.
+    // Set bytesSent to match the ahead limit so the scheduler starts in steady-state pacing,
+    // not burst mode. The client already has buffered audio from the crossfade overlap.
     this.engine.streamingStartTime = Date.now();
     this.engine.streamClockStart = Date.now();
-    this.engine.bytesSent = this.engine.currentTrack.position || 0;
-    console.log(`🕐 Reset streaming timer for new track (${this.engine.currentTrack.estimatedDuration?.toFixed(1)}s duration, ${this.engine.chunkSize} bytes/chunk)`);
+    this.engine.bytesSent = Math.floor((this.engine.aheadLimitMs / 1000) * this.engine.bytesPerSecond);
+    console.log(JSON.stringify({
+      _type: 'stream_clock_reset',
+      ts: new Date().toISOString(),
+      trackDuration: this.engine.currentTrack.estimatedDuration,
+      bufferLength: this.engine.currentTrack.buffer?.length || 0,
+      positionCarried: this.engine.currentTrack.position,
+      bytesSentReset: this.engine.bytesSent,
+      preResetElapsedMs: preResetElapsed,
+      preResetBytesSent: this.engine.bytesSent,
+      preResetBytesOwed: preResetBytesOwed,
+      serverAheadMs: Math.round(serverAheadMs),
+      clientAheadMs: clientAheadMs === Infinity ? 'no-report' : Math.round(clientAheadMs),
+      clientBufferSecs: this.clientBufferSecs,
+      chunkSize: this.engine.chunkSize,
+      bytesPerSecond: this.engine.bytesPerSecond
+    }));
 
     // Clear next track
     this.engine.nextTrack = {
@@ -974,15 +1049,20 @@ class AdvancedAudioMixer {
     this.engine.crossfadePosition = 0;
     this.engine.crossfadeStartTime = null;
     this.engine.tempoAdjustment = 1.0;
+    console.log(JSON.stringify({
+      _type: 'metadata_promotion',
+      ts: new Date().toISOString(),
+      fromNext: this.trackMetadata.next ? { id: this.trackMetadata.next.identifier, title: this.trackMetadata.next.title } : null,
+      previousCurrent: this.trackMetadata.current ? { id: this.trackMetadata.current.identifier, title: this.trackMetadata.current.title } : null
+    }));
     this.trackMetadata.current = this.trackMetadata.next || null;
     this.trackMetadata.next = null;
 
-    // Fire onTrackStart immediately for internal state management.
-    // The buffer-ahead amount is passed so the mixer can defer *external* metadata
-    // (heartbeats, SSE broadcasts) while handling internal state (currentTrack promotion,
-    // nextTrack clearing, history) right away.
+    // Fire onTrackStart immediately — no server-side deferral.
+    // The client uses sentinels (in the audio stream) as the source of truth
+    // for track changes, with a buffer-aware heartbeat fallback.
     if (this.onTrackStart) {
-      this.onTrackStart('crossfade_complete', { bufferAheadMs });
+      this.onTrackStart('crossfade_complete');
     }
   }
 
@@ -1062,7 +1142,9 @@ class AdvancedAudioMixer {
       title: metadata.title || null,
       artist: metadata.artist || null,
       album: metadata.album || null,
-      path: metadata.path || null
+      path: metadata.path || null,
+      track: metadata.track || metadata.trackNumber || null,
+      disc: metadata.disc || metadata.discNumber || null
     };
   }
 
