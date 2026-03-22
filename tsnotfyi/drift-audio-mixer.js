@@ -72,6 +72,7 @@ class DriftAudioMixer {
     this.pendingUserOverrideGeneration = null; // Generation id for the in-flight manual override
     this.manualSelectionGeneration = 0; // Bumps per-track whenever the user requests an override
     this.autoRecoveryTimer = null; // Timer handle for auto requeue after failure
+    this.deadVolumes = new Set(); // Volume paths that are offline (ENOENT from FFmpeg)
 
     // Broadcast caching for lean event comms
     this.lastHeartbeatPayload = null;
@@ -953,6 +954,13 @@ class DriftAudioMixer {
       return;
     }
 
+    // Cap consecutive auto-recovery attempts
+    this._autoRecoveryAttempts = (this._autoRecoveryAttempts || 0) + 1;
+    if (this._autoRecoveryAttempts > 10) {
+      console.warn('⛔ Auto-recovery exhausted (10 consecutive failures) — stopping');
+      return;
+    }
+
     this.autoRecoveryTimer = setTimeout(async () => {
       this.autoRecoveryTimer = null;
 
@@ -967,6 +975,7 @@ class DriftAudioMixer {
         });
 
         if (this.nextTrack) {
+          this._autoRecoveryAttempts = 0; // Reset on success
           this.broadcastSelectionEvent('selection_auto_requeued', {
             status: 'prepared',
             trackId: this.nextTrack.identifier,
@@ -1147,8 +1156,23 @@ class DriftAudioMixer {
           hydratedNextTrack.transitionReason = preparationReason;
         }
 
+        // Check if track is on a dead volume
+        const trackPath = hydratedNextTrack.path || '';
+        const trackVolume = trackPath.match(/^(\/Volumes\/[^/]+)/)?.[1];
+        if (trackVolume && this.deadVolumes.has(trackVolume)) {
+          console.warn(`🔌 Skipping ${hydratedNextTrack.title} — volume ${trackVolume} is offline`);
+          throw Object.assign(new Error(`Volume offline: ${trackVolume}`), { code: 'ENOENT', ffmpegDetail: 'file_not_found' });
+        }
+
+        // Check if track has exceeded retry cap
+        const priorAttempts = this.state.failedTrackAttempts.get(hydratedNextTrack.identifier) || 0;
+        if (priorAttempts >= 3) {
+          console.warn(`⛔ Skipping ${hydratedNextTrack.title} — failed ${priorAttempts} times previously`);
+          throw new Error(`Track permanently failed after ${priorAttempts} attempts`);
+        }
+
         console.log(`🎯 Preparing next track for crossfade (${preparationReason}): ${hydratedNextTrack.title}`);
-        console.log(`🔧 DEBUG: Next track path: ${hydratedNextTrack.path}`);
+        console.log(`🔧 DEBUG: Next track path: ${trackPath}`);
         console.log(`🔧 DEBUG: Current this.nextTrack: ${this.nextTrack?.title || 'null'}`);
 
         if (!forceRefresh && this.nextTrack && this.nextTrack.identifier === hydratedNextTrack.identifier) {
@@ -1243,8 +1267,20 @@ class DriftAudioMixer {
         }
         console.log(`✅ Next track prepared successfully: ${hydratedNextTrack.title}`);
       } catch (error) {
-        console.error('❌ Failed to prepare next track:', error);
-        console.error('❌ Error details:', error.stack);
+        console.error('❌ Failed to prepare next track:', error.message);
+
+        // Detect dead volume (file not found → volume offline)
+        if (error.code === 'ENOENT' || error.ffmpegDetail === 'file_not_found') {
+          const trackPath = hydratedNextTrack?.path || '';
+          const volumeMatch = trackPath.match(/^(\/Volumes\/[^/]+)/);
+          if (volumeMatch) {
+            const volume = volumeMatch[1];
+            if (!this.deadVolumes.has(volume)) {
+              this.deadVolumes.add(volume);
+              console.warn(`🔌 Volume offline: ${volume} — skipping all tracks from this volume`);
+            }
+          }
+        }
 
         // Track failures to skip persistently broken tracks
         const failedId = hydratedNextTrack?.identifier || overrideTrackId;
@@ -1252,6 +1288,11 @@ class DriftAudioMixer {
           const attempts = (this.state.failedTrackAttempts.get(failedId) || 0) + 1;
           this.state.failedTrackAttempts.set(failedId, attempts);
           console.warn(`⚠️ Track ${failedId.substring(0,8)} failed (attempt ${attempts}/3)`);
+
+          // Hard cap: don't retry this track again
+          if (attempts >= 3) {
+            console.warn(`⛔ Track ${failedId.substring(0,8)} permanently failed after ${attempts} attempts`);
+          }
         }
 
         if (overrideTrackId) {

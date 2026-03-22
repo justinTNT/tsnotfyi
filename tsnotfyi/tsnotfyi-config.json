@@ -31,5 +31,13 @@
     "stackSize": 12,
     "randomBackfill": 4,
     "comment": "stackSize = total tracks per direction. randomBackfill = how many random picks. Difference = strategic picks from 4-pile diversity sort"
+  },
+  "api": {
+    "port": 3003,
+    "url": "http://localhost:3003"
+  },
+  "audioServer": {
+    "port": 3002,
+    "url": "http://localhost:3002"
   }
 }

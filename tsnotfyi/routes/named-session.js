@@ -21,7 +21,7 @@ function isReservedName(name) {
     || name.startsWith('playlist/') || name.includes('/');
 }
 
-function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, registerSession, createSession, calculateStackDuration, db }) {
+function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, registerSession, createSession, calculateStackDuration, db, audioClient }) {
 
   // /:sessionName/forget — delete named session from DB and memory
   app.get('/:sessionName/forget', async (req, res, next) => {
@@ -31,6 +31,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     try {
       const session = getSessionById(sessionName);
       if (session) {
+        try { await audioClient.destroySession(sessionName); } catch (e) { /* ignore */ }
         unregisterSession(sessionName);
         console.log(`🗑️ Unregistered named session: ${sessionName}`);
       }
@@ -51,8 +52,8 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     try {
       const session = getSessionById(sessionName);
       if (session) {
-        session.mixer.resetStack();
-        session.mixer.state.ephemeral = false;
+        await audioClient.resetStack(sessionName);
+        await audioClient.updateMetadata(sessionName, { ephemeral: false });
         console.log(`🔄 Reset named session: ${sessionName}`);
       }
       res.json({ message: `Session ${sessionName} reset` });
@@ -73,12 +74,12 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      const stackState = session.mixer.getStackState();
+      const stackState = await audioClient.getStackState(sessionName);
       res.json({
         ...stackState,
         shareUrl: `/${sessionName}`,
-        trackCount: stackState.stack.length,
-        duration: calculateStackDuration(stackState.stack)
+        trackCount: stackState.stack?.length || 0,
+        duration: calculateStackDuration(stackState.stack || [])
       });
     } catch (error) {
       console.error('Error exporting session:', error);
@@ -97,7 +98,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      const state = session.mixer.getStackState();
+      const state = await audioClient.getStackState(sessionName);
       await db.saveNamedSession(sessionName, state);
       console.log(`💾 Saved named session: ${sessionName}`);
       res.json({ message: `Session ${sessionName} saved` });
@@ -118,7 +119,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
     }
   });
 
-  // /:sessionName/name — rename current session (give a name to an ephemeral session)
+  // /:sessionName/name — rename current session
   app.post('/:sessionName/name', async (req, res, next) => {
     const { sessionName } = req.params;
     if (isReservedName(sessionName)) return next();
@@ -134,16 +135,20 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         return res.status(404).json({ error: 'Current session not found' });
       }
 
-      // Unregister from old ID, re-register under new name
+      // Update mixer metadata on Audio server
+      await audioClient.updateMetadata(currentSessionId, {
+        sessionId: sessionName,
+        sessionType: 'named',
+        sessionName: sessionName
+      });
+
+      // Re-register under new name
       unregisterSession(currentSessionId);
       session.sessionId = sessionName;
-      session.mixer.state.sessionId = sessionName;
-      session.mixer.state.sessionType = 'named';
-      session.mixer.state.sessionName = sessionName;
       registerSession(sessionName, session);
 
       // Auto-save to DB
-      const state = session.mixer.getStackState();
+      const state = await audioClient.getStackState(sessionName);
       await db.saveNamedSession(sessionName, state);
 
       console.log(`📛 Renamed session ${currentSessionId} → ${sessionName}`);
@@ -173,7 +178,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      await session.mixer.jumpToStackPosition(index, position);
+      await audioClient.jumpToStackPosition(sessionName, index, position);
       console.log(`🎯 Named session ${sessionName} jumped to position ${index}/${position}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
@@ -200,7 +205,7 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         return res.status(404).json({ error: 'Session not found' });
       }
 
-      await session.mixer.jumpToStackPosition(index, 0);
+      await audioClient.jumpToStackPosition(sessionName, index, 0);
       console.log(`🎯 Named session ${sessionName} jumped to position ${index}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
@@ -229,28 +234,18 @@ function setupNamedSessionRoutes(app, { getSessionById, unregisterSession, regis
         // Try to restore from DB
         const savedState = await db.loadNamedSession(sessionName);
         if (savedState) {
-          session.mixer.loadStackState(savedState);
+          await audioClient.loadStackState(sessionName, savedState);
           console.log(`📚 Restored named session from DB: ${sessionName}`);
         } else {
-          session.mixer.initializeSession('named', sessionName);
+          await audioClient.initializeSession(sessionName, 'named', sessionName);
           console.log(`🆕 Created new named session: ${sessionName}`);
         }
 
         registerSession(sessionName, session);
 
-        // Auto-save on disconnect: when all clients leave, save state to DB
-        const originalOnIdle = session.mixer.onIdle;
-        session.mixer.onIdle = async () => {
-          try {
-            const state = session.mixer.getStackState();
-            await db.saveNamedSession(sessionName, state);
-            console.log(`💾 Auto-saved named session on disconnect: ${sessionName}`);
-          } catch (err) {
-            console.error(`Failed to auto-save session ${sessionName}:`, err);
-          }
-          // Don't unregister named sessions on idle — they persist
-          if (originalOnIdle) originalOnIdle();
-        };
+        // Set up auto-save on disconnect via callback URL
+        const webUrl = `http://localhost:${app.get('port') || 3001}`;
+        await audioClient.setOnIdle(sessionName, `${webUrl}/internal/session-idle/${sessionName}`);
       } else {
         console.log(`📚 Resuming existing named session: ${sessionName}`);
       }

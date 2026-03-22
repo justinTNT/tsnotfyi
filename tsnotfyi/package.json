@@ -5,6 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
+    "start:split": "./start-split.sh",
+    "start:api": "node api-server.js",
+    "start:audio": "node audio-server.js",
     "dev": "npm start",
     "dev:watch": "nodemon --watch server.js --watch drift-audio-mixer.js --watch routes --watch services --watch utils --watch public/scripts --ext js,json --exec \"node server.js\"",
     "logs:tail": "node scripts/logs.js tail",

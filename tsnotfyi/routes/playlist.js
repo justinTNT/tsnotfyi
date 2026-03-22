@@ -7,7 +7,6 @@ const path = require('path');
 function reverseDirectionName(directionName) {
   if (!directionName) return null;
 
-  // Handle PCA directions
   if (directionName.includes('_positive')) {
     return directionName.replace('_positive', '_negative');
   }
@@ -15,22 +14,14 @@ function reverseDirectionName(directionName) {
     return directionName.replace('_negative', '_positive');
   }
 
-  // Handle semantic directions
   const reverseMap = {
-    'faster': 'slower',
-    'slower': 'faster',
-    'brighter': 'darker',
-    'darker': 'brighter',
-    'more_energetic': 'calmer',
-    'calmer': 'more_energetic',
-    'more_danceable': 'less_danceable',
-    'less_danceable': 'more_danceable',
-    'more_tonal': 'more_atonal',
-    'more_atonal': 'more_tonal',
-    'more_complex': 'simpler',
-    'simpler': 'more_complex',
-    'more_punchy': 'smoother',
-    'smoother': 'more_punchy'
+    'faster': 'slower', 'slower': 'faster',
+    'brighter': 'darker', 'darker': 'brighter',
+    'more_energetic': 'calmer', 'calmer': 'more_energetic',
+    'more_danceable': 'less_danceable', 'less_danceable': 'more_danceable',
+    'more_tonal': 'more_atonal', 'more_atonal': 'more_tonal',
+    'more_complex': 'simpler', 'simpler': 'more_complex',
+    'more_punchy': 'smoother', 'smoother': 'more_punchy'
   };
 
   return reverseMap[directionName] || directionName;
@@ -38,62 +29,30 @@ function reverseDirectionName(directionName) {
 
 // ==================== PLAYLIST TRANSFORMATION FUNCTIONS ====================
 
-// Generate similar playlist (different tracks, same directions)
 async function generateSimilarPlaylist(originalTracks) {
-  const similarStack = [];
-
-  for (const track of originalTracks) {
-    // TODO: Implement actual similarity search
-    // For now, just return the same tracks (placeholder)
-    similarStack.push({
-      identifier: track.identifier, // Would be replaced with similar track
-      direction: track.direction,
-      scope: track.scope || 'magnify'
-    });
-  }
-
-  console.log(`🔄 Generated similar playlist: ${similarStack.length} tracks (placeholder)`);
-  return similarStack;
+  return originalTracks.map(track => ({
+    identifier: track.identifier,
+    direction: track.direction,
+    scope: track.scope || 'magnify'
+  }));
 }
 
-// Generate reverse playlist (same tracks, opposite directions)
 function generateReversePlaylist(originalTracks) {
-  const reverseStack = [];
-
-  // Reverse the track order
   const reversedTracks = [...originalTracks].reverse();
-
-  for (let i = 0; i < reversedTracks.length; i++) {
-    const track = reversedTracks[i];
-    let reverseDirection = null;
-
-    if (track.direction) {
-      // Reverse the direction
-      reverseDirection = reverseDirectionName(track.direction);
-    }
-
-    reverseStack.push({
-      identifier: track.identifier,
-      direction: i === 0 ? null : reverseDirection, // First track has no direction
-      scope: track.scope || 'magnify'
-    });
-  }
-
-  console.log(`🔄 Generated reverse playlist: ${reverseStack.length} tracks`);
-  return reverseStack;
+  return reversedTracks.map((track, i) => ({
+    identifier: track.identifier,
+    direction: i === 0 ? null : reverseDirectionName(track.direction),
+    scope: track.scope || 'magnify'
+  }));
 }
 
-// Generate reverse similar playlist (different tracks, opposite directions)
 async function generateReverseSimilarPlaylist(originalTracks) {
-  // First generate reverse, then make similar
   const reverseStack = generateReversePlaylist(originalTracks);
   return await generateSimilarPlaylist(reverseStack);
 }
 
-// Generate scaled playlist (same pattern, different density)
 async function generateScaledPlaylist(originalTracks, scaleFactor) {
   if (scaleFactor === 1.0) {
-    // No scaling needed
     return originalTracks.map(track => ({
       identifier: track.identifier,
       direction: track.direction,
@@ -104,41 +63,22 @@ async function generateScaledPlaylist(originalTracks, scaleFactor) {
   const scaledStack = [];
 
   if (scaleFactor > 1.0) {
-    // Scale up: Add intermediate tracks between existing ones
     for (let i = 0; i < originalTracks.length; i++) {
       const track = originalTracks[i];
+      scaledStack.push({ identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify' });
 
-      // Add original track
-      scaledStack.push({
-        identifier: track.identifier,
-        direction: track.direction,
-        scope: track.scope || 'magnify'
-      });
-
-      // Add intermediate tracks (except after last track)
       if (i < originalTracks.length - 1) {
         const intermediateCount = Math.floor(scaleFactor) - 1;
         for (let j = 0; j < intermediateCount; j++) {
-          // TODO: Generate intermediate tracks with similar characteristics
-          // For now, just duplicate the track (placeholder)
-          scaledStack.push({
-            identifier: track.identifier, // Would be similar track
-            direction: track.direction,
-            scope: track.scope || 'magnify'
-          });
+          scaledStack.push({ identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify' });
         }
       }
     }
   } else {
-    // Scale down: Skip tracks to compress the journey
     const skipRate = Math.ceil(1 / scaleFactor);
     for (let i = 0; i < originalTracks.length; i += skipRate) {
       const track = originalTracks[i];
-      scaledStack.push({
-        identifier: track.identifier,
-        direction: track.direction,
-        scope: track.scope || 'magnify'
-      });
+      scaledStack.push({ identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify' });
     }
   }
 
@@ -148,7 +88,7 @@ async function generateScaledPlaylist(originalTracks, scaleFactor) {
 
 // ==================== ROUTE SETUP ====================
 
-function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerSession }) {
+function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerSession, audioClient }) {
 
   // Playlist session: /playlist/title
   app.get('/playlist/:title', async (req, res) => {
@@ -165,20 +105,13 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
       let session = getSessionById(sessionId);
 
       if (!session) {
-        console.log(`Creating new playlist session: ${sessionId}`);
-        session = await createSession({
-          sessionId,
-          sessionType: 'playlist',
-          sessionName: playlistTitle
-        });
+        session = await createSession({ sessionId, sessionType: 'playlist', sessionName: playlistTitle });
 
         const playlistStack = playlistData.tracks.map(track => ({
-          identifier: track.identifier,
-          direction: track.direction,
-          scope: track.scope || 'magnify'
+          identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify'
         }));
 
-        session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+        await audioClient.initializeSession(sessionId, 'playlist', playlistTitle, playlistStack);
         console.log(`📚 Loaded playlist: ${playlistTitle} (${playlistStack.length} tracks)`);
 
         registerSession(sessionId, session);
@@ -193,7 +126,7 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
     }
   });
 
-  // Playlist session with position navigation: /playlist/title/4/20
+  // Playlist session with position navigation
   app.get('/playlist/:title/:stackIndex/:positionSeconds', async (req, res) => {
     const { title, stackIndex, positionSeconds } = req.params;
     const playlistTitle = decodeURIComponent(title);
@@ -210,27 +143,19 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
 
       if (!session) {
         const playlistData = await db.getPlaylistByName(playlistTitle);
-        if (!playlistData) {
-          return res.status(404).json({ error: 'Playlist not found' });
-        }
+        if (!playlistData) return res.status(404).json({ error: 'Playlist not found' });
 
-        session = await createSession({
-          sessionId,
-          sessionType: 'playlist',
-          sessionName: playlistTitle
-        });
+        session = await createSession({ sessionId, sessionType: 'playlist', sessionName: playlistTitle });
 
         const playlistStack = playlistData.tracks.map(track => ({
-          identifier: track.identifier,
-          direction: track.direction,
-          scope: track.scope || 'magnify'
+          identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify'
         }));
 
-        session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+        await audioClient.initializeSession(sessionId, 'playlist', playlistTitle, playlistStack);
         registerSession(sessionId, session);
       }
 
-      await session.mixer.jumpToStackPosition(index, position);
+      await audioClient.jumpToStackPosition(sessionId, index, position);
 
       console.log(`🎯 Playlist ${playlistTitle} jumped to position ${index}/${position}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
@@ -240,7 +165,7 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
     }
   });
 
-  // Playlist session with stack index: /playlist/title/4
+  // Playlist session with stack index
   app.get('/playlist/:title/:stackIndex', async (req, res) => {
     const { title, stackIndex } = req.params;
     const playlistTitle = decodeURIComponent(title);
@@ -256,27 +181,19 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
 
       if (!session) {
         const playlistData = await db.getPlaylistByName(playlistTitle);
-        if (!playlistData) {
-          return res.status(404).json({ error: 'Playlist not found' });
-        }
+        if (!playlistData) return res.status(404).json({ error: 'Playlist not found' });
 
-        session = await createSession({
-          sessionId,
-          sessionType: 'playlist',
-          sessionName: playlistTitle
-        });
+        session = await createSession({ sessionId, sessionType: 'playlist', sessionName: playlistTitle });
 
         const playlistStack = playlistData.tracks.map(track => ({
-          identifier: track.identifier,
-          direction: track.direction,
-          scope: track.scope || 'magnify'
+          identifier: track.identifier, direction: track.direction, scope: track.scope || 'magnify'
         }));
 
-        session.mixer.initializeSession('playlist', playlistTitle, playlistStack);
+        await audioClient.initializeSession(sessionId, 'playlist', playlistTitle, playlistStack);
         registerSession(sessionId, session);
       }
 
-      await session.mixer.jumpToStackPosition(index, 0);
+      await audioClient.jumpToStackPosition(sessionId, index, 0);
 
       console.log(`🎯 Playlist ${playlistTitle} jumped to position ${index}`);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
@@ -288,30 +205,21 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
 
   // ==================== TRANSFORMATION ROUTES ====================
 
-  // Similar playlist: /similar/playlist_name
+  async function createTransformSession(playlistTitle, prefix, labelPrefix, stack, createSession, registerSession) {
+    const sessionId = `${prefix}_${playlistTitle}_${Date.now()}`;
+    const session = await createSession({ sessionId, sessionType: 'playlist', sessionName: `${labelPrefix} ${playlistTitle}` });
+    await audioClient.initializeSession(sessionId, 'playlist', sessionId, stack);
+    registerSession(sessionId, session);
+    return session;
+  }
+
   app.get('/similar/:playlistName', async (req, res) => {
-    const { playlistName } = req.params;
-    const playlistTitle = decodeURIComponent(playlistName);
-
+    const playlistTitle = decodeURIComponent(req.params.playlistName);
     try {
-      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
-      if (!originalPlaylist) {
-        return res.status(404).json({ error: 'Original playlist not found' });
-      }
-
-      const similarStack = await generateSimilarPlaylist(originalPlaylist.tracks);
-
-      const sessionId = `similar_${playlistTitle}_${Date.now()}`;
-      const session = await createSession({
-        sessionId,
-        sessionType: 'playlist',
-        sessionName: `Similar to ${playlistTitle}`
-      });
-
-      session.mixer.initializeSession('playlist', sessionId, similarStack);
-      registerSession(sessionId, session);
-
-      console.log(`📚 Generated similar playlist: ${similarStack.length} tracks`);
+      const original = await db.getPlaylistByName(playlistTitle);
+      if (!original) return res.status(404).json({ error: 'Original playlist not found' });
+      const stack = await generateSimilarPlaylist(original.tracks);
+      await createTransformSession(playlistTitle, 'similar', 'Similar to', stack, createSession, registerSession);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
       console.error('Error generating similar playlist:', error);
@@ -319,30 +227,13 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
     }
   });
 
-  // Reverse playlist: /reverse/playlist_name
   app.get('/reverse/:playlistName', async (req, res) => {
-    const { playlistName } = req.params;
-    const playlistTitle = decodeURIComponent(playlistName);
-
+    const playlistTitle = decodeURIComponent(req.params.playlistName);
     try {
-      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
-      if (!originalPlaylist) {
-        return res.status(404).json({ error: 'Original playlist not found' });
-      }
-
-      const reverseStack = generateReversePlaylist(originalPlaylist.tracks);
-
-      const sessionId = `reverse_${playlistTitle}_${Date.now()}`;
-      const session = await createSession({
-        sessionId,
-        sessionType: 'playlist',
-        sessionName: `Reverse of ${playlistTitle}`
-      });
-
-      session.mixer.initializeSession('playlist', sessionId, reverseStack);
-      registerSession(sessionId, session);
-
-      console.log(`📚 Generated reverse playlist: ${reverseStack.length} tracks`);
+      const original = await db.getPlaylistByName(playlistTitle);
+      if (!original) return res.status(404).json({ error: 'Original playlist not found' });
+      const stack = generateReversePlaylist(original.tracks);
+      await createTransformSession(playlistTitle, 'reverse', 'Reverse of', stack, createSession, registerSession);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
       console.error('Error generating reverse playlist:', error);
@@ -350,30 +241,13 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
     }
   });
 
-  // Reverse similar playlist: /reverse_similar/playlist_name
   app.get('/reverse_similar/:playlistName', async (req, res) => {
-    const { playlistName } = req.params;
-    const playlistTitle = decodeURIComponent(playlistName);
-
+    const playlistTitle = decodeURIComponent(req.params.playlistName);
     try {
-      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
-      if (!originalPlaylist) {
-        return res.status(404).json({ error: 'Original playlist not found' });
-      }
-
-      const reverseSimilarStack = await generateReverseSimilarPlaylist(originalPlaylist.tracks);
-
-      const sessionId = `reverse_similar_${playlistTitle}_${Date.now()}`;
-      const session = await createSession({
-        sessionId,
-        sessionType: 'playlist',
-        sessionName: `Reverse Similar to ${playlistTitle}`
-      });
-
-      session.mixer.initializeSession('playlist', sessionId, reverseSimilarStack);
-      registerSession(sessionId, session);
-
-      console.log(`📚 Generated reverse similar playlist: ${reverseSimilarStack.length} tracks`);
+      const original = await db.getPlaylistByName(playlistTitle);
+      if (!original) return res.status(404).json({ error: 'Original playlist not found' });
+      const stack = await generateReverseSimilarPlaylist(original.tracks);
+      await createTransformSession(playlistTitle, 'reverse_similar', 'Reverse Similar to', stack, createSession, registerSession);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
       console.error('Error generating reverse similar playlist:', error);
@@ -381,36 +255,19 @@ function setupPlaylistRoutes(app, { db, createSession, getSessionById, registerS
     }
   });
 
-  // Scaled playlist: /scaled/2x/playlist_name
   app.get('/scaled/:scale/:playlistName', async (req, res) => {
-    const { scale, playlistName } = req.params;
-    const playlistTitle = decodeURIComponent(playlistName);
+    const { scale } = req.params;
+    const playlistTitle = decodeURIComponent(req.params.playlistName);
 
     const scaleMatch = scale.match(/^(\d+(?:\.\d+)?)x$/);
-    if (!scaleMatch) {
-      return res.status(400).json({ error: 'Invalid scale format (use 2x, 0.5x, etc.)' });
-    }
+    if (!scaleMatch) return res.status(400).json({ error: 'Invalid scale format (use 2x, 0.5x, etc.)' });
     const scaleFactor = parseFloat(scaleMatch[1]);
 
     try {
-      const originalPlaylist = await db.getPlaylistByName(playlistTitle);
-      if (!originalPlaylist) {
-        return res.status(404).json({ error: 'Original playlist not found' });
-      }
-
-      const scaledStack = await generateScaledPlaylist(originalPlaylist.tracks, scaleFactor);
-
-      const sessionId = `scaled_${scale}_${playlistTitle}_${Date.now()}`;
-      const session = await createSession({
-        sessionId,
-        sessionType: 'playlist',
-        sessionName: `${scale} ${playlistTitle}`
-      });
-
-      session.mixer.initializeSession('playlist', sessionId, scaledStack);
-      registerSession(sessionId, session);
-
-      console.log(`📚 Generated ${scale} scaled playlist: ${scaledStack.length} tracks`);
+      const original = await db.getPlaylistByName(playlistTitle);
+      if (!original) return res.status(404).json({ error: 'Original playlist not found' });
+      const stack = await generateScaledPlaylist(original.tracks, scaleFactor);
+      await createTransformSession(playlistTitle, `scaled_${scale}`, `${scale}`, stack, createSession, registerSession);
       res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
     } catch (error) {
       console.error('Error generating scaled playlist:', error);

@@ -40,6 +40,8 @@ const LOG_DIRECTORIES = {
 const logStreams = new Map();
 // Per-restart suffix so each server start gets its own log file
 const RESTART_SUFFIX = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+// Server name prefix for log files — set via setServerName('web'|'api'|'audio')
+let serverName = 'server';
 
 function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -56,7 +58,8 @@ function getLogStream(type) {
   if (logStreams.has(streamKey)) {
     return logStreams.get(streamKey);
   }
-  const filePath = path.join(dirPath, `${type}_${dateKey}_${RESTART_SUFFIX}.log`);
+  const prefix = type === 'server' ? serverName : type;
+  const filePath = path.join(dirPath, `${prefix}_${dateKey}_${RESTART_SUFFIX}.log`);
   const stream = fs.createWriteStream(filePath, { flags: 'a' });
   logStreams.set(streamKey, stream);
   return stream;
@@ -245,8 +248,13 @@ function createLogger(channel) {
   };
 }
 
+function setServerName(name) {
+  serverName = name || 'server';
+}
+
 module.exports = {
   createLogger,
+  setServerName,
   logInfo: (channel, ...args) => logChannel('info', channel, ...args),
   logWarn: (channel, ...args) => logChannel('warn', channel, ...args),
   logError: (channel, ...args) => logChannel('error', channel, ...args),

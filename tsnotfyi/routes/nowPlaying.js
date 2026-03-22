@@ -1,61 +1,42 @@
-function normalizeTrack(track) {
-  return track || null;
-}
-
-function buildNowPlayingSessions(audioSessions = new Map(), ephemeralSessions = new Map(), { now = Date.now() } = {}) {
+async function buildNowPlayingSessions(audioSessions = new Map(), ephemeralSessions = new Map(), { now = Date.now(), audioClient } = {}) {
   const sessions = [];
 
-  const collectSessions = (collection, isEphemeral = false) => {
-    for (const [sessionId, session] of collection) {
-      const mixer = session?.mixer;
-      const currentTrack = mixer?.state?.currentTrack;
-      const clientCount = mixer?.clients instanceof Set || Array.isArray(mixer?.clients)
-        ? mixer.clients.size ?? mixer.clients.length
-        : Number(mixer?.clients) || 0;
-      if (!mixer || !currentTrack || clientCount <= 0) continue;
+  const allSessions = [
+    ...[...audioSessions.entries()].map(([id, s]) => ({ id, session: s, isEphemeral: false })),
+    ...[...ephemeralSessions.entries()].map(([id, s]) => ({ id, session: s, isEphemeral: true }))
+  ];
 
-      const durationSeconds = typeof mixer.getAdjustedTrackDuration === 'function'
-        ? Number(mixer.getAdjustedTrackDuration()) || null
-        : typeof currentTrack.length === 'number'
-          ? currentTrack.length
-          : null;
+  // Fetch state from Audio server for each session
+  for (const { id, session, isEphemeral } of allSessions) {
+    try {
+      const state = audioClient ? await audioClient.getFullState(id) : null;
+      if (!state || !state.currentTrack || state.audioClients <= 0) continue;
 
-      const durationMs = durationSeconds != null ? Math.max(Math.round(durationSeconds * 1000), 0) : null;
-      const elapsedMs = mixer.state.trackStartTime ? Math.max(now - mixer.state.trackStartTime, 0) : null;
-      const liveState = typeof mixer.getLiveStreamState === 'function'
-        ? mixer.getLiveStreamState()
-        : null;
-      const hasMismatch = liveState?.trackId && currentTrack?.identifier && liveState.trackId !== currentTrack.identifier;
+      const currentTrack = state.currentTrack;
+      const durationMs = currentTrack.length ? Math.round(currentTrack.length * 1000) : null;
+      const elapsedMs = state.trackStartTime ? Math.max(now - state.trackStartTime, 0) : null;
 
       sessions.push({
-        sessionId,
+        sessionId: id,
         md5: currentTrack.identifier || null,
         title: currentTrack.title || null,
         artist: currentTrack.artist || null,
-        nextTrack: mixer.nextTrack ? {
-          identifier: mixer.nextTrack.identifier || null,
-          title: mixer.nextTrack.title || null,
-          artist: mixer.nextTrack.artist || null,
-          direction: mixer.nextTrack.direction || null
+        nextTrack: state.nextTrack ? {
+          identifier: state.nextTrack.identifier || null,
+          title: state.nextTrack.title || null,
+          artist: state.nextTrack.artist || null,
+          direction: state.nextTrack.direction || null
         } : null,
         elapsedMs,
         durationMs,
-        clients: clientCount,
-        isEphemeral: isEphemeral || Boolean(session.isEphemeral),
-        live: liveState ? {
-          trackId: liveState.trackId,
-          title: liveState.title,
-          artist: liveState.artist,
-          startedAt: liveState.startedAt,
-          lastChunkAt: liveState.lastChunkAt
-        } : null,
-        liveMismatch: Boolean(hasMismatch)
+        clients: state.audioClients || 0,
+        isEphemeral: isEphemeral || Boolean(session.isEphemeral)
       });
+    } catch (e) {
+      // Session not on Audio server
     }
-  };
+  }
 
-  collectSessions(audioSessions, false);
-  collectSessions(ephemeralSessions, true);
   return sessions;
 }
 

@@ -1,13 +1,11 @@
 require('./utils/logTimestamps');
+require('./server-logger').setServerName('web');
 const express = require('express');
 const session = require('express-session');
 const https = require('https');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
-const { Worker } = require('worker_threads');
-const RadialSearchService = require('./radial-search');
-const VAEService = require('./services/vaeService');
 const { Pool } = require('pg');
 const fingerprintRegistry = require('./fingerprint-registry');
 const serverLogger = require('./server-logger');
@@ -16,10 +14,10 @@ const { ExplorerResponse, validateOrWarn } = require('./contracts-zod');
 const { setupPlaylistRoutes } = require('./routes/playlist');
 const { setupNamedSessionRoutes, isValidMD5, RESERVED_SESSION_PREFIXES } = require('./routes/named-session');
 const { setupApiRoutes } = require('./routes/api');
-const { setupVaeRoutes } = require('./routes/vae');
 const DataAccess = require('./services/db');
 const { SessionManager, buildRequestContext, extractRequestIp } = require('./services/session-manager');
 const { SSEManager } = require('./services/sse-manager');
+const AudioClient = require('./services/audio-client');
 
 const startupLog = serverLogger.createLogger('startup');
 const serverLog = serverLogger.createLogger('server');
@@ -121,15 +119,9 @@ function checkSingleton() {
 
 // ─── Service Initialization ─────────────────────────────────────────────────
 
-// Initialize radial search service
-const radialSearch = new RadialSearchService();
-
-// Initialize VAE service
-const vaeService = new VAEService({
-  modelPath: config.vae?.modelPath || path.join(__dirname, 'models/music_vae.pt'),
-  pythonPath: config.vae?.pythonPath || 'python3',
-  scriptPath: path.join(__dirname, 'scripts/vae_inference.py')
-});
+const ApiClient = require('./services/api-client');
+const apiClient = new ApiClient({ url: config.api?.url || 'http://localhost:3003' });
+const audioClient = new AudioClient({ url: config.audioServer?.url || 'http://localhost:3002' });
 
 // Initialize database connection
 const TRIGRAM_SIMILARITY_THRESHOLD = parseFloat(process.env.SEARCH_SIMILARITY_THRESHOLD || '0.18');
@@ -157,73 +149,21 @@ pool.on('connect', (client) => {
 // Phase 1: Data Access Layer
 const db = new DataAccess(pool);
 
-// Phase 2: Session Manager
+// Phase 2: Session Manager (delegates mixer operations to Audio server)
 const sessionManager = new SessionManager({
   config,
   db,
-  radialSearch,
-  fingerprintRegistry,
-  // Defer mixer's internal explorer computation to the worker thread.
-  // If the worker isn't ready yet, wait for it — audio plays fine in the dark.
-  onExplorerNeeded: async (mixer, trackId, opts) => {
-    const ready = await waitForExplorerWorker(45000);
-    if (!ready) {
-      serverLog.error('❌ Explorer worker did not become ready in 45s (mixer path)');
-      return null; // fall through to main-thread as last resort
-    }
-
-    const resolution = mixer.state.explorerResolution || 'adaptive';
-    const sessionContext = {
-      seenArtists: Array.from(mixer.state.seenArtists || []),
-      seenAlbums: Array.from(mixer.state.seenAlbums || []),
-      sessionHistoryIds: (mixer.state.sessionHistory || []).map(e => e.identifier),
-      currentTrackId: mixer.state.currentTrack?.identifier || null,
-      noArtist: mixer.state.noArtist,
-      noAlbum: mixer.state.noAlbum,
-      failedTrackIds: Array.from(mixer.state.failedTrackAttempts || new Map())
-        .filter(([_, count]) => count >= 3).map(([id]) => id)
-    };
-    const workerConfig = {
-      explorerResolution: resolution,
-      stackTotalCount: mixer.state.stackTotalCount || 0,
-      stackRandomCount: mixer.state.stackRandomCount || 0,
-      cachedRadius: mixer.adaptiveRadiusCache?.get(trackId)?.radius ?? null,
-      dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
-        ? mixer.dynamicRadiusState.currentRadius : null
-    };
-
-    const result = await requestExplorerFromWorker(trackId, sessionContext, workerConfig);
-
-    if (result.radiusUsed != null) {
-      mixer.adaptiveRadiusCache.set(trackId, {
-        radius: result.radiusUsed,
-        count: result.neighborhoodSize,
-        updatedAt: Date.now()
-      });
-      mixer.currentAdaptiveRadius = {
-        radius: result.radiusUsed,
-        count: result.neighborhoodSize,
-        cachedRadiusReused: false
-      };
-    }
-    if (result.dynamicRadiusState && Number.isFinite(result.dynamicRadiusState.currentRadius)) {
-      mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
-    }
-    if (result.explorerData) {
-      mixer.explorerDataCache.set(trackId, resolution, result.explorerData);
-      mixer.recordExplorerSummary(result.explorerData,
-        result.explorerData.diagnostics?.radius || null,
-        result.neighborhoodSize || 0);
-    }
-    return result.explorerData || null;
-  }
+  audioClient,
+  fingerprintRegistry
 });
 
 // Phase 3: SSE Manager
 const sseManager = new SSEManager({
   sessionManager,
   fingerprintRegistry,
-  persistAudioSessionBinding
+  persistAudioSessionBinding,
+  audioClient,
+  audioServerUrl: config.audioServer?.url || 'http://localhost:3002'
 });
 
 // Convenience accessors for backward compatibility
@@ -235,130 +175,24 @@ async function initializeServices() {
     startupLog.info('Skipping service initialization (SKIP_SERVICE_INIT set)');
     return;
   }
-  try {
-    await radialSearch.initialize();
-    searchLog.info('✅ Radial search service initialized');
 
-    // Initialize VAE service (optional - may not have model available)
-    try {
-      await vaeService.initialize();
-      serverLog.info('✅ VAE service initialized');
-    } catch (vaeError) {
-      serverLog.warn('⚠️ VAE service initialization failed (continuing without VAE):', vaeError.message);
-    }
-  } catch (err) {
-    startupLog.error('Failed to initialize services:', err);
+  // Wait for API server (KD-tree, explorer, search)
+  startupLog.info(`🌐 API server: ${config.api?.url || 'http://localhost:3003'}`);
+  const apiReady = await apiClient.waitForReady(60000);
+  if (!apiReady) {
+    startupLog.error('❌ API server did not become ready in 60s');
+    process.exit(1);
   }
-}
+  startupLog.info('✅ API server is ready');
 
-// ─── Explorer Worker Management ─────────────────────────────────────────────
-
-let explorerWorker = null;
-let explorerWorkerReady = false;
-const pendingExplorerRequests = new Map(); // requestId -> { resolve, reject, timer }
-let explorerRequestCounter = 0;
-
-// Promise that resolves when the explorer worker reports ready.
-// Callers can await this instead of falling back to main-thread explorer.
-let _resolveWorkerReady = null;
-const explorerWorkerReadyPromise = new Promise(resolve => { _resolveWorkerReady = resolve; });
-
-/**
- * Wait for the explorer worker to become ready, up to timeoutMs.
- * Returns true if ready, false if timed out.
- */
-async function waitForExplorerWorker(timeoutMs = 45000) {
-  if (explorerWorkerReady) return true;
-  const timeout = new Promise(resolve => setTimeout(() => resolve(false), timeoutMs));
-  return Promise.race([explorerWorkerReadyPromise.then(() => true), timeout]);
-}
-
-function spawnExplorerWorker() {
-  const workerPath = path.join(__dirname, 'explorer-worker.js');
-  if (!fs.existsSync(workerPath)) {
-    startupLog.warn('⚠️ explorer-worker.js not found — explorer will run on main thread');
-    return;
+  // Wait for Audio server (mixer, streaming)
+  startupLog.info(`🎵 Audio server: ${config.audioServer?.url || 'http://localhost:3002'}`);
+  const audioReady = await audioClient.waitForReady(30000);
+  if (!audioReady) {
+    startupLog.error('❌ Audio server did not become ready in 30s');
+    process.exit(1);
   }
-
-  explorerWorker = new Worker(workerPath);
-  explorerWorkerReady = false;
-
-  explorerWorker.on('message', (msg) => {
-    switch (msg.type) {
-      case 'ready':
-        explorerWorkerReady = true;
-        if (_resolveWorkerReady) { _resolveWorkerReady(); _resolveWorkerReady = null; }
-        startupLog.info(`✅ Explorer worker ready (KD-tree loaded in ${msg.loadTimeMs}ms)`);
-        break;
-
-      case 'explore_result': {
-        const pending = pendingExplorerRequests.get(msg.requestId);
-        if (pending) {
-          clearTimeout(pending.timer);
-          pendingExplorerRequests.delete(msg.requestId);
-          if (msg.error) {
-            pending.reject(new Error(msg.error));
-          } else {
-            pending.resolve(msg);
-          }
-        }
-        break;
-      }
-
-      case 'error':
-        startupLog.error('Explorer worker initialization error:', msg.error);
-        break;
-    }
-  });
-
-  explorerWorker.on('error', (err) => {
-    startupLog.error('Explorer worker error:', err);
-    explorerWorkerReady = false;
-  });
-
-  explorerWorker.on('exit', (code) => {
-    startupLog.warn(`Explorer worker exited with code ${code}`);
-    explorerWorkerReady = false;
-    explorerWorker = null;
-    // Reject all pending requests
-    for (const [requestId, pending] of pendingExplorerRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('Explorer worker exited'));
-    }
-    pendingExplorerRequests.clear();
-  });
-
-  // Tell worker to initialize (sequenced after main thread's KD-tree is ready)
-  explorerWorker.postMessage({ type: 'init' });
-}
-
-/**
- * Send an explorer request to the worker thread.
- * Returns a Promise that resolves with the explorer result.
- */
-function requestExplorerFromWorker(trackId, sessionContext, config, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    if (!explorerWorker || !explorerWorkerReady) {
-      reject(new Error('explorer_not_ready'));
-      return;
-    }
-
-    const requestId = `req_${++explorerRequestCounter}_${Date.now()}`;
-    const timer = setTimeout(() => {
-      pendingExplorerRequests.delete(requestId);
-      reject(new Error('Explorer request timed out'));
-    }, timeoutMs);
-
-    pendingExplorerRequests.set(requestId, { resolve, reject, timer });
-
-    explorerWorker.postMessage({
-      type: 'explore',
-      requestId,
-      trackId,
-      sessionContext,
-      config
-    });
-  });
+  startupLog.info('✅ Audio server is ready');
 }
 
 function findTrackInExplorerSnapshot(explorer, trackId) {
@@ -399,8 +233,6 @@ function findTrackInExplorerSnapshot(explorer, trackId) {
 
 const servicesReady = initializeServices();
 servicesReady.then(() => {
-  // Spawn explorer worker AFTER main KD-tree is loaded (sequenced, not parallel)
-  spawnExplorerWorker();
   sessionManager.schedulePrimedSessions('startup');
 }).catch(err => {
   serverLog.error('🔥 Failed to schedule startup primed sessions:', err);
@@ -534,11 +366,20 @@ app.post('/session/bootstrap', async (req, res) => {
       ip: extractRequestIp(req)
     });
 
+    const audioServerUrl = config.audioServer?.url || 'http://localhost:3002';
+    let mixerReady = true;
+    try {
+      const state = await audioClient.getMixerState(session.sessionId);
+      mixerReady = state.isActive || state.audioClients > 0;
+    } catch (e) { mixerReady = false; }
+
     res.json({
       sessionId: session.sessionId,
       fingerprint: fingerprint || null,
-      mixerReady: Boolean(session.mixer && !session.mixer.pendingClientBootstrap),
-      createdAt: session.created ? session.created.toISOString() : null
+      mixerReady,
+      createdAt: session.created ? session.created.toISOString() : null,
+      audioStreamUrl: `${audioServerUrl}/stream?sessionId=${session.sessionId}`,
+      audioEventsUrl: `${audioServerUrl}/events?sessionId=${session.sessionId}`
     });
   } catch (error) {
     sessionLog.error('Failed to bootstrap session:', error);
@@ -547,75 +388,59 @@ app.post('/session/bootstrap', async (req, res) => {
 });
 
 // ─── Stream Route ───────────────────────────────────────────────────────────
+// Proxies PCM stream from Audio server. Client connects here on same origin,
+// avoiding CORS. Future: client connects directly to Audio server on LAN.
 
 app.get('/stream', async (req, res) => {
   try {
     const session = await getSessionForRequest(req, { createIfMissing: true });
 
     if (!session) {
-      sessionManager.logSessionEvent('audio_stream_request_failed', {
-        reason: 'session_unavailable',
-        ip: extractRequestIp(req)
-      }, { level: 'warn' });
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    const clientIp = extractRequestIp(req);
-    session.clientIp = clientIp;
-    session.lastAudioConnect = Date.now();
+    await sessionManager.ensureAudioSession(session);
+    const audioServerUrl = config.audioServer?.url || 'http://localhost:3002';
+    const audioStreamUrl = `${audioServerUrl}/stream?sessionId=${session.sessionId}`;
 
-    console.log(JSON.stringify({
-      _type: 'stream_connect',
-      ts: new Date().toISOString(),
-      sessionId: session.sessionId,
-      trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
-      trackTitle: session.mixer?.state?.currentTrack?.title || null,
-      ip: clientIp
-    }));
+    // Proxy the PCM stream from Audio server
+    const controller = new AbortController();
+    const audioRes = await fetch(audioStreamUrl, { signal: controller.signal });
 
-    const currentTrackId = session.mixer?.state?.currentTrack?.identifier || null;
-    const trackStartTime = session.mixer?.state?.trackStartTime || Date.now();
-    const fingerprint = fingerprintRegistry.ensureFingerprint(
-      session.sessionId,
-      {
-        trackId: currentTrackId,
-        startTime: trackStartTime,
-        streamIp: clientIp
-      }
-    );
+    if (!audioRes.ok) {
+      return res.status(audioRes.status).json({ error: 'Audio stream unavailable' });
+    }
 
-    sessionManager.logSessionEvent('audio_stream_request', {
-      sessionId: session.sessionId,
-      fingerprint: fingerprint || null,
-      ip: clientIp,
-      method: req.method
+    // Forward headers
+    res.writeHead(200, {
+      'Content-Type': audioRes.headers.get('content-type') || 'audio/mpeg',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Transfer-Encoding': 'chunked'
     });
 
-    if (req.method === 'HEAD') {
-      return res.end();
-    }
+    const reader = audioRes.body.getReader();
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.writableEnded) res.write(value);
+        }
+      } catch (e) {
+        // Stream ended
+      }
+      if (!res.writableEnded) res.end();
+    };
+    pump();
 
-    session.mixer.addClient(res);
-
-    session.awaitingAudioClient = false;
-    session.lastAudioClientAt = Date.now();
-
-    if (clientIp) {
-      sessionManager.lastHealthySessionByIp.set(clientIp, session.sessionId);
-    }
-
-    sessionManager.logSessionEvent('audio_client_connected', {
-      sessionId: session.sessionId,
-      fingerprint: fingerprint || null,
-      ip: clientIp,
-      clientCount: session.mixer?.clients?.size || 0
+    req.on('close', () => {
+      controller.abort();
     });
   } catch (error) {
-    console.error('Stream connection error:', error);
+    console.error('Stream proxy error:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to attach to stream' });
-    } else {
-      res.end();
+      res.status(500).json({ error: 'Failed to proxy stream' });
     }
   }
 });
@@ -664,7 +489,8 @@ setupPlaylistRoutes(app, {
   db,
   createSession: (opts) => sessionManager.createSession(opts),
   getSessionById: (id) => sessionManager.getSessionById(id),
-  registerSession: (id, s, opts) => sessionManager.registerSession(id, s, opts)
+  registerSession: (id, s, opts) => sessionManager.registerSession(id, s, opts),
+  audioClient
 });
 
 setupNamedSessionRoutes(app, {
@@ -673,12 +499,13 @@ setupNamedSessionRoutes(app, {
   registerSession: (id, s, opts) => sessionManager.registerSession(id, s, opts),
   createSession: (opts) => sessionManager.createSession(opts),
   calculateStackDuration,
-  db
+  db,
+  audioClient
 });
 
-setupApiRoutes(app, { db, radialSearch });
+setupApiRoutes(app, { db, apiClient });
 
-setupVaeRoutes(app, { vaeService, radialSearch });
+// VAE routes are served by the API server
 
 // ─── MD5 Journey Routes ─────────────────────────────────────────────────────
 
@@ -698,15 +525,15 @@ app.get('/:md5', async (req, res, next) => {
     if (!session) {
       console.log(`Creating new session for MD5: ${sessionId}`);
       session = await sessionManager.createSession({ sessionId, autoStart: false, ephemeral: true });
-      session.mixer.initializeSession('anonymous', sessionId);
+      await audioClient.initializeSession(sessionId, 'anonymous', sessionId);
     }
 
-    const track = session.mixer.radialSearch.kdTree.getTrack(md5);
+    const track = await apiClient.getTrack(md5);
     if (!track) {
       return res.status(404).json({ error: 'Track not found' });
     }
 
-    session.mixer.resetForJourney(track);
+    await audioClient.resetForJourney(sessionId, track);
 
     console.log(`🎯 Session seeded with: ${track.title} by ${track.artist}`);
 
@@ -739,11 +566,11 @@ app.get('/:md51/:md52', async (req, res, next) => {
         { identifier: md51, direction: null, scope: 'magnify' },
         { identifier: md52, direction: null, scope: 'magnify' }
       ];
-      session.mixer.initializeSession('anonymous', sessionId, initialStack);
+      await audioClient.initializeSession(sessionId, 'anonymous', sessionId, initialStack);
     }
 
-    const track1 = session.mixer.radialSearch.kdTree.getTrack(md51);
-    const track2 = session.mixer.radialSearch.kdTree.getTrack(md52);
+    const track1 = await apiClient.getTrack(md51);
+    const track2 = await apiClient.getTrack(md52);
 
     if (!track1) {
       return res.status(404).json({ error: `First track not found: ${md51}` });
@@ -752,8 +579,8 @@ app.get('/:md51/:md52', async (req, res, next) => {
       return res.status(404).json({ error: `Second track not found: ${md52}` });
     }
 
-    session.mixer.resetForJourney(track1);
-    session.mixer.selectNextTrack(md52, { origin: 'contrived-journey' }).catch(err => {
+    await audioClient.resetForJourney(sessionId, track1);
+    audioClient.selectNextTrack(sessionId, md52, { origin: 'contrived-journey' }).catch(err => {
       console.warn('⚠️ Contrived journey next-track queue failed:', err?.message || err);
     });
 
@@ -855,39 +682,19 @@ app.get('/track/:identifier/meta', async (req, res) => {
   }
 
   try {
-    let track = radialSearch.kdTree?.getTrack(identifier);
+    // Look up from API server (KD-tree)
+    let track = await apiClient.getTrack(identifier);
 
+    // Fall back: try to hydrate from any active Audio server session
     if (!track) {
-      const searchCollections = [audioSessions, ephemeralSessions];
-
-      for (const collection of searchCollections) {
-        for (const session of collection.values()) {
-          const mixer = session?.mixer;
-          if (!mixer) continue;
-
-          try {
-            if (mixer.state.currentTrack?.identifier === identifier) {
-              track = mixer.hydrateTrackRecord(mixer.state.currentTrack);
-              if (track) break;
-            }
-
-            if (mixer.nextTrack?.identifier === identifier) {
-              track = mixer.hydrateTrackRecord(mixer.nextTrack);
-              if (track) break;
-            }
-
-            if (typeof mixer.hydrateTrackRecord === 'function') {
-              const hydrated = mixer.hydrateTrackRecord({ identifier });
-              if (hydrated?.identifier === identifier) {
-                track = hydrated;
-                break;
-              }
-            }
-          } catch (error) {
-            console.warn('⚠️ Mixer hydration failed for track', identifier, error?.message || error);
+      for (const session of sessionManager.allSessions()) {
+        try {
+          const result = await audioClient.hydrateTrack(session.sessionId, identifier);
+          if (result?.track?.identifier === identifier) {
+            track = result.track;
+            break;
           }
-        }
-        if (track) break;
+        } catch (e) { /* ignore */ }
       }
     }
 
@@ -895,8 +702,7 @@ app.get('/track/:identifier/meta', async (req, res) => {
       return res.status(404).json({ error: 'track not found' });
     }
 
-    const payload = JSON.parse(JSON.stringify(track));
-    return res.json({ track: payload });
+    return res.json({ track });
   } catch (error) {
     console.error('Failed to fetch track metadata:', error);
     res.status(500).json({ error: 'failed to load track metadata' });
@@ -923,35 +729,32 @@ app.get('/', async (req, res) => {
 // ─── Status & Current Track ─────────────────────────────────────────────────
 
 app.get('/status', async (req, res) => {
-    const session = await getSessionForRequest(req, { createIfMissing: true });
+  const session = await getSessionForRequest(req, { createIfMissing: true });
+  if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
+  try {
+    const result = await audioClient.getStats(session.sessionId);
+    res.json({
+      ...result.stats,
+      created: session.created,
+      lastAccess: session.lastAccess
+    });
+  } catch (e) {
+    res.json({ created: session.created, lastAccess: session.lastAccess, error: 'Audio server unavailable' });
   }
-
-  res.json({
-    ...session.mixer.getStats(),
-    created: session.created,
-    lastAccess: session.lastAccess
-  });
 });
 
 app.get('/current-track', async (req, res) => {
   const session = await getSessionForRequest(req, { createIfMissing: false });
-  if (!session?.mixer) return res.status(404).json({ error: 'No active session' });
+  if (!session) return res.status(404).json({ error: 'No active session' });
 
-  const payload = session.mixer.buildHeartbeatPayload('current-track-request');
-  if (!payload?.currentTrack) return res.status(204).send();
-
-  res.json({
-    currentTrack: payload.currentTrack,
-    timing: payload.timing,
-    nextTrack: payload.nextTrack,
-    override: payload.override,
-    fingerprint: payload.fingerprint,
-    driftState: payload.drift,
-    currentTrackDirection: payload.currentTrackDirection
-  });
+  try {
+    const result = await audioClient.getStats(session.sessionId);
+    if (!result?.heartbeat?.currentTrack) return res.status(204).send();
+    res.json(result.heartbeat);
+  } catch (e) {
+    res.status(503).json({ error: 'Audio server unavailable' });
+  }
 });
 
 app.get('/status/:sessionId', (req, res) => {
@@ -959,91 +762,39 @@ app.get('/status/:sessionId', (req, res) => {
   res.status(410).json({ error: 'Session-specific status URLs have been removed. Query /status instead.' });
 });
 
-// ─── Radial Search Routes ───────────────────────────────────────────────────
+// Search/PCA/radial-search endpoints are served by the API server (port 3003)
+// Proxy them for backward compatibility with client JS
 
 app.post('/radial-search', async (req, res) => {
-  try {
-    const { trackId, config = {} } = req.body;
-
-    if (!trackId) {
-      return res.status(400).json({ error: 'trackId is required' });
-    }
-
-    const result = await radialSearch.exploreFromTrack(trackId, config);
-    res.json(result);
-  } catch (error) {
-    console.error('Radial search error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  try { res.json(await apiClient.radialSearch(req.body.trackId, req.body.config)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/directional-search', async (req, res) => {
-  try {
-    const { trackId, direction, config = {} } = req.body;
-
-    if (!trackId || !direction) {
-      return res.status(400).json({ error: 'trackId and direction are required' });
-    }
-
-    const result = await radialSearch.getDirectionalCandidates(trackId, direction, config);
-    res.json(result);
-  } catch (error) {
-    console.error('Directional search error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  try { res.json(await apiClient.directionalSearch(req.body.trackId, req.body.direction, req.body.config)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/radial-search/stats', (req, res) => {
-  try {
-    const stats = radialSearch.getStats();
-    res.json(stats);
-  } catch (error) {
-    console.error('Stats error:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.get('/radial-search/stats', async (req, res) => {
+  try { res.json(await apiClient.getStats()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PCA-enhanced search endpoints
-app.get('/pca/directions', (req, res) => {
-  try {
-    const directions = radialSearch.getPCADirections();
-    res.json(directions);
-  } catch (error) {
-    console.error('PCA directions error:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.get('/pca/directions', async (req, res) => {
+  try { res.json(await apiClient.getPCADirections()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/pca/resolutions', (req, res) => {
-  try {
-    const resolutions = radialSearch.getResolutionSettings();
-    res.json(resolutions);
-  } catch (error) {
-    console.error('PCA resolutions error:', error);
-    res.status(500).json({ error: error.message });
-  }
+app.get('/pca/resolutions', async (req, res) => {
+  try { res.json(await apiClient.getResolutionSettings()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/pca/directional-search', async (req, res) => {
   try {
     const { trackId, pcaDomain, pcaComponent, direction, config = {} } = req.body;
-
-    if (!trackId || !pcaDomain || !direction) {
-      return res.status(400).json({ error: 'trackId, pcaDomain, and direction are required' });
-    }
-
-    const result = await radialSearch.getPCADirectionalCandidates(
-      trackId, pcaDomain, pcaComponent || 'pc1', direction, config
-    );
-    res.json(result);
-  } catch (error) {
-    console.error('PCA directional search error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/pca/explore', async (req, res) => {
-  res.status(410).json({ error: 'This endpoint has been deprecated. Use POST /explorer instead.' });
+    res.json(await apiClient.pcaDirectionalSearch(trackId, pcaDomain, pcaComponent || 'pc1', direction, config));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Explorer Endpoint ──────────────────────────────────────────────────────
@@ -1161,14 +912,16 @@ app.post('/explorer', async (req, res) => {
     const playlistArtists = new Set();
     const playlistAlbums = new Set();
     for (const pid of playlistTrackSet) {
-      const trackData = radialSearch.kdTree?.getTrack(pid);
-      if (trackData) {
-        if (trackData.artist) playlistArtists.add(trackData.artist.toLowerCase());
-        if (trackData.album) playlistAlbums.add(trackData.album.toLowerCase());
-      }
+      try {
+        const trackData = await apiClient.getTrack(pid);
+        if (trackData) {
+          if (trackData.artist) playlistArtists.add(trackData.artist.toLowerCase());
+          if (trackData.album) playlistAlbums.add(trackData.album.toLowerCase());
+        }
+      } catch (e) { /* ignore */ }
     }
 
-    const sourceTrack = radialSearch.kdTree?.getTrack(trackId);
+    const sourceTrack = await apiClient.getTrack(trackId);
     if (!sourceTrack) {
       serverLog.warn(`🎯 Track not found: ${trackId}`);
       return res.status(404).json({ error: 'Track not found' });
@@ -1176,130 +929,54 @@ app.post('/explorer', async (req, res) => {
     serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
 
     let explorerData;
-    const isSameTrack = session?.mixer?.state?.currentTrack?.identifier === sourceTrack?.identifier;
-    if (session?.mixer) {
-      const mixer = session.mixer;
-      const resolution = mixer.state.explorerResolution || 'adaptive';
+    if (session) {
+      // Try cache on Audio server first, then API server
+      serverLog.info(`🎯 Routing explorer via Audio server (trackId=${trackId.substring(0,8)})`);
+      try {
+        const cachedResult = await audioClient.getExplorerData(session.sessionId, { trackId: sourceTrack.identifier, forceFresh: false });
+        if (cachedResult?.explorerData) {
+          explorerData = cachedResult.explorerData;
+          serverLog.info(`🎯 Explorer cache hit on Audio server`);
+        }
+      } catch (e) { /* cache miss, proceed to API */ }
 
-      // Cache hit — reuse cached data (cheap)
-      if (isSameTrack && mixer.explorerDataCache?.has(sourceTrack.identifier, resolution)) {
-        serverLog.info(`🎯 Explorer cache hit (trackId=${trackId.substring(0,8)})`);
-        explorerData = await mixer.getComprehensiveExplorerData({
-          trackId: sourceTrack.identifier,
-          forceFresh: false
-        });
-      } else {
-        // Wait for worker if not ready — audio streams fine while we wait
-        if (!explorerWorkerReady) {
-          serverLog.info(`🎯 Waiting for explorer worker (trackId=${trackId.substring(0,8)})`);
-          const ready = await waitForExplorerWorker(45000);
-          if (!ready) {
-            serverLog.error(`❌ Explorer worker did not become ready in 45s`);
-            return res.status(503).json({ error: 'Explorer service unavailable' });
-          }
+      if (!explorerData) {
+        // Get session state from Audio server for context
+        let sessionState;
+        try {
+          sessionState = await audioClient.getFullState(session.sessionId);
+        } catch (e) {
+          sessionState = {};
         }
 
-        serverLog.info(`🎯 Routing explorer to worker thread (trackId=${trackId.substring(0,8)})`);
         const sessionContext = {
-          seenArtists: Array.from(mixer.state.seenArtists || []),
-          seenAlbums: Array.from(mixer.state.seenAlbums || []),
-          sessionHistoryIds: (mixer.state.sessionHistory || []).map(e => e.identifier),
-          currentTrackId: mixer.state.currentTrack?.identifier || null,
-          noArtist: mixer.state.noArtist,
-          noAlbum: mixer.state.noAlbum,
-          failedTrackIds: Array.from(mixer.state.failedTrackAttempts || new Map())
+          seenArtists: sessionState.seenArtists || [],
+          seenAlbums: sessionState.seenAlbums || [],
+          sessionHistoryIds: (sessionState.sessionHistory || []).map(e => e.identifier),
+          currentTrackId: sessionState.currentTrack?.identifier || null,
+          noArtist: sessionState.noArtist,
+          noAlbum: sessionState.noAlbum,
+          failedTrackIds: (sessionState.failedTrackAttempts || [])
             .filter(([_, count]) => count >= 3).map(([id]) => id)
         };
 
         const workerConfig = {
-          explorerResolution: resolution,
-          stackTotalCount: mixer.state.stackTotalCount || 0,
-          stackRandomCount: mixer.state.stackRandomCount || 0,
-          cachedRadius: mixer.adaptiveRadiusCache?.get(sourceTrack.identifier)?.radius ?? null,
-          dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
-            ? mixer.dynamicRadiusState.currentRadius : null
+          explorerResolution: sessionState.explorerResolution || 'adaptive',
+          stackTotalCount: sessionState.stackTotalCount || 0,
+          stackRandomCount: sessionState.stackRandomCount || 0,
+          cachedRadius: sessionState.adaptiveRadiusCache?.[sourceTrack.identifier]?.radius ?? null,
+          dynamicRadiusHint: Number.isFinite(sessionState.dynamicRadiusState?.currentRadius)
+            ? sessionState.dynamicRadiusState.currentRadius : null
         };
 
-        const result = await requestExplorerFromWorker(sourceTrack.identifier, sessionContext, workerConfig);
+        const result = await apiClient.explore(sourceTrack.identifier, sessionContext, workerConfig);
         explorerData = result.explorerData;
-
-        if (result.radiusUsed != null) {
-          mixer.adaptiveRadiusCache.set(sourceTrack.identifier, {
-            radius: result.radiusUsed,
-            count: result.neighborhoodSize,
-            updatedAt: Date.now()
-          });
-          mixer.currentAdaptiveRadius = {
-            radius: result.radiusUsed,
-            count: result.neighborhoodSize,
-            cachedRadiusReused: false
-          };
-        }
-        if (result.dynamicRadiusState && Number.isFinite(result.dynamicRadiusState.currentRadius)) {
-          mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
-        }
-        if (explorerData) {
-          mixer.explorerDataCache.set(sourceTrack.identifier, resolution, explorerData);
-          mixer.recordExplorerSummary(explorerData,
-            explorerData.diagnostics?.radius || null,
-            result.neighborhoodSize || 0);
-        }
-        serverLog.info(`🎯 Worker explorer complete (${result.computeTimeMs}ms)`);
+        serverLog.info(`🎯 API explorer complete (${result.computeTimeMs}ms)`);
       }
     } else {
-      serverLog.info(`🎯 No session available, using standalone radial search for explorer data`);
-      const rawExplorer = await radialSearch.exploreFromTrack(trackId, { usePCA: true });
-      const rawOptionCount = Object.keys(rawExplorer.directionalOptions || {}).length;
-      serverLog.info(`🎯 Standalone: ${rawOptionCount} directional options (fallback path)`);
-      const convertedDirections = {};
-      for (const [dimName, dimData] of Object.entries(rawExplorer.directionalOptions || {})) {
-        const posCandidates = dimData.positive?.candidates || dimData.positive || [];
-        const negCandidates = dimData.negative?.candidates || dimData.negative || [];
-        for (const pole of [
-          { key: `${dimName}_positive`, candidates: posCandidates, polarity: 'positive' },
-          { key: `${dimName}_negative`, candidates: negCandidates, polarity: 'negative' }
-        ]) {
-          if (pole.candidates.length > 0) {
-            convertedDirections[pole.key] = {
-              direction: dimName,
-              description: dimData.contextLabel || dimName,
-              domain: 'original',
-              component: dimName,
-              polarity: pole.polarity,
-              sampleTracks: pole.candidates.map(sample => {
-                const track = sample.track || sample;
-                return {
-                  identifier: track.identifier,
-                  title: track.title,
-                  artist: track.artist,
-                  albumCover: track.albumCover,
-                  duration: track.length || track.duration,
-                  distance: sample.distance || sample.similarity,
-                  features: track.features
-                };
-              }),
-              trackCount: pole.candidates.length
-            };
-          }
-        }
-      }
-      const assignedTrackIds = new Set();
-      for (const [dirKey, direction] of Object.entries(convertedDirections)) {
-        direction.sampleTracks = direction.sampleTracks.filter(t => {
-          const id = t.identifier;
-          if (!id || assignedTrackIds.has(id)) return false;
-          assignedTrackIds.add(id);
-          return true;
-        });
-        direction.trackCount = direction.sampleTracks.length;
-      }
-      serverLog.info(`🎯 Standalone dedup: ${assignedTrackIds.size} unique tracks across ${Object.keys(convertedDirections).length} directions`);
-
-      explorerData = {
-        directions: convertedDirections,
-        currentTrack: rawExplorer.currentTrack,
-        diagnostics: { mode: 'standalone' }
-      };
+      serverLog.info(`🎯 No session available, routing to API server (trackId=${trackId.substring(0,8)})`);
+      const result = await apiClient.explore(trackId, {}, {});
+      explorerData = result.explorerData;
     }
 
     serverLog.info(`🎯 Explorer data has ${Object.keys(explorerData.directions || {}).length} directions before filtering`);
@@ -1393,57 +1070,58 @@ app.post('/explorer', async (req, res) => {
       }
     }
 
-    // Reconcile explorer recommendation with mixer state
-    const currentTrackId = session?.mixer?.currentTrack?.identifier;
-    const preparedNextId = session?.mixer?.nextTrack?.identifier;
+    // Reconcile explorer recommendation with mixer state on Audio server
     const explorerNextId = nextTrack?.track?.identifier;
-    const isPreparationInProgress = session?.mixer?._preparationInProgress || session?.mixer?.pendingPreparationPromise;
+    if (session && explorerNextId) {
+      try {
+        const mixerState = await audioClient.getFullState(session.sessionId);
+        const currentTrackId = mixerState?.currentTrack?.identifier;
+        const preparedNextId = mixerState?.nextTrack?.identifier;
 
-    if (session?.mixer && explorerNextId && trackId === currentTrackId) {
-      if (preparedNextId && preparedNextId !== explorerNextId && preparedNextId !== currentTrackId) {
-        const preparedTrack = session.mixer.nextTrack;
-        const preparedDirection = preparedTrack?.direction || preparedTrack?.transitionDirection || null;
-        const preparedDirKey = preparedTrack?.directionKey || preparedTrack?.transitionDirectionKey || null;
-        serverLog.info(`📌 Explorer recommends ${explorerNextId?.substring(0,8)} but mixer has ${preparedNextId?.substring(0,8)} prepared — overriding response`);
-        nextTrack = {
-          directionKey: preparedDirKey,
-          direction: preparedDirection,
-          track: {
-            identifier: preparedTrack.identifier,
-            title: preparedTrack.title,
-            artist: preparedTrack.artist,
-            album: preparedTrack.album,
-            albumCover: preparedTrack.albumCover,
-            duration: preparedTrack.duration || preparedTrack.length
-          }
-        };
-      } else if (preparedNextId && preparedNextId === currentTrackId) {
-        serverLog.warn(`📌 Mixer nextTrack ${preparedNextId?.substring(0,8)} === currentTrack — ignoring stale mixer state`);
-      } else if (preparedNextId && preparedNextId === explorerNextId) {
-        serverLog.info(`📌 Explorer recommendation ${explorerNextId?.substring(0,8)} matches prepared next — not storing (would cause repeat)`);
-      } else {
-        session.mixer.explorerRecommendedNext = {
-          trackId: explorerNextId,
-          direction: nextTrack.direction,
-          directionKey: nextTrack.directionKey,
-          track: nextTrack.track
-        };
-        serverLog.info(`📌 Stored explorer recommendation: ${explorerNextId?.substring(0,8)}`);
+        if (preparedNextId && preparedNextId !== explorerNextId && preparedNextId !== currentTrackId && trackId === currentTrackId) {
+          const preparedTrack = mixerState.nextTrack;
+          serverLog.info(`📌 Explorer recommends ${explorerNextId?.substring(0,8)} but mixer has ${preparedNextId?.substring(0,8)} prepared — overriding response`);
+          nextTrack = {
+            directionKey: preparedTrack?.directionKey || preparedTrack?.transitionDirectionKey || null,
+            direction: preparedTrack?.direction || preparedTrack?.transitionDirection || null,
+            track: {
+              identifier: preparedTrack.identifier,
+              title: preparedTrack.title,
+              artist: preparedTrack.artist,
+              album: preparedTrack.album,
+              albumCover: preparedTrack.albumCover,
+              duration: preparedTrack.duration || preparedTrack.length
+            }
+          };
+        } else if (!preparedNextId && trackId === currentTrackId) {
+          // Store recommendation and fill empty next slot
+          await audioClient.setRecommendation(session.sessionId, {
+            trackId: explorerNextId,
+            direction: nextTrack.direction,
+            directionKey: nextTrack.directionKey,
+            track: nextTrack.track
+          });
+          audioClient.prepareNextCrossfade(session.sessionId, {
+            forceRefresh: false,
+            reason: 'explorer-fill',
+            overrideTrackId: explorerNextId,
+            overrideDirection: nextTrack.direction
+          }).catch(err => {
+            serverLog.warn(`⚠️ Explorer-fill preparation failed: ${err?.message || err}`);
+          });
+          serverLog.info(`📌 Stored recommendation and filling: ${explorerNextId?.substring(0,8)}`);
+        } else if (trackId === currentTrackId && preparedNextId !== explorerNextId) {
+          await audioClient.setRecommendation(session.sessionId, {
+            trackId: explorerNextId,
+            direction: nextTrack.direction,
+            directionKey: nextTrack.directionKey,
+            track: nextTrack.track
+          });
+          serverLog.info(`📌 Stored explorer recommendation: ${explorerNextId?.substring(0,8)}`);
+        }
+      } catch (e) {
+        serverLog.warn(`📌 Failed to reconcile with Audio server: ${e.message}`);
       }
-    } else if (session?.mixer && explorerNextId) {
-      serverLog.info(`📌 Skipping explorer recommendation store: exploring from ${trackId?.substring(0,8)}, current is ${currentTrackId?.substring(0,8)}`);
-    }
-
-    if (session?.mixer && explorerNextId && !preparedNextId && !isPreparationInProgress) {
-      serverLog.info(`🔄 Explorer filling empty next slot: ${explorerNextId?.substring(0,8)}`);
-      session.mixer.prepareNextTrackForCrossfade({
-        forceRefresh: false,
-        reason: 'explorer-fill',
-        overrideTrackId: explorerNextId,
-        overrideDirection: nextTrack.direction
-      }).catch(err => {
-        serverLog.warn(`⚠️ Explorer-fill preparation failed: ${err?.message || err}`);
-      });
     }
 
     const rawResponse = {
@@ -1488,12 +1166,8 @@ app.post('/session/reset-drift', async (req, res) => {
   }
 
   try {
-    if (session.mixer.resetDrift) {
-      session.mixer.resetDrift();
-      res.json({ message: 'Drift reset successfully' });
-    } else {
-      res.status(400).json({ error: 'Session does not support drift reset' });
-    }
+    await audioClient.resetDrift(session.sessionId);
+    res.json({ message: 'Drift reset successfully' });
   } catch (error) {
     console.error('Drift reset error:', error);
     res.status(500).json({ error: error.message });
@@ -1514,13 +1188,9 @@ app.post('/session/flow/:direction', async (req, res) => {
   }
 
   try {
-    if (session.mixer.triggerDirectionalFlow) {
-      console.log(`🎛️ User triggered: ${direction}`);
-      session.mixer.triggerDirectionalFlow(direction);
-      res.json({ message: `Flowing ${direction}`, direction });
-    } else {
-      res.status(400).json({ error: 'Session does not support directional flow' });
-    }
+    console.log(`🎛️ User triggered: ${direction}`);
+    await audioClient.triggerDirectionalFlow(session.sessionId, direction);
+    res.json({ message: `Flowing ${direction}`, direction });
   } catch (error) {
     console.error('Directional flow error:', error);
     res.status(500).json({ error: error.message });
@@ -1542,12 +1212,8 @@ app.post('/session/force-next', async (req, res) => {
   try {
     console.log(`🎮 Force next track for session ${session.sessionId}`);
 
-    if (session.mixer.triggerGaplessTransition) {
-      session.mixer.triggerGaplessTransition();
-      res.json({ message: 'Track change forced' });
-    } else {
-      res.status(400).json({ error: 'Session does not support forced transitions' });
-    }
+    await audioClient.forceNext(session.sessionId);
+    res.json({ message: 'Track change forced' });
   } catch (error) {
     console.error('Force next error:', error);
     res.status(500).json({ error: error.message });
@@ -1575,38 +1241,20 @@ app.post('/session/zoom/:mode', async (req, res) => {
   try {
     console.log(`🔍 Zoom mode request '${mode}' for session ${session.sessionId}`);
 
-    if (!session.mixer.setExplorerResolution) {
-      return res.status(400).json({ error: 'Session does not support zoom controls' });
-    }
-
     const normalizedMode = mode === 'auto' ? 'adaptive' : mode;
-    const changed = session.mixer.setExplorerResolution(normalizedMode);
+    await audioClient.setResolution(session.sessionId, normalizedMode);
 
     const deprecated = ['microscope', 'magnifying', 'binoculars'].includes(mode);
-
-    if (changed) {
-      await session.mixer.broadcastHeartbeat('zoom-change', { force: false });
-    }
-
-    const modeEmoji = {
-      'adaptive': '🧭',
-      'auto': '🧭',
-      'microscope': '🔬',
-      'magnifying': '🔍',
-      'binoculars': '🔭'
-    };
-
-    const emoji = modeEmoji[normalizedMode] || modeEmoji[mode] || '';
+    const modeEmoji = { 'adaptive': '🧭', 'auto': '🧭', 'microscope': '🔬', 'magnifying': '🔍', 'binoculars': '🔭' };
 
     res.json({
       message: deprecated
-        ? `${emoji} Adaptive explorer tuning is now automatic`
-        : `${emoji} Adaptive explorer tuning confirmed`,
+        ? `${modeEmoji[normalizedMode] || ''} Adaptive explorer tuning is now automatic`
+        : `${modeEmoji[normalizedMode] || ''} Adaptive explorer tuning confirmed`,
       mode: 'adaptive',
       requestedMode: mode,
       sessionId: session.sessionId,
-      resolution: session.mixer.state.explorerResolution,
-      broadcast: changed,
+      resolution: normalizedMode,
       deprecated
     });
   } catch (error) {
@@ -1643,14 +1291,17 @@ app.post('/next-track', async (req, res) => {
 
   if (typeof requestFingerprint === 'string' && requestFingerprint.trim()) {
     const entry = fingerprintRegistry.lookup(requestFingerprint.trim());
-    if (!entry) {
-      return res.status(404).json({ error: 'Fingerprint not found' });
+    if (entry) {
+      session = sessionManager.getSessionById(entry.sessionId) || null;
+      if (session) {
+        fingerprintRegistry.touch(requestFingerprint.trim(), { metadataIp: req.ip });
+      }
     }
-    session = sessionManager.getSessionById(entry.sessionId) || null;
+    // Fall back to cookie/session resolution if fingerprint lookup failed
     if (!session) {
-      return res.status(404).json({ error: 'Session not found for fingerprint' });
+      serverLog.warn(`⚠️ /next-track fingerprint lookup failed, falling back to session resolution`);
+      session = await getSessionForRequest(req, { createIfMissing: false });
     }
-    fingerprintRegistry.touch(requestFingerprint.trim(), { metadataIp: req.ip });
   } else {
     session = await getSessionForRequest(req, { createIfMissing: false });
   }
@@ -1659,12 +1310,10 @@ app.post('/next-track', async (req, res) => {
     return res.status(404).json({ error: 'Session not found' });
   }
 
-  // Store client buffer depth for deferred broadcast timing
+  // Store client buffer depth
   if (Number.isFinite(clientBufferSecs) && clientBufferSecs >= 0) {
     session.clientBufferSecs = clientBufferSecs;
-    if (session.mixer) {
-      session.mixer.clientBufferSecs = clientBufferSecs;
-    }
+    audioClient.setClientBuffer(session.sessionId, clientBufferSecs).catch(() => {});
   }
 
   try {
@@ -1672,141 +1321,80 @@ app.post('/next-track', async (req, res) => {
     const advertisedDirection = typeof direction === 'string' ? direction : null;
     const isDeckSelection = normalizedSource === 'user' && normalizedOrigin === 'deck';
 
-    let deckMatch = null;
+    // For deck selections, try to find track in explorer data and prepare
     if (isDeckSelection) {
-      const lastExplorer = session.mixer.lastExplorerSnapshotPayload?.explorer || null;
-      deckMatch = findTrackInExplorerSnapshot(lastExplorer, cleanMd5);
-    }
+      try {
+        const state = await audioClient.getFullState(session.sessionId);
+        const lastExplorer = state.lastExplorerSnapshotPayload?.explorer || null;
+        const deckMatch = findTrackInExplorerSnapshot(lastExplorer, cleanMd5);
 
-    if (isDeckSelection && deckMatch) {
-      const deckDirection = advertisedDirection || deckMatch.directionKey || null;
-      const hydrated = session.mixer.hydrateTrackRecord(deckMatch.track || cleanMd5, {
-        direction: deckDirection,
-        transitionReason: 'deck-selection'
-      });
+        if (deckMatch) {
+          const deckDirection = advertisedDirection || deckMatch.directionKey || null;
+          await audioClient.prepareNextCrossfade(session.sessionId, {
+            forceRefresh: true,
+            reason: 'deck-selection',
+            overrideTrackId: cleanMd5,
+            overrideDirection: deckDirection
+          });
+          await audioClient.clearPendingSelection(session.sessionId);
+          await audioClient.broadcastSelection(session.sessionId, 'selection_ack', {
+            status: 'promoted', trackId: cleanMd5, direction: deckDirection, origin: 'deck'
+          });
 
-      if (hydrated && hydrated.identifier) {
-        if (session.mixer.nextTrack?.identifier !== hydrated.identifier) {
-          try {
-            await session.mixer.prepareNextTrackForCrossfade({
-              forceRefresh: true,
-              reason: 'deck-selection',
-              overrideTrackId: hydrated.identifier,
-              overrideDirection: deckDirection
-            });
-          } catch (prepErr) {
-            console.warn('⚠️ Deck selection preparation failed:', prepErr?.message || prepErr);
-            session.mixer.nextTrack = hydrated;
-          }
-        }
+          const updatedState = await audioClient.getFullState(session.sessionId);
+          console.log(`📤 /next-track deck promotion: ${cleanMd5?.substring(0,8) || 'none'} via ${deckDirection || 'unknown'}`);
 
-        session.mixer.nextTrack = session.mixer.nextTrack || hydrated;
-        if (typeof session.mixer.clearPendingUserSelection === 'function') {
-          session.mixer.clearPendingUserSelection();
-        } else {
-          session.mixer.pendingUserOverrideTrackId = null;
-          session.mixer.pendingUserOverrideDirection = null;
-          session.mixer.isUserSelectionPending = false;
-        }
-        session.mixer.lockedNextTrackIdentifier = hydrated.identifier;
-
-        if (typeof session.mixer.broadcastSelectionEvent === 'function') {
-          session.mixer.broadcastSelectionEvent('selection_ack', {
-            status: 'promoted',
+          return res.json({
+            status: 'deck_ack',
+            origin: 'deck',
+            sessionId: session.sessionId,
+            fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
+            currentTrack: updatedState.currentTrack?.identifier || null,
+            nextTrack: updatedState.nextTrack?.identifier || null,
+            pendingTrack: updatedState.pendingCurrentTrack?.identifier || null,
             trackId: cleanMd5,
-            direction: deckDirection,
-            origin: 'deck'
+            direction: deckDirection
           });
         }
-
-        const durationMs = session.mixer.getAdjustedTrackDuration() * 1000;
-        const elapsed = session.mixer.state.trackStartTime ? (Date.now() - session.mixer.state.trackStartTime) : 0;
-        const remainingMs = Math.max(0, durationMs - elapsed);
-
-        const currentTrackId = session.mixer.state.currentTrack?.identifier || null;
-        const preparedNextId = session.mixer.nextTrack?.identifier || null;
-        const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
-
-        console.log(`📤 /next-track deck promotion: ${cleanMd5?.substring(0,8) || 'none'} via ${deckDirection || 'unknown'}`);
-
-        return res.json({
-          status: 'deck_ack',
-          origin: 'deck',
-          sessionId: session.sessionId,
-          fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
-          currentTrack: currentTrackId,
-          nextTrack: preparedNextId,
-          pendingTrack: pendingCurrentId,
-          trackId: cleanMd5,
-          direction: deckDirection,
-          duration: Math.round(durationMs),
-          remaining: Math.round(remainingMs)
-        });
+      } catch (e) {
+        console.warn(`⚠️ Deck selection via Audio server failed: ${e.message}`);
       }
-
-      console.warn(`⚠️ Deck selection hydrate failed for ${cleanMd5}; falling back to override flow`);
-    }
-
-    if (isDeckSelection) {
-      console.warn(`🎯 Deck selection for ${cleanMd5} not found in current explorer data; treating as override`);
     }
 
     if (normalizedSource === 'user') {
       const originLabel = normalizedOrigin ? `/${normalizedOrigin}` : '';
       console.log(`🎯 User selected specific track${originLabel}: ${trackMd5} (direction: ${direction})`);
-
-      await session.mixer.selectNextTrack(trackMd5, { direction, origin: normalizedOrigin });
+      await audioClient.selectNextTrack(session.sessionId, trackMd5, { direction, origin: normalizedOrigin });
     } else {
-      const serverNextTrack = session.mixer.nextTrack?.identifier || null;
-
-      console.log(`💓 Heartbeat sync request received (clientNext=${cleanMd5?.substring(0,8) || 'none'}, direction=${advertisedDirection || 'unknown'})`);
-
-      if (cleanMd5 && serverNextTrack && cleanMd5 !== serverNextTrack) {
-        console.warn('💓 HEARTBEAT next-track mismatch', {
-          clientNext: cleanMd5,
-          serverNext: serverNextTrack,
-          direction: advertisedDirection
-        });
-      }
+      console.log(`💓 Heartbeat sync request received (clientNext=${cleanMd5?.substring(0,8) || 'none'})`);
     }
 
-    const duration = session.mixer.getAdjustedTrackDuration() * 1000;
-    const elapsed = session.mixer.state.trackStartTime ? (Date.now() - session.mixer.state.trackStartTime) : 0;
-    const remaining = Math.max(0, duration - elapsed);
-
-    const currentTrackId = session.mixer.state.currentTrack?.identifier || null;
-    const preparedNextId = session.mixer.nextTrack?.identifier || null;
-    const pendingCurrentId = session.mixer.pendingCurrentTrack?.identifier || null;
-
-    console.log(`📤 /next-track response (${normalizedSource}): current=${currentTrackId?.substring(0,8) || 'none'}, pending=${pendingCurrentId?.substring(0,8) || 'none'}, serverNext=${preparedNextId?.substring(0,8) || 'none'}, remaining=${Math.round(remaining)}ms`);
+    // Get final state from Audio server
+    const finalState = await audioClient.getFullState(session.sessionId);
 
     const responsePayload = {
       status: normalizedSource === 'user' ? 'locked' : 'ok',
       origin: normalizedOrigin || null,
       sessionId: session.sessionId,
       fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
-      currentTrack: currentTrackId,
-      nextTrack: preparedNextId,
-      pendingTrack: pendingCurrentId,
-      duration: Math.round(duration),
-      remaining: Math.round(remaining)
+      currentTrack: finalState.currentTrack?.identifier || null,
+      nextTrack: finalState.nextTrack?.identifier || null,
+      pendingTrack: finalState.pendingCurrentTrack?.identifier || null
     };
 
     if (normalizedSource === 'user') {
       responsePayload.trackId = cleanMd5 || null;
-      responsePayload.direction = advertisedDirection || session.mixer.pendingUserOverrideDirection || null;
+      responsePayload.direction = advertisedDirection || null;
       responsePayload.origin = normalizedOrigin || responsePayload.origin;
     }
 
     res.json(responsePayload);
   } catch (error) {
     console.error('Next track selection error:', error);
-    if (normalizedSource === 'user' && session?.mixer) {
-      session.mixer.broadcastSelectionEvent('selection_failed', {
-        status: 'failed',
-        trackId: trackMd5,
-        reason: error?.message || 'request_failed'
-      });
+    if (normalizedSource === 'user') {
+      audioClient.broadcastSelection(session.sessionId, 'selection_failed', {
+        status: 'failed', trackId: trackMd5, reason: error?.message || 'request_failed'
+      }).catch(() => {});
     }
     res.status(500).json({ error: error.message });
   }
@@ -1821,29 +1409,32 @@ app.post('/session/:sessionId/next-track', (req, res) => {
 app.post('/session/random', async (req, res) => {
   try {
     const session = await sessionManager.createSession({ autoStart: true, ephemeral: true });
-    const mixer = session.mixer;
 
-    const publicSessionId = mixer.state.currentTrack?.identifier || session.sessionId;
-    if (publicSessionId !== session.sessionId) {
-      sessionManager.unregisterSession(session.sessionId);
-      session.sessionId = publicSessionId;
-      session.mixer.state.sessionId = publicSessionId;
-      sessionManager.registerSession(publicSessionId, session, { ephemeral: true });
-      sessionManager.attachEphemeralCleanup(publicSessionId, session);
-    }
+    // Get current track from Audio server
+    let currentTrack = null;
+    try {
+      const state = await audioClient.getMixerState(session.sessionId);
+      currentTrack = state?.currentTrack || null;
 
-    await persistAudioSessionBinding(req, publicSessionId);
+      // Rename session to track identifier if available
+      const publicSessionId = currentTrack?.identifier || session.sessionId;
+      if (publicSessionId !== session.sessionId) {
+        await audioClient.updateMetadata(session.sessionId, { sessionId: publicSessionId });
+        sessionManager.unregisterSession(session.sessionId);
+        session.sessionId = publicSessionId;
+        sessionManager.registerSession(publicSessionId, session, { ephemeral: true });
+      }
+    } catch (e) { /* ignore */ }
 
+    await persistAudioSessionBinding(req, session.sessionId);
+
+    const audioServerUrl = config.audioServer?.url || 'http://localhost:3002';
     res.json({
-      sessionId: publicSessionId,
-      streamUrl: '/stream',
-      eventsUrl: '/events',
+      sessionId: session.sessionId,
+      streamUrl: `${audioServerUrl}/stream?sessionId=${session.sessionId}`,
+      eventsUrl: `${audioServerUrl}/events?sessionId=${session.sessionId}`,
       webUrl: '/',
-      currentTrack: mixer.state.currentTrack ? {
-        identifier: mixer.state.currentTrack.identifier,
-        title: mixer.state.currentTrack.title,
-        artist: mixer.state.currentTrack.artist
-      } : null
+      currentTrack
     });
   } catch (error) {
     console.error('Failed to create random journey session:', error);
@@ -1851,59 +1442,57 @@ app.post('/session/random', async (req, res) => {
   }
 });
 
+// ─── Internal Callbacks from Audio Server ────────────────────────────────────
+
+// Audio server calls this when a track reaches halfway (for play count recording)
+app.post('/internal/track-completed', async (req, res) => {
+  const { identifier } = req.body;
+  if (!identifier) return res.status(400).json({ error: 'identifier required' });
+  try {
+    await db.recordCompletion(identifier);
+    sessionLog.info(`🎵 Halfway reached for ${identifier.substring(0, 8)} — recorded completion`);
+    res.json({ ok: true });
+  } catch (err) {
+    sessionLog.error(`Failed to record halfway completion for ${identifier}:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Audio server calls this when a named session goes idle (for auto-save)
+app.post('/internal/session-idle/:sessionName', async (req, res) => {
+  const { sessionName } = req.params;
+  try {
+    const state = await audioClient.getStackState(sessionName);
+    await db.saveNamedSession(sessionName, state);
+    console.log(`💾 Auto-saved named session on disconnect: ${sessionName}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(`Failed to auto-save session ${sessionName}:`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Health & Monitoring ────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => {
-  const sessionDetails = {};
-
-  for (const [sessionId, session] of audioSessions) {
-    const sessionHistory = session.mixer.state.sessionHistory || [];
-    const currentTrack = session.mixer.state.currentTrack;
-    const nextTrack = session.mixer.nextTrack;
-
-    sessionDetails[sessionId] = {
-      clients: session.mixer.clients ? session.mixer.clients.size : 0,
-      isActive: session.mixer.isActive || false,
-      created: session.created,
-      lastAccess: session.lastAccess,
-      currentTrack: currentTrack ? {
-        title: currentTrack.title,
-        artist: currentTrack.artist,
-        identifier: currentTrack.identifier,
-        md5: currentTrack.md5,
-        path: currentTrack.path,
-        startTime: session.mixer.state.trackStartTime
-      } : null,
-      nextTrack: nextTrack ? {
-        title: nextTrack.title,
-        artist: nextTrack.artist,
-        identifier: nextTrack.identifier,
-        md5: nextTrack.md5,
-        path: nextTrack.path
-      } : null,
-      historyCount: sessionHistory.length,
-      recentHistory: sessionHistory.slice(-5).map(track => ({
-        title: track.title,
-        artist: track.artist,
-        direction: track.direction,
-        startTime: track.startTime
-      }))
-    };
-  }
+app.get('/health', async (req, res) => {
+  let audioHealth = null;
+  let apiHealth = null;
+  try { audioHealth = await audioClient.health(); } catch (e) { /* ignore */ }
+  try { apiHealth = await apiClient.health(); } catch (e) { /* ignore */ }
 
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    activeSessions: audioSessions.size,
-    sessionDetails: sessionDetails,
-    radialSearch: radialSearch.getStats()
+    webSessions: audioSessions.size,
+    audioServer: audioHealth,
+    apiServer: apiHealth
   });
 });
 
 const { buildNowPlayingSessions } = require('./routes/nowPlaying');
 
-app.get('/sessions/now-playing', (req, res) => {
-  const sessions = buildNowPlayingSessions(audioSessions, ephemeralSessions, { now: Date.now() });
+app.get('/sessions/now-playing', async (req, res) => {
+  const sessions = await buildNowPlayingSessions(audioSessions, ephemeralSessions, { now: Date.now(), audioClient });
   res.json({
     status: 'ok',
     timestamp: Date.now(),
@@ -1911,14 +1500,16 @@ app.get('/sessions/now-playing', (req, res) => {
   });
 });
 
-app.get('/internal/metrics', (req, res) => {
+app.get('/internal/metrics', async (req, res) => {
+  let apiStats = null;
+  try { apiStats = await apiClient.getStats(); } catch (e) { /* ignore */ }
+
   const snapshot = internalMetrics.getMetricsSnapshot({
     sessions: {
       active: audioSessions.size,
       ephemeral: ephemeralSessions.size
     },
-    radialSearch: radialSearch.getStats(),
-    adaptiveRadius: internalMetrics.summarizeAdaptiveRadius(audioSessions, ephemeralSessions)
+    apiServer: apiStats
   });
   res.json(snapshot);
 });
@@ -1948,21 +1539,17 @@ app.get('/internal/logs/recent', (req, res) => {
   });
 });
 
-app.get('/internal/sessions/:sessionId/events', (req, res) => {
+app.get('/internal/sessions/:sessionId/events', async (req, res) => {
   const sessionId = req.params.sessionId;
-  const session = sessionManager.getSessionById(sessionId);
-  if (!session || !session.mixer) {
-    return res.status(404).json({ error: 'Session not found' });
+  try {
+    const state = await audioClient.getFullState(sessionId);
+    const limit = Number(req.query.limit);
+    const events = Array.isArray(state.sessionEvents) ? state.sessionEvents : [];
+    const payload = Number.isFinite(limit) && limit > 0 ? events.slice(-limit) : events;
+    res.json({ sessionId, timestamp: Date.now(), count: payload.length, events: payload });
+  } catch (e) {
+    res.status(404).json({ error: 'Session not found' });
   }
-  const limit = Number(req.query.limit);
-  const events = Array.isArray(session.mixer.sessionEvents) ? session.mixer.sessionEvents : [];
-  const payload = Number.isFinite(limit) && limit > 0 ? events.slice(-limit) : events;
-  res.json({
-    sessionId,
-    timestamp: Date.now(),
-    count: payload.length,
-    events: payload
-  });
 });
 
 // Session control endpoints (legacy compatibility)
@@ -2004,20 +1591,6 @@ function startServer() {
 
       // Phase 2: delegate to session manager
       sessionManager.close();
-
-      radialSearch.close();
-
-      // Terminate explorer worker
-      if (explorerWorker) {
-        explorerWorker.terminate().catch(() => {});
-        explorerWorker = null;
-        explorerWorkerReady = false;
-      }
-
-      // Cleanup VAE service
-      if (vaeService && typeof vaeService.shutdown === 'function') {
-        vaeService.shutdown().catch(console.error);
-      }
 
       if (cleanupTimer) {
         clearInterval(cleanupTimer);

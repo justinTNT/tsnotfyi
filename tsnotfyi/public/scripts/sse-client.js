@@ -283,7 +283,9 @@ export function connectSSE() {
       const durationSeconds = newDurationSeconds || currentTrack.duration || currentTrack.length || 0;
       const driftStateForCard = heartbeat.driftState || heartbeat.drift || null;
 
-      if (typeof window.updateNowPlayingCard === 'function') {
+      // Don't overwrite card if sentinel just promoted a track (avoids wobble)
+      const sentinelLocked = state._sentinelPromotionLockUntil && Date.now() < state._sentinelPromotionLockUntil;
+      if (typeof window.updateNowPlayingCard === 'function' && !sentinelLocked) {
         window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
       }
       if (durationSeconds > 0 && !state.progressAnimation) {

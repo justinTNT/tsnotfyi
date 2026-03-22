@@ -229,20 +229,27 @@ class AdvancedAudioMixer {
       });
 
       let pcmBuffer = Buffer.alloc(0);
+      let stderrOutput = '';
 
       process.stdout.on('data', (chunk) => {
         pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
       });
 
       process.stderr.on('data', (data) => {
-        // Suppress FFmpeg verbose output
+        stderrOutput += data.toString();
       });
 
       process.on('close', (code) => {
         if (code === 0) {
           resolve(pcmBuffer);
         } else {
-          reject(new Error(`FFmpeg PCM conversion failed with code ${code}`));
+          const err = new Error(`FFmpeg PCM conversion failed with code ${code}`);
+          // Detect file/volume not found for caller to handle
+          if (stderrOutput.includes('No such file or directory')) {
+            err.code = 'ENOENT';
+            err.ffmpegDetail = 'file_not_found';
+          }
+          reject(err);
         }
       });
     });

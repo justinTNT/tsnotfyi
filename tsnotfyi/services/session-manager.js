@@ -1,18 +1,16 @@
 // Session Manager — owns session lifecycle, maps, resolution, and priming
-// Phase 2: Extracted from server.js lines 120-782
+// Delegates mixer operations to Audio server via AudioClient
 
 const crypto = require('crypto');
-const DriftAudioMixer = require('../drift-audio-mixer');
 const serverLogger = require('../server-logger');
 const sessionLog = serverLogger.createLogger('session');
 
 class SessionManager {
-  constructor({ config, db, radialSearch, fingerprintRegistry, onExplorerNeeded }) {
+  constructor({ config, db, audioClient, fingerprintRegistry }) {
     this._config = config;
     this._db = db;
-    this._radialSearch = radialSearch;
+    this._audioClient = audioClient;
     this._fingerprintRegistry = fingerprintRegistry;
-    this._onExplorerNeeded = onExplorerNeeded || null; // async (mixer, trackId, opts) => explorerData|null
 
     // Session maps
     this._audioSessions = new Map();
@@ -33,22 +31,16 @@ class SessionManager {
   // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
   async close() {
-    // Drain primed sessions
     this._primedSessionIds.clear();
     this._primingSessionsInFlight = 0;
 
-    // Destroy all sessions
-    for (const [sessionId, session] of this._audioSessions) {
-      if (session.mixer && typeof session.mixer.destroy === 'function') {
-        session.mixer.destroy();
-      }
+    for (const [sessionId] of this._audioSessions) {
+      try { await this._audioClient.destroySession(sessionId); } catch (e) { /* ignore */ }
     }
     this._audioSessions.clear();
 
-    for (const [sessionId, session] of this._ephemeralSessions) {
-      if (session.mixer && typeof session.mixer.destroy === 'function') {
-        session.mixer.destroy();
-      }
+    for (const [sessionId] of this._ephemeralSessions) {
+      try { await this._audioClient.destroySession(sessionId); } catch (e) { /* ignore */ }
     }
     this._ephemeralSessions.clear();
     this._lastHealthySessionByIp.clear();
@@ -56,21 +48,10 @@ class SessionManager {
 
   // ─── Maps access ───────────────────────────────────────────────────────────
 
-  get audioSessions() {
-    return this._audioSessions;
-  }
-
-  get ephemeralSessions() {
-    return this._ephemeralSessions;
-  }
-
-  get lastHealthySessionByIp() {
-    return this._lastHealthySessionByIp;
-  }
-
-  get activeSessions() {
-    return this._audioSessions.size;
-  }
+  get audioSessions() { return this._audioSessions; }
+  get ephemeralSessions() { return this._ephemeralSessions; }
+  get lastHealthySessionByIp() { return this._lastHealthySessionByIp; }
+  get activeSessions() { return this._audioSessions.size; }
 
   allSessions() {
     return [...this._audioSessions.values(), ...this._ephemeralSessions.values()];
@@ -96,22 +77,8 @@ class SessionManager {
   }
 
   unregisterSession(sessionId) {
-    if (this._ephemeralSessions.delete(sessionId)) {
-      return;
-    }
+    if (this._ephemeralSessions.delete(sessionId)) return;
     this._audioSessions.delete(sessionId);
-  }
-
-  attachEphemeralCleanup(sessionId, session) {
-    if (!session || !session.mixer) {
-      return;
-    }
-
-    session.mixer.onIdle = () => {
-      sessionLog.info(`🧹 Cleaning up ephemeral session: ${sessionId}`);
-      this.unregisterSession(sessionId);
-      session.mixer.onIdle = null;
-    };
   }
 
   // ─── Session creation ───────────────────────────────────────────────────────
@@ -126,50 +93,31 @@ class SessionManager {
 
     sessionLog.info(`🎯 Creating session: ${sessionId}`);
 
-    const mixer = new DriftAudioMixer(sessionId, this._radialSearch);
-    mixer.pendingClientBootstrap = true;
-
-    // Delegate explorer computation to worker thread when available
-    if (this._onExplorerNeeded) {
-      const onExplorerNeeded = this._onExplorerNeeded;
-      mixer.onExplorerNeeded = async (trackId, opts) => {
-        return onExplorerNeeded(mixer, trackId, opts);
-      };
-    }
-
-    // Record completion at halfway point
-    mixer.onHalfwayReached = async (identifier) => {
-      try {
-        await this._db.recordCompletion(identifier);
-        sessionLog.info(`🎵 Halfway reached for ${identifier.substring(0, 8)} — recorded completion`);
-      } catch (err) {
-        sessionLog.error(`Failed to record halfway completion for ${identifier}:`, err.message);
-      }
-    };
-
-    if (autoStart) {
-      try {
-        await mixer.startDriftPlayback();
-        sessionLog.info(`✅ Session ${sessionId} started with initial track`);
-      } catch (error) {
-        sessionLog.error(`❌ Failed to start session ${sessionId}:`, error);
-      }
-    }
+    // Create mixer on Audio server
+    await this._audioClient.createSession(sessionId, { autoStart, ephemeral });
 
     const session = {
       sessionId,
-      mixer,
       created: new Date(),
       lastAccess: new Date(),
       isEphemeral: ephemeral
     };
 
+    // Fetch initial state for logging
+    let trackInfo = null;
+    if (autoStart) {
+      try {
+        const state = await this._audioClient.getMixerState(sessionId);
+        trackInfo = state?.currentTrack || null;
+      } catch (e) { /* ignore */ }
+    }
+
     console.log(JSON.stringify({
       _type: 'session_created',
       ts: new Date().toISOString(),
       sessionId,
-      trackId: mixer.state?.currentTrack?.identifier?.substring(0, 8) || null,
-      trackTitle: mixer.state?.currentTrack?.title || null,
+      trackId: trackInfo?.identifier?.substring(0, 8) || null,
+      trackTitle: trackInfo?.title || null,
       autoStart,
       ephemeral,
       isPrimed: false
@@ -177,9 +125,6 @@ class SessionManager {
 
     if (register) {
       this.registerSession(sessionId, session, { ephemeral });
-      if (ephemeral) {
-        this.attachEphemeralCleanup(sessionId, session);
-      }
     }
 
     return session;
@@ -188,9 +133,7 @@ class SessionManager {
   // ─── Priming ────────────────────────────────────────────────────────────────
 
   async primeSession(reason = 'unspecified') {
-    if (this._desiredPrimedSessions <= 0) {
-      return;
-    }
+    if (this._desiredPrimedSessions <= 0) return;
 
     this._primingSessionsInFlight += 1;
     try {
@@ -199,12 +142,19 @@ class SessionManager {
         session.isPrimed = true;
         session.primeReason = reason;
         this._primedSessionIds.add(session.sessionId);
+
+        let trackInfo = null;
+        try {
+          const state = await this._audioClient.getMixerState(session.sessionId);
+          trackInfo = state?.currentTrack || null;
+        } catch (e) { /* ignore */ }
+
         console.log(JSON.stringify({
           _type: 'session_primed',
           ts: new Date().toISOString(),
           sessionId: session.sessionId,
-          trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
-          trackTitle: session.mixer?.state?.currentTrack?.title || null,
+          trackId: trackInfo?.identifier?.substring(0, 8) || null,
+          trackTitle: trackInfo?.title || null,
           reason,
           primedCount: this._primedSessionIds.size
         }));
@@ -217,14 +167,10 @@ class SessionManager {
   }
 
   schedulePrimedSessions(reason = 'unspecified') {
-    if (this._desiredPrimedSessions <= 0) {
-      return;
-    }
+    if (this._desiredPrimedSessions <= 0) return;
 
     const needed = this._desiredPrimedSessions - this._primedSessionIds.size - this._primingSessionsInFlight;
-    if (needed <= 0) {
-      return;
-    }
+    if (needed <= 0) return;
 
     for (let i = 0; i < needed; i += 1) {
       this.primeSession(reason).catch(err => {
@@ -234,14 +180,10 @@ class SessionManager {
   }
 
   checkoutPrimedSession(resolution = 'request') {
-    if (!this._primedSessionIds.size) {
-      return null;
-    }
+    if (!this._primedSessionIds.size) return null;
 
     const iterator = this._primedSessionIds.values().next();
-    if (iterator.done) {
-      return null;
-    }
+    if (iterator.done) return null;
 
     const sessionId = iterator.value;
     this._primedSessionIds.delete(sessionId);
@@ -258,8 +200,6 @@ class SessionManager {
       _type: 'session_checkout',
       ts: new Date().toISOString(),
       sessionId,
-      trackId: session.mixer?.state?.currentTrack?.identifier?.substring(0, 8) || null,
-      trackTitle: session.mixer?.state?.currentTrack?.title || null,
       resolution,
       remainingPrimed: this._primedSessionIds.size
     }));
@@ -267,15 +207,33 @@ class SessionManager {
     return session;
   }
 
+  // ─── Audio server sync ───────────────────────────────────────────────────────
+
+  /**
+   * Ensure a session exists on the Audio server. If it doesn't (e.g. Audio server
+   * restarted), recreate it. Call this before proxying stream/SSE to Audio server.
+   */
+  async ensureAudioSession(session) {
+    if (!session) return;
+    try {
+      await this._audioClient.getMixerState(session.sessionId);
+    } catch (e) {
+      sessionLog.info(`🔄 Session ${session.sessionId} missing on Audio server — recreating`);
+      try {
+        await this._audioClient.createSession(session.sessionId, {
+          autoStart: true,
+          ephemeral: session.isEphemeral || false
+        });
+      } catch (createErr) {
+        sessionLog.error(`Failed to recreate session on Audio server: ${createErr.message}`);
+      }
+    }
+  }
+
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
   logSessionEvent(event, details = {}, { level = 'log' } = {}) {
-    const payload = {
-      event,
-      ts: new Date().toISOString(),
-      ...details
-    };
-
+    const payload = { event, ts: new Date().toISOString(), ...details };
     const message = `🛰️ session ${JSON.stringify(payload)}`;
     if (level === 'warn') {
       sessionLog.warn(message);
@@ -300,17 +258,12 @@ class SessionManager {
 
   // ─── Session resolution ─────────────────────────────────────────────────────
 
-  /**
-   * Resolve a session from a RequestContext.
-   * ctx: { sessionId, fingerprint, ip, url, cookieSessionId, persistBinding }
-   *   persistBinding: async (sessionId) => void — persists audio session binding to express session
-   */
   async getSessionForContext(ctx, { createIfMissing = true } = {}) {
     const queryId = ctx.sessionId || null;
     const cookieId = ctx.cookieSessionId || null;
     const fingerprintParam = ctx.fingerprint || null;
 
-    // Resolve session from fingerprint
+    // Resolve from fingerprint
     if (fingerprintParam && !queryId) {
       const entry = this._fingerprintRegistry.lookup(fingerprintParam);
       if (entry) {
@@ -328,7 +281,7 @@ class SessionManager {
       }
     }
 
-    // Resolve from explicit session ID (query param)
+    // Resolve from explicit session ID
     if (queryId) {
       let session = this.getSessionById(queryId);
       let createdViaQuery = false;
@@ -390,7 +343,7 @@ class SessionManager {
       return session;
     }
 
-    // Resolve from cookie (express session)
+    // Resolve from cookie
     if (cookieId !== undefined) {
       let session = cookieId ? this.getSessionById(cookieId) : null;
 
@@ -426,42 +379,30 @@ class SessionManager {
     }
 
     if (!createIfMissing) {
-      this.logSessionResolution(ctx, 'fallback', {
-        sessionId: null,
-        note: 'create_disabled'
-      });
+      this.logSessionResolution(ctx, 'fallback', { sessionId: null, note: 'create_disabled' });
       return null;
     }
 
-    // Before creating, check if an active session already exists.
-    // Prevents duplicate sessions from different network interfaces on the same machine.
-    // Prefer ephemeral sessions over named ones (ephemeral = current drift, named = saved journey).
-    let bestExisting = null;
-    for (const existing of this._audioSessions.values()) {
-      if (existing?.mixer?.isActive || (existing?.mixer?.clients?.size > 0)) {
-        if (!bestExisting || existing.isEphemeral) {
-          bestExisting = existing;
+    // Check for existing active session (prevents duplicates from different network interfaces)
+    try {
+      const health = await this._audioClient.health();
+      if (health.sessions && health.sessions.length > 0) {
+        const active = health.sessions.find(s => s.isActive || s.audioClients > 0);
+        if (active) {
+          const existing = this.getSessionById(active.sessionId);
+          if (existing) {
+            this.logSessionResolution(ctx, 'existing_active', {
+              sessionId: existing.sessionId,
+              created: false,
+              note: existing.isEphemeral ? 'joined_existing_ephemeral' : 'joined_existing_named'
+            });
+            existing.lastAccess = new Date();
+            if (ctx.persistBinding) await ctx.persistBinding(existing.sessionId);
+            return existing;
+          }
         }
       }
-    }
-    if (!bestExisting) {
-      for (const existing of this._ephemeralSessions.values()) {
-        if (existing?.mixer?.isActive || (existing?.mixer?.clients?.size > 0)) {
-          bestExisting = existing;
-          break;
-        }
-      }
-    }
-    if (bestExisting) {
-      this.logSessionResolution(ctx, 'existing_active', {
-        sessionId: bestExisting.sessionId,
-        created: false,
-        note: bestExisting.isEphemeral ? 'joined_existing_ephemeral' : 'joined_existing_named'
-      });
-      bestExisting.lastAccess = new Date();
-      if (ctx.persistBinding) await ctx.persistBinding(bestExisting.sessionId);
-      return bestExisting;
-    }
+    } catch (e) { /* ignore health check failure */ }
 
     let session = this.checkoutPrimedSession('fallback');
     if (!session) {
@@ -480,21 +421,23 @@ class SessionManager {
 
   // ─── Cleanup ────────────────────────────────────────────────────────────────
 
-  cleanupInactiveSessions(timeoutMs = 60 * 60 * 1000) {
+  async cleanupInactiveSessions(timeoutMs = 60 * 60 * 1000) {
     const now = new Date();
 
     for (const [sessionId, session] of this._audioSessions) {
-      const hasActiveAudioClients = session.mixer.clients && session.mixer.clients.size > 0;
-      const hasActiveEventClients = session.mixer.eventClients && session.mixer.eventClients.size > 0;
-      const isActiveStreaming = session.mixer.isActive;
       const hasRecentActivity = (now - session.lastAccess) < timeoutMs;
+      if (hasRecentActivity) continue;
 
-      if (hasActiveAudioClients || hasActiveEventClients || isActiveStreaming || hasRecentActivity) {
-        continue;
+      // Check Audio server for active clients
+      try {
+        const state = await this._audioClient.getMixerState(sessionId);
+        if (state.audioClients > 0 || state.eventClients > 0 || state.isActive) continue;
+      } catch (e) {
+        // Session may not exist on Audio server anymore
       }
 
       console.log(`🧹 Cleaning up inactive session: ${sessionId} (idle: ${Math.round((now - session.lastAccess) / 60000)}m)`);
-      session.mixer.destroy();
+      try { await this._audioClient.destroySession(sessionId); } catch (e) { /* ignore */ }
       this._audioSessions.delete(sessionId);
     }
   }

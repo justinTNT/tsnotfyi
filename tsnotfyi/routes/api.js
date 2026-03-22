@@ -1,7 +1,7 @@
 // User data and analysis API endpoints
 // Extracted from server.js for readability
 
-function setupApiRoutes(app, { db, radialSearch }) {
+function setupApiRoutes(app, { db, apiClient }) {
 
   // ==================== TRACK RATING/COMPLETION ====================
 
@@ -23,9 +23,12 @@ function setupApiRoutes(app, { db, radialSearch }) {
       if (!result) {
         return res.status(404).json({ error: 'Track not found' });
       }
-      // Update in-memory KD-tree so heartbeats carry the correct value
-      const inMemory = radialSearch.kdTree?.getTrack(id);
-      if (inMemory) inMemory.loved = rating === 1;
+      // Update API server's in-memory KD-tree
+      try {
+        await apiClient._post('/internal/track-loved', { identifier: id, loved: rating === 1 });
+      } catch (e) {
+        console.warn('Failed to update API server loved state:', e.message);
+      }
       res.json(result);
     } catch (error) {
       console.error('Error updating track rating:', error);
@@ -72,14 +75,9 @@ function setupApiRoutes(app, { db, radialSearch }) {
 
   // ==================== PLAYLISTS ====================
 
-  // Create playlist
   app.post('/api/playlists', async (req, res) => {
     const { name, description } = req.body;
-
-    if (!name) {
-      return res.status(400).json({ error: 'Playlist name is required' });
-    }
-
+    if (!name) return res.status(400).json({ error: 'Playlist name is required' });
     try {
       const result = await db.createPlaylist(name, description);
       res.json(result);
@@ -89,7 +87,6 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // List playlists
   app.get('/api/playlists', async (req, res) => {
     try {
       const playlists = await db.getPlaylists();
@@ -100,15 +97,11 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // Get playlist with tracks
   app.get('/api/playlists/:id', async (req, res) => {
     const { id } = req.params;
-
     try {
       const playlist = await db.getPlaylistWithTracks(id);
-      if (!playlist) {
-        return res.status(404).json({ error: 'Playlist not found' });
-      }
+      if (!playlist) return res.status(404).json({ error: 'Playlist not found' });
       res.json(playlist);
     } catch (error) {
       console.error('Error getting playlist:', error);
@@ -116,20 +109,13 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // Add track to playlist
   app.post('/api/playlists/:id/tracks', async (req, res) => {
     const { id } = req.params;
     const { identifier, direction, scope, position } = req.body;
-
-    if (!identifier) {
-      return res.status(400).json({ error: 'Track identifier is required' });
-    }
-
+    if (!identifier) return res.status(400).json({ error: 'Track identifier is required' });
     try {
       const result = await db.addToPlaylist(id, identifier, direction, scope, position);
-      if (!result) {
-        return res.status(404).json({ error: 'Playlist not found' });
-      }
+      if (!result) return res.status(404).json({ error: 'Playlist not found' });
       res.json(result);
     } catch (error) {
       console.error('Error adding track to playlist:', error);
@@ -139,7 +125,6 @@ function setupApiRoutes(app, { db, radialSearch }) {
 
   // ==================== PLAYLIST TREE ====================
 
-  // Get full tree: folders + playlists with cover art
   app.get('/api/playlist-tree', async (req, res) => {
     try {
       const tree = await db.getPlaylistTree();
@@ -218,7 +203,6 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // Batch reorder folders and playlists
   app.post('/api/reorder', async (req, res) => {
     const { folders, playlists } = req.body;
     try {
@@ -230,28 +214,33 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // ==================== DIMENSION ANALYSIS ====================
+  // ==================== FOLDER TRACKS ====================
 
-  // Get all tracks in the same folder as a given track
   app.get('/api/folder-tracks/:id', async (req, res) => {
     const { id } = req.params;
     try {
       const result = await db.getFolderTracks(id);
-      if (!result) {
-        return res.status(404).json({ error: 'Track not found' });
-      }
+      if (!result) return res.status(404).json({ error: 'Track not found' });
 
-      // Enrich with metadata from KD-tree (or DB for hated tracks excluded from KD-tree)
+      // Enrich with metadata from API server
       let folderCover = null;
       for (const track of result.tracks) {
-        const kdTrack = radialSearch.kdTree?.getTrack(track.identifier);
-        if (kdTrack) {
-          track.albumCover = kdTrack.albumCover || null;
-          track.loved = kdTrack.loved || false;
-          track.hated = false;
-          track.duration = kdTrack.length || null;
-          if (!folderCover && track.albumCover) folderCover = track.albumCover;
-        } else {
+        try {
+          const kdTrack = await apiClient.getTrack(track.identifier);
+          if (kdTrack) {
+            track.albumCover = kdTrack.albumCover || null;
+            track.loved = kdTrack.loved || false;
+            track.hated = false;
+            track.duration = kdTrack.length || null;
+            if (!folderCover && track.albumCover) folderCover = track.albumCover;
+          } else {
+            const stats = await db.getRatingWithStats(track.identifier);
+            track.hated = stats?.rating === -1;
+            track.loved = stats?.rating === 1;
+            track.albumCover = null;
+            track.duration = null;
+          }
+        } catch (e) {
           const stats = await db.getRatingWithStats(track.identifier);
           track.hated = stats?.rating === -1;
           track.loved = stats?.rating === 1;
@@ -259,7 +248,6 @@ function setupApiRoutes(app, { db, radialSearch }) {
           track.duration = null;
         }
       }
-      // Fill missing covers from siblings
       if (folderCover) {
         for (const track of result.tracks) {
           if (!track.albumCover) track.albumCover = folderCover;
@@ -273,7 +261,8 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // Get dimension statistics and availability
+  // ==================== DIMENSION ANALYSIS ====================
+
   app.get('/api/dimensions/stats', async (req, res) => {
     try {
       const stats = await db.getDimensionStats();
@@ -284,15 +273,11 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // Get dimensions for a specific track
   app.get('/api/dimensions/track/:id', async (req, res) => {
     const { id } = req.params;
-
     try {
       const track = await db.getTrackDimensions(id);
-      if (!track) {
-        return res.status(404).json({ error: 'Track not found' });
-      }
+      if (!track) return res.status(404).json({ error: 'Track not found' });
       res.json(track);
     } catch (error) {
       console.error('Error getting track dimensions:', error);
@@ -300,186 +285,7 @@ function setupApiRoutes(app, { db, radialSearch }) {
     }
   });
 
-  // ==================== KD-TREE SEARCH ====================
-
-  // Get neighbors for a track using KD-tree search
-  app.get('/api/kd-tree/neighbors/:id', async (req, res) => {
-    const { id } = req.params;
-    const { embedding = 'auto', include_distances = false } = req.query;
-    const resolution = req.query.resolution || 'magnifying_glass';
-    const discriminator = req.query.discriminator || 'primary_d';
-    const radiusSupplied = Object.prototype.hasOwnProperty.call(req.query, 'radius');
-    const limitSupplied = Object.prototype.hasOwnProperty.call(req.query, 'limit');
-    const parsedRadius = radiusSupplied ? parseFloat(req.query.radius) : null;
-    const radiusValue = Number.isFinite(parsedRadius) ? parsedRadius : null;
-    const parsedLimit = limitSupplied ? parseInt(req.query.limit, 10) : 100;
-    const limitValue = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 100;
-
-    try {
-      if (!radialSearch.initialized) {
-        await radialSearch.initialize();
-      }
-
-      const centerTrack = radialSearch.kdTree.getTrack(id);
-      if (!centerTrack) {
-        return res.status(404).json({ error: 'Track not found' });
-      }
-
-      let neighbors = [];
-      let appliedRadius = radiusValue ?? 0.3;
-      let calibrationMeta = null;
-
-      if (embedding === 'auto' || embedding === 'pca') {
-        neighbors = radialSearch.kdTree.radiusSearch(
-          centerTrack,
-          radiusValue ?? 0.3,
-          null,
-          limitValue
-        );
-        appliedRadius = radiusValue ?? 0.3;
-      } else if (embedding === 'vae') {
-        try {
-          if (radiusSupplied) {
-            neighbors = radialSearch.kdTree.vaeRadiusSearch(
-              centerTrack,
-              radiusValue,
-              limitValue
-            );
-            appliedRadius = radiusValue;
-          } else {
-            const { neighbors: calibratedNeighbors, appliedRadius: calibratedRadius, calibration } =
-              radialSearch.kdTree.vaeCalibratedSearch(centerTrack, resolution, limitValue);
-            neighbors = calibratedNeighbors;
-            appliedRadius = calibratedRadius;
-            calibrationMeta = calibration;
-          }
-        } catch (vaeError) {
-          console.warn('VAE search failed, falling back to PCA:', vaeError.message);
-          neighbors = radialSearch.kdTree.radiusSearch(
-            centerTrack,
-            radiusValue ?? 0.3,
-            null,
-            limitValue
-          );
-        }
-      }
-
-      const includeDist = include_distances === 'true' || include_distances === true;
-
-      const result = {
-        center: {
-          identifier: centerTrack.identifier,
-          title: centerTrack.title,
-          artist: centerTrack.artist,
-          album: centerTrack.album
-        },
-        neighbors: neighbors.map(n => {
-          const base = {
-            identifier: n.identifier,
-            title: n.title,
-            artist: n.artist,
-            album: n.album
-          };
-          if (includeDist && n.distance !== undefined) {
-            base.distance = n.distance;
-          }
-          return base;
-        }),
-        meta: {
-          embedding,
-          resolution,
-          appliedRadius,
-          count: neighbors.length,
-          calibration: calibrationMeta
-        }
-      };
-
-      res.json(result);
-    } catch (error) {
-      console.error('Error searching KD-tree:', error);
-      res.status(500).json({ error: 'Failed to search neighbors' });
-    }
-  });
-
-  // Batch neighbors search
-  app.post('/api/kd-tree/batch-neighbors', async (req, res) => {
-    const { identifiers, embedding = 'auto', radius, limit = 50 } = req.body;
-
-    if (!identifiers || !Array.isArray(identifiers)) {
-      return res.status(400).json({ error: 'identifiers array is required' });
-    }
-
-    if (identifiers.length > 100) {
-      return res.status(400).json({ error: 'Maximum 100 identifiers per batch' });
-    }
-
-    try {
-      if (!radialSearch.initialized) {
-        await radialSearch.initialize();
-      }
-
-      const results = {};
-
-      for (const id of identifiers) {
-        const centerTrack = radialSearch.kdTree.getTrack(id);
-        if (!centerTrack) {
-          results[id] = { error: 'Track not found' };
-          continue;
-        }
-
-        let neighbors = [];
-        const searchRadius = radius ?? 0.3;
-
-        if (embedding === 'vae') {
-          try {
-            neighbors = radialSearch.kdTree.vaeRadiusSearch(centerTrack, searchRadius, limit);
-          } catch (e) {
-            neighbors = radialSearch.kdTree.radiusSearch(centerTrack, searchRadius, null, limit);
-          }
-        } else {
-          neighbors = radialSearch.kdTree.radiusSearch(centerTrack, searchRadius, null, limit);
-        }
-
-        results[id] = {
-          neighbors: neighbors.map(n => ({
-            identifier: n.identifier,
-            distance: n.distance
-          }))
-        };
-      }
-
-      res.json({ results, meta: { embedding, radius: radius ?? 0.3, limit } });
-    } catch (error) {
-      console.error('Error in batch neighbors search:', error);
-      res.status(500).json({ error: 'Failed to search neighbors' });
-    }
-  });
-
-  // Get random tracks
-  app.get('/api/kd-tree/random-tracks', async (req, res) => {
-    const count = Math.min(parseInt(req.query.count) || 10, 100);
-
-    try {
-      if (!radialSearch.initialized) {
-        await radialSearch.initialize();
-      }
-
-      const randomTracks = radialSearch.kdTree.getRandomTracks(count);
-
-      res.json({
-        tracks: randomTracks.map(t => ({
-          identifier: t.identifier,
-          title: t.title,
-          artist: t.artist,
-          album: t.album
-        })),
-        count: randomTracks.length
-      });
-    } catch (error) {
-      console.error('Error getting random tracks:', error);
-      res.status(500).json({ error: 'Failed to get random tracks' });
-    }
-  });
+  // KD-tree search endpoints are served by the API server (port 3003)
 }
 
 module.exports = { setupApiRoutes };

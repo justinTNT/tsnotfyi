@@ -5,8 +5,22 @@
 
 import { state, elements, rootElement, DECK_STALE_FAILSAFE_MS, PENDING_EXPLORER_FORCE_MS } from './globals.js';
 import { cloneExplorerData } from './explorer-utils.js';
+import { playlistHasItems, getPlaylistTail } from './playlist-tray.js';
 import { createLogger } from './log.js';
 const log = createLogger('deck');
+
+/**
+ * Returns the track ID the explorer should explore from.
+ * With a playlist: explore from the last playlist item (what comes after the playlist).
+ * Without: explore from the current track.
+ */
+export function getExplorerSourceTrackId(currentTrackId) {
+  if (playlistHasItems()) {
+    const tail = getPlaylistTail();
+    if (tail?.trackId) return tail.trackId;
+  }
+  return currentTrackId;
+}
 
 // Dynamic import to avoid potential circular dependency issues
 async function loadExplorerFetch() {
@@ -70,6 +84,8 @@ export function clearExplorerSnapshotTimer(resolvedTrackId = null) {
 }
 
 export function armExplorerSnapshotTimer(trackId, context = {}) {
+  // Explore from the end of the playlist, not the current track
+  trackId = getExplorerSourceTrackId(trackId);
   if (!trackId) {
     return;
   }

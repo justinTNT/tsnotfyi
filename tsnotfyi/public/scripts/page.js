@@ -436,32 +436,45 @@ async function initializeApp() {
     fullResync,
     onSentinel: async (type, { bufferDelaySecs = 0 } = {}) => {
       if (type === 'crossfade-start') {
-        // Crossfade start: pop the tray and update the now-playing card immediately.
-        // The incoming track is audibly arriving — show it now.
+        // Crossfade start: delay promotion by buffer depth so visual aligns with audio.
+        // The sentinel fires when the marker arrives in the data stream, but the audio
+        // won't be heard until bufferDelaySecs later.
         if (playlistHasItems()) {
           const head = getPlaylistNext();
           if (head) {
-            sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing`);
-            popPlaylistHead();
-            renderPlaylistTray();
+            const delayMs = Math.max(0, Math.round(bufferDelaySecs * 1000));
+            sentinelLog.info(`🔔 Sentinel: crossfade-start — will promote ${head.trackId.substring(0, 8)} in ${delayMs}ms (buffer: ${bufferDelaySecs.toFixed(1)}s)`);
 
-            // Update now-playing card with the incoming track
-            const trackState = {
-              identifier: head.trackId,
-              title: head.title || '',
-              artist: head.artist || '',
-              album: head.album || '',
-              albumCover: head.albumCover || ''
+            const doPromote = () => {
+              sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing (after delay)`);
+              popPlaylistHead();
+              renderPlaylistTray();
+
+              const trackState = {
+                identifier: head.trackId,
+                title: head.title || '',
+                artist: head.artist || '',
+                album: head.album || '',
+                albumCover: head.albumCover || ''
+              };
+              state.latestCurrentTrack = trackState;
+              window.state.latestCurrentTrack = trackState;
+              // Lock against heartbeat overwrites for a few seconds
+              state._sentinelPromotionLockUntil = Date.now() + 15000;
+              if (typeof window.updateNowPlayingCard === 'function') {
+                window.updateNowPlayingCard(trackState, null);
+              }
+
+              const newHead = getPlaylistNext();
+              if (newHead && typeof window.sendNextTrack === 'function') {
+                window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+              }
             };
-            state.latestCurrentTrack = trackState;
-            window.state.latestCurrentTrack = trackState;
-            if (typeof window.updateNowPlayingCard === 'function') {
-              window.updateNowPlayingCard(trackState, null);
-            }
 
-            const newHead = getPlaylistNext();
-            if (newHead && typeof window.sendNextTrack === 'function') {
-              window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+            if (delayMs > 50) {
+              setTimeout(doPromote, delayMs);
+            } else {
+              doPromote();
             }
           }
         }
@@ -670,8 +683,14 @@ async function initializeApp() {
 
       state.pendingSnapshotTrackId = currentTrackId;
       state.trackChangeAnimationComplete = true;
-      if (!explorerAlreadyCurrent) {
+      // Skip re-explore if playlist still has items and explorer already shows post-playlist options
+      const playlistStillActive = typeof playlistHasItems === 'function' && playlistHasItems();
+      const explorerAlreadyAtTail = playlistStillActive &&
+        state.latestExplorerData?.currentTrack?.identifier === (typeof getPlaylistTail === 'function' ? getPlaylistTail()?.trackId : null);
+      if (!explorerAlreadyCurrent && !explorerAlreadyAtTail) {
         armExplorerSnapshotTimer(currentTrackId, { reason: 'sentinel-track-change' });
+      } else if (explorerAlreadyAtTail) {
+        sentinelLog.info(`🔔 Skipping re-explore: explorer already shows post-playlist options`);
       }
 
       state._sentinelHandlerInFlight = false;

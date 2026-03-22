@@ -192,10 +192,10 @@ async function unfoldAlbum(trackId, playlistIndex) {
             return;
         }
 
-        // Build playlist items for all folder tracks from clicked position onward
+        // Build playlist items for ALL folder tracks
         const original = state.playlist[playlistIndex];
         const totalTracks = data.tracks.length;
-        const folderItems = data.tracks.slice(clickedIndex).map(track => ({
+        const folderItems = data.tracks.map(track => ({
             trackId: track.identifier,
             albumCover: track.albumCover || original?.albumCover || '/images/albumcover.png',
             directionKey: original?.directionKey || null,
@@ -314,6 +314,17 @@ export function getPlaylistNext() {
  */
 export function playlistHasItems() {
     return Array.isArray(state.playlist) && state.playlist.length > 0;
+}
+
+/**
+ * Get the last item in the playlist (the track after which explorer options apply)
+ * @returns {object|null}
+ */
+export function getPlaylistTail() {
+    if (!Array.isArray(state.playlist) || state.playlist.length === 0) {
+        return null;
+    }
+    return state.playlist[state.playlist.length - 1];
 }
 
 /**
@@ -1057,6 +1068,7 @@ if (typeof window !== 'undefined') {
     window.popPlaylistHead = popPlaylistHead;
     window.getPlaylistNext = getPlaylistNext;
     window.playlistHasItems = playlistHasItems;
+    window.getPlaylistTail = getPlaylistTail;
     window.clearPlaylist = clearPlaylist;
     window.refreshExplorerForPlaylist = refreshExplorerForPlaylist;
     window.getLeftStack = getLeftStack;

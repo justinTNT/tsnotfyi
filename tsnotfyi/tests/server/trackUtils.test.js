@@ -37,7 +37,9 @@ describe('buildTrackMetadata', () => {
       title: 'Song',
       artist: 'Artist',
       album: 'Album',
-      path: '/music/song.mp3'
+      path: '/music/song.mp3',
+      track: null,
+      disc: null
     });
   });
 
