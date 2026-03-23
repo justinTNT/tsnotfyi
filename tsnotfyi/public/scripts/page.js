@@ -683,14 +683,14 @@ async function initializeApp() {
 
       state.pendingSnapshotTrackId = currentTrackId;
       state.trackChangeAnimationComplete = true;
-      // Skip re-explore if playlist still has items and explorer already shows post-playlist options
+      // Skip explorer fetch (and the clock redraw it triggers) when playlist has
+      // queued items — the user has already made their selections, so we don't
+      // need fresh explorer data until the playlist drains.
       const playlistStillActive = typeof playlistHasItems === 'function' && playlistHasItems();
-      const explorerAlreadyAtTail = playlistStillActive &&
-        state.latestExplorerData?.currentTrack?.identifier === (typeof getPlaylistTail === 'function' ? getPlaylistTail()?.trackId : null);
-      if (!explorerAlreadyCurrent && !explorerAlreadyAtTail) {
+      if (!explorerAlreadyCurrent && !playlistStillActive) {
         armExplorerSnapshotTimer(currentTrackId, { reason: 'sentinel-track-change' });
-      } else if (explorerAlreadyAtTail) {
-        sentinelLog.info(`🔔 Skipping re-explore: explorer already shows post-playlist options`);
+      } else if (playlistStillActive) {
+        sentinelLog.info(`🎵 Playlist active (${state.playlist?.length || 0} items) — skipping explorer fetch`);
       }
 
       state._sentinelHandlerInFlight = false;
@@ -895,15 +895,21 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
       const normalizeTracks = (direction) => {
           if (!direction || !Array.isArray(direction.sampleTracks)) return;
-          direction.sampleTracks = direction.sampleTracks.map(entry => {
-              if (!entry) {
-                  return entry;
-              }
-              if (entry.track) {
-                  return entry;
-              }
-              return { track: entry };
-          });
+          const seen = new Set();
+          direction.sampleTracks = direction.sampleTracks
+              .map(entry => {
+                  if (!entry) return null;
+                  if (entry.track) return entry;
+                  return { track: entry };
+              })
+              .filter(entry => {
+                  if (!entry) return false;
+                  const id = (entry.track || entry)?.identifier;
+                  if (!id) return true;
+                  if (seen.has(id)) return false;
+                  seen.add(id);
+                  return true;
+              });
           if (direction.oppositeDirection) {
               normalizeTracks(direction.oppositeDirection);
           }

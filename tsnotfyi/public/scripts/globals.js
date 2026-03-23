@@ -54,6 +54,7 @@ export function getCardBackgroundColor(directionType) {
 
 // Global application state
 export const state = {
+  hasHeardAudio: false,
   lastSSEMessageTime: null,
   latestExplorerData: null,
   latestCurrentTrack: null,

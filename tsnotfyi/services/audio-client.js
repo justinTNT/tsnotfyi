@@ -177,6 +177,10 @@ class AudioClient {
     return this.command(sessionId, 'selectNextTrack', { trackMd5, ...opts });
   }
 
+  async replaceSeedTrack(sessionId, trackMd5, opts = {}) {
+    return this.command(sessionId, 'replaceSeedTrack', { trackMd5, ...opts });
+  }
+
   async hydrateTrack(sessionId, trackIdOrObj, annotations) {
     return this.command(sessionId, 'hydrateTrack', { track: trackIdOrObj, annotations });
   }

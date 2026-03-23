@@ -186,7 +186,9 @@ export function connectSSE() {
           startProgressAnimationFromPosition(fallbackDurationSeconds, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
         }
 
-        armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
+        if (!playlistHasItems()) {
+          armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
+        }
       }, Math.max(5000, Math.round(getBufferDelaySecs() * 1000) + 3000));
 
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];

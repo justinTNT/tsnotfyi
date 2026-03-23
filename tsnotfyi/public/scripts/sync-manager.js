@@ -156,6 +156,11 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     }
 
     try {
+        const seedOverride = !state.hasHeardAudio && source === 'user';
+        if (seedOverride) {
+            log.info(`🌱 User selection before audio started — sending as seed override`);
+        }
+
         const response = await fetch('/next-track', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -163,6 +168,7 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
                 trackMd5: md5ToSend,
                 direction: dirToSend,
                 source,
+                seedOverride,
                 fingerprint: state.streamFingerprint,
                 sessionId: state.sessionId,
                 clientBufferSecs: getBufferDelaySecs()

@@ -444,6 +444,15 @@ app.post('/internal/sessions/:id/command', async (req, res) => {
         return res.json({ ok: true });
       }
 
+      case 'replaceSeedTrack': {
+        const { trackMd5, direction } = req.body;
+        await mixer.replaceSeedTrack(trackMd5, { direction });
+        return res.json({
+          ok: true,
+          currentTrack: mixer.state.currentTrack?.identifier || null
+        });
+      }
+
       case 'selectNextTrack': {
         const { trackMd5, direction, origin } = req.body;
         await mixer.selectNextTrack(trackMd5, { direction, origin });

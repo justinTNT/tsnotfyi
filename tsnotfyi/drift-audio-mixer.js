@@ -416,6 +416,59 @@ class DriftAudioMixer {
    *   mixer.lockedNextTrackIdentifier = trackMd5
    *   mixer.driftPlayer.currentDirection = direction
    */
+  /**
+   * Replace the initial seed track before the user has heard any audio.
+   * Stops current streaming, loads the requested track as current, restarts.
+   */
+  async replaceSeedTrack(trackMd5, { direction = null } = {}) {
+    const secondsStreamed = this.audioMixer?.engine?.bytesSent
+      ? this.audioMixer.engine.bytesSent / (this.audioMixer.engine.bytesPerSecond || 176400)
+      : 0;
+
+    // Only allow seed replacement if we're very early in the stream
+    // (client buffers ~8s, so anything under ~12s of server-side bytes is pre-audible)
+    if (secondsStreamed > 12) {
+      console.log(`🌱 Seed override rejected: ${secondsStreamed.toFixed(1)}s already streamed`);
+      // Fall back to normal next-track selection
+      return this.selectNextTrack(trackMd5, { direction, origin: 'seed-override-late' });
+    }
+
+    console.log(`🌱 Replacing seed track with ${trackMd5.substring(0, 8)} (${secondsStreamed.toFixed(1)}s streamed)`);
+
+    const track = this.trackLookup
+      ? await this.trackLookup.getTrack(trackMd5)
+      : null;
+
+    if (!track) {
+      console.warn(`🌱 Seed override: track ${trackMd5.substring(0, 8)} not found`);
+      throw new Error(`Track not found: ${trackMd5}`);
+    }
+
+    // Stop current streaming
+    try {
+      this.stopStreaming();
+    } catch (e) {
+      console.warn('🌱 stopStreaming during seed override:', e?.message);
+    }
+
+    // Seed the new track as current
+    this.clearPendingUserSelection();
+    this.lockedNextTrackIdentifier = null;
+    this.nextTrack = null;
+
+    if (direction && this.driftPlayer) {
+      this.driftPlayer.currentDirection = direction;
+    }
+
+    this.pendingCurrentTrack = this.hydrateTrackRecord(track, {
+      transitionReason: 'seed-override'
+    }) || track;
+
+    await this.playCurrentTrack();
+    await this.broadcastTrackEvent(true, { reason: 'seed-override' });
+    console.log(`🌱 Seed override complete: now playing ${track.title || trackMd5.substring(0, 8)}`);
+  }
+
   async selectNextTrack(trackMd5, { direction = null, origin = null } = {}) {
     if (typeof this.handleUserSelectedNextTrack === 'function') {
       await this.handleUserSelectedNextTrack(trackMd5, { direction });

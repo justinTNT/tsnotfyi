@@ -1277,6 +1277,7 @@ app.post('/next-track', async (req, res) => {
     source = 'user',
     origin = null,
     explorerSignature = null,
+    seedOverride = false,
     fingerprint: requestFingerprint,
     clientBufferSecs
   } = req.body;
@@ -1320,6 +1321,25 @@ app.post('/next-track', async (req, res) => {
     const cleanMd5 = typeof trackMd5 === 'string' ? trackMd5 : null;
     const advertisedDirection = typeof direction === 'string' ? direction : null;
     const isDeckSelection = normalizedSource === 'user' && normalizedOrigin === 'deck';
+
+    // Seed override: user made a selection before hearing any audio.
+    // Replace the random seed track instead of queuing as next.
+    if (seedOverride && cleanMd5 && normalizedSource === 'user') {
+      serverLog.info(`🌱 Seed override: replacing initial track with ${cleanMd5.substring(0, 8)}`);
+      try {
+        await audioClient.replaceSeedTrack(session.sessionId, cleanMd5, { direction: advertisedDirection });
+        const updatedState = await audioClient.getFullState(session.sessionId);
+        return res.json({
+          status: 'seed_replaced',
+          sessionId: session.sessionId,
+          fingerprint: fingerprintRegistry.getFingerprintForSession(session.sessionId),
+          currentTrack: updatedState.currentTrack?.identifier || null,
+          nextTrack: updatedState.nextTrack?.identifier || null
+        });
+      } catch (e) {
+        serverLog.warn(`⚠️ Seed override failed (${e.message}), falling through to normal selection`);
+      }
+    }
 
     // For deck selections, try to find track in explorer data and prepare
     if (isDeckSelection) {

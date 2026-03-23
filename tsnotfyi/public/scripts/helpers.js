@@ -129,11 +129,34 @@ import { setSelection } from './selection.js';
       return cleaned || null;
   }
 
+  function stripMetadataPrefix(title, candidates) {
+      if (!title) return title;
+      for (const name of candidates) {
+          if (!name) continue;
+          // Match patterns like "Name - 03 - Track Title" or "Name - 3 - Track Title"
+          const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const pattern = new RegExp(`^${escaped}\\s*[-–—]\\s*\\d+\\s*[-–—]\\s*`, 'i');
+          const stripped = title.replace(pattern, '').trim();
+          if (stripped && stripped !== title.trim()) {
+              return stripped;
+          }
+      }
+      return title;
+  }
+
   function getDisplayTitle(track) {
       if (!track) return 'Unknown Track';
 
       const directTitle = typeof track.title === 'string' ? track.title.trim() : '';
-      if (directTitle) return directTitle;
+      if (directTitle) {
+          const album = track.album || track.beetsMeta?.album?.album || track.beetsMeta?.item?.album || '';
+          const artist = track.artist || '';
+          const candidates = [album, artist].filter(Boolean);
+          if (candidates.length > 0) {
+              return stripMetadataPrefix(directTitle, candidates);
+          }
+          return directTitle;
+      }
 
       const beetsTitle = typeof track.beetsMeta?.title === 'string'
           ? track.beetsMeta.title.trim()
@@ -418,6 +441,11 @@ import { setSelection } from './selection.js';
       const existing = card.querySelector('.uno-reverse');
       if (existing) {
           existing.remove();
+      }
+
+      // Outlier directions should never have a reverse icon
+      if (direction?.isOutlier) {
+          return;
       }
 
       const oppositeKey = resolveOppositeDirectionKey(direction) || getOppositeDirection(context.resolvedKey);
@@ -834,7 +862,7 @@ import { setSelection } from './selection.js';
       }
       card.dataset.trackDurationDisplay = duration;
 
-      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
+      const directionName = formatDirectionName(resolvedKey);
 
       const albumName = track.album
           || track.beetsMeta?.album?.album
@@ -898,6 +926,7 @@ import { setSelection } from './selection.js';
                       state.latestExplorerData.directions[oppositeKey] = {
                           ...currentDirection.oppositeDirection,
                           hasOpposite: true,
+                          isOutlier: false,
                           key: oppositeKey
                       };
 
@@ -1352,7 +1381,7 @@ import { setSelection } from './selection.js';
           }
       }
 
-      const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(resolvedKey);
+      const directionName = formatDirectionName(resolvedKey);
       const hasOpposite = declaredOpposite || oppositeAvailable;
       // Center cards (promoted cards) should also get interactive reverse if opposite is available
       const isCardInCenter = card.classList.contains('center') || card.classList.contains('now-playing') || card.classList.contains('current-track');

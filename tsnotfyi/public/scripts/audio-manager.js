@@ -433,6 +433,9 @@ function handlePipelineEvent(msg) {
       audioHealth.lastTimeUpdate = Date.now();
       audioHealth.bufferingStarted = null;
       audioHealth.isHealthy = true;
+      if (!state.hasHeardAudio) {
+        state.hasHeardAudio = true;
+      }
       audioHealth.lastObservedTime = softwareClock;
       if (audioHealth.stallTimer) {
         clearTimeout(audioHealth.stallTimer);
