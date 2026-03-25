@@ -9,6 +9,7 @@
 require('./utils/logTimestamps');
 require('./server-logger').setServerName('audio');
 const express = require('express');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const DriftAudioMixer = require('./drift-audio-mixer');
@@ -444,6 +445,11 @@ app.post('/internal/sessions/:id/command', async (req, res) => {
         return res.json({ ok: true });
       }
 
+      case 'skipToCrossfade': {
+        const result = mixer.audioMixer?.skipToCrossfade();
+        return res.json({ ok: !!result, skipped: !!result });
+      }
+
       case 'replaceSeedTrack': {
         const { trackMd5, direction } = req.body;
         await mixer.replaceSeedTrack(trackMd5, { direction });
@@ -503,6 +509,14 @@ app.post('/internal/sessions/:id/command', async (req, res) => {
         const stats = mixer.getStats();
         const heartbeat = mixer.buildHeartbeatPayload ? mixer.buildHeartbeatPayload('api') : null;
         return res.json({ stats, heartbeat });
+      }
+
+      case 'skipToCrossfade': {
+        if (typeof mixer.audioMixer?.skipToCrossfade === 'function') {
+          const skipped = mixer.audioMixer.skipToCrossfade();
+          return res.json({ ok: true, skipped });
+        }
+        return res.json({ ok: false, skipped: false, error: 'skipToCrossfade not available' });
       }
 
       default:
@@ -600,6 +614,9 @@ async function start() {
     process.exit(1);
   }
 
+  // Audio server stays HTTP — inter-server traffic doesn't need TLS.
+  // Browser access goes through the Web server's HTTPS proxy.
+  // Direct browser→Audio HTTPS connection is a future optimization.
   serverInstance = app.listen(port, () => {
     startupLog.info(`🎵 Audio Server listening on port ${port}`);
     startupLog.info(`📊 ${trackLookup.trackCount} tracks in index`);

@@ -181,6 +181,10 @@ class AudioClient {
     return this.command(sessionId, 'replaceSeedTrack', { trackMd5, ...opts });
   }
 
+  async skipToCrossfade(sessionId) {
+    return this.command(sessionId, 'skipToCrossfade', {});
+  }
+
   async hydrateTrack(sessionId, trackIdOrObj, annotations) {
     return this.command(sessionId, 'hydrateTrack', { track: trackIdOrObj, annotations });
   }

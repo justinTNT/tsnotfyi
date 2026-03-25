@@ -128,6 +128,9 @@ class AdvancedAudioMixer {
 
         // Set crossfade lead time (use cached analysis or default)
         track.crossfadeLeadTime = cached.analysis.crossfadeLeadTime || 8;
+        track.intro = cached.analysis.intro || null;
+        track.outro = cached.analysis.outro || null;
+        track.introQuietPeriod = cached.analysis.introQuietPeriod || 0;
         console.log(`🎯 ${slot} track (cached) crossfade lead time: ${track.crossfadeLeadTime}s`);
 
         this.setSlotMetadata(slot, metadata);
@@ -156,10 +159,15 @@ class AdvancedAudioMixer {
       // Store trimmed PCM directly — no MP3 encoding, crossfade happens in PCM
       const track = this.engine[slot === 'current' ? 'currentTrack' : 'nextTrack'];
 
+      // Analyze quiet periods and crossfade lead time
+      const introQuietPeriod = this.analyzeIntroEnergy(trimmedResult.buffer);
+      const crossfadeLeadTime = this.analyzeCrossfadeLeadTime(trimmedResult, analysis.outro);
+
       const extendedAnalysis = {
         ...analysis,
         actualDuration: trimmedResult.actualDuration,
-        crossfadeLeadTime: slot === 'next' ? track.crossfadeLeadTime : undefined
+        crossfadeLeadTime,
+        introQuietPeriod
       };
 
       this.cacheTrackMixdown(trackPath, trimmedResult.buffer, extendedAnalysis);
@@ -167,11 +175,12 @@ class AdvancedAudioMixer {
       track.bpm = analysis.bpm;
       track.key = analysis.key;
       track.analyzed = true;
-      track.estimatedDuration = trimmedResult.actualDuration; // Use recalculated duration from trimming
-
-      // Analyze quiet tail to determine when to start crossfading out of this track
-      track.crossfadeLeadTime = this.analyzeCrossfadeLeadTime(trimmedResult);
-      console.log(`🎯 ${slot} track crossfade lead time: ${track.crossfadeLeadTime}s`);
+      track.estimatedDuration = trimmedResult.actualDuration;
+      track.intro = analysis.intro;
+      track.outro = analysis.outro;
+      track.introQuietPeriod = introQuietPeriod;
+      track.crossfadeLeadTime = crossfadeLeadTime;
+      console.log(`🎯 ${slot} track crossfade lead time: ${crossfadeLeadTime}s, intro quiet: ${introQuietPeriod}s`);
 
       console.log(`✅ Track processed and cached: BPM=${analysis.bpm}, Key=${analysis.key}, Size=${trimmedResult.buffer.length} bytes (PCM)`);
 
@@ -228,11 +237,13 @@ class AdvancedAudioMixer {
         stdio: ['ignore', 'pipe', 'pipe']
       });
 
-      let pcmBuffer = Buffer.alloc(0);
+      const pcmChunks = [];
+      let pcmTotalLength = 0;
       let stderrOutput = '';
 
       process.stdout.on('data', (chunk) => {
-        pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+        pcmChunks.push(chunk);
+        pcmTotalLength += chunk.length;
       });
 
       process.stderr.on('data', (data) => {
@@ -241,7 +252,7 @@ class AdvancedAudioMixer {
 
       process.on('close', (code) => {
         if (code === 0) {
-          resolve(pcmBuffer);
+          resolve(Buffer.concat(pcmChunks, pcmTotalLength));
         } else {
           const err = new Error(`FFmpeg PCM conversion failed with code ${code}`);
           // Detect file/volume not found for caller to handle
@@ -264,10 +275,12 @@ class AdvancedAudioMixer {
       key: this.detectKey(pcmBuffer),
       duration: pcmBuffer.length / (this.sampleRate * this.channels * 2),
       rms: this.calculateRMS(pcmBuffer),
-      peaks: this.findPeaks(pcmBuffer)
+      peaks: this.findPeaks(pcmBuffer),
+      intro: this.analyzeIntroBeats(pcmBuffer),
+      outro: this.analyzeOutroBeats(pcmBuffer)
     };
 
-    console.log(`📈 Analysis: BPM=${analysis.bpm}, Key=${analysis.key}, Duration=${analysis.duration.toFixed(1)}s`);
+    console.log(`📈 Analysis: BPM=${analysis.bpm}, Key=${analysis.key}, Duration=${analysis.duration.toFixed(1)}s, introBeats=${analysis.intro.hasRhythm}, outroBeats=${analysis.outro.hasRhythm}`);
 
     return analysis;
   }
@@ -355,25 +368,37 @@ class AdvancedAudioMixer {
 
   // Find audio peaks for beat alignment
   findPeaks(pcmBuffer) {
+    return this.findPeaksAdaptive(pcmBuffer, 0);
+  }
+
+  // Find audio peaks with adaptive threshold.
+  // thresholdFraction=0 uses fixed 0.1 (legacy behavior).
+  // thresholdFraction>0 uses that fraction of the slice's peak window energy.
+  findPeaksAdaptive(pcmBuffer, thresholdFraction = 0.15) {
     const frameSize = this.channels * 2;
     const windowSize = Math.floor(this.sampleRate * 0.05); // 50ms windows
     const numWindows = Math.floor((pcmBuffer.length / frameSize) / windowSize);
-    const peaks = [];
 
-    for (let i = 1; i < numWindows - 1; i++) {
+    // First pass: compute all window energies and find peak
+    const energies = new Float64Array(numWindows);
+    let peakWindowEnergy = 0;
+    for (let i = 0; i < numWindows; i++) {
       const start = i * windowSize * frameSize;
-      const prevStart = (i - 1) * windowSize * frameSize;
-      const nextStart = (i + 1) * windowSize * frameSize;
+      energies[i] = this.getWindowEnergy(pcmBuffer, start, windowSize * frameSize);
+      if (energies[i] > peakWindowEnergy) peakWindowEnergy = energies[i];
+    }
 
-      const currentEnergy = this.getWindowEnergy(pcmBuffer, start, windowSize * frameSize);
-      const prevEnergy = this.getWindowEnergy(pcmBuffer, prevStart, windowSize * frameSize);
-      const nextEnergy = this.getWindowEnergy(pcmBuffer, nextStart, windowSize * frameSize);
+    const threshold = thresholdFraction > 0 && peakWindowEnergy > 0
+      ? thresholdFraction * peakWindowEnergy
+      : 0.1;
 
-      // Peak if current > both neighbors and above threshold
-      if (currentEnergy > prevEnergy && currentEnergy > nextEnergy && currentEnergy > 0.1) {
+    // Second pass: find local maxima above threshold
+    const peaks = [];
+    for (let i = 1; i < numWindows - 1; i++) {
+      if (energies[i] > energies[i - 1] && energies[i] > energies[i + 1] && energies[i] > threshold) {
         peaks.push({
           position: i * windowSize / this.sampleRate, // Time in seconds
-          energy: currentEnergy
+          energy: energies[i]
         });
       }
     }
@@ -770,14 +795,80 @@ class AdvancedAudioMixer {
     // Calculate BPM matching
     this.calculateAudioMatching();
 
-    console.log(`🎵 Starting 2.5s cosine crossfade: ${this.engine.currentTrack.bpm} BPM → ${this.engine.nextTrack.bpm} BPM`);
+    // Duration depends on rhythmic content of both tracks.
+    // Ambient → ambient: long blend (full lead time) — textures merge smoothly.
+    // Rhythmic → rhythmic: short blend — beats clash during overlap.
+    // Mixed: medium blend.
+    const outroLeadTime = this.engine.currentTrack.crossfadeLeadTime || 16;
+    const remainingSec = this.engine.currentTrack.buffer
+      ? (this.engine.currentTrack.buffer.length - this.engine.currentTrack.position) / this.engine.bytesPerSecond
+      : 16;
+
+    const incomingHasBeats = this.engine.nextTrack.intro?.hasRhythm || false;
+    // Use both local outro analysis AND global beat_punch — sparse hard hits
+    // (like Cherry Drops) may fail rhythmic periodicity checks but still clash
+    const outgoingBeatPunch = this.trackMetadata.current?.features?.beat_punch || 0;
+    const outgoingHasBeats = this.engine.currentTrack.outro?.hasRhythm || outgoingBeatPunch > 0.08;
+
+    let targetDuration;
+    if (incomingHasBeats && outgoingHasBeats) {
+      // Both rhythmic: short crossfade to minimize beat clash
+      targetDuration = 3;
+    } else if (incomingHasBeats || outgoingHasBeats) {
+      // One rhythmic, one ambient: medium crossfade
+      targetDuration = 6;
+    } else {
+      // Both ambient: full lead time blend
+      targetDuration = Math.min(outroLeadTime, remainingSec);
+    }
+
+    this.engine.activeCrossfadeDuration = Math.max(
+      this.engine.crossfadeDuration, // absolute floor from config (2.5s)
+      targetDuration
+    );
+
+    // Store analysis for logging / future stretch goals
+    this.engine.activeOutroAnalysis = this.engine.currentTrack.outro || null;
+    this.engine.activeIntroAnalysis = this.engine.nextTrack.intro || null;
+
+    const currentId = this.trackMetadata.current?.identifier || '????????';
+    const nextId = this.trackMetadata.next?.identifier || '????????';
+    const currentTitle = this.trackMetadata.current?.title || 'unknown';
+    const nextTitle = this.trackMetadata.next?.title || 'unknown';
+    const outroAnalysis = this.engine.activeOutroAnalysis;
+    const introAnalysis = this.engine.activeIntroAnalysis;
+    const introQuiet = this.engine.nextTrack.introQuietPeriod || 0;
+
+    console.log(JSON.stringify({
+      _type: 'crossfade_start',
+      ts: new Date().toISOString(),
+      duration: parseFloat(this.engine.activeCrossfadeDuration.toFixed(1)),
+      replay: `/${currentId}/${nextId}`,
+      outgoing: {
+        id: currentId,
+        title: currentTitle,
+        leadTime: parseFloat(outroLeadTime.toFixed(1)),
+        remaining: parseFloat(remainingSec.toFixed(1)),
+        beats: outroAnalysis?.hasRhythm || false,
+        bpm: outroAnalysis?.localBpm || null,
+        anchor: outroAnalysis?.anchorPosition ? parseFloat(outroAnalysis.anchorPosition.toFixed(2)) : null
+      },
+      incoming: {
+        id: nextId,
+        title: nextTitle,
+        quietIntro: parseFloat(introQuiet.toFixed(1)),
+        beats: introAnalysis?.hasRhythm || false,
+        bpm: introAnalysis?.localBpm || null,
+        anchor: introAnalysis?.anchorPosition ? parseFloat(introAnalysis.anchorPosition.toFixed(2)) : null
+      }
+    }));
 
     if (this.onCrossfadeStart) {
       this.onCrossfadeStart({
         currentBPM: this.engine.currentTrack.bpm,
         nextBPM: this.engine.nextTrack.bpm,
         tempoAdjustment: this.engine.tempoAdjustment,
-        duration: this.engine.crossfadeDuration
+        duration: this.engine.activeCrossfadeDuration
       });
     }
   }
@@ -870,7 +961,8 @@ class AdvancedAudioMixer {
   // Every sample gets its own fade coefficient — the volume curve is continuous,
   // not stepped at chunk boundaries.
   createCrossfadeChunk() {
-    const totalCrossfadeSamples = this.engine.crossfadeDuration * this.sampleRate;
+    const activeDuration = this.engine.activeCrossfadeDuration || this.engine.crossfadeDuration;
+    const totalCrossfadeSamples = activeDuration * this.sampleRate;
     const crossfadeSamplePos = this.engine.crossfadePosition; // in samples (not bytes)
 
     if (crossfadeSamplePos >= totalCrossfadeSamples) {
@@ -1056,6 +1148,9 @@ class AdvancedAudioMixer {
     this.engine.crossfadePosition = 0;
     this.engine.crossfadeStartTime = null;
     this.engine.tempoAdjustment = 1.0;
+    this.engine.activeCrossfadeDuration = null;
+    this.engine.activeOutroAnalysis = null;
+    this.engine.activeIntroAnalysis = null;
     console.log(JSON.stringify({
       _type: 'metadata_promotion',
       ts: new Date().toISOString(),
@@ -1088,6 +1183,37 @@ class AdvancedAudioMixer {
     }
 
     this.stopStreaming();
+  }
+
+  // Skip current track's playback position to just before the crossfade trigger.
+  // The next streamTick will see estimatedSequenceSeconds <= crossfadeLeadTime and
+  // start the crossfade naturally (including sentinel).
+  skipToCrossfade() {
+    const track = this.engine.currentTrack;
+    if (!track.buffer) {
+      console.warn('🎮 skipToCrossfade: no current track buffer');
+      return false;
+    }
+
+    const leadTime = track.crossfadeLeadTime || this.engine.crossfadeDuration;
+    const targetBytesRemaining = Math.ceil((leadTime + 0.5) * this.engine.bytesPerSecond);
+    const targetPosition = Math.max(0, track.buffer.length - targetBytesRemaining);
+
+    if (targetPosition <= track.position) {
+      console.log('🎮 skipToCrossfade: already past crossfade point');
+      return false;
+    }
+
+    const skippedSeconds = (targetPosition - track.position) / this.engine.bytesPerSecond;
+    console.log(`🎮 skipToCrossfade: jumping ${skippedSeconds.toFixed(1)}s ahead (${leadTime.toFixed(1)}s of audio remaining)`);
+
+    track.position = targetPosition;
+
+    // Reset stream clock so the pacing loop doesn't think we're massively behind
+    this.engine.streamClockStart = Date.now();
+    this.engine.bytesSent = 0;
+
+    return true;
   }
 
   // Force immediate transition (for testing)
@@ -1202,41 +1328,190 @@ class AdvancedAudioMixer {
     };
   }
 
-  // Analyze audio buffer to determine optimal crossfade lead time
-  analyzeCrossfadeLeadTime(audioBuffer, sampleRate = 44100) {
-    if (!audioBuffer || audioBuffer.length === 0) return 8; // Default fallback
+  // Analyze audio buffer to determine optimal crossfade lead time.
+  // The lead time is now also the crossfade DURATION (the blend spans the full quiet tail).
+  // Second argument: outro beat analysis (if available) to set beat-aware minimums.
+  analyzeCrossfadeLeadTime(audioBuffer, outroAnalysis = null, sampleRate = 44100) {
+    const isBuffer = audioBuffer && (Buffer.isBuffer(audioBuffer) || audioBuffer.buffer);
+    const rawBuffer = isBuffer ? audioBuffer : (audioBuffer?.buffer || audioBuffer);
+    if (!rawBuffer || rawBuffer.length === 0) return 16; // Default: 16s for beatless
 
-    const channelData = this.extractMonoChannel(audioBuffer);
+    const channelData = this.extractMonoChannel(rawBuffer);
     const duration = channelData.length / sampleRate;
 
-    // Calculate RMS energy for different ending windows
-    const windows = [4, 8, 16, 32];
-    const energyThreshold = 0.25; // 25% of peak energy
-
-    // Find peak energy across entire track
     const peakEnergy = this.calculatePeakRMS(channelData, sampleRate);
+    if (peakEnergy === 0) return 16;
+
+    const energyThreshold = 0.25;
+    // Scan from small to large windows — first quiet window wins
+    const windows = [4, 8, 16, 32];
 
     for (const windowSize of windows) {
-      if (duration < windowSize + 2) continue; // Need at least 2s buffer
+      if (duration < windowSize + 2) continue;
 
       const startSample = Math.max(0, channelData.length - (windowSize * sampleRate));
       const endingEnergy = this.calculateRMSFromFloat(channelData, startSample, windowSize * sampleRate);
-
       const energyRatio = endingEnergy / peakEnergy;
+
       console.log(`📊 Last ${windowSize}s: energy=${energyRatio.toFixed(3)} (${energyRatio < energyThreshold ? 'QUIET' : 'ACTIVE'})`);
 
       if (energyRatio < energyThreshold) {
-        // Found quiet ending - use this window for crossfade lead time
-        // Add 1s buffer for beat alignment (future enhancement)
         const leadTime = windowSize + 1;
+        // For rhythmic outros, ensure lead time covers at least a couple beat periods
+        if (outroAnalysis?.hasRhythm && outroAnalysis.beatPeriodSec) {
+          const beatMinimum = 2 * outroAnalysis.beatPeriodSec + 1;
+          const adjusted = Math.max(leadTime, beatMinimum);
+          console.log(`✅ Crossfade lead time: ${adjusted.toFixed(1)}s (quiet ending, beat min ${beatMinimum.toFixed(1)}s)`);
+          return adjusted;
+        }
         console.log(`✅ Crossfade lead time: ${leadTime}s (quiet ending detected)`);
         return leadTime;
       }
     }
 
-    // No quiet ending found - use default with shorter lead time
-    console.log(`⚡ Active ending - using short crossfade lead time: 6s`);
-    return 6;
+    // No quiet ending found
+    if (outroAnalysis?.hasRhythm && outroAnalysis.beatPeriodSec) {
+      // Rhythmic active ending: use beat-aware minimum
+      const beatLeadTime = Math.max(6, 2 * outroAnalysis.beatPeriodSec + 1);
+      console.log(`⚡ Active rhythmic ending - crossfade lead time: ${beatLeadTime.toFixed(1)}s`);
+      return beatLeadTime;
+    }
+
+    // Beatless active ending: use full 16s default for gentle overlap
+    console.log(`⚡ Active beatless ending - using 16s crossfade lead time`);
+    return 16;
+  }
+
+  // Analyze how many seconds of quiet intro exist before energy kicks in.
+  // Mirror of analyzeCrossfadeLeadTime but scanning from the START.
+  analyzeIntroEnergy(audioBuffer, sampleRate = 44100) {
+    if (!audioBuffer || audioBuffer.length === 0) return 0;
+
+    const channelData = this.extractMonoChannel(audioBuffer);
+    const duration = channelData.length / sampleRate;
+    const peakEnergy = this.calculatePeakRMS(channelData, sampleRate);
+
+    if (peakEnergy === 0) return 0;
+
+    const windows = [4, 8, 16, 32];
+    const energyThreshold = 0.25; // 25% of peak energy
+
+    for (const windowSize of windows) {
+      if (duration < windowSize + 2) continue;
+
+      const introEnergy = this.calculateRMSFromFloat(channelData, 0, windowSize * sampleRate);
+      const energyRatio = introEnergy / peakEnergy;
+
+      console.log(`📊 First ${windowSize}s: energy=${energyRatio.toFixed(3)} (${energyRatio < energyThreshold ? 'QUIET' : 'ACTIVE'})`);
+
+      if (energyRatio < energyThreshold) {
+        const quietPeriod = windowSize + 1;
+        console.log(`✅ Intro quiet period: ${quietPeriod}s`);
+        return quietPeriod;
+      }
+    }
+
+    console.log(`⚡ Active intro - no quiet period detected`);
+    return 0;
+  }
+
+  // Analyze intro beats: find where rhythm begins in the first 16s.
+  analyzeIntroBeats(pcmBuffer) {
+    const frameSize = this.channels * 2;
+    const sliceDuration = 16; // seconds
+    const sliceBytes = Math.min(pcmBuffer.length, Math.floor(sliceDuration * this.sampleRate * frameSize));
+    const slice = pcmBuffer.subarray(0, sliceBytes);
+
+    const peaks = this.findPeaksAdaptive(slice, 0.15);
+    const localBpm = this.detectBPM(slice);
+    const beatPeriodSec = localBpm > 0 ? 60 / localBpm : null;
+
+    // Classify rhythm: 3+ peaks with periodic autocorrelation
+    const hasRhythm = this.classifyRhythm(peaks, localBpm, slice);
+
+    // Find first strong peak (anchor where beats begin)
+    let anchorPosition = 0;
+    if (peaks.length > 0) {
+      const peakMax = Math.max(...peaks.map(p => p.energy));
+      const strongPeak = peaks.find(p => p.energy >= peakMax * 0.5);
+      if (strongPeak) anchorPosition = strongPeak.position;
+    }
+
+    console.log(`🎵 Intro analysis: hasRhythm=${hasRhythm}, bpm=${localBpm}, anchor=${anchorPosition.toFixed(2)}s, peaks=${peaks.length}`);
+
+    return {
+      hasRhythm,
+      localBpm: hasRhythm ? localBpm : null,
+      beatPeriodSec: hasRhythm ? beatPeriodSec : null,
+      anchorPosition,
+      confidence: hasRhythm ? 1 : 0
+    };
+  }
+
+  // Analyze outro beats: find where rhythm ends in the last 16s.
+  analyzeOutroBeats(pcmBuffer) {
+    const frameSize = this.channels * 2;
+    const sliceDuration = 16;
+    const totalBytes = pcmBuffer.length;
+    const sliceBytes = Math.min(totalBytes, Math.floor(sliceDuration * this.sampleRate * frameSize));
+    const sliceStart = totalBytes - sliceBytes;
+    const slice = pcmBuffer.subarray(sliceStart, totalBytes);
+    const sliceOffsetSec = sliceStart / (this.sampleRate * frameSize);
+
+    const peaks = this.findPeaksAdaptive(slice, 0.15);
+    const localBpm = this.detectBPM(slice);
+    const beatPeriodSec = localBpm > 0 ? 60 / localBpm : null;
+
+    const hasRhythm = this.classifyRhythm(peaks, localBpm, slice);
+
+    // Find last strong peak (anchor where beats end)
+    let anchorPosition = sliceDuration;
+    if (peaks.length > 0) {
+      const peakMax = Math.max(...peaks.map(p => p.energy));
+      const lastStrongPeak = [...peaks].reverse().find(p => p.energy >= peakMax * 0.5);
+      if (lastStrongPeak) anchorPosition = lastStrongPeak.position;
+    }
+
+    // Convert to absolute position from buffer start
+    const absoluteAnchor = sliceOffsetSec + anchorPosition;
+
+    console.log(`🎵 Outro analysis: hasRhythm=${hasRhythm}, bpm=${localBpm}, anchor=${anchorPosition.toFixed(2)}s into slice (${absoluteAnchor.toFixed(2)}s absolute), peaks=${peaks.length}`);
+
+    return {
+      hasRhythm,
+      localBpm: hasRhythm ? localBpm : null,
+      beatPeriodSec: hasRhythm ? beatPeriodSec : null,
+      anchorPosition: absoluteAnchor,
+      confidence: hasRhythm ? 1 : 0
+    };
+  }
+
+  // Classify whether a peak set shows periodic rhythm.
+  // Requires 3+ peaks and autocorrelation confidence above threshold.
+  classifyRhythm(peaks, bpm, pcmSlice) {
+    if (peaks.length < 3 || !bpm || bpm <= 0) return false;
+
+    // Check if peaks show periodicity consistent with the detected BPM
+    const beatPeriod = 60 / bpm;
+    const intervals = [];
+    for (let i = 1; i < peaks.length; i++) {
+      intervals.push(peaks[i].position - peaks[i - 1].position);
+    }
+
+    if (intervals.length < 2) return false;
+
+    // Count intervals that are close to a multiple of the beat period
+    let periodicCount = 0;
+    for (const interval of intervals) {
+      const beats = interval / beatPeriod;
+      const nearestInt = Math.round(beats);
+      if (nearestInt > 0 && Math.abs(beats - nearestInt) < 0.25) {
+        periodicCount++;
+      }
+    }
+
+    const periodicRatio = periodicCount / intervals.length;
+    return periodicRatio >= 0.5; // At least half the intervals are periodic
   }
 
   // Extract mono channel from potentially multi-channel buffer

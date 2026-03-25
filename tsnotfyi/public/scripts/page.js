@@ -1,7 +1,7 @@
 // Main page orchestrator - imports from all other modules
 import { state, elements, connectionHealth, audioHealth, rootElement, PANEL_VARIANTS, getCardBackgroundColor, initializeElements } from './globals.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
-import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI, initPCMPipeline, getBufferDelaySecs } from './audio-manager.js';
+import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI, initPCMPipeline, getBufferDelaySecs, flushAudioBuffer } from './audio-manager.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
 import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, resolveCanonicalDirectionKey } from './explorer-utils.js';
 import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer } from './deck-state.js';
@@ -11,7 +11,7 @@ import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, f
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
 import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
-import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray } from './playlist-tray.js';
+import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, getPlaylistTail, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray, getCachedTrackMeta } from './playlist-tray.js';
 import { cancelPackAwayAnimation } from './clock-animation.js';
 import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
@@ -21,7 +21,11 @@ const sentinelLog = createLogger('sentinel');
 const overrideLog = createLogger('override');
 const audioLog = createLogger('audio');
 
-(function hydrateStateFromLocation() {
+(async function hydrateStateFromLocation() {
+  // Direct audio connection requires the Audio server to support HTTPS
+  // (mixed content blocks HTTP fetch from an HTTPS page).
+  // For now, use the Web server proxy. When Audio server has TLS,
+  // this can try direct connection first with proxy fallback.
   state.streamUrlBase = '/stream';
   state.eventsEndpointBase = '/events';
   state.streamUrl = state.streamUrlBase;
@@ -123,7 +127,9 @@ let nextTrackPreviewFadeTimer = null;
       // Preserve client-side loved/hated state when heartbeat updates the same track
       // (heartbeat loved comes from KD-tree which has no rating data)
       const prev = state.latestCurrentTrack;
-      if (prev && prev.identifier === (trackData.identifier || trackData.trackMd5) && prev.loved !== undefined) {
+      const prevId = prev?.identifier;
+      const newId = trackData.identifier || trackData.trackMd5;
+      if (prev && prevId === newId && prev.loved !== undefined) {
           trackData.loved = prev.loved;
           trackData.hated = prev.hated;
       }
@@ -131,6 +137,19 @@ let nextTrackPreviewFadeTimer = null;
       window.state = window.state || {};
       window.state.latestCurrentTrack = trackData;
       state.lastTrackUpdateTs = Date.now();
+
+      // Restart progress bar when the now-playing card changes to a different track.
+      // This is the single source of truth for progress bar restarts on track change.
+      if (newId && prevId !== newId) {
+          const newDuration = trackData.durationMs
+            ? trackData.durationMs / 1000
+            : (trackData.duration || trackData.length || 0);
+          if (newDuration > 0) {
+              state.playbackDurationSeconds = newDuration;
+              state.playbackStartTimestamp = Date.now();
+              startProgressAnimationFromPosition(newDuration, 0, { resync: false, trackChanged: true, trackId: newId });
+          }
+      }
 
       if (state.pendingResyncCheckTimer) {
         clearTimeout(state.pendingResyncCheckTimer);
@@ -436,18 +455,36 @@ async function initializeApp() {
     fullResync,
     onSentinel: async (type, { bufferDelaySecs = 0 } = {}) => {
       if (type === 'crossfade-start') {
-        // Crossfade start: delay promotion by buffer depth so visual aligns with audio.
-        // The sentinel fires when the marker arrives in the data stream, but the audio
-        // won't be heard until bufferDelaySecs later.
+        // Crossfade start: pop tray and delay visual card update by buffer depth.
         if (playlistHasItems()) {
           const head = getPlaylistNext();
           if (head) {
+            const isSkip = state._skipInProgress && Date.now() < state._skipInProgress;
             const delayMs = Math.max(0, Math.round(bufferDelaySecs * 1000));
-            sentinelLog.info(`🔔 Sentinel: crossfade-start — will promote ${head.trackId.substring(0, 8)} in ${delayMs}ms (buffer: ${bufferDelaySecs.toFixed(1)}s)`);
+            // During a skip, delay the pop so the pulse animation completes first
+            const popDelayMs = isSkip ? 600 : 0;
 
-            const doPromote = () => {
-              sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing (after delay)`);
+            const doPop = () => {
               popPlaylistHead();
+              sentinelLog.info(`🔔 Sentinel: crossfade-start — popped ${head.trackId.substring(0, 8)}, visual in ${delayMs}ms (buffer: ${bufferDelaySecs.toFixed(1)}s)`);
+
+              // Tell server about the NEW playlist head (next-next track)
+              const newHead = getPlaylistNext();
+              if (newHead && typeof window.sendNextTrack === 'function') {
+                window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
+              }
+            };
+
+            if (popDelayMs > 0) {
+              setTimeout(doPop, popDelayMs);
+            } else {
+              doPop();
+            }
+
+            // Delay visual update to align with audio
+            const promoteDelayMs = Math.max(delayMs, popDelayMs);
+            const doPromote = () => {
+              sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing`);
               renderPlaylistTray();
 
               const trackState = {
@@ -459,20 +496,15 @@ async function initializeApp() {
               };
               state.latestCurrentTrack = trackState;
               window.state.latestCurrentTrack = trackState;
-              // Lock against heartbeat overwrites for a few seconds
-              state._sentinelPromotionLockUntil = Date.now() + 15000;
+              state._sentinelPromotionLockUntil = Date.now() + 25000;
               if (typeof window.updateNowPlayingCard === 'function') {
                 window.updateNowPlayingCard(trackState, null);
               }
-
-              const newHead = getPlaylistNext();
-              if (newHead && typeof window.sendNextTrack === 'function') {
-                window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
-              }
+              state._skipInProgress = null;
             };
 
-            if (delayMs > 50) {
-              setTimeout(doPromote, delayMs);
+            if (promoteDelayMs > 50) {
+              setTimeout(doPromote, promoteDelayMs);
             } else {
               doPromote();
             }
@@ -1930,7 +1962,8 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                           deckLog2.info(`⏪ Shift+Tab: included current track ${currentId.substring(0, 8)} as bridge (rewinding into played history)`);
                       }
 
-                      const cached = state.trackMetadataCache?.[rewoundTrackId];
+                      const cached = state.trackMetadataCache?.[rewoundTrackId]
+                          || (typeof getCachedTrackMeta === 'function' ? getCachedTrackMeta(rewoundTrackId) : null);
                       deckLog2.info(`⏪ Shift+Tab: recovering ${rewoundTrackId.substring(0, 8)} (${fromPlaybackHistory ? 'played' : 'shifted'})`);
                       state.playlist.unshift({
                           trackId: rewoundTrackId,
@@ -1942,6 +1975,23 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                           folderLabel: '',
                           addedAt: Date.now()
                       });
+                      // Backfill metadata from server if cache missed
+                      if (!cached?.title) {
+                          fetch(`/track/${rewoundTrackId}/meta`).then(r => r.ok ? r.json() : null).then(data => {
+                              if (!data?.track) return;
+                              if (!state.trackMetadataCache) state.trackMetadataCache = {};
+                              state.trackMetadataCache[rewoundTrackId] = data.track;
+                              // Update the playlist item we just inserted
+                              const item = state.playlist.find(p => p.trackId === rewoundTrackId);
+                              if (item) {
+                                  item.title = data.track.title || item.title;
+                                  item.artist = data.track.artist || item.artist;
+                                  item.album = data.track.album || item.album;
+                                  item.albumCover = data.track.albumCover || item.albumCover;
+                                  if (typeof window.renderPlaylistTray === 'function') window.renderPlaylistTray();
+                              }
+                          }).catch(() => {});
+                      }
 
                       if (typeof window.renderPlaylistTray === 'function') {
                           window.renderPlaylistTray();
@@ -1977,8 +2027,15 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                           if (newHead && currentId && newHead.trackId === currentId) {
                               deckLog2.info(`🎵 Tab: auto-skipping current track ${currentId.substring(0, 8)} at head`);
                               const skipped = window.popPlaylistHead();
-                              if (skipped && typeof window.renderPlaylistTray === 'function') {
-                                  window.renderPlaylistTray();
+                              if (skipped) {
+                                  // Stash so Shift+Tab can recover it
+                                  if (!state._trayShiftHistory) state._trayShiftHistory = [];
+                                  if (!state._trayShiftHistory.includes(skipped.trackId)) {
+                                      state._trayShiftHistory.push(skipped.trackId);
+                                  }
+                                  if (typeof window.renderPlaylistTray === 'function') {
+                                      window.renderPlaylistTray();
+                                  }
                               }
                               newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
                           }
@@ -1990,6 +2047,66 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               }
               e.preventDefault();
               break;
+
+          case 'Delete':
+          case 'Backspace': {
+              // Skip to crossfade — jumps the audio stream to just before the
+              // crossfade trigger so the transition plays out naturally with sentinels.
+              // Debounce: ignore if a skip is already in flight
+              if (state._skipInProgress && Date.now() < state._skipInProgress) {
+                  deckLog2.info('🎮 Delete: suppressed — skip already in progress');
+                  e.preventDefault();
+                  break;
+              }
+              deckLog2.info('🎮 Delete: skipping to crossfade');
+              // Visual feedback: pulse the first cover in the playlist tray
+              const trayHead = document.querySelector('.playlist-strip .playlist-cover');
+              if (trayHead) {
+                trayHead.classList.remove('skip-pulse');
+                void trayHead.offsetWidth;
+                trayHead.classList.add('skip-pulse');
+                trayHead.addEventListener('animationend', () => trayHead.classList.remove('skip-pulse'), { once: true });
+              }
+              // Suppress sentinel tray pop for 2s — the skip will trigger it naturally
+              // but we want the pulse to complete before the item disappears
+              state._skipInProgress = Date.now() + 20000;
+              // Ensure playlist head is prepared before skipping
+              const playlistHead = playlistHasItems() ? getPlaylistNext() : null;
+              const ensureHead = playlistHead
+                  ? fetch('/next-track', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                          trackMd5: playlistHead.trackId,
+                          direction: playlistHead.directionKey,
+                          source: 'user',
+                          origin: 'skip',
+                          fingerprint: state.streamFingerprint
+                      })
+                    }).then(r => r.json()).catch(() => null)
+                  : Promise.resolve(null);
+
+              ensureHead.then((result) => {
+                  if (playlistHead && result && result.status !== 'locked') {
+                      deckLog2.warn(`🎮 Playlist head not locked (${result.status}) — skipping anyway`);
+                  }
+                  return fetch('/session/skip-to-crossfade', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                          fingerprint: state.streamFingerprint,
+                          sessionId: state.sessionId
+                      })
+                  });
+              }).then(r => r.json()).then(data => {
+                  deckLog2.info(`🎮 Skip result: ${JSON.stringify(data)}`);
+                  if (data.ok) flushAudioBuffer();
+              }).catch(err => {
+                  deckLog2.error('🎮 Skip failed:', err);
+              });
+              e.preventDefault();
+              break;
+          }
 
           case 't':
               // Seek behavior: halfway in first wipe, 5 secs before crossfade in second wipe

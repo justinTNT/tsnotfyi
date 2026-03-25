@@ -32,7 +32,7 @@ function cacheLog(...args) {
 const configPath = path.join(__dirname, 'tsnotfyi-config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 
-const CROSSFADE_GUARD_MS = 6000;
+const CROSSFADE_GUARD_MS = 20000;
 const STREAM_IDLE_GRACE_MS = 5000;
 const STREAM_OVERRIDE_GRACE_MS = 20000;
 const HEARTBEAT_DIVERGENCE_THRESHOLD_MS = 2000;
@@ -1155,6 +1155,14 @@ class DriftAudioMixer {
             return;
           }
 
+          // Never queue the same track that's currently playing
+          if (hydratedNextTrack.identifier === this.state.currentTrack?.identifier) {
+            console.warn(`🔁 Rejecting user override — same as current track (${hydratedNextTrack.identifier?.substring(0,8)})`);
+            this.lockedNextTrackIdentifier = null;
+            this.clearPendingUserSelection(manualGenerationAtStart);
+            return;
+          }
+
           preparationReason = 'user-selection';
           console.log(`🎯 [prepare] Hydrated override track ${hydratedNextTrack.title} (${hydratedNextTrack.identifier})`);
         } else {
@@ -2050,9 +2058,25 @@ class DriftAudioMixer {
   broadcastToClients(chunk) {
     for (const client of this.clients) {
       try {
-        if (!client.destroyed) {
-          client.write(chunk);
+        if (client.destroyed) {
+          this.clients.delete(client);
+          continue;
         }
+        // Track consecutive backpressure hits per client.
+        // A momentary blip is fine; sustained backpressure means the client is dead.
+        if (client.writableNeedsDrain) {
+          client._backpressureCount = (client._backpressureCount || 0) + 1;
+          if (client._backpressureCount > 50) {
+            console.warn(`🧹 Dropping unresponsive stream client after ${client._backpressureCount} backpressure events (session ${this.state.sessionId})`);
+            this.clients.delete(client);
+            try { client.end(); } catch (e) { /* ignore */ }
+            continue;
+          }
+          // Skip this write — don't block the loop for other clients
+          continue;
+        }
+        client._backpressureCount = 0;
+        client.write(chunk);
       } catch (err) {
         console.error('Error writing to client:', err);
         this.clients.delete(client);

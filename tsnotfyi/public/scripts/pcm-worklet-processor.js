@@ -4,9 +4,9 @@
 class PCMWorkletProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Ring buffer: 16 seconds of stereo interleaved float32 at context sample rate
-    // sampleRate is a global provided by the AudioWorklet scope
-    this._bufferSize = sampleRate * 2 * 16; // 16s × 2ch
+    // Ring buffer: 24 seconds of stereo interleaved float32 at context sample rate
+    // Must exceed server's aheadLimitMs (12s) by a comfortable margin to avoid overflows
+    this._bufferSize = sampleRate * 2 * 24; // 24s × 2ch
     this._bufferCapacity = this._bufferSize / 2; // max frames the buffer can hold
     this._buffer = new Float32Array(this._bufferSize);
     this._writePos = 0;
@@ -24,6 +24,12 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     // SSE/explorer/render burst that happens immediately after ready fires
     this._readyThresholdFrames = sampleRate * 6;
 
+    // Fade state: flush triggers fade-out, then fade-in on next data
+    this._fadeOutRemaining = 0;
+    this._fadeOutTotal = 0;
+    this._fadeInRemaining = 0;
+    this._fadeInTotal = 0;
+
     this.port.onmessage = (e) => {
       if (e.data.type === 'pcm') {
         this._enqueuePCM(new Float32Array(e.data.data));
@@ -36,6 +42,19 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
         this._readySent = false;
         this._underrunReported = false;
         this._overflowCount = 0;
+      } else if (e.data.type === 'flush') {
+        // Fade out over ~10ms (441 frames at 44100Hz), then clear
+        const fadeFrames = Math.min(Math.floor(sampleRate * 0.01), this._available());
+        if (fadeFrames > 0) {
+          this._fadeOutRemaining = fadeFrames;
+          this._fadeOutTotal = fadeFrames;
+        } else {
+          // Nothing to fade — just reset
+          this._writePos = 0;
+          this._readPos = 0;
+          this._samplesWritten = 0;
+          this._samplesPlayed = 0;
+        }
       }
     };
 
@@ -99,10 +118,49 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     }
 
     for (let i = 0; i < frames; i++) {
-      left[i] = this._buffer[this._readPos];
+      let l = this._buffer[this._readPos];
       this._readPos = (this._readPos + 1) % this._bufferSize;
-      right[i] = this._buffer[this._readPos];
+      let r = this._buffer[this._readPos];
       this._readPos = (this._readPos + 1) % this._bufferSize;
+
+      // Apply fade-in after flush
+      if (this._fadeInRemaining > 0) {
+        const gain = 1 - (this._fadeInRemaining / this._fadeInTotal);
+        l *= gain;
+        r *= gain;
+        this._fadeInRemaining--;
+      }
+
+      // Apply fade-out during flush
+      if (this._fadeOutRemaining > 0) {
+        const gain = this._fadeOutRemaining / this._fadeOutTotal;
+        l *= gain;
+        r *= gain;
+        this._fadeOutRemaining--;
+        if (this._fadeOutRemaining === 0) {
+          // Fade complete — clear the buffer, accept new data
+          this._writePos = 0;
+          this._readPos = 0;
+          this._samplesWritten = 0;
+          this._samplesPlayed = 0;
+          this._readySent = false;
+          // Arm fade-in for the next data
+          const fadeInFrames = Math.floor(sampleRate * 0.01);
+          this._fadeInRemaining = fadeInFrames;
+          this._fadeInTotal = fadeInFrames;
+          // Fill remaining output with silence
+          for (let j = i + 1; j < frames; j++) {
+            left[j] = 0;
+            right[j] = 0;
+          }
+          this._framesRendered += i + 1;
+          this.port.postMessage({ type: 'flushed' });
+          return true;
+        }
+      }
+
+      left[i] = l;
+      right[i] = r;
     }
     this._samplesPlayed += frames;
     this._framesRendered += frames;

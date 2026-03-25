@@ -760,6 +760,43 @@ export function logAudioDiagnostics(label, extra = {}) {
  * Returns how many seconds of audio are buffered ahead of playback.
  * Used to delay UI transitions so they align with what the listener hears.
  */
+/**
+ * Flush the audio buffer — dumps stale PCM so new data plays immediately.
+ * Used after skip-to-crossfade to eliminate the lag between visual and audible transition.
+ */
+/**
+ * Flush the audio buffer — 50ms fade-out on stale PCM, then clear for new data.
+ * Used after skip-to-crossfade to eliminate the lag between visual and audible transition.
+ */
+export function flushAudioBuffer() {
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'flush' });
+    // Reset tracking counters — worklet will post 'flushed' when fade completes
+    workletTotalSent = 0;
+    softwareClock = 0;
+    log.info('🔄 Audio buffer flush requested (10ms fade-out)');
+  } else if (useScriptProcessor && mtBuffer) {
+    // Apply 10ms fade-out to what's in the buffer, then clear
+    const fadeFrames = Math.min(Math.floor(44100 * 0.01), mtSamplesWritten - mtSamplesPlayed);
+    if (fadeFrames > 0) {
+      let pos = mtReadPos;
+      for (let i = 0; i < fadeFrames; i++) {
+        const gain = 1 - (i / fadeFrames);
+        mtBuffer[pos] *= gain;
+        pos = (pos + 1) % mtBufferSize;
+        mtBuffer[pos] *= gain;
+        pos = (pos + 1) % mtBufferSize;
+      }
+    }
+    // Clear everything after the fade
+    mtWritePos = 0;
+    mtReadPos = 0;
+    mtSamplesWritten = 0;
+    mtSamplesPlayed = 0;
+    log.info('🔄 Audio buffer flushed (ScriptProcessor, 10ms fade-out)');
+  }
+}
+
 export function getBufferDelaySecs() {
   if (useScriptProcessor && mtBuffer) {
     const fill = mtSamplesWritten - mtSamplesPlayed;

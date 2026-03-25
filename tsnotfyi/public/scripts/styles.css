@@ -505,12 +505,12 @@ audio {
 /* Love/Hate buttons — hover above card shoulders */
 .love-btn, .hate-btn {
     position: absolute;
-    top: 8px;
+    top: 16px;
     width: 32px;
     height: 32px;
     border-radius: 50%;
     border: none;
-    background: rgba(0, 0, 0, 0.4);
+    background: rgba(0, 0, 0, 0.3);
     backdrop-filter: blur(4px);
     cursor: pointer;
     display: flex;
@@ -524,7 +524,7 @@ audio {
 
 #nowPlayingCard:hover .love-btn,
 #nowPlayingCard:hover .hate-btn {
-    opacity: 0.6;
+    opacity: 0.75;
 }
 
 .love-btn:hover, .hate-btn:hover {
@@ -533,11 +533,11 @@ audio {
 }
 
 .love-btn {
-    left: 0px;
+    left: 16px;
 }
 
 .hate-btn {
-    right: 0px;
+    right: 16px;
 }
 
 /* Love button states */
@@ -578,8 +578,8 @@ audio {
 /* Heart on track cards (loved indicator) */
 .next-track-heart {
     position: absolute;
-    top: 8px;
-    left: 8px;
+    top: 16px;
+    left: 16px;
     z-index: 5;
     pointer-events: none;
 }
@@ -940,6 +940,34 @@ audio {
 .dimension-card.duplicate-flash {
     animation: duplicate-shake 0.4s ease;
 }
+@keyframes skip-pulse {
+    0% { filter: brightness(1); }
+    30% { filter: brightness(1.6); }
+    100% { filter: brightness(1); }
+}
+
+@keyframes xfade-ready-breathe {
+    0%, 100% { filter: brightness(1); }
+    50% { filter: brightness(1.25); }
+}
+
+#nowPlayingCard.skip-pulse .card,
+.playlist-cover.skip-pulse {
+    animation: skip-pulse 0.6s ease-out !important;
+}
+
+/* Slow breathing pulse on tray head when crossfade is NOT ready */
+.playlist-cover.xfade-pending {
+    animation: xfade-ready-breathe 2s ease-in-out infinite;
+}
+
+/* Stop breathing when crossfade IS ready (static bright) */
+.playlist-cover.xfade-ready {
+    filter: brightness(1.15);
+    animation: none;
+    transition: filter 0.3s ease;
+}
+
 @keyframes duplicate-shake {
     0%, 100% { transform: translate(-50%, -50%) scale(0.85); }
     20% { transform: translate(-50%, -50%) scale(0.85) translateX(-8px); }

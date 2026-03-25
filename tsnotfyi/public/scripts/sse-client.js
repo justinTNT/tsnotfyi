@@ -82,12 +82,28 @@ export function connectSSE() {
 
     const currentTrack = heartbeat.currentTrack;
     const currentTrackId = currentTrack.identifier || null;
-    const previousTrackId = state.latestCurrentTrack?.identifier || null;
-    const trackChanged = Boolean(currentTrackId && previousTrackId && currentTrackId !== previousTrackId);
+    // Compare against what the server last told us, not what the card shows.
+    // latestCurrentTrack tracks the CARD (updated by sentinel), _serverCurrentTrack tracks the SERVER.
+    const previousServerTrackId = state._serverCurrentTrack?.identifier || state.latestCurrentTrack?.identifier || null;
+    const trackChanged = Boolean(currentTrackId && previousServerTrackId && currentTrackId !== previousServerTrackId);
 
     if (trackChanged) {
       const clientBuffer = getBufferDelaySecs();
       syncLog.info(`🔄 Heartbeat track change: ${previousTrackId?.substring(0, 8)} → ${currentTrackId?.substring(0, 8)} (clientBuffer: ${clientBuffer.toFixed(1)}s)`);
+
+      // Update internal state so subsequent heartbeats are steady-state, not repeated changes.
+      // This does NOT update the card — the sentinel owns card presentation timing.
+      state.playbackDurationSeconds = newDurationSeconds;
+      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
+      // Store the server's track as the known current — card display may lag behind
+      state._serverCurrentTrack = newTrackState;
+
+      // Record to session history
+      if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
+      if (!state.sessionTrackHistory.includes(currentTrackId)) {
+        state.sessionTrackHistory.push(currentTrackId);
+        syncLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
+      }
     }
 
     // Compute duration and start time
@@ -137,6 +153,12 @@ export function connectSSE() {
     // cover stays in the tray until it appears on the card. But if the sentinel
     // doesn't handle it within a few seconds, pop here as a fallback.
     if (trackChanged && currentTrackId) {
+      // DON'T reset progress here — the heartbeat arrives instantly via SSE but the audio
+      // is still buffered. The sentinel fires when the crossfade actually reaches the
+      // speakers. Resetting progress on heartbeat would show 0:00 for the new track
+      // while the old track is still audibly playing.
+      // The sentinel handler (page.js) owns the progress reset.
+
       // Stash the heartbeat's track data for deferred fallback.
       // The sentinel handler is the primary path for card update + tray pop.
       // The server broadcasts immediately; the client waits for the sentinel.
@@ -152,8 +174,9 @@ export function connectSSE() {
 
         const cardAlreadyUpdated = state.latestCurrentTrack?.identifier === currentTrackId;
 
-        // Update card if sentinel didn't handle it
-        if (!cardAlreadyUpdated) {
+        // Update card if sentinel didn't handle it — but respect sentinel lock
+        const sentinelLocked = state._sentinelPromotionLockUntil && Date.now() < state._sentinelPromotionLockUntil;
+        if (!cardAlreadyUpdated && !sentinelLocked) {
           syncLog.info(`🎵 Heartbeat fallback: sentinel didn't handle track change to ${currentTrackId.substring(0, 8)} — promoting now`);
           state.playbackDurationSeconds = fallbackDurationSeconds;
           if (fallbackStartTimestamp) state.playbackStartTimestamp = fallbackStartTimestamp;
@@ -165,6 +188,8 @@ export function connectSSE() {
           if (typeof window.updateNowPlayingCard === 'function') {
             window.updateNowPlayingCard(fallbackTrackState, fallbackDriftState);
           }
+        } else if (sentinelLocked && !cardAlreadyUpdated) {
+          syncLog.info(`🎵 Heartbeat fallback: suppressed by sentinel lock (${Math.round((state._sentinelPromotionLockUntil - Date.now()) / 1000)}s remaining)`);
         }
 
         // Pop playlist head if it matches — even if sentinel updated the card,
@@ -189,7 +214,7 @@ export function connectSSE() {
         if (!playlistHasItems()) {
           armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
         }
-      }, Math.max(5000, Math.round(getBufferDelaySecs() * 1000) + 3000));
+      }, Math.max(30000, Math.round(getBufferDelaySecs() * 1000) + 5000));
 
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
       if (!state.sessionTrackHistory.includes(currentTrackId)) {
@@ -217,8 +242,13 @@ export function connectSSE() {
 
       state.currentTrackDirection = heartbeat.currentTrackDirection || null;
 
+      // Show now-playing card immediately — don't wait for explorer data.
+      // The clock/direction cards appear when explorer data arrives.
       state.awaitingInitialExplorer = true;
-      sseLog.info(`🎵 First track detected — deferring card presentation until explorer data arrives`);
+      sseLog.info(`🎵 First track detected — showing card now, explorer loading in background`);
+      if (typeof window.updateNowPlayingCard === 'function') {
+        window.updateNowPlayingCard(newTrackState, null);
+      }
 
       const durationSeconds = newDurationSeconds || currentTrack.duration || currentTrack.length || 0;
       if (durationSeconds > 0 && !state.progressAnimation) {
@@ -294,6 +324,21 @@ export function connectSSE() {
         startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackId: currentTrackId });
       }
     }
+
+    // Update tray head readiness indicator
+    if (playlistHasItems()) {
+      const trayHead = document.querySelector('.playlist-strip .playlist-cover');
+      if (trayHead) {
+        const reason = heartbeat.reason || '';
+        const nextReady = reason.includes('next-prepared') || heartbeat.nextTrack;
+        if (nextReady) {
+          trayHead.classList.remove('xfade-pending');
+          trayHead.classList.add('xfade-ready');
+        } else if (!trayHead.classList.contains('xfade-ready')) {
+          trayHead.classList.add('xfade-pending');
+        }
+      }
+    }
   };
 
   const handleSelectionAck = (event) => {
@@ -318,10 +363,10 @@ export function connectSSE() {
       if (typeof window.refreshCardsWithNewSelection === 'function') {
         window.refreshCardsWithNewSelection();
       }
-    } else if (centerCard) {
-      // Track not in explorer data - just update the trackMd5 so state stays consistent
-      sseLog.info(`🛰️ selection_ack: track ${trackId.substring(0,8)} not in explorer, updating card dataset only`);
-      centerCard.dataset.trackMd5 = trackId;
+    } else {
+      // Track not in explorer — don't touch the center card. The playlist tray
+      // owns next-track state; the center card shows post-playlist explorer options.
+      sseLog.info(`🛰️ selection_ack: track ${trackId.substring(0,8)} not in explorer, leaving center card alone`);
     }
   };
 
@@ -579,6 +624,16 @@ export function connectSSE() {
     updateConnectionHealthUI();
 
     resetStuckTimer();
+
+    // Eagerly fetch current track — don't wait for the first heartbeat (up to 10s away)
+    if (!state.latestCurrentTrack?.identifier) {
+      fetch('/current-track').then(r => r.ok ? r.json() : null).then(data => {
+        if (data?.currentTrack && !state.latestCurrentTrack?.identifier) {
+          sseLog.info(`🎵 Eager current-track: ${data.currentTrack.identifier?.substring(0, 8)}`);
+          handleHeartbeat(data);
+        }
+      }).catch(() => {});
+    }
   };
 
   eventSource.onmessage = (event) => {

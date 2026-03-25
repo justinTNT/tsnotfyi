@@ -436,6 +436,7 @@ app.get('/stream', async (req, res) => {
 
     req.on('close', () => {
       controller.abort();
+      reader.cancel().catch(() => {});
     });
   } catch (error) {
     console.error('Stream proxy error:', error);
@@ -596,82 +597,15 @@ app.get('/:md51/:md52', async (req, res, next) => {
 });
 
 
-// ─── Search Route ───────────────────────────────────────────────────────────
+// ─── Search Route (proxied to API server) ───────────────────────────────────
 
 app.get('/search', async (req, res) => {
-  const rawQuery = req.query.q;
-  const query = typeof rawQuery === 'string' ? rawQuery.trim() : '';
-  const normalizedQuery = query.toLowerCase();
-  const limit = parseInt(req.query.limit) || 50;
-
-  if (!normalizedQuery || normalizedQuery.length < 2) {
-    return res.json({ results: [], query: query, total: 0 });
-  }
-
-  console.log(`🔍 Fuzzy search: "${query}" (limit: ${limit})`);
-
   try {
-    const rows = await db.trigramSearch(normalizedQuery, limit);
-
-    const decodeBtPath = (btPath) => {
-      if (btPath && btPath.startsWith('\\x')) {
-        try {
-          const hexString = btPath.slice(2);
-          const buffer = Buffer.from(hexString, 'hex');
-          return buffer.toString('utf8');
-        } catch (error) {
-          return btPath;
-        }
-      }
-      return btPath;
-    };
-
-    const results = rows.map(row => {
-      try {
-        const decodedPath = decodeBtPath(row.bt_path);
-        const filename = path.basename(decodedPath);
-        const directory = path.dirname(decodedPath).replace('/Volumes/', '');
-
-        // Parse path segments like: /Volumes/tranche/year/month/artist/album/title.mp3
-        const pathParts = directory.split('/').filter(p => p);
-        const segments = {
-          tranche: pathParts[0] || '',
-          year: pathParts[1] || '',
-          month: pathParts[2] || '',
-          pathArtist: pathParts[3] || '',
-          pathAlbum: pathParts[4] || ''
-        };
-
-        return {
-          md5: row.identifier,
-          path: decodedPath,
-          filename: filename,
-          directory: directory,
-          segments: pathParts.slice(3),  // ignore tranche, year, month
-          albumCover: '/images/albumcover.png',
-          title: row.bt_title || filename,
-          artist: row.bt_artist || segments.pathArtist || '',
-          album: row.bt_album || segments.pathAlbum || '',
-          year: row.bt_year || segments.year || '',
-          score: row.score,  // Similarity score 0.0-1.0
-          displayText: `${row.bt_artist || segments.pathArtist || 'Unknown'} - ${row.bt_title || filename}`,
-          searchableText: `${decodedPath} ${row.bt_artist || ''} ${row.bt_title || ''} ${row.bt_album || ''} ${segments.tranche} ${segments.year} ${segments.month}`
-        };
-      } catch (e) {
-        console.error('Error processing row:', e);
-        return null;
-      }
-    }).filter(Boolean);
-
-    res.json({
-      results: results,
-      query: query,
-      total: results.length,
-      hasMore: results.length === limit
-    });
-  } catch (err) {
-    console.error('Search error:', err);
-    return res.status(500).json({ error: 'Search failed' });
+    const result = await apiClient.search(req.query.q || '', parseInt(req.query.limit) || 50);
+    res.json(result);
+  } catch (e) {
+    console.error('Search proxy error:', e.message);
+    res.status(500).json({ error: 'Search failed' });
   }
 });
 
@@ -1202,6 +1136,20 @@ app.post('/session/:sessionId/flow/:direction', (req, res) => {
   res.status(410).json({ error: 'Session-specific control URLs have been removed. Use /session/flow/:direction instead.' });
 });
 
+app.post('/session/skip-to-crossfade', async (req, res) => {
+  const session = await getSessionForRequest(req, { createIfMissing: false });
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  try {
+    const result = await audioClient.skipToCrossfade(session.sessionId);
+    res.json({ ok: result.ok, skipped: result.skipped });
+  } catch (error) {
+    console.error('Skip to crossfade error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/session/force-next', async (req, res) => {
   const session = await getSessionForRequest(req, { createIfMissing: false });
 
@@ -1300,7 +1248,7 @@ app.post('/next-track', async (req, res) => {
     }
     // Fall back to cookie/session resolution if fingerprint lookup failed
     if (!session) {
-      serverLog.warn(`⚠️ /next-track fingerprint lookup failed, falling back to session resolution`);
+      serverLog.info(`/next-track: fingerprint not in registry, using session fallback`);
       session = await getSessionForRequest(req, { createIfMissing: false });
     }
   } else {
@@ -1504,7 +1452,7 @@ app.get('/health', async (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     webSessions: audioSessions.size,
-    audioServer: audioHealth,
+    audioServer: { ...audioHealth, url: config.audioServer?.url || 'http://localhost:3002' },
     apiServer: apiHealth
   });
 });

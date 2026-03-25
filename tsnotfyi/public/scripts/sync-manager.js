@@ -6,11 +6,18 @@ import { setDeckStaleFlag } from './deck-state.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI, getBufferDelaySecs } from './audio-manager.js';
-import { getPlaylistNext, popPlaylistHead, playlistHasItems } from './playlist-tray.js';
+import { getPlaylistNext, popPlaylistHead, playlistHasItems, getCachedTrackMeta } from './playlist-tray.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
 const log = createLogger('sync');
 const overrideLog = createLogger('override');
+
+function trackLabel(id) {
+    if (!id) return 'none';
+    const meta = getCachedTrackMeta(id) || state.trackMetadataCache?.[id];
+    const title = meta?.title;
+    return title ? `${title} (${id})` : id;
+}
 
 // ====== Heartbeat & Sync System ======
 
@@ -20,8 +27,9 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         state.heartbeatTimeout = null;
     }
 
-    if (!state.streamFingerprint) {
-        log.warn('⚠️ sendNextTrack: No fingerprint yet; waiting for SSE to bind');
+    const hasValidFingerprint = state.streamFingerprint && !state.streamFingerprint.startsWith('unknown@');
+    if (!hasValidFingerprint) {
+        log.warn('⚠️ sendNextTrack: No valid fingerprint yet; waiting for SSE to bind');
         const ready = await waitForFingerprint(5000);
 
         if (!ready || !state.streamFingerprint) {
@@ -134,6 +142,13 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         } else {
             await requestSSERefresh();
         }
+        return;
+    }
+
+    // Skip redundant heartbeat calls — server already has this track locked
+    if (source === 'heartbeat' && md5ToSend === state.serverNextTrack) {
+        log.debug(`💓 Heartbeat: server already has ${md5ToSend.substring(0,8)} — skipping`);
+        scheduleHeartbeat(60000);
         return;
     }
 
@@ -269,7 +284,11 @@ function analyzeAndAct(data, source, sentMd5) {
         return;
     }
 
-    const expectedNextMd5 = state.latestExplorerData?.nextTrack?.track?.identifier || state.selection.trackId;
+    // When a playlist is active, the server's next track IS the playlist head —
+    // don't compare against the explorer recommendation (which shows post-playlist options).
+    const expectedNextMd5 = playlistHasItems()
+        ? (getPlaylistNext()?.trackId || null)
+        : (state.latestExplorerData?.nextTrack?.track?.identifier || state.selection.trackId);
     const hasServerNext = Boolean(nextTrack);
     const nextTrackMismatch = Boolean(expectedNextMd5 && hasServerNext && nextTrack !== expectedNextMd5);
 
@@ -286,14 +305,23 @@ function analyzeAndAct(data, source, sentMd5) {
 
     if (nextTrackMismatch) {
         if (isUserSelection() || state.selection.pendingTrackId) {
-            overrideLog.info(`${ICON} ACTION server-next-ignored`, {
-                expected: expectedNextMd5,
-                received: nextTrack,
-                source,
-                overrideActive: isUserSelection(),
-                pendingManualTrackId: state.selection.pendingTrackId,
-                sentMd5
-            });
+            // Track how many times we've disagreed with the server
+            state._nextTrackDisagreeCount = (state._nextTrackDisagreeCount || 0) + 1;
+            if (state._nextTrackDisagreeCount >= 3) {
+                // Server wins after 3 attempts — accept its version
+                overrideLog.error(`🚨 CLIENT-SERVER DISAGREE: gave up after ${state._nextTrackDisagreeCount} attempts. Client wanted ${trackLabel(expectedNextMd5)}, server has ${trackLabel(nextTrack)}. Selection: ${trackLabel(state.selection?.trackId)}, source=${state.selection?.source}`);
+                overrideLog.info(`${ICON} ACTION accepting-server-next`, {
+                    clientWanted: expectedNextMd5,
+                    serverHas: nextTrack,
+                    selectionState: { ...state.selection }
+                });
+                state._nextTrackDisagreeCount = 0;
+                clearSelection('server-override');
+                state.serverNextTrack = nextTrack;
+                scheduleHeartbeat(60000);
+                return;
+            }
+            overrideLog.info(`${ICON} ACTION server-next-ignored (attempt ${state._nextTrackDisagreeCount}/3): wanted ${trackLabel(expectedNextMd5)}, got ${trackLabel(nextTrack)}`);
             scheduleHeartbeat(20000);
             return;
         }
@@ -336,6 +364,7 @@ function analyzeAndAct(data, source, sentMd5) {
     // Using server elapsed would cause desync when client joins mid-stream
     // (server knows where playhead is, but audio stream starts from current position)
 
+    state._nextTrackDisagreeCount = 0;
     overrideLog.info(`${ICON} ACTION sync-ok`, { source });
 
     if (state.cardsDormant) {

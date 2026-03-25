@@ -35,6 +35,41 @@ function monthFromPath(path) {
     return parts.length >= 4 ? parts[parts.length - 4] : '';
 }
 
+// ─── Track Metadata Cache (localStorage) ─────────────────────────────────────
+
+const TRACK_CACHE_KEY = 'tsnotfyi_track_meta';
+const TRACK_CACHE_MAX = 2000;
+
+function cacheTrackMeta(trackId, meta) {
+    if (!trackId || !meta?.title) return;
+    try {
+        const cache = JSON.parse(localStorage.getItem(TRACK_CACHE_KEY) || '{}');
+        cache[trackId] = {
+            title: meta.title || '',
+            artist: meta.artist || '',
+            album: meta.album || '',
+            albumCover: meta.albumCover || null,
+            duration: meta.duration || meta.length || null
+        };
+        // Evict oldest if over limit
+        const keys = Object.keys(cache);
+        if (keys.length > TRACK_CACHE_MAX) {
+            for (let i = 0; i < keys.length - TRACK_CACHE_MAX; i++) {
+                delete cache[keys[i]];
+            }
+        }
+        localStorage.setItem(TRACK_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) { /* localStorage full or unavailable */ }
+}
+
+export function getCachedTrackMeta(trackId) {
+    if (!trackId) return null;
+    try {
+        const cache = JSON.parse(localStorage.getItem(TRACK_CACHE_KEY) || '{}');
+        return cache[trackId] || null;
+    } catch (e) { return null; }
+}
+
 /**
  * Add a track to the playlist queue
  * @param {Object} item - Playlist item
@@ -82,6 +117,7 @@ export function addToPlaylist(item) {
     };
 
     state.playlist.push(playlistItem);
+    cacheTrackMeta(item.trackId, playlistItem);
     log.info(`addToPlaylist: Added ${item.trackId.substring(0, 8)} (${state.playlist.length} in queue)`);
 
     // Update tray UI
@@ -506,6 +542,12 @@ export function renderPlaylistTray() {
         });
     });
 
+    // Mark tray head as pending crossfade (breathing pulse)
+    const firstCover = strip.querySelector('.playlist-cover');
+    if (firstCover) {
+        firstCover.classList.add('xfade-pending');
+    }
+
     // Update tray visibility
     const hasItems = items.length > 0;
     trayRoot.classList.toggle('has-items', hasItems);
@@ -528,6 +570,13 @@ export function renderPlaylistTray() {
  * Animates the card to the tray, then fetches explorer for that track
  */
 export async function promoteCenterCardToTray() {
+    // Guard: skip if a promote is already in flight (cards exiting / explorer loading)
+    if (state._promoteInFlight) {
+        log.info('🎯 promoteCenterCardToTray: skipped — promote already in flight');
+        return null;
+    }
+
+    log.info(`🎯 promoteCenterCardToTray called`);
     // Primary source: the center card's DOM state (what the user is looking at).
     // Fallback: state.selection.trackId matched against explorer data.
     // Last resort: server's nextTrack recommendation.
@@ -620,6 +669,8 @@ export async function promoteCenterCardToTray() {
 
     log.info(`🎯 Promoting center card to tray: ${trackId.substring(0, 8)} (${title})`);
 
+    state._promoteInFlight = true;
+
     // Check if playlist is empty BEFORE adding (first item needs server notification)
     const wasEmpty = !playlistHasItems();
 
@@ -642,6 +693,7 @@ export async function promoteCenterCardToTray() {
 
     if (!item) {
         log.info('🎯 addToPlaylist returned falsy - track may be duplicate or invalid');
+        state._promoteInFlight = false;
         // Visual feedback: briefly flash the existing item in the tray
         if (centerCard) {
             centerCard.classList.add('duplicate-flash');
@@ -720,6 +772,8 @@ export async function promoteCenterCardToTray() {
         }
     } catch (error) {
         log.error('promoteCenterCardToTray: Explorer fetch failed', error);
+    } finally {
+        state._promoteInFlight = false;
     }
 
     return item;
@@ -873,8 +927,9 @@ export async function loadPlaylistIntoTray(playlistId) {
         return 0;
     }
 
-    // Clear existing tray
+    // Clear existing tray and any stale override expectations
     clearPlaylist();
+    clearSelection('playlist-load');
 
     // Add each track to the tray (skip duplicates of current track)
     const currentId = state.latestCurrentTrack?.identifier;
@@ -1070,6 +1125,7 @@ if (typeof window !== 'undefined') {
     window.playlistHasItems = playlistHasItems;
     window.getPlaylistTail = getPlaylistTail;
     window.clearPlaylist = clearPlaylist;
+    window.getCachedTrackMeta = getCachedTrackMeta;
     window.refreshExplorerForPlaylist = refreshExplorerForPlaylist;
     window.getLeftStack = getLeftStack;
     window.getRightStack = getRightStack;

@@ -106,7 +106,14 @@ class ApiClient {
     return this._post('/explorer', { trackId, sessionContext, config });
   }
 
-  // ─── Search ─────────────────────────────────────────────────────────────────
+  // ─── Text Search ───────────────────────────────────────────────────────────
+
+  async search(query, limit = 20) {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    return this._fetch(`/search?${params}`);
+  }
+
+  // ─── Spatial Search ────────────────────────────────────────────────────────
 
   async radialSearch(trackId, config = {}) {
     return this._post('/radial-search', { trackId, config });

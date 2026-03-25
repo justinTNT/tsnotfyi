@@ -74,6 +74,40 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ─── Text Search ────────────────────────────────────────────────────────────
+
+app.get('/search', (req, res) => {
+  const query = (req.query.q || '').trim();
+  if (query.length < 2) {
+    return res.json({ results: [], query, total: 0, hasMore: false });
+  }
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+
+  const textSearch = radialSearch.kdTree?.getTextSearch?.();
+  if (!textSearch) {
+    return res.status(503).json({ error: 'Search index not ready' });
+  }
+
+  const results = textSearch.search(query, limit).map(({ track, score }) => {
+    const pathStr = track.path || '';
+    const directory = pathStr.replace(/\/[^/]+$/, '');
+    return {
+      md5: track.identifier,
+      identifier: track.identifier,
+      title: track.title || '',
+      artist: track.artist || '',
+      album: track.album || '',
+      albumCover: track.albumCover || '/images/albumcover.png',
+      directory,
+      path: pathStr,
+      displayText: `${track.artist || ''} - ${track.title || ''}`.replace(/^ - | - $/g, ''),
+      score
+    };
+  });
+
+  res.json({ results, query, total: results.length, hasMore: results.length === limit });
+});
+
 // ─── Track Lookup ───────────────────────────────────────────────────────────
 
 app.get('/track/:id', (req, res) => {
