@@ -40,7 +40,7 @@ function monthFromPath(path) {
 const TRACK_CACHE_KEY = 'tsnotfyi_track_meta';
 const TRACK_CACHE_MAX = 2000;
 
-function cacheTrackMeta(trackId, meta) {
+export function cacheTrackMeta(trackId, meta) {
     if (!trackId || !meta?.title) return;
     try {
         const cache = JSON.parse(localStorage.getItem(TRACK_CACHE_KEY) || '{}');
@@ -725,21 +725,21 @@ export async function promoteCenterCardToTray() {
         // Trigger exit animation with a placeholder that will be replaced
         const deckContainer = document.getElementById('dimensionCards');
         if (deckContainer) {
-            const exitingCards = deckContainer.querySelectorAll('.dimension-card');
-            exitingCards.forEach(card => {
-                const computed = window.getComputedStyle(card);
-                const baseTransform = card.style.transform || computed.transform || '';
+            const exitingElements = deckContainer.querySelectorAll('.dimension-card, .direction-stack');
+            exitingElements.forEach(el => {
+                const computed = window.getComputedStyle(el);
+                const baseTransform = el.style.transform || computed.transform || '';
                 const exitTransform = baseTransform && baseTransform !== 'none'
                     ? `${baseTransform} translateZ(-1200px) scale(0.2)`
                     : 'translateZ(-1200px) scale(0.2)';
 
-                card.classList.add('card-exit');
-                card.style.pointerEvents = 'none';
-                card.style.transition = 'transform 0.6s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.45s ease';
+                el.classList.add('card-exit');
+                el.style.pointerEvents = 'none';
+                el.style.transition = 'transform 0.6s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.45s ease';
 
                 requestAnimationFrame(() => {
-                    card.style.opacity = '0';
-                    card.style.transform = exitTransform;
+                    el.style.opacity = '0';
+                    el.style.transform = exitTransform;
                 });
             });
         }

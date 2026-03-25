@@ -71,6 +71,11 @@ export function applyFingerprint(fingerprint) {
   if (!fingerprint) {
     return;
   }
+  // Reject stale unknown@ fingerprints — these come from the SSE proxy
+  // before the real fingerprint is assigned. Don't let them overwrite a valid one.
+  if (fingerprint.startsWith('unknown@') && state.streamFingerprint && !state.streamFingerprint.startsWith('unknown@')) {
+    return;
+  }
 
   state.streamFingerprint = fingerprint;
   syncEventsEndpoint(fingerprint);

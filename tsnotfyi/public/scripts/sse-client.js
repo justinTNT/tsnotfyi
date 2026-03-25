@@ -8,7 +8,7 @@ import { exitCardsDormantState, ensureDeckHydratedAfterTrackChange } from './car
 import { cloneExplorerData, explorerContainsTrack, findTrackInExplorer, shouldIgnoreExplorerUpdate, summarizeExplorerSnapshot } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
 import { updateConnectionHealthUI, handleDeadAudioSession, getBufferDelaySecs } from './audio-manager.js';
-import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray } from './playlist-tray.js';
+import { popPlaylistHead, playlistHasItems, getPlaylistNext, renderPlaylistTray, cacheTrackMeta } from './playlist-tray.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
 
 const sseLog = createLogger('sse');
@@ -98,11 +98,21 @@ export function connectSSE() {
       // Store the server's track as the known current — card display may lag behind
       state._serverCurrentTrack = newTrackState;
 
-      // Record to session history
+      // Record to session history and cache metadata for history display
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
       if (!state.sessionTrackHistory.includes(currentTrackId)) {
         state.sessionTrackHistory.push(currentTrackId);
+        // Cache metadata so history cards have album art
+        if (!state.trackMetadataCache) state.trackMetadataCache = {};
+        state.trackMetadataCache[currentTrackId] = newTrackState;
+        if (typeof cacheTrackMeta === 'function') {
+          cacheTrackMeta(currentTrackId, newTrackState);
+        }
         syncLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
+        // Update history stack visual
+        if (typeof window.renderSessionHistory === 'function') {
+          window.renderSessionHistory();
+        }
       }
     }
 
@@ -312,7 +322,6 @@ export function connectSSE() {
     // === STEADY-STATE PROGRESS RESYNC ===
 
     if (!trackChanged && !isFirstTrack) {
-      const durationSeconds = newDurationSeconds || currentTrack.duration || currentTrack.length || 0;
       const driftStateForCard = heartbeat.driftState || heartbeat.drift || null;
 
       // Don't overwrite card if sentinel just promoted a track (avoids wobble)
@@ -320,9 +329,8 @@ export function connectSSE() {
       if (typeof window.updateNowPlayingCard === 'function' && !sentinelLocked) {
         window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
       }
-      if (durationSeconds > 0 && !state.progressAnimation) {
-        startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackId: currentTrackId });
-      }
+      // Progress is started by updateNowPlayingCard on track change or by the sentinel.
+      // Don't restart from 0 on steady-state heartbeats — causes clock reset loop.
     }
 
     // Update tray head readiness indicator

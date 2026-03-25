@@ -489,7 +489,7 @@ export async function fullResync() {
 
         const result = await response.json();
 
-        if (result.fingerprint) {
+        if (result.fingerprint && !result.fingerprint.startsWith('unknown@')) {
             if (state.streamFingerprint !== result.fingerprint) {
                 log.info(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
             }
@@ -705,7 +705,7 @@ export async function requestSSERefresh(options = {}) {
 
             state.lastRefreshSummary = result;
 
-            if (result.fingerprint) {
+            if (result.fingerprint && !result.fingerprint.startsWith('unknown@')) {
                 if (state.streamFingerprint !== result.fingerprint) {
                     log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
                 }
@@ -754,7 +754,7 @@ export async function requestSSERefresh(options = {}) {
                 log.info(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
                 log.info(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
 
-                if (result.fingerprint && state.streamFingerprint !== result.fingerprint) {
+                if (result.fingerprint && !result.fingerprint.startsWith('unknown@') && state.streamFingerprint !== result.fingerprint) {
                     log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
                     applyFingerprint(result.fingerprint);
                 }

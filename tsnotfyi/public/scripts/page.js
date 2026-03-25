@@ -11,9 +11,9 @@ import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, f
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
 import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
-import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, getPlaylistTail, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray, getCachedTrackMeta } from './playlist-tray.js';
+import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, getPlaylistTail, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray, getCachedTrackMeta, cacheTrackMeta } from './playlist-tray.js';
 import { cancelPackAwayAnimation } from './clock-animation.js';
-import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
+import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, packAwayDirectionStack, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
 import { createLogger } from './log.js';
 const deckLog2 = createLogger('deck');
@@ -73,12 +73,20 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
   const datasetTrackId = card.dataset.trackMd5 || card.dataset.trackIdentifier || null;
   if (skipTargetId && datasetTrackId && skipTargetId === datasetTrackId) {
     state.skipTrayDemotionForTrack = null;
+    const dirKey = card.dataset?.directionKey;
+    if (dirKey && card.parentElement) {
+      card.parentElement.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(dirKey)}"]`).forEach(el => el.remove());
+    }
     card.remove();
     onComplete();
     return;
   }
 
   if (immediate) {
+    const dirKey = card.dataset?.directionKey;
+    if (dirKey && card.parentElement) {
+      card.parentElement.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(dirKey)}"]`).forEach(el => el.remove());
+    }
     card.remove();
     onComplete();
     return;
@@ -89,6 +97,21 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
   card.style.willChange = 'transform, opacity';
   card.style.transition = 'transform 0.45s cubic-bezier(0.18, 0.8, 0.3, 1), opacity 0.4s ease';
 
+  // Exit-animate associated direction stacks alongside the card
+  const exitDirKey = card.dataset?.directionKey;
+  if (exitDirKey && card.parentElement) {
+    card.parentElement.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(exitDirKey)}"]`).forEach(stack => {
+      stack.classList.add('card-exit');
+      stack.style.pointerEvents = 'none';
+      stack.style.transition = 'transform 0.45s cubic-bezier(0.18, 0.8, 0.3, 1), opacity 0.4s ease';
+      requestAnimationFrame(() => {
+        stack.style.opacity = '0';
+        const baseTransform = stack.style.transform || '';
+        stack.style.transform = `${baseTransform} translateZ(-900px) scale(0.45)`;
+      });
+    });
+  }
+
   requestAnimationFrame(() => {
     card.style.transform = 'translate(-50%, -50%) translateZ(-900px) scale(0.45)';
     card.style.opacity = '0';
@@ -96,6 +119,11 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
 
   const cleanup = () => {
     card.removeEventListener('transitionend', handler);
+    // Remove associated direction stack cards (siblings in same container)
+    const dirKey = card.dataset?.directionKey;
+    if (dirKey && card.parentElement) {
+      card.parentElement.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(dirKey)}"]`).forEach(el => el.remove());
+    }
     if (card.parentElement) {
       card.parentElement.removeChild(card);
     }
@@ -120,6 +148,57 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
 
 let nextTrackPreviewFadeTimer = null;
 
+  function renderSessionHistory() {
+      const container = document.getElementById('sessionHistoryStack');
+      if (!container) return;
+
+      const history = state.sessionTrackHistory || [];
+      const currentId = state.latestCurrentTrack?.identifier || state._serverCurrentTrack?.identifier;
+      // Show played tracks (exclude current), most recent first
+      const played = history.filter(id => id !== currentId);
+
+      container.innerHTML = '';
+
+      const maxCards = Math.min(played.length, 20);
+      for (let i = 0; i < maxCards; i++) {
+          const trackId = played[played.length - 1 - i]; // most recent first
+          const meta = (typeof getCachedTrackMeta === 'function' ? getCachedTrackMeta(trackId) : null)
+              || state.trackMetadataCache?.[trackId];
+
+          const card = document.createElement('div');
+          card.className = 'history-card';
+
+          const offset = (i + 1) * 20;
+          const scale = 1 - (i + 1) * 0.02;
+          card.style.transform = `translate(${offset}px, ${offset}px) scale(${scale})`;
+          card.style.zIndex = `${-i - 1}`;
+
+          if (meta?.albumCover) {
+              const img = document.createElement('img');
+              img.src = meta.albumCover;
+              img.alt = '';
+              img.draggable = false;
+              card.appendChild(img);
+          }
+
+          if (meta) {
+              card.style.pointerEvents = 'auto';
+              card.addEventListener('mouseenter', () => {
+                  if (typeof window.showTrackTooltip === 'function') {
+                      const dur = meta.duration || meta.length;
+                      const durStr = Number.isFinite(dur) ? `${Math.floor(dur / 60)}:${String(Math.floor(dur % 60)).padStart(2, '0')}` : '';
+                      window.showTrackTooltip(meta.title || '', meta.artist || '', meta.album || '', durStr);
+                  }
+              });
+              card.addEventListener('mouseleave', () => {
+                  if (typeof window.hideTrackTooltip === 'function') window.hideTrackTooltip();
+              });
+          }
+
+          container.appendChild(card);
+      }
+  }
+
   function updateNowPlayingCard(trackData, driftState) {
       // Departure animation cleared after DOM updates below (so new content renders under the blur)
       const nowPlayingEl = document.getElementById('nowPlayingCard');
@@ -141,6 +220,10 @@ let nextTrackPreviewFadeTimer = null;
       // Restart progress bar when the now-playing card changes to a different track.
       // This is the single source of truth for progress bar restarts on track change.
       if (newId && prevId !== newId) {
+          // Cache metadata for history display
+          if (!state.trackMetadataCache) state.trackMetadataCache = {};
+          state.trackMetadataCache[newId] = trackData;
+          renderSessionHistory();
           const newDuration = trackData.durationMs
             ? trackData.durationMs / 1000
             : (trackData.duration || trackData.length || 0);
@@ -497,6 +580,7 @@ async function initializeApp() {
               state.latestCurrentTrack = trackState;
               window.state.latestCurrentTrack = trackState;
               state._sentinelPromotionLockUntil = Date.now() + 25000;
+              renderSessionHistory();
               if (typeof window.updateNowPlayingCard === 'function') {
                 window.updateNowPlayingCard(trackState, null);
               }
@@ -640,8 +724,12 @@ async function initializeApp() {
       if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
       if (!state.sessionTrackHistory.includes(currentTrackId)) {
         state.sessionTrackHistory.push(currentTrackId);
+        if (!state.trackMetadataCache) state.trackMetadataCache = {};
+        state.trackMetadataCache[currentTrackId] = newTrackState;
+        if (typeof cacheTrackMeta === 'function') cacheTrackMeta(currentTrackId, newTrackState);
         audioLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
       }
+      renderSessionHistory();
 
       // === Direction ===
       // Only use server-provided current track direction; never fall back to next-track properties
@@ -719,9 +807,10 @@ async function initializeApp() {
       // queued items — the user has already made their selections, so we don't
       // need fresh explorer data until the playlist drains.
       const playlistStillActive = typeof playlistHasItems === 'function' && playlistHasItems();
-      if (!explorerAlreadyCurrent && !playlistStillActive) {
+      const hasExplorerData = !!state.latestExplorerData?.directions;
+      if (!explorerAlreadyCurrent && (!playlistStillActive || !hasExplorerData)) {
         armExplorerSnapshotTimer(currentTrackId, { reason: 'sentinel-track-change' });
-      } else if (playlistStillActive) {
+      } else if (playlistStillActive && hasExplorerData) {
         sentinelLog.info(`🎵 Playlist active (${state.playlist?.length || 0} items) — skipping explorer fetch`);
       }
 
@@ -923,6 +1012,20 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
       if (!explorerData || typeof explorerData !== 'object') {
           deckLog2.warn('⚠️ Explorer render skipped: invalid explorer data payload');
           return null;
+      }
+
+      // Clear ALL direction stack cards before redrawing — prevents ghost stacks
+      // from cards that were removed without proper cleanup
+      const deckContainer = document.getElementById('dimensionCards');
+      if (deckContainer) {
+          deckContainer.querySelectorAll('.direction-stack').forEach(el => el.remove());
+      }
+      // Also clear any stale stacked-preview-layer cards from previous direction stacks
+      if (deckContainer) {
+          const layer = deckContainer.querySelector('.stacked-preview-layer');
+          if (layer) {
+              layer.querySelectorAll('.direction-stack-card').forEach(el => el.remove());
+          }
       }
 
       const normalizeTracks = (direction) => {
@@ -1855,11 +1958,19 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               if (currentDirection && currentDirection.oppositeDirection) {
                   const oppositeKey = getOppositeDirection(dk);
                   if (oppositeKey) {
-                      state.latestExplorerData.directions[oppositeKey] = {
+                      // Create the opposite direction entry with a back-link to the original
+                      const oppositeData = {
                           ...currentDirection.oppositeDirection,
                           hasOpposite: true,
-                          key: oppositeKey
+                          key: oppositeKey,
+                          oppositeDirection: {
+                              ...currentDirection,
+                              key: dk
+                          }
                       };
+                      // Don't nest infinitely — remove the nested oppositeDirection from the back-link
+                      delete oppositeData.oppositeDirection.oppositeDirection;
+                      state.latestExplorerData.directions[oppositeKey] = oppositeData;
                       swapStackContents(dk, oppositeKey);
                   }
               } else {
@@ -1945,8 +2056,8 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                   }
 
                   if (rewoundTrackId) {
-                      // Only insert current track as bridge when rewinding into played history
-                      if (fromPlaybackHistory && currentId && !trayIds.has(currentId)) {
+                      // Always insert current track as bridge so it stays in the playlist order
+                      if (currentId && !trayIds.has(currentId)) {
                           const curTrack = state.latestCurrentTrack;
                           const curCached = state.trackMetadataCache?.[currentId];
                           state.playlist.unshift({
@@ -2022,20 +2133,15 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                               albumCover: popped.albumCover
                           };
                           // If the new head is the current track, auto-skip it
+                          // Don't stash in _trayShiftHistory — it's the playing track, not a shifted track.
+                          // Shift+Tab handles the current track as a bridge insertion separately.
                           let newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
                           const currentId = state.latestCurrentTrack?.identifier;
                           if (newHead && currentId && newHead.trackId === currentId) {
                               deckLog2.info(`🎵 Tab: auto-skipping current track ${currentId.substring(0, 8)} at head`);
-                              const skipped = window.popPlaylistHead();
-                              if (skipped) {
-                                  // Stash so Shift+Tab can recover it
-                                  if (!state._trayShiftHistory) state._trayShiftHistory = [];
-                                  if (!state._trayShiftHistory.includes(skipped.trackId)) {
-                                      state._trayShiftHistory.push(skipped.trackId);
-                                  }
-                                  if (typeof window.renderPlaylistTray === 'function') {
-                                      window.renderPlaylistTray();
-                                  }
+                              window.popPlaylistHead();
+                              if (typeof window.renderPlaylistTray === 'function') {
+                                  window.renderPlaylistTray();
                               }
                               newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
                           }
@@ -2059,6 +2165,24 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                   break;
               }
               deckLog2.info('🎮 Delete: skipping to crossfade');
+              // Record current track in history before skipping — otherwise it's lost
+              const skippedId = state.latestCurrentTrack?.identifier;
+              if (skippedId) {
+                  if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
+                  if (!state.sessionTrackHistory.includes(skippedId)) {
+                      state.sessionTrackHistory.push(skippedId);
+                  }
+                  if (!state._trayShiftHistory) state._trayShiftHistory = [];
+                  if (!state._trayShiftHistory.includes(skippedId)) {
+                      state._trayShiftHistory.push(skippedId);
+                  }
+                  // Cache metadata for Shift+Tab recovery
+                  if (!state.trackMetadataCache) state.trackMetadataCache = {};
+                  state.trackMetadataCache[skippedId] = state.latestCurrentTrack;
+                  if (typeof cacheTrackMeta === 'function') {
+                      cacheTrackMeta(skippedId, state.latestCurrentTrack);
+                  }
+              }
               // Visual feedback: pulse the first cover in the playlist tray
               const trayHead = document.querySelector('.playlist-strip .playlist-cover');
               if (trayHead) {
@@ -2748,8 +2872,8 @@ if (typeof window !== 'undefined') {
       card.style.setProperty('--card-background-color', getCardBackgroundColor(directionType));
       // Convert clock position to angle (12 o'clock = -90°, proceed clockwise)
       const angle = (clockPosition / 12) * Math.PI * 2 - Math.PI / 2;
-      const radiusX = 38; // Horizontal radius for clock layout
-      const radiusY = 42; // Vertical radius for clock layout
+      const radiusX = 46; // Horizontal radius for clock layout
+      const radiusY = 50; // Vertical radius for clock layout
       const centerX = 50; // Center horizontally for clock layout
       const centerY = 50; // Vertical center
       const x = centerX + radiusX * Math.cos(angle);
@@ -3432,7 +3556,12 @@ if (typeof window !== 'undefined') {
           track: primaryTrack
       };
 
-      // Pack up stack cards, then rotate existing center out, then promote new one
+      // Pack away the incoming direction's stack cards (animate to center)
+      if (typeof packAwayDirectionStack === 'function') {
+          packAwayDirectionStack(canonicalDirectionKey);
+      }
+
+      // Pack up center stack cards, then rotate existing center out, then promote new one
       if (currentCenterKey && currentCenterKey !== canonicalDirectionKey && typeof rotateCenterCardToNextPosition === 'function') {
           packUpStackCards().then(() => {
               rotateCenterCardToNextPosition(currentCenterKey);
@@ -3688,6 +3817,10 @@ function exposeDeckHelpers(attempt = 0) {
         : undefined;
     window.hideNextTrackPreview = typeof hideNextTrackPreview === 'function'
         ? hideNextTrackPreview
+        : undefined;
+
+    window.renderSessionHistory = typeof renderSessionHistory === 'function'
+        ? renderSessionHistory
         : undefined;
 
     window.__deckTestHooks = Object.assign({}, window.__deckTestHooks, {

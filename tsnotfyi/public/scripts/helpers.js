@@ -680,6 +680,9 @@ import { setSelection } from './selection.js';
           existingIndicator.remove();
       }
 
+      // Re-declare container reference (may have been nulled if card moved)
+      const container = card.parentElement;
+
       const sampleTracks = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
       const reportedCount = Number(direction.trackCount);
       const totalTracks = Number.isFinite(reportedCount) && reportedCount > 0
@@ -692,36 +695,77 @@ import { setSelection } from './selection.js';
           return;
       }
 
-      const stackLineContainer = document.createElement('div');
-      stackLineContainer.className = 'stack-line-visual';
+      if (!container) return;
 
-      const computedStyle = window.getComputedStyle(card);
-      const fallbackColor = direction.borderColor || '#ffffff';
-      const lineColor = (computedStyle.getPropertyValue('--border-color') || computedStyle.borderColor || fallbackColor).trim() || fallbackColor;
+      // Remove any previous stack for this direction
+      const dirKey = direction.key || direction.direction || '';
+      container.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(dirKey)}"]`).forEach(el => el.remove());
 
-      let cardHeight = card.offsetHeight || 0;
-      if (!cardHeight) {
-          const rect = card.getBoundingClientRect();
-          cardHeight = rect?.height || 0;
+      const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
+      const maxStackCards = 4;
+
+      for (let i = 0; i < Math.min(lineCount, maxStackCards); i++) {
+          const sample = samples[i + 1]; // skip first (it's the front card)
+          const track = sample?.track || sample;
+          const stackCard = document.createElement('div');
+          stackCard.className = 'direction-stack';
+          stackCard.dataset.directionKey = dirKey;
+
+          // Copy the card's position — start stacked behind (no offset), then animate out
+          stackCard.style.cssText = card.style.cssText;
+          const currentTransform = card.style.transform || '';
+          const cardZ = parseInt(card.style.zIndex || '0');
+          stackCard.style.zIndex = `${cardZ - i - 1}`;
+          stackCard.style.opacity = card.style.opacity;
+
+          // Start at card's position (no offset)
+          stackCard.style.transform = `${currentTransform} translate(0px, 0px)`;
+          stackCard.style.transition = 'transform 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
+
+          // Animate to final peeking position after a frame
+          const offset = (i + 1) * 24;
+          requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                  stackCard.style.transform = `${currentTransform} translate(${offset}px, ${offset}px)`;
+              });
+          });
+
+          if (track?.albumCover) {
+              const img = document.createElement('img');
+              img.src = track.albumCover;
+              img.alt = '';
+              img.draggable = false;
+              stackCard.appendChild(img);
+          }
+
+          stackCard.addEventListener('click', (e) => {
+              e.stopPropagation();
+              card.click();
+          });
+
+          // Hover tooltip — same info as the front card
+          if (track) {
+              stackCard.addEventListener('mouseenter', () => {
+                  if (typeof window.showTrackTooltip === 'function') {
+                      const dur = track.duration || track.length;
+                      const durStr = Number.isFinite(dur) ? `${Math.floor(dur / 60)}:${String(Math.floor(dur % 60)).padStart(2, '0')}` : '';
+                      window.showTrackTooltip(
+                          getDisplayTitle(track),
+                          track.artist || '',
+                          track.album || '',
+                          durStr
+                      );
+                  }
+              });
+              stackCard.addEventListener('mouseleave', () => {
+                  if (typeof window.hideTrackTooltip === 'function') {
+                      window.hideTrackTooltip();
+                  }
+              });
+          }
+
+          container.appendChild(stackCard);
       }
-      const baseHeight = cardHeight ? Math.max(2, Math.round(cardHeight * 0.66)) : 40;
-
-      let currentHeight = baseHeight;
-      for (let i = 0; i < lineCount; i += 1) {
-          const line = document.createElement('div');
-          line.className = 'stack-line';
-          line.style.height = `${Math.max(2, Math.round(currentHeight))}px`;
-          line.style.backgroundColor = lineColor;
-          stackLineContainer.appendChild(line);
-          currentHeight *= 0.75;
-      }
-
-      stackLineContainer.addEventListener('click', (e) => {
-          e.stopPropagation();
-          card.click();
-      });
-
-      card.appendChild(stackLineContainer);
   }
 
   // Cycle through stack contents for back card clicks
@@ -1017,6 +1061,45 @@ import { setSelection } from './selection.js';
               resolve();
           }, 320);
       });
+  }
+
+  /**
+   * Animate direction stack cards to pack behind the center card, then remove them.
+   * Called when a direction card is promoted to center.
+   */
+  function packAwayDirectionStack(directionKey) {
+      const container = document.getElementById('dimensionCards');
+      if (!container || !directionKey) return;
+
+      const stackCards = container.querySelectorAll(`.direction-stack[data-direction-key="${CSS.escape(directionKey)}"]`);
+      if (stackCards.length === 0) return;
+
+      const centerCard = document.querySelector('.dimension-card.next-track');
+      if (!centerCard) {
+          stackCards.forEach(el => el.remove());
+          return;
+      }
+
+      const containerRect = container.getBoundingClientRect();
+      const cardRect = centerCard.getBoundingClientRect();
+      const targetX = cardRect.left - containerRect.left;
+      const targetY = cardRect.top - containerRect.top;
+
+      stackCards.forEach(card => {
+          card.style.transition = 'transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease';
+          card.style.pointerEvents = 'none';
+
+          requestAnimationFrame(() => {
+              card.style.left = `${targetX}px`;
+              card.style.top = `${targetY}px`;
+              card.style.transform = 'scale(1)';
+              card.style.opacity = '0';
+          });
+      });
+
+      setTimeout(() => {
+          stackCards.forEach(el => el.remove());
+      }, 320);
   }
 
   function renderStackedPreviews(card, direction, selectedIndex) {
@@ -1611,6 +1694,7 @@ export {
     ensureStackedPreviewLayer,
     clearStackedPreviewLayer,
     packUpStackCards,
+    packAwayDirectionStack,
     renderStackedPreviews,
     redrawDimensionCardsWithNewNext,
     hideDirectionKeyOverlay,
@@ -1624,5 +1708,6 @@ if (typeof window !== 'undefined') {
     window.photoStyle = photoStyle;
     window.updateCardWithTrackDetails = updateCardWithTrackDetails;
     window.packUpStackCards = packUpStackCards;
+    window.packAwayDirectionStack = packAwayDirectionStack;
     window.preloadAlbumCovers = preloadAlbumCovers;
 }
