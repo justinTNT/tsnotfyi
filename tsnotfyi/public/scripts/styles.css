@@ -436,10 +436,7 @@ body {
     left: 0;
     height: 100%;
     width: 0%;
-    background: linear-gradient(90deg,
-        rgba(255, 255, 255, 0.08) 0%,
-        rgba(255, 255, 255, 0.12) 50%,
-        rgba(255, 255, 255, 0.08) 100%);
+    /* Gradient set dynamically by progress-ui.js — soft edge faces the exposed side */
     mix-blend-mode: screen;
     transition: none; /* Animation will be handled by JavaScript */
 }
@@ -633,7 +630,7 @@ audio {
 /* Image div with mask */
 .photo {
     position: absolute;
-    background-size: cover !important;
+    /* maybe not background-size: cover !important; */
     inset: 0;
     background: linear-gradient(135deg, #1a0, #051); /* Fallback gradient */
     z-index: 1;
@@ -839,11 +836,12 @@ audio {
 /* Session History Stack — played tracks trailing behind now-playing card */
 #sessionHistoryStack {
     position: fixed;
-    left: 2rem;
-    top: 33%;
+    left: 3rem;
+    top: 30%;
     transform: translateY(-50%);
     z-index: 90;
     pointer-events: none;
+    opacity: 0.5;
 }
 
 #sessionHistoryStack .history-card {

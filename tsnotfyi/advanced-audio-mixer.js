@@ -24,6 +24,15 @@ for (let i = 0; i < 16; i += 4) {
   SENTINEL_CROSSFADE_END.writeInt16LE(0x7FFF, i + 2);
 }
 
+// Halfway: pairs pattern [MAX, MAX, MIN, MIN, MAX, MAX, MIN, MIN]
+const SENTINEL_HALFWAY = Buffer.alloc(16);
+for (let i = 0; i < 16; i += 8) {
+  SENTINEL_HALFWAY.writeInt16LE(0x7FFF, i);
+  SENTINEL_HALFWAY.writeInt16LE(0x7FFF, i + 2);
+  SENTINEL_HALFWAY.writeInt16LE(-32768, i + 4);
+  SENTINEL_HALFWAY.writeInt16LE(-32768, i + 6);
+}
+
 class AdvancedAudioMixer {
   constructor(options = {}) {
     this.sampleRate = options.sampleRate || config.audio.sampleRate;
@@ -589,6 +598,15 @@ class AdvancedAudioMixer {
     const currentBuffer = this.engine.currentTrack.buffer;
     const position = this.engine.currentTrack.position;
     const remainingBytes = currentBuffer.length - position;
+
+    // Emit halfway sentinel once per track when crossing the 50% mark
+    if (!this.engine.currentTrack._halfwaySent && currentBuffer.length > 0) {
+      const halfwayByte = Math.floor(currentBuffer.length / 2);
+      if (position >= halfwayByte) {
+        this.engine.currentTrack._halfwaySent = true;
+        if (this.onData) this.onData(SENTINEL_HALFWAY);
+      }
+    }
 
     // Check if track has actually finished playing (wall-clock time)
     if (this.engine.streamingStartTime && this.engine.currentTrack.estimatedDuration) {

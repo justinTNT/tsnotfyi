@@ -134,8 +134,9 @@ export function connectSSE() {
 
     // Update server state and history on track change
     if (trackChanged) {
-      state.playbackDurationSeconds = newDurationSeconds;
-      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
+      // Don't reset playbackDurationSeconds or playbackStartTimestamp here —
+      // the sentinel owns progress resets. Setting them on heartbeat would reset
+      // the counter while the old track is still audibly playing (buffered audio).
       state._serverCurrentTrack = newTrackState;
 
       // Cache metadata — history push happens in updateNowPlayingCard (single writer)
@@ -177,8 +178,9 @@ export function connectSSE() {
       if (newDurationSeconds) state.playbackDurationSeconds = newDurationSeconds;
       // Only set start timestamp if not already tracking — don't reset mid-track
       if (newStartTimestamp && !state.playbackStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
-      state.latestCurrentTrack = newTrackState;
-      window.state.latestCurrentTrack = state.latestCurrentTrack;
+      // Don't update latestCurrentTrack here — it's owned by updateNowPlayingCard.
+      // Updating it here would make updateNowPlayingCard unable to detect track changes
+      // (prevId would already match newId when the sentinel fires).
       state.lastTrackUpdateTs = Date.now();
     }
 
@@ -211,7 +213,7 @@ export function connectSSE() {
         if (playlistHasItems()) {
           const head = getPlaylistNext();
           if (head && head.trackId === currentTrackId) {
-            syncLog.info(`🎵 ${cardAlreadyUpdated ? 'Playlist pop fallback' : 'Atomic tray→card (heartbeat fallback)'}: popping ${currentTrackId.substring(0, 8)} from tray`);
+            syncLog.info(`🎵 Playlist pop fallback: popping ${currentTrackId.substring(0, 8)} from tray`);
             popPlaylistHead();
             renderPlaylistTray();
             const newHead = getPlaylistNext();
@@ -221,9 +223,9 @@ export function connectSSE() {
           }
         }
 
-        if (fallbackDurationSeconds > 0) {
-          startProgressAnimationFromPosition(fallbackDurationSeconds, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
-        }
+        // Don't reset progress here — if the sentinel fired, progress is already running.
+        // If the sentinel never fired, the card hasn't changed either, so resetting
+        // progress would restart the counter on a track that's been playing for 30s+.
 
         if (!playlistHasItems()) {
           armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-fallback-track-change' });
@@ -234,7 +236,8 @@ export function connectSSE() {
     }
 
     // === FIRST-TRACK DETECTION (no sentinel for the very first track) ===
-    const isFirstTrack = !previousServerTrackId && currentTrackId;
+    // Only fire if we genuinely have no track showing — not on SSE reconnects
+    const isFirstTrack = !previousServerTrackId && currentTrackId && !state.latestCurrentTrack?.identifier;
     if (isFirstTrack) {
       state.playbackDurationSeconds = newDurationSeconds;
       if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
@@ -316,19 +319,8 @@ export function connectSSE() {
       }
     }
 
-    // === STEADY-STATE PROGRESS RESYNC ===
-
-    if (!trackChanged && !isFirstTrack) {
-      const driftStateForCard = heartbeat.driftState || heartbeat.drift || null;
-
-      // Don't overwrite card if sentinel just promoted a track (avoids wobble)
-      const sentinelLocked = state._sentinelPromotionLockUntil && Date.now() < state._sentinelPromotionLockUntil;
-      if (typeof window.updateNowPlayingCard === 'function' && !sentinelLocked) {
-        window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
-      }
-      // Progress is started by updateNowPlayingCard on track change or by the sentinel.
-      // Don't restart from 0 on steady-state heartbeats — causes clock reset loop.
-    }
+    // Heartbeats do NOT update the card. The sentinel is the sole owner of card presentation.
+    // This eliminates the entire class of heartbeat/sentinel racing bugs.
 
     // Track crossfade readiness in state (survives DOM rebuilds)
     if (playlistHasItems()) {

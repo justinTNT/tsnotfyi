@@ -733,7 +733,23 @@ app.get('/current-track', async (req, res) => {
   try {
     const result = await audioClient.getStats(session.sessionId);
     if (!result?.heartbeat?.currentTrack) return res.status(204).send();
-    res.json(result.heartbeat);
+    const heartbeat = result.heartbeat;
+    // Enrich with metadata from DB — audio server only sends {identifier, startTime, durationMs}
+    const trackId = heartbeat.currentTrack.identifier;
+    if (trackId) {
+      const metaMap = await db.batchGetTrackMeta([trackId]);
+      const meta = metaMap.get(trackId);
+      if (meta) {
+        Object.assign(heartbeat.currentTrack, {
+          title: meta.title,
+          artist: meta.artist,
+          album: meta.album,
+          albumCover: meta.albumCover,
+          duration: meta.duration || meta.length
+        });
+      }
+    }
+    res.json(heartbeat);
   } catch (e) {
     res.status(503).json({ error: 'Audio server unavailable' });
   }
@@ -1463,7 +1479,7 @@ app.get('/health', async (req, res) => {
     status: 'ok',
     timestamp: new Date().toISOString(),
     webSessions: audioSessions.size,
-    audioServer: { ...audioHealth, url: config.audioServer?.url || 'http://localhost:3002' },
+    audioServer: { ...audioHealth, url: config.audioServer?.publicUrl || config.audioServer?.url || 'http://localhost:3002' },
     apiServer: apiHealth
   });
 });

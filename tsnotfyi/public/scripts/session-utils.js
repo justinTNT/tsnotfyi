@@ -18,6 +18,10 @@ export function normalizeResolution(resolution) {
 export function composeStreamEndpoint(fingerprint, cacheBust = false) {
   const base = state.streamUrlBase || '/stream';
   const params = [];
+  // When connecting directly to Audio server, include sessionId
+  if (state.sessionId) {
+    params.push(`sessionId=${encodeURIComponent(state.sessionId)}`);
+  }
   if (fingerprint) {
     params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
   }
@@ -33,10 +37,15 @@ export function composeStreamEndpoint(fingerprint, cacheBust = false) {
 
 export function composeEventsEndpoint(fingerprint) {
   const base = state.eventsEndpointBase || '/events';
-  if (!fingerprint) {
-    return base;
+  const params = [];
+  if (state.sessionId) {
+    params.push(`sessionId=${encodeURIComponent(state.sessionId)}`);
   }
-  return `${base}?fingerprint=${encodeURIComponent(fingerprint)}`;
+  if (fingerprint) {
+    params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
+  }
+  if (!params.length) return base;
+  return `${base}?${params.join('&')}`;
 }
 
 export function syncStreamEndpoint(fingerprint, { cacheBust = false } = {}) {

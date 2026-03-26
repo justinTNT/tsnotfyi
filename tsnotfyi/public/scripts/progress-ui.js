@@ -72,37 +72,36 @@ function applyProgressEnvelope(raw) {
     return Math.min(raw, Math.min(1, Math.max(0, pulse)));
 }
 
+let _renderCount = 0;
 export function renderProgressBar(progressFraction) {
     const clamped = Math.min(Math.max(progressFraction, 0), 1);
     const visualProgress = applyProgressEnvelope(clamped);
     const phase = clamped <= 0.5 ? 'fill' : 'drain';
     if (phase !== lastProgressPhase) {
-        log.debug(`Progress phase → ${phase}`, { progress: Number(clamped.toFixed(3)) });
+        log.info(`🌊 Progress phase → ${phase}`, { progress: Number(clamped.toFixed(3)), xfade: !!state._crossfadeWipe });
         lastProgressPhase = phase;
+    }
+    // Log every 100th render to track wave is moving
+    if (++_renderCount % 100 === 0) {
+        log.info(`🌊 wave tick #${_renderCount}: progress=${clamped.toFixed(3)} phase=${phase} xfade=${!!state._crossfadeWipe} width=${elements.progressWipe.style.width}`);
     }
     const background = document.getElementById('background');
 
+
+    // Single gradient for both phases — soft on both edges, peak in center.
+    // No flip at the midpoint. The wave sweeps left-to-right continuously.
+    elements.progressWipe.style.background = 'linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0) 100%)';
 
     if (clamped <= 0.5) {
         const widthPercent = visualProgress * 2 * 100;
         elements.progressWipe.style.left = '0%';
         elements.progressWipe.style.right = 'auto';
         elements.progressWipe.style.width = `${widthPercent}%`;
-
-        if (background) {
-            let green = Math.floor(clamped * 10);
-            background.style.background = `linear-gradient(135deg, #235, #4${green}3)`;
-        }
     } else {
         const phase2Progress = Math.max(0, visualProgress - 0.5) * 2;
         elements.progressWipe.style.left = `${phase2Progress * 100}%`;
         elements.progressWipe.style.right = 'auto';
         elements.progressWipe.style.width = `${(1 - phase2Progress) * 100}%`;
-
-        if (background) {
-            let green = 10 - Math.floor(clamped * 10);
-            background.style.background = `linear-gradient(135deg, #235, #4${green}3)`;
-        }
     }
 
     if (state.pendingExplorerNext && clamped >= TRACK_SWITCH_PROGRESS_THRESHOLD) {
@@ -148,19 +147,7 @@ export function updatePlaybackClockDisplay(forceSeconds = null) {
 
     const clampedElapsed = Math.min(Math.max(0, elapsedSeconds), state.playbackDurationSeconds);
 
-    // Midpoint watchdog: if we're past 50% and the deck has no cards, force a refresh
-    if (!midpointWatchdogFired && state.playbackDurationSeconds > 0 && clampedElapsed > state.playbackDurationSeconds * 0.5) {
-        const deckContainer = document.getElementById('dimensionCards');
-        const hasCards = deckContainer && deckContainer.querySelector('.dimension-card');
-        if (!hasCards) {
-            midpointWatchdogFired = true;
-            log.warn('🐕 Midpoint watchdog: no cards at 50% — forcing refresh');
-            clearSelection('watchdog');
-            if (typeof window.requestSSERefresh === 'function') {
-                window.requestSSERefresh({ escalate: false });
-            }
-        }
-    }
+    // Midpoint watchdog replaced by halfway sentinel (in-band, authoritative)
 
     const formattedElapsed = formatTimecode(clampedElapsed);
     const formattedTotal = formatTimecode(state.playbackDurationSeconds);
@@ -302,6 +289,18 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
             }
         } else if (hasCards) {
             state._trackStartWatchdogFired = false;
+        }
+
+        // Shift background hue on track change — alternates between two subtle palettes.
+        // The wipe handles the per-frame visual; the background stays stable within a track.
+        const background = document.getElementById('background');
+        if (background) {
+            state._bgHueIndex = ((state._bgHueIndex || 0) + 1) % 2;
+            const palettes = [
+                'linear-gradient(135deg, #223355, #2a3a4a)',
+                'linear-gradient(135deg, #223355, #2a4a3a)'
+            ];
+            background.style.background = palettes[state._bgHueIndex];
         }
     }
     const safeDuration = Math.max(durationSeconds, 0.001);
@@ -466,8 +465,17 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
     }
 
     if (wantsAudioDelay && !isFirstProgress) {
-        state.playbackDurationSeconds = 0;
-        state.playbackStartTimestamp = null;
+        // Keep duration and start timestamp alive so the clock shows 0:00/X:XX
+        // while waiting for audio. Only clear audioTrackStartClock (re-synced when audio starts).
+        if (trackChanged) {
+            state.playbackDurationSeconds = safeDuration;
+            state.playbackStartTimestamp = Date.now();
+            renderProgressBar(0);
+            updatePlaybackClockDisplay(0);
+        } else {
+            state.playbackDurationSeconds = 0;
+            state.playbackStartTimestamp = null;
+        }
         state.audioTrackStartClock = null;
         state._autoPromoted = false;
         state.pendingProgressStart = {
@@ -536,6 +544,8 @@ export function startProgressAnimationFromPosition(durationSeconds, startPositio
 
     // Ease-out function: fast start, slow finish (feels natural for catching up)
     const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+
+    log.info(`🌊 Progress animation STARTED: duration=${safeDuration.toFixed(1)}s startPos=${clampedStartPosition.toFixed(1)}s trackChanged=${trackChanged} trackId=${trackId?.substring(0, 8) || '?'}`);
 
     state.progressAnimation = setInterval(() => {
         // Get target progress from audio element (source of truth)
@@ -630,6 +640,7 @@ export function stopProgressAnimation() {
     stopPlaybackClockTicker();
     clearPendingProgressStart();
 }
+
 
 // Expose globally for cross-module access
 if (typeof window !== 'undefined') {

@@ -111,6 +111,14 @@ function classifySentinel(held) {
   if (isCrossfadeStart) return 'crossfade-start';
   if (isCrossfadeEnd) return 'crossfade-end';
 
+  // halfway: pairs [MAX, MAX, MIN, MIN, MAX, MAX, MIN, MIN]
+  if (held[0] === SENTINEL_VAL_MAX && held[1] === SENTINEL_VAL_MAX &&
+      held[2] === SENTINEL_VAL_MIN && held[3] === SENTINEL_VAL_MIN &&
+      held[4] === SENTINEL_VAL_MAX && held[5] === SENTINEL_VAL_MAX &&
+      held[6] === SENTINEL_VAL_MIN && held[7] === SENTINEL_VAL_MIN) {
+    return 'halfway';
+  }
+
   return null; // not a sentinel
 }
 
@@ -133,47 +141,49 @@ function isSentinelValue(int16) {
 
 function int16ToFloat32(uint8Array) {
   // uint8Array is raw bytes of Int16 LE PCM (stereo interleaved)
+  // Write pointer approach: confirmed sentinels are excised (not written),
+  // the ring buffer absorbs the ~0.09ms gap seamlessly.
   const dataView = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
   const numSamples = Math.floor(uint8Array.byteLength / 2);
-  const float32 = new Float32Array(numSamples);
+  const float32 = new Float32Array(sentinelHeldValues.length + numSamples);
+  let wp = 0;
+
   for (let i = 0; i < numSamples; i++) {
     const int16 = dataView.getInt16(i * 2, true); // little-endian
 
     if (isSentinelValue(int16)) {
       sentinelHeldValues.push(int16);
-      float32[i] = 0; // Hold as silence until classification
+      // Don't write — held until classified
 
       if (sentinelHeldValues.length >= 8) {
         const type = classifySentinel(sentinelHeldValues);
         if (type) {
-          // Confirmed sentinel — held samples stay zeroed
+          // Confirmed sentinel — excise (don't write), stitch audio
           fireSentinel(type);
         } else {
           // 8 sentinel-possible values but no pattern match — restore as audio
-          const restoreCount = sentinelHeldValues.length;
-          for (let j = 0; j < restoreCount && i - (restoreCount - 1 - j) >= 0; j++) {
-            float32[i - (restoreCount - 1 - j)] = sentinelHeldValues[j] / 32768;
+          for (let j = 0; j < sentinelHeldValues.length; j++) {
+            float32[wp++] = sentinelHeldValues[j] / 32768;
           }
-          log.warn(`🔔 Sentinel false positive: ${restoreCount} held values restored (not a pattern)`);
+          log.warn(`🔔 Sentinel false positive: ${sentinelHeldValues.length} held values restored`);
         }
         sentinelHeldValues = [];
       }
     } else {
       if (sentinelHeldValues.length > 0) {
-        // False alarm: non-sentinel value broke the run — restore held samples
-        const restoreCount = sentinelHeldValues.length;
-        for (let j = 0; j < restoreCount && i - (restoreCount - j) >= 0; j++) {
-          float32[i - (restoreCount - j)] = sentinelHeldValues[j] / 32768;
+        // False alarm: non-sentinel broke the run — restore held samples
+        if (sentinelHeldValues.length >= 6) {
+          log.warn(`🔔 Sentinel false alarm: ${sentinelHeldValues.length} held values restored`);
         }
-        if (restoreCount >= 2) {
-          log.warn(`🔔 Sentinel false alarm: ${restoreCount} held values restored (run broken by non-sentinel)`);
+        for (let j = 0; j < sentinelHeldValues.length; j++) {
+          float32[wp++] = sentinelHeldValues[j] / 32768;
         }
         sentinelHeldValues = [];
       }
-      float32[i] = int16 / 32768;
+      float32[wp++] = int16 / 32768;
     }
   }
-  return float32;
+  return float32.subarray(0, wp);
 }
 
 // ====== Fetch + Decode Pump ======
@@ -480,6 +490,11 @@ function handlePipelineEvent(msg) {
       log.info(`Audio buffer underrun (available: ${msg.available}, needed: ${msg.needed})`);
       audioHealth.bufferingStarted = Date.now();
       audioHealth.lastObservedTime = softwareClock;
+      break;
+    }
+
+    case 'overflow': {
+      log.warn(`🔴 Ring buffer overflow #${msg.count}: dropped ${msg.dropped} frames (buffered: ${msg.buffered}/${msg.capacity})`);
       break;
     }
 

@@ -67,12 +67,20 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     const incomingFrames = len / 2;
     const currentAvail = this._samplesWritten - this._samplesPlayed;
 
-    // Overflow check: if incoming data would exceed buffer capacity, advance read pointer
+    // Overflow check: if incoming data would exceed buffer capacity, drop the incoming data.
+    // Never advance the read pointer — that creates a hard cut (audible pop).
+    // The server's aheadLimitMs (12s) should keep us within the 24s buffer.
+    // If we overflow, something unusual happened (reconnect burst, main thread stall).
     if (currentAvail + incomingFrames > this._bufferCapacity) {
-      const overflow = (currentAvail + incomingFrames) - this._bufferCapacity;
-      this._readPos = (this._readPos + overflow * 2) % this._bufferSize;
-      this._samplesPlayed += overflow;
       this._overflowCount++;
+      this.port.postMessage({
+        type: 'overflow',
+        dropped: incomingFrames,
+        buffered: currentAvail,
+        capacity: this._bufferCapacity,
+        count: this._overflowCount
+      });
+      return; // drop this chunk — buffer is full, server is too far ahead
     }
 
     for (let i = 0; i < len; i++) {

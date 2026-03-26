@@ -21,13 +21,46 @@ const sentinelLog = createLogger('sentinel');
 const overrideLog = createLogger('override');
 const audioLog = createLogger('audio');
 
-(async function hydrateStateFromLocation() {
-  // Direct audio connection requires the Audio server to support HTTPS
-  // (mixed content blocks HTTP fetch from an HTTPS page).
-  // For now, use the Web server proxy. When Audio server has TLS,
-  // this can try direct connection first with proxy fallback.
-  state.streamUrlBase = '/stream';
-  state.eventsEndpointBase = '/events';
+const _hydrationReady = (async function hydrateStateFromLocation() {
+  // Bootstrap session via Web server first — ensures session exists on Audio server
+  let sessionId = null;
+  try {
+    const bootstrapResp = await fetch('/session/bootstrap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+    if (bootstrapResp.ok) {
+      const bootstrap = await bootstrapResp.json();
+      sessionId = bootstrap.sessionId;
+      if (sessionId) state.sessionId = sessionId;
+    }
+  } catch (e) { /* proceed without bootstrap */ }
+
+  // Try direct audio connection via Cloudflare Tunnel.
+  let audioServerUrl = null;
+  try {
+    const resp = await fetch('/health');
+    if (resp.ok) {
+      const health = await resp.json();
+      if (health.audioServer?.url) {
+        const directUrl = health.audioServer.url.replace(/^http:/, 'https:');
+        const probe = await fetch(`${directUrl}/health`, { signal: AbortSignal.timeout(3000) });
+        if (probe.ok) {
+          audioServerUrl = directUrl;
+          audioLog.info(`🎵 Direct audio: ${audioServerUrl} (session: ${sessionId || '?'})`);
+        }
+      }
+    }
+  } catch (e) { /* fall back to proxy */ }
+
+  if (audioServerUrl) {
+    state.streamUrlBase = `${audioServerUrl}/stream`;
+    state.eventsEndpointBase = `${audioServerUrl}/events`;
+  } else {
+    state.streamUrlBase = '/stream';
+    state.eventsEndpointBase = '/events';
+  }
   state.streamUrl = state.streamUrlBase;
   state.eventsEndpoint = state.eventsEndpointBase;
   window.streamUrl = state.streamUrl;
@@ -233,6 +266,7 @@ let nextTrackPreviewFadeTimer = null;
       const prev = state.latestCurrentTrack;
       const prevId = prev?.identifier;
       const newId = trackData.identifier || trackData.trackMd5;
+      deckLog2.info(`🎵 updateNowPlayingCard called: prevId=${prevId?.substring(0, 8) || 'none'} newId=${newId?.substring(0, 8) || 'none'} sameTrack=${prevId === newId} hasDuration=${!!(trackData.durationMs || trackData.duration || trackData.length)}`);
       if (prev && prevId === newId && prev.loved !== undefined) {
           trackData.loved = prev.loved;
           trackData.hated = prev.hated;
@@ -245,7 +279,7 @@ let nextTrackPreviewFadeTimer = null;
       // Restart progress bar when the now-playing card changes to a different track.
       // This is the single source of truth for progress bar restarts on track change.
       if (newId && prevId !== newId) {
-          deckLog2.info(`🎵 Card track change: ${prevId?.substring(0, 8) || 'none'} → ${newId.substring(0, 8)}`);
+          deckLog2.info(`🎵 Card track CHANGE: ${prevId?.substring(0, 8) || 'none'} → ${newId.substring(0, 8)} duration=${(trackData.durationMs ? trackData.durationMs/1000 : trackData.duration || trackData.length || 0).toFixed(1)}s`);
           // Push the previous track into history (if it existed and isn't already there)
           if (prevId) {
               if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
@@ -263,7 +297,8 @@ let nextTrackPreviewFadeTimer = null;
           if (!state.trackMetadataCache) state.trackMetadataCache = {};
           state.trackMetadataCache[newId] = trackData;
           renderSessionHistory();
-          // Always reset clock to 0 on track change
+          // Reset clock to 0 on track change — but skip if crossfade wipe is active.
+          // The wipe owns the visual during crossfade; crossfade-end handler starts the real progress.
           const newDuration = trackData.durationMs
             ? trackData.durationMs / 1000
             : (trackData.duration || trackData.length || 0);
@@ -556,6 +591,8 @@ initializeApp().catch((error) => {
 });
 
 async function initializeApp() {
+  // Wait for bootstrap + direct audio discovery before connecting
+  await _hydrationReady;
 
   // ====== Audio Streaming Setup ======
 
@@ -575,6 +612,30 @@ async function initializeApp() {
     composeStreamEndpoint,
     fullResync,
     onSentinel: async (type, { bufferDelaySecs = 0 } = {}) => {
+      if (type === 'halfway') {
+        // Authoritative midpoint from the audio stream, offset by buffer delay.
+        // The sentinel fires when the midpoint enters the buffer, not when you hear it.
+        const duration = state.playbackDurationSeconds;
+        if (duration > 0) {
+          const audibleMidpoint = duration / 2 - bufferDelaySecs;
+          sentinelLog.info(`🔔 Halfway sentinel — resyncing to ${audibleMidpoint.toFixed(0)}s / ${duration.toFixed(0)}s (buffer: ${bufferDelaySecs.toFixed(1)}s)`);
+          state.playbackStartTimestamp = Date.now() - audibleMidpoint * 1000;
+          startProgressAnimationFromPosition(duration, Math.max(0, audibleMidpoint), { resync: true, trackId: state.latestCurrentTrack?.identifier });
+        }
+
+        // Recovery: if deck has no cards, force refresh (replaces wall-clock midpoint watchdog)
+        const deckContainer = document.getElementById('dimensionCards');
+        const hasCards = deckContainer && deckContainer.querySelector('.dimension-card');
+        if (!hasCards && state.isStarted) {
+          sentinelLog.warn('🐕 Halfway sentinel: no cards — forcing refresh');
+          clearSelection('watchdog');
+          if (typeof window.requestSSERefresh === 'function') {
+            window.requestSSERefresh({ escalate: false });
+          }
+        }
+        return;
+      }
+
       if (type === 'crossfade-start') {
         // Crossfade start: pop tray and delay visual card update by buffer depth.
         if (playlistHasItems()) {
@@ -582,53 +643,38 @@ async function initializeApp() {
           if (head) {
             const isSkip = state._skipInProgress && Date.now() < state._skipInProgress;
             const delayMs = Math.max(0, Math.round(bufferDelaySecs * 1000));
-            // During a skip, delay the pop so the pulse animation completes first
             const popDelayMs = isSkip ? 600 : 0;
-
-            const doPop = () => {
-              popPlaylistHead();
-              sentinelLog.info(`🔔 Sentinel: crossfade-start — popped ${head.trackId.substring(0, 8)}, visual in ${delayMs}ms (buffer: ${bufferDelaySecs.toFixed(1)}s)`);
-
-              // Tell server about the NEW playlist head (next-next track)
-              const newHead = getPlaylistNext();
-              if (newHead && typeof window.sendNextTrack === 'function') {
-                window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
-              }
-            };
-
-            if (popDelayMs > 0) {
-              setTimeout(doPop, popDelayMs);
-            } else {
-              doPop();
-            }
-
-            // Delay visual update to align with audio
             const promoteDelayMs = Math.max(delayMs, popDelayMs);
-            const doPromote = () => {
-              sentinelLog.info(`🔔 Sentinel: crossfade-start — promoting ${head.trackId.substring(0, 8)} to now-playing`);
+
+            // Atomic: pop + promote happen together, after buffer delay.
+            // Track stays in tray (pulsating) until it appears on the card.
+            const doAtomicTransition = () => {
+              popPlaylistHead();
+              sentinelLog.info(`🔔 Sentinel: crossfade-start — atomic pop+promote ${head.trackId.substring(0, 8)}`);
               renderPlaylistTray();
 
+              const cached = (typeof getCachedTrackMeta === 'function' && getCachedTrackMeta(head.trackId)) || {};
               const trackState = {
                 identifier: head.trackId,
-                title: head.title || '',
-                artist: head.artist || '',
-                album: head.album || '',
-                albumCover: head.albumCover || ''
+                title: head.title || cached.title || '',
+                artist: head.artist || cached.artist || '',
+                album: head.album || cached.album || '',
+                albumCover: head.albumCover || cached.albumCover || '',
+                duration: head.duration || cached.duration || cached.length || null,
+                durationMs: cached.durationMs || null
               };
-              state.latestCurrentTrack = trackState;
-              window.state.latestCurrentTrack = trackState;
               state._sentinelPromotionLockUntil = Date.now() + 25000;
-              renderSessionHistory();
               if (typeof window.updateNowPlayingCard === 'function') {
                 window.updateNowPlayingCard(trackState, null);
               }
+              renderSessionHistory();
               state._skipInProgress = null;
             };
 
             if (promoteDelayMs > 50) {
-              setTimeout(doPromote, promoteDelayMs);
+              setTimeout(doAtomicTransition, promoteDelayMs);
             } else {
-              doPromote();
+              doAtomicTransition();
             }
           }
         }
@@ -681,7 +727,39 @@ async function initializeApp() {
       const currentTrackId = currentTrack.identifier || null;
 
       if (currentTrackId === previousTrackId) {
-        sentinelLog.info('🔔 Sentinel: track unchanged, skipping');
+        // Crossfade-start already promoted this track — but it may have had
+        // incomplete metadata (playlist head only). Update the card with the
+        // full server data, and start progress if endCrossfadeWipe killed it.
+        const serverTrackState = {
+          ...data.currentTrack,
+          identifier: currentTrackId
+        };
+        if (typeof window.updateNowPlayingCard === 'function') {
+          // This will be a same-track update (prevId === newId), so it won't
+          // push history or restart progress — just refreshes the card DOM.
+          window.updateNowPlayingCard(serverTrackState, data.driftState || null);
+        }
+        if (!state.progressAnimation) {
+          const fallbackDur = data.currentTrack.durationMs
+            ? data.currentTrack.durationMs / 1000
+            : (data.currentTrack.duration || data.currentTrack.length || 0);
+          if (fallbackDur > 0) {
+            sentinelLog.info(`🔔 Sentinel: track unchanged but no progress running — starting wave (${fallbackDur.toFixed(1)}s)`);
+            state.playbackDurationSeconds = fallbackDur;
+            state.playbackStartTimestamp = Date.now();
+            startProgressAnimationFromPosition(fallbackDur, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
+          }
+        }
+        // Crossfade complete — now safe to tell the server about the next playlist head.
+        // (Deferred from crossfade-start to avoid aborting the in-flight override.)
+        if (playlistHasItems()) {
+          const nextHead = getPlaylistNext();
+          if (nextHead && typeof window.sendNextTrack === 'function') {
+            sentinelLog.info(`🔔 Sentinel: crossfade done — notifying server of next head: ${nextHead.trackId.substring(0, 8)}`);
+            window.sendNextTrack(nextHead.trackId, nextHead.directionKey, 'user');
+          }
+        }
+        sentinelLog.info('🔔 Sentinel: track unchanged, skipping remaining handler');
         state._sentinelHandlerInFlight = false;
         return;
       }
@@ -779,16 +857,11 @@ async function initializeApp() {
       }
 
       // === Apply presentation state (content changes under blur) ===
-      state.playbackDurationSeconds = newDurationSeconds;
-      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
-      state.latestCurrentTrack = newTrackState;
-      window.state.latestCurrentTrack = state.latestCurrentTrack;
+      // Don't set state.latestCurrentTrack here — updateNowPlayingCard reads it as
+      // "prev" to detect track changes. Setting it before the call would make
+      // prevId === newId, preventing progress restart and history push.
+      // updateNowPlayingCard sets it internally at line 273.
       state.lastTrackUpdateTs = Date.now();
-
-      const durationSeconds = newDurationSeconds || currentTrack.duration || currentTrack.length || 0;
-      if (durationSeconds > 0) {
-        startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
-      }
 
       // Clear stale nextTrack from explorer data — it just became the current track.
       // Without this, any re-render (heartbeat hydration, etc.) during the gap before
@@ -812,21 +885,39 @@ async function initializeApp() {
 
       const driftStateForCard = data.driftState || null;
 
+      sentinelLog.info(`🔔 Sentinel about to call updateNowPlayingCard: newTrackState.identifier=${newTrackState.identifier?.substring(0, 8)} latestCurrentTrack=${state.latestCurrentTrack?.identifier?.substring(0, 8)} durationMs=${newTrackState.durationMs} duration=${newTrackState.duration}`);
       if (typeof window.updateNowPlayingCard === 'function') {
-        window.updateNowPlayingCard(state.latestCurrentTrack, driftStateForCard);
+        window.updateNowPlayingCard(newTrackState, driftStateForCard);
+      }
+
+      // If updateNowPlayingCard didn't start progress (prevId === newId because
+      // crossfade-start already set latestCurrentTrack), force-start it now.
+      // endCrossfadeWipe() killed the old animation, so we need a new one.
+      const newDur = newDurationSeconds || newTrackState.duration || newTrackState.length || 0;
+      sentinelLog.info(`🔔 Force-start check: newDur=${newDur.toFixed(1)} progressAnimation=${!!state.progressAnimation} xfadeWipe=${!!state._crossfadeWipe}`);
+      if (newDur > 0 && !state.progressAnimation) {
+        sentinelLog.info(`🔔 Force-starting progress: crossfade-end (duration=${newDur.toFixed(1)}s)`);
+        state.playbackDurationSeconds = newDur;
+        state.playbackStartTimestamp = Date.now();
+        startProgressAnimationFromPosition(newDur, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
+      } else if (newDur <= 0) {
+        sentinelLog.warn(`🔔 Force-start SKIPPED: no duration! newDurationSeconds=${newDurationSeconds} duration=${newTrackState.duration} length=${newTrackState.length}`);
+      } else {
+        sentinelLog.info(`🔔 Force-start not needed: progressAnimation already running`);
       }
 
       // Now that the card shows the new track, pop the playlist tray atomically —
       // cover leaves tray at the same moment it appears on the current track card.
+      // Cancel deferred heartbeat fallback — sentinel handled the track change
+      if (state._deferredPlaylistPopTimer) {
+        clearTimeout(state._deferredPlaylistPopTimer);
+        state._deferredPlaylistPopTimer = null;
+      }
+
       if (pendingPlaylistPop) {
         audioLog.info(`🎵 Atomic tray→card: popping ${currentTrackId.substring(0, 8)} from tray (card just painted)`);
         popPlaylistHead();
         renderPlaylistTray();
-        // Cancel deferred heartbeat fallback — sentinel handled it
-        if (state._deferredPlaylistPopTimer) {
-          clearTimeout(state._deferredPlaylistPopTimer);
-          state._deferredPlaylistPopTimer = null;
-        }
         const newHead = getPlaylistNext();
         if (newHead && typeof window.sendNextTrack === 'function') {
           audioLog.info(`🎵 Notifying server of new queue head: ${newHead.trackId.substring(0, 8)}`);
@@ -3601,8 +3692,9 @@ if (typeof window !== 'undefined') {
     window.__deckTestHooks.clearExplorerSnapshotTimer = clearExplorerSnapshotTimer;
 }
 
-// Initialize manual refresh button when page loads
-document.addEventListener('DOMContentLoaded', function () {
+// Initialize buttons and UI when DOM is ready.
+// Module scripts are deferred — DOMContentLoaded may have already fired.
+function onDOMReady() {
     if (typeof window.setupManualRefreshButton === 'function') {
         window.setupManualRefreshButton();
     }
@@ -3668,7 +3760,13 @@ document.addEventListener('DOMContentLoaded', function () {
     window.addEventListener('online', () => {
         setTimeout(() => connectSSE(), 1000);
     });
-});
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', onDOMReady);
+} else {
+    onDOMReady();
+}
 
 }
 
