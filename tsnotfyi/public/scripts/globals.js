@@ -156,6 +156,7 @@ export const state = {
 
   // Playlist queue state (new explorer architecture)
   playlist: [],          // Array of {trackId, albumCover, directionKey, explorerSnapshot}
+  _tabUndoStack: [],     // Items skipped by Tab, restorable via Shift+Tab (cleared on track consumption)
 
   // Session track history (for explorer exclusions)
   sessionTrackHistory: [], // Array of track IDs played in this session (most recent last)

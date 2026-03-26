@@ -43,6 +43,63 @@ class DataAccess {
     }
   }
 
+  // ─── Track metadata (batch) ─────────────────────────────────────────────────
+
+  /**
+   * Batch-resolve track metadata by identifiers.
+   * Returns a Map of identifier → {identifier, title, artist, album, albumCover, duration, year, path}
+   */
+  async batchGetTrackMeta(identifiers) {
+    if (!identifiers || identifiers.length === 0) return new Map();
+    const result = await this._query(
+      `SELECT identifier, bt_title, bt_artist, bt_album, bt_year, bt_length,
+              convert_from(bt_path::bytea, 'UTF8') as path,
+              beets_meta
+       FROM music_analysis
+       WHERE identifier = ANY($1)`,
+      [identifiers]
+    );
+    const map = new Map();
+    for (const row of result.rows) {
+      let albumCover = '/images/albumcover.png';
+      try {
+        const meta = typeof row.beets_meta === 'string' ? JSON.parse(row.beets_meta) : row.beets_meta;
+        if (meta?.album?.artpath?.length > 0) albumCover = meta.album.artpath;
+      } catch (e) { /* ignore */ }
+      map.set(row.identifier, {
+        identifier: row.identifier,
+        title: row.bt_title || '',
+        artist: row.bt_artist || '',
+        album: row.bt_album || '',
+        year: row.bt_year || '',
+        duration: row.bt_length || null,
+        path: row.path || '',
+        albumCover
+      });
+    }
+    return map;
+  }
+
+  /**
+   * Get all tracks for search indexing (title, artist, album, path, identifier, albumCover).
+   * Used to build the text search index on the Web server.
+   */
+  async getAllTracksForSearch() {
+    const result = await this._query(
+      `SELECT identifier, bt_title, bt_artist, bt_album,
+              convert_from(bt_path::bytea, 'UTF8') as path
+       FROM music_analysis
+       ORDER BY bt_artist, bt_title`
+    );
+    return result.rows.map(row => ({
+      identifier: row.identifier,
+      title: row.bt_title || '',
+      artist: row.bt_artist || '',
+      album: row.bt_album || '',
+      path: row.path || ''
+    }));
+  }
+
   // ─── Track existence ────────────────────────────────────────────────────────
 
   async trackExists(identifier) {

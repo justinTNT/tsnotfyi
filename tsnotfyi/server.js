@@ -597,14 +597,62 @@ app.get('/:md51/:md52', async (req, res, next) => {
 });
 
 
-// ─── Search Route (proxied to API server) ───────────────────────────────────
+// ─── Search Route (local text search index, lazy-built from DB) ─────────────
+
+const TextSearchIndex = require('./services/text-search');
+let _searchIndex = null;
+let _searchIndexBuilding = false;
+
+async function getSearchIndex() {
+  if (_searchIndex) return _searchIndex;
+  if (_searchIndexBuilding) {
+    // Wait for in-flight build
+    await new Promise(r => setTimeout(r, 500));
+    return _searchIndex;
+  }
+  _searchIndexBuilding = true;
+  try {
+    const tracks = await db.getAllTracksForSearch();
+    _searchIndex = new TextSearchIndex();
+    _searchIndex.buildIndex(tracks);
+    return _searchIndex;
+  } finally {
+    _searchIndexBuilding = false;
+  }
+}
 
 app.get('/search', async (req, res) => {
+  const query = (req.query.q || '').trim();
+  if (query.length < 2) {
+    return res.json({ results: [], query, total: 0, hasMore: false });
+  }
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+
   try {
-    const result = await apiClient.search(req.query.q || '', parseInt(req.query.limit) || 50);
-    res.json(result);
+    const index = await getSearchIndex();
+    if (!index) {
+      return res.status(503).json({ error: 'Search index not ready' });
+    }
+
+    const results = index.search(query, limit).map(({ track, score }) => {
+      const directory = (track.path || '').replace(/\/[^/]+$/, '');
+      return {
+        md5: track.identifier,
+        identifier: track.identifier,
+        title: track.title || '',
+        artist: track.artist || '',
+        album: track.album || '',
+        albumCover: track.albumCover || '/images/albumcover.png',
+        directory,
+        path: track.path || '',
+        displayText: `${track.artist || ''} - ${track.title || ''}`.replace(/^ - | - $/g, ''),
+        score
+      };
+    });
+
+    res.json({ results, query, total: results.length, hasMore: results.length === limit });
   } catch (e) {
-    console.error('Search proxy error:', e.message);
+    console.error('Search error:', e.message);
     res.status(500).json({ error: 'Search failed' });
   }
 });
@@ -816,17 +864,15 @@ function stripExplorerDataForClient(data, logLabel = 'explorer') {
 
 app.post('/explorer', async (req, res) => {
   const startTime = Date.now();
-  serverLog.info(`🎯 Explorer request received: ${JSON.stringify(req.body)}`);
   try {
     const { trackId, sessionId, playlistTrackIds = [], fingerprint: requestFingerprint } = req.body;
 
     if (!trackId) {
-      serverLog.warn('🎯 Explorer request missing trackId');
       return res.status(400).json({ error: 'trackId is required' });
     }
     serverLog.info(`🎯 Explorer request for trackId: ${trackId.substring(0, 8)}`);
 
-    // Resolve session from fingerprint or sessionId
+    // Resolve session
     let session = null;
     if (typeof requestFingerprint === 'string' && requestFingerprint.trim()) {
       const entry = fingerprintRegistry.lookup(requestFingerprint.trim());
@@ -839,172 +885,149 @@ app.post('/explorer', async (req, res) => {
       session = sessionManager.getSessionById(sessionId) || null;
     }
 
-    // Build track lookup set for playlist filtering
-    const playlistTrackSet = new Set(Array.isArray(playlistTrackIds) ? playlistTrackIds : []);
+    // Step 1: Call API server — pure math, returns IDs + distances only
+    const result = await apiClient.explore(trackId, {}, {});
+    const explorerData = result.explorerData;
+    if (!explorerData) {
+      return res.status(500).json({ error: 'Explorer computation returned no data' });
+    }
+    serverLog.info(`🎯 API explorer: ${Object.keys(explorerData.directions || {}).length} directions in ${result.computeTimeMs}ms`);
 
-    // Get artists/albums from playlist tracks for deprioritization
+    // Step 2: Collect all unique track IDs from the response
+    const allIds = new Set();
+    allIds.add(trackId); // source track
+    for (const dir of Object.values(explorerData.directions || {})) {
+      for (const sample of (dir.sampleTracks || [])) {
+        if (sample.identifier) allIds.add(sample.identifier);
+      }
+      if (dir.oppositeDirection) {
+        for (const sample of (dir.oppositeDirection.sampleTracks || [])) {
+          if (sample.identifier) allIds.add(sample.identifier);
+        }
+      }
+    }
+    if (explorerData.nextTrack?.identifier) allIds.add(explorerData.nextTrack.identifier);
+
+    // Step 3: Batch-resolve metadata from DB
+    const metaMap = await db.batchGetTrackMeta(Array.from(allIds));
+    const sourceTrack = metaMap.get(trackId);
+    if (!sourceTrack) {
+      return res.status(404).json({ error: 'Track not found' });
+    }
+    serverLog.info(`🎯 Resolved ${metaMap.size}/${allIds.size} track metadata from DB`);
+
+    // Step 4: Build playlist filter sets from DB metadata
+    const playlistTrackSet = new Set(Array.isArray(playlistTrackIds) ? playlistTrackIds : []);
     const playlistArtists = new Set();
     const playlistAlbums = new Set();
     for (const pid of playlistTrackSet) {
-      try {
-        const trackData = await apiClient.getTrack(pid);
-        if (trackData) {
-          if (trackData.artist) playlistArtists.add(trackData.artist.toLowerCase());
-          if (trackData.album) playlistAlbums.add(trackData.album.toLowerCase());
-        }
-      } catch (e) { /* ignore */ }
-    }
-
-    const sourceTrack = await apiClient.getTrack(trackId);
-    if (!sourceTrack) {
-      serverLog.warn(`🎯 Track not found: ${trackId}`);
-      return res.status(404).json({ error: 'Track not found' });
-    }
-    serverLog.info(`🎯 Exploring from track: ${sourceTrack.title} by ${sourceTrack.artist}`);
-
-    let explorerData;
-    if (session) {
-      // Try cache on Audio server first, then API server
-      serverLog.info(`🎯 Routing explorer via Audio server (trackId=${trackId.substring(0,8)})`);
-      try {
-        const cachedResult = await audioClient.getExplorerData(session.sessionId, { trackId: sourceTrack.identifier, forceFresh: false });
-        if (cachedResult?.explorerData) {
-          explorerData = cachedResult.explorerData;
-          serverLog.info(`🎯 Explorer cache hit on Audio server`);
-        }
-      } catch (e) { /* cache miss, proceed to API */ }
-
-      if (!explorerData) {
-        // Get session state from Audio server for context
-        let sessionState;
+      const meta = metaMap.get(pid);
+      if (meta) {
+        if (meta.artist) playlistArtists.add(meta.artist.toLowerCase());
+        if (meta.album) playlistAlbums.add(meta.album.toLowerCase());
+      } else {
+        // Playlist track not in explorer results — look up individually
         try {
-          sessionState = await audioClient.getFullState(session.sessionId);
-        } catch (e) {
-          sessionState = {};
-        }
-
-        const sessionContext = {
-          seenArtists: sessionState.seenArtists || [],
-          seenAlbums: sessionState.seenAlbums || [],
-          sessionHistoryIds: (sessionState.sessionHistory || []).map(e => e.identifier),
-          currentTrackId: sessionState.currentTrack?.identifier || null,
-          noArtist: sessionState.noArtist,
-          noAlbum: sessionState.noAlbum,
-          failedTrackIds: (sessionState.failedTrackAttempts || [])
-            .filter(([_, count]) => count >= 3).map(([id]) => id)
-        };
-
-        const workerConfig = {
-          explorerResolution: sessionState.explorerResolution || 'adaptive',
-          stackTotalCount: sessionState.stackTotalCount || 0,
-          stackRandomCount: sessionState.stackRandomCount || 0,
-          cachedRadius: sessionState.adaptiveRadiusCache?.[sourceTrack.identifier]?.radius ?? null,
-          dynamicRadiusHint: Number.isFinite(sessionState.dynamicRadiusState?.currentRadius)
-            ? sessionState.dynamicRadiusState.currentRadius : null
-        };
-
-        const result = await apiClient.explore(sourceTrack.identifier, sessionContext, workerConfig);
-        explorerData = result.explorerData;
-        serverLog.info(`🎯 API explorer complete (${result.computeTimeMs}ms)`);
+          const row = await db.batchGetTrackMeta([pid]);
+          const m = row.get(pid);
+          if (m) {
+            if (m.artist) playlistArtists.add(m.artist.toLowerCase());
+            if (m.album) playlistAlbums.add(m.album.toLowerCase());
+          }
+        } catch (e) { /* ignore */ }
       }
-    } else {
-      serverLog.info(`🎯 No session available, routing to API server (trackId=${trackId.substring(0,8)})`);
-      const result = await apiClient.explore(trackId, {}, {});
-      explorerData = result.explorerData;
     }
 
-    serverLog.info(`🎯 Explorer data has ${Object.keys(explorerData.directions || {}).length} directions before filtering`);
+    // Step 5: Enrich and filter directions
+    const enrichTrack = (sample) => {
+      const meta = metaMap.get(sample.identifier);
+      return {
+        identifier: sample.identifier,
+        title: meta?.title || '',
+        artist: meta?.artist || '',
+        album: meta?.album || '',
+        albumCover: meta?.albumCover || '/images/albumcover.png',
+        duration: meta?.duration || null,
+        distance: sample.distance
+      };
+    };
 
-    // Filter and deprioritize directions based on playlist
     const filteredDirections = {};
     for (const [dirKey, direction] of Object.entries(explorerData.directions || {})) {
-      if (!direction.sampleTracks || !Array.isArray(direction.sampleTracks)) {
-        filteredDirections[dirKey] = direction;
-        continue;
-      }
+      const samples = direction.sampleTracks || [];
 
       const prioritized = [];
       const deprioritized = [];
 
-      for (const sample of direction.sampleTracks) {
-        const track = sample.track || sample;
-        const trackIdentifier = track.identifier || track.trackMd5;
+      for (const sample of samples) {
+        if (playlistTrackSet.has(sample.identifier)) continue;
 
-        if (playlistTrackSet.has(trackIdentifier)) {
-          continue;
-        }
+        const meta = metaMap.get(sample.identifier);
+        const artistLower = (meta?.artist || '').toLowerCase();
+        const albumLower = (meta?.album || '').toLowerCase();
 
-        const artistLower = (track.artist || '').toLowerCase();
-        const albumLower = (track.album || '').toLowerCase();
-        const isDeprioritized = playlistArtists.has(artistLower) || playlistAlbums.has(albumLower);
-
-        if (isDeprioritized) {
-          deprioritized.push(sample);
+        if (playlistArtists.has(artistLower) || playlistAlbums.has(albumLower)) {
+          deprioritized.push(enrichTrack(sample));
         } else {
-          prioritized.push(sample);
+          prioritized.push(enrichTrack(sample));
         }
+      }
+
+      // Enrich opposite direction tracks too
+      let enrichedOpposite = null;
+      if (direction.oppositeDirection) {
+        const oppSamples = (direction.oppositeDirection.sampleTracks || []).map(enrichTrack);
+        enrichedOpposite = {
+          key: direction.oppositeDirection.key,
+          direction: direction.oppositeDirection.direction,
+          sampleTracks: oppSamples,
+          trackCount: oppSamples.length
+        };
       }
 
       filteredDirections[dirKey] = {
-        ...direction,
+        direction: direction.direction,
+        description: direction.description,
+        domain: direction.domain,
+        component: direction.component,
+        polarity: direction.polarity,
+        diversityScore: direction.diversityScore,
         sampleTracks: [...prioritized, ...deprioritized],
         trackCount: prioritized.length + deprioritized.length,
-        filteredCount: direction.sampleTracks.length - (prioritized.length + deprioritized.length)
+        hasOpposite: direction.hasOpposite,
+        oppositeDirection: enrichedOpposite
       };
     }
 
-    const filteredDirSummary = Object.entries(filteredDirections).map(([k, d]) => ({
-      key: k,
-      trackCount: d.sampleTracks?.length || 0,
-      diversityScore: d.diversityScore
-    }));
-    serverLog.info(`🎯 Filtered directions: ${JSON.stringify(filteredDirSummary)}`);
-
-    // Pick recommended next track from filtered directions
+    // Step 6: Pick next track recommendation
     let nextTrack = null;
     if (explorerData.nextTrack) {
-      const rawNext = explorerData.nextTrack;
-      const recKey = rawNext.directionKey;
-      const recTrackId = rawNext.track?.identifier || rawNext.identifier;
+      const recKey = explorerData.nextTrack.directionKey;
+      const recId = explorerData.nextTrack.identifier;
       const dirHasTracks = filteredDirections[recKey]?.sampleTracks?.length > 0;
-      serverLog.info(`🎯 Mixer recommended: dirKey=${recKey}, trackId=${recTrackId?.substring(0,8)}, inFiltered=${!!filteredDirections[recKey]}, hasTracks=${dirHasTracks}, inPlaylist=${playlistTrackSet.has(recTrackId)}`);
-      if (recKey && dirHasTracks && !playlistTrackSet.has(recTrackId)) {
+      if (recKey && dirHasTracks && !playlistTrackSet.has(recId)) {
         nextTrack = {
           directionKey: recKey,
-          direction: rawNext.direction,
-          track: rawNext.track || {
-            identifier: rawNext.identifier,
-            title: rawNext.title,
-            artist: rawNext.artist,
-            album: rawNext.album,
-            albumCover: rawNext.albumCover,
-            duration: rawNext.duration || rawNext.length
-          }
+          direction: explorerData.nextTrack.direction,
+          track: enrichTrack(explorerData.nextTrack)
         };
       }
-    } else {
-      serverLog.info(`🎯 No mixer recommendation (explorerData.nextTrack is falsy)`);
     }
     if (!nextTrack) {
       const sortedDirs = Object.entries(filteredDirections)
         .filter(([_, dir]) => dir.sampleTracks && dir.sampleTracks.length > 0)
         .sort((a, b) => (b[1].diversityScore || 0) - (a[1].diversityScore || 0));
-      serverLog.info(`🎯 Fallback: ${sortedDirs.length} directions with tracks after filter`);
       if (sortedDirs.length > 0) {
         const [dirKey, dir] = sortedDirs[0];
-        const firstTrack = dir.sampleTracks[0];
-        serverLog.info(`🎯 Fallback picked: ${dirKey} with track ${firstTrack?.identifier?.substring(0,8)}`);
         nextTrack = {
           directionKey: dirKey,
           direction: dir.direction,
-          track: firstTrack
+          track: dir.sampleTracks[0]
         };
-      } else {
-        serverLog.warn(`🎯 Fallback found no directions with tracks!`);
       }
     }
 
-    // Reconcile explorer recommendation with mixer state on Audio server
+    // Step 7: Reconcile with Audio server mixer state
     const explorerNextId = nextTrack?.track?.identifier;
     if (session && explorerNextId) {
       try {
@@ -1013,22 +1036,21 @@ app.post('/explorer', async (req, res) => {
         const preparedNextId = mixerState?.nextTrack?.identifier;
 
         if (preparedNextId && preparedNextId !== explorerNextId && preparedNextId !== currentTrackId && trackId === currentTrackId) {
-          const preparedTrack = mixerState.nextTrack;
-          serverLog.info(`📌 Explorer recommends ${explorerNextId?.substring(0,8)} but mixer has ${preparedNextId?.substring(0,8)} prepared — overriding response`);
+          const preparedMeta = metaMap.get(preparedNextId) || {};
+          serverLog.info(`📌 Mixer has ${preparedNextId?.substring(0,8)} prepared — overriding explorer recommendation`);
           nextTrack = {
-            directionKey: preparedTrack?.directionKey || preparedTrack?.transitionDirectionKey || null,
-            direction: preparedTrack?.direction || preparedTrack?.transitionDirection || null,
+            directionKey: mixerState.nextTrack?.directionKey || null,
+            direction: mixerState.nextTrack?.direction || null,
             track: {
-              identifier: preparedTrack.identifier,
-              title: preparedTrack.title,
-              artist: preparedTrack.artist,
-              album: preparedTrack.album,
-              albumCover: preparedTrack.albumCover,
-              duration: preparedTrack.duration || preparedTrack.length
+              identifier: preparedNextId,
+              title: preparedMeta.title || mixerState.nextTrack?.title || '',
+              artist: preparedMeta.artist || mixerState.nextTrack?.artist || '',
+              album: preparedMeta.album || mixerState.nextTrack?.album || '',
+              albumCover: preparedMeta.albumCover || '/images/albumcover.png',
+              duration: preparedMeta.duration || null
             }
           };
         } else if (!preparedNextId && trackId === currentTrackId) {
-          // Store recommendation and fill empty next slot
           await audioClient.setRecommendation(session.sessionId, {
             trackId: explorerNextId,
             direction: nextTrack.direction,
@@ -1043,7 +1065,6 @@ app.post('/explorer', async (req, res) => {
           }).catch(err => {
             serverLog.warn(`⚠️ Explorer-fill preparation failed: ${err?.message || err}`);
           });
-          serverLog.info(`📌 Stored recommendation and filling: ${explorerNextId?.substring(0,8)}`);
         } else if (trackId === currentTrackId && preparedNextId !== explorerNextId) {
           await audioClient.setRecommendation(session.sessionId, {
             trackId: explorerNextId,
@@ -1051,37 +1072,27 @@ app.post('/explorer', async (req, res) => {
             directionKey: nextTrack.directionKey,
             track: nextTrack.track
           });
-          serverLog.info(`📌 Stored explorer recommendation: ${explorerNextId?.substring(0,8)}`);
         }
       } catch (e) {
         serverLog.warn(`📌 Failed to reconcile with Audio server: ${e.message}`);
       }
     }
 
-    const rawResponse = {
+    // Step 8: Build response
+    const response = {
+      currentTrack: {
+        identifier: sourceTrack.identifier,
+        title: sourceTrack.title,
+        artist: sourceTrack.artist,
+        album: sourceTrack.album,
+        albumCover: sourceTrack.albumCover,
+        duration: sourceTrack.duration
+      },
       directions: filteredDirections,
-      currentTrack: sourceTrack,
       nextTrack
     };
 
-    const response = stripExplorerDataForClient(rawResponse);
-
-    // TEMP DIAGNOSTIC: Check opposite direction data in stripped response
-    const oppositeDiag = Object.entries(response.directions || {}).map(([k, d]) => {
-      const oppTracks = d.oppositeDirection?.sampleTracks?.length || 0;
-      return `${k}:hasOpp=${d.hasOpposite},oppTracks=${oppTracks}`;
-    });
-    serverLog.info(`🔄 OPPOSITE DIAG: ${oppositeDiag.join(' | ')}`);
-
-    const undefinedDirs = Object.entries(response.directions || {})
-      .filter(([, v]) => !v || typeof v.direction !== 'string')
-      .map(([k, v]) => `${k}: direction=${v?.direction}, domain=${v?.domain}`);
-    if (undefinedDirs.length > 0) {
-      serverLog.warn(`🔍 Directions with undefined .direction field: ${undefinedDirs.join(' | ')}`);
-    }
-    validateOrWarn(ExplorerResponse, response, `explorer:${trackId.substring(0, 8)}`);
-
-    serverLog.info(`🎯 Explorer request for ${trackId.substring(0, 8)} completed in ${Date.now() - startTime}ms`);
+    serverLog.info(`🎯 Explorer for ${trackId.substring(0, 8)} complete in ${Date.now() - startTime}ms`);
     res.json(response);
 
   } catch (error) {

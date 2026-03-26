@@ -3,25 +3,17 @@
 exports[`DriftAudioMixer heartbeat + snapshot contracts heartbeat payload matches contract reference: heartbeat-normalized 1`] = `
 {
   "currentTrack": {
-    "artist": "Test Artist",
+    "artist": null,
     "durationMs": 180000,
     "identifier": "aaaabbbbccccddddeeeeffff11112222",
     "startTime": 1704067050000,
-    "title": "Test Track",
+    "title": null,
   },
   "drift": {
-    "currentDirection": "beat_punch_positive",
+    "currentDirection": null,
   },
   "fingerprint": "fingerprint-mock",
-  "nextTrack": {
-    "direction": null,
-    "track": {
-      "artist": "Future Artist",
-      "direction": null,
-      "identifier": "9999aaaabbbbccccddddeeeeffff0000",
-      "title": "Next Track",
-    },
-  },
+  "nextTrack": null,
   "override": null,
   "reason": "user-next-prepared",
   "session": {

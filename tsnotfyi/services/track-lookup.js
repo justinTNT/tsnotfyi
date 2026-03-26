@@ -48,19 +48,7 @@ class TrackLookup {
     console.log(`📥 Track index loaded: ${this._index.size} tracks in ${elapsed}ms`);
   }
 
-  /**
-   * Load track index from an in-memory radialSearch instance (embedded mode).
-   * @param {object} radialSearch - RadialSearchService with kdTree
-   */
-  loadFromRadialSearch(radialSearch) {
-    this._index.clear();
-    const tracks = radialSearch.kdTree?.tracks || [];
-    for (const track of tracks) {
-      this._index.set(track.identifier, track);
-    }
-    this._loaded = true;
-    console.log(`📥 Track index loaded from local KD-tree: ${this._index.size} tracks`);
-  }
+  // loadFromRadialSearch removed — embedded mode is gone
 
   /**
    * Get track by identifier — drop-in replacement for kdTree.getTrack().

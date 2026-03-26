@@ -495,22 +495,14 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
   const beetsMeta = displayTrack.beetsMeta || mixer.lookupTrackBeetsMeta(displayTrack.identifier) || null;
 
   const canonicalStartTime = liveStartTime ?? displayStartTime ?? null;
+
+  // Purified heartbeat: identifier + timing only.
+  // Client resolves title/artist/albumCover from its own metadata cache.
   const currentTrackPayload = {
     identifier: displayTrack.identifier,
-    title: displayTrack.title,
-    artist: displayTrack.artist,
-    albumCover: displayTrack.albumCover || mixer.lookupTrackAlbumCover(displayTrack.identifier) || null,
-    loved: displayTrack.loved || false,
     startTime: canonicalStartTime,
     durationMs
   };
-
-  if (typeof sanitizeBeets === 'function') {
-    const sanitizedBeetsMeta = sanitizeBeets(beetsMeta);
-    if (sanitizedBeetsMeta) {
-      currentTrackPayload.beetsMeta = sanitizedBeetsMeta;
-    }
-  }
 
   const fingerprint = mixer.currentFingerprint
     || (fpRegistry && typeof fpRegistry.getFingerprintForSession === 'function'
@@ -528,7 +520,11 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
       elapsedMs,
       remainingMs
     },
-    nextTrack: nextSummary,
+    nextTrack: nextSummary ? {
+      identifier: nextSummary.track?.identifier || nextSummary.identifier || null,
+      direction: nextSummary.direction || null,
+      directionKey: nextSummary.directionKey || null
+    } : null,
     override: overrideId ? {
       identifier: overrideId,
       status: overrideStatus,
@@ -538,11 +534,7 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
       id: mixer.state.sessionId,
       audioClients: mixer.clients.size,
       eventClients: mixer.eventClients.size
-    },
-    drift: {
-      currentDirection: mixer.driftPlayer.currentDirection
-    },
-    currentTrackDirection: mixer.state.currentTrackDirection || mixer.driftPlayer.currentDirection || null
+    }
   };
 }
 

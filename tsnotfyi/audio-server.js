@@ -113,59 +113,24 @@ app.post('/internal/sessions', async (req, res) => {
       }
     };
 
-    // Explorer computation via API server
+    // Explorer computation via API server (pure math — no session context)
     mixer.onExplorerNeeded = async (trackId, opts) => {
       try {
-        const sessionContext = {
-          seenArtists: Array.from(mixer.state.seenArtists || []),
-          seenAlbums: Array.from(mixer.state.seenAlbums || []),
-          sessionHistoryIds: (mixer.state.sessionHistory || []).map(e => e.identifier),
-          currentTrackId: mixer.state.currentTrack?.identifier || null,
-          noArtist: mixer.state.noArtist,
-          noAlbum: mixer.state.noAlbum,
-          failedTrackIds: Array.from(mixer.state.failedTrackAttempts || new Map())
-            .filter(([_, count]) => count >= 3).map(([id]) => id)
-        };
-        const workerConfig = {
-          explorerResolution: mixer.state.explorerResolution || 'adaptive',
-          stackTotalCount: mixer.state.stackTotalCount || 0,
-          stackRandomCount: mixer.state.stackRandomCount || 0,
-          cachedRadius: mixer.adaptiveRadiusCache?.get(trackId)?.radius ?? null,
-          dynamicRadiusHint: Number.isFinite(mixer.dynamicRadiusState?.currentRadius)
-            ? mixer.dynamicRadiusState.currentRadius : null
-        };
-
         const resp = await fetch(`${apiUrl}/explorer`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ trackId, sessionContext, config: workerConfig })
+          body: JSON.stringify({ trackId, sessionContext: {}, config: {} })
         });
 
         if (!resp.ok) throw new Error(`API explorer returned ${resp.status}`);
         const result = await resp.json();
 
-        // Update mixer bookkeeping from results
         if (result.radiusUsed != null) {
           mixer.adaptiveRadiusCache.set(trackId, {
             radius: result.radiusUsed,
             count: result.neighborhoodSize,
             updatedAt: Date.now()
           });
-          mixer.currentAdaptiveRadius = {
-            radius: result.radiusUsed,
-            count: result.neighborhoodSize,
-            cachedRadiusReused: false
-          };
-        }
-        if (result.dynamicRadiusState && Number.isFinite(result.dynamicRadiusState.currentRadius)) {
-          mixer.dynamicRadiusState.currentRadius = result.dynamicRadiusState.currentRadius;
-        }
-        if (result.explorerData) {
-          const resolution = mixer.state.explorerResolution || 'adaptive';
-          mixer.explorerDataCache.set(trackId, resolution, result.explorerData);
-          mixer.recordExplorerSummary(result.explorerData,
-            result.explorerData.diagnostics?.radius || null,
-            result.neighborhoodSize || 0);
         }
 
         return result.explorerData || null;

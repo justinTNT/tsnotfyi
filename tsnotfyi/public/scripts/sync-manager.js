@@ -4,7 +4,7 @@ import { createLogger } from './log.js';
 import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint } from './session-utils.js';
 import { setDeckStaleFlag } from './deck-state.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
-import { startProgressAnimationFromPosition, startProgressAnimation } from './progress-ui.js';
+import { startProgressAnimationFromPosition, startProgressAnimation, isPlaylistHeadLocked } from './progress-ui.js';
 import { startAudioHealthMonitoring, updateConnectionHealthUI, getBufferDelaySecs } from './audio-manager.js';
 import { getPlaylistNext, popPlaylistHead, playlistHasItems, getCachedTrackMeta } from './playlist-tray.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
@@ -22,6 +22,14 @@ function trackLabel(id) {
 // ====== Heartbeat & Sync System ======
 
 export async function sendNextTrack(trackMd5 = null, direction = null, source = 'user') {
+    // Don't send overrides during the danger zone (crossfade imminent, head is committed)
+    // Exception: explicit user actions with a specific trackMd5 (e.g. clicking a direction card)
+    if (isPlaylistHeadLocked() && !trackMd5 && source !== 'user') {
+        log.info('📤 sendNextTrack: suppressed — danger zone (playlist head locked)');
+        scheduleHeartbeat(10000);
+        return;
+    }
+
     if (state.heartbeatTimeout) {
         clearTimeout(state.heartbeatTimeout);
         state.heartbeatTimeout = null;
@@ -52,8 +60,15 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
     let dirToSend = direction;
 
     // First priority: Check playlist queue for pre-selected next track
+    // Skip the head if it's the currently playing track
     if (!md5ToSend && allowFallback && playlistHasItems()) {
-        const queuedNext = getPlaylistNext();
+        let queuedNext = getPlaylistNext();
+        const currentId = state.latestCurrentTrack?.identifier || state._serverCurrentTrack?.identifier;
+        if (queuedNext && currentId && queuedNext.trackId === currentId) {
+            log.info(`📤 sendNextTrack: skipping playlist head ${currentId.substring(0,8)} (same as current track)`);
+            // Peek at the next item instead
+            queuedNext = state.playlist?.length > 1 ? state.playlist[1] : null;
+        }
         if (queuedNext) {
             md5ToSend = queuedNext.trackId;
             dirToSend = dirToSend || queuedNext.directionKey || null;

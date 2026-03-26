@@ -224,6 +224,19 @@ export function getVisualProgressFraction() {
     return Math.min(1, Math.max(0, elapsedSeconds) / state.playbackDurationSeconds);
 }
 
+/**
+ * Returns true when the playlist head should not be modified.
+ * The last 30s of a track is the "danger zone" — crossfade is imminent,
+ * the head is committed to the Audio server.
+ */
+export function isPlaylistHeadLocked() {
+    if (!Number.isFinite(state.playbackDurationSeconds) || state.playbackDurationSeconds <= 0) return false;
+    if (!Number.isFinite(state.playbackStartTimestamp)) return false;
+    const elapsed = (Date.now() - state.playbackStartTimestamp) / 1000;
+    const remaining = state.playbackDurationSeconds - elapsed;
+    return remaining > 0 && remaining < 30;
+}
+
 export function maybeApplyDeferredNextTrack(trigger = 'progress', options = {}) {
     const pending = state.pendingExplorerNext;
     if (!pending || !state.latestExplorerData) {

@@ -320,6 +320,8 @@ export function popPlaylistHead() {
     }
 
     const removed = state.playlist.shift();
+    state._tabUndoStack = []; // track consumed — skipped items are committed
+    state._trayHeadReady = false; // new head needs preparation
     log.info(`popPlaylistHead: Popped ${removed.trackId.substring(0, 8)} (${state.playlist.length} remaining)`);
 
     // Show playlist name label when first track from a named playlist starts
@@ -361,6 +363,34 @@ export function getPlaylistTail() {
         return null;
     }
     return state.playlist[state.playlist.length - 1];
+}
+
+/**
+ * Skip playlist head: pop it and stash for Shift+Tab undo.
+ * @returns {object|null} The new head after skip, or null if playlist empty
+ */
+export function skipPlaylistHead() {
+    if (!Array.isArray(state.playlist) || state.playlist.length === 0) return null;
+    const skipped = state.playlist.shift();
+    if (!Array.isArray(state._tabUndoStack)) state._tabUndoStack = [];
+    state._tabUndoStack.push(skipped);
+    log.info(`⏭️ Tab: skipped ${skipped.trackId.substring(0, 8)} (${state._tabUndoStack.length} undoable)`);
+    renderPlaylistTray();
+    return state.playlist[0] || null;
+}
+
+/**
+ * Undo last Tab: restore the most recently skipped item to head.
+ * @returns {object|null} The restored head, or null if nothing to undo
+ */
+export function undoSkipPlaylistHead() {
+    if (!Array.isArray(state._tabUndoStack) || state._tabUndoStack.length === 0) return null;
+    const restored = state._tabUndoStack.pop();
+    if (!Array.isArray(state.playlist)) state.playlist = [];
+    state.playlist.unshift(restored);
+    log.info(`⏮️ Shift+Tab: restored ${restored.trackId.substring(0, 8)} (${state._tabUndoStack.length} undoable)`);
+    renderPlaylistTray();
+    return restored;
 }
 
 /**
@@ -542,10 +572,14 @@ export function renderPlaylistTray() {
         });
     });
 
-    // Mark tray head as pending crossfade (breathing pulse)
+    // Mark tray head readiness — breathing pulse until crossfade is prepared
     const firstCover = strip.querySelector('.playlist-cover');
     if (firstCover) {
-        firstCover.classList.add('xfade-pending');
+        if (state._trayHeadReady) {
+            firstCover.classList.add('xfade-ready');
+        } else {
+            firstCover.classList.add('xfade-pending');
+        }
     }
 
     // Update tray visibility
@@ -1125,6 +1159,8 @@ if (typeof window !== 'undefined') {
     window.playlistHasItems = playlistHasItems;
     window.getPlaylistTail = getPlaylistTail;
     window.clearPlaylist = clearPlaylist;
+    window.skipPlaylistHead = skipPlaylistHead;
+    window.undoSkipPlaylistHead = undoSkipPlaylistHead;
     window.getCachedTrackMeta = getCachedTrackMeta;
     window.refreshExplorerForPlaylist = refreshExplorerForPlaylist;
     window.getLeftStack = getLeftStack;

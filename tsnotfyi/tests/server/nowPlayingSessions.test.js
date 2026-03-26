@@ -1,48 +1,42 @@
 const { buildNowPlayingSessions } = require('../../routes/nowPlaying');
 
-function createMixer(overrides = {}) {
+function createMockAudioClient(sessionStates = {}) {
   return {
-    state: {
-      currentTrack: overrides.currentTrack || {
-        identifier: 'track-md5',
-        title: 'Mock Track',
-        artist: 'Mock Artist',
-        length: 200
-      },
-      trackStartTime: overrides.trackStartTime || (Date.now() - 5000),
-    },
-    nextTrack: overrides.nextTrack || {
-      identifier: 'next-track-md5',
-      title: 'Next Track',
-      artist: 'Next Artist',
-      direction: 'beat_punch_positive'
-    },
-    clients: overrides.clients || new Set(['client']),
-    getAdjustedTrackDuration: overrides.getAdjustedTrackDuration || (() => 180),
-    getLiveStreamState: () => null
-  };
-}
-
-function createSession(overrides = {}) {
-  return {
-    mixer: overrides.mixer || createMixer(),
-    isEphemeral: Boolean(overrides.isEphemeral)
+    async getFullState(sessionId) {
+      const state = sessionStates[sessionId];
+      if (!state) throw new Error('Session not found');
+      return state;
+    }
   };
 }
 
 describe('buildNowPlayingSessions', () => {
-  test('includes timing and metadata for active sessions', () => {
+  test('includes timing and metadata for active sessions', async () => {
     const now = Date.now();
     const audioSessions = new Map([
-      ['session-a', createSession({
-        mixer: createMixer({
-          trackStartTime: now - 30_000,
-          getAdjustedTrackDuration: () => 240
-        })
-      })]
+      ['session-a', { isEphemeral: false }]
     ]);
 
-    const result = buildNowPlayingSessions(audioSessions, new Map(), { now });
+    const audioClient = createMockAudioClient({
+      'session-a': {
+        currentTrack: {
+          identifier: 'track-md5',
+          title: 'Mock Track',
+          artist: 'Mock Artist',
+          length: 240
+        },
+        nextTrack: {
+          identifier: 'next-track-md5',
+          title: 'Next Track',
+          artist: 'Next Artist',
+          direction: 'beat_punch_positive'
+        },
+        trackStartTime: now - 30_000,
+        audioClients: 1
+      }
+    });
+
+    const result = await buildNowPlayingSessions(audioSessions, new Map(), { now, audioClient });
     expect(result).toHaveLength(1);
 
     const session = result[0];
@@ -58,24 +52,39 @@ describe('buildNowPlayingSessions', () => {
     });
   });
 
-  test('marks ephemeral sessions from secondary collection', () => {
+  test('marks ephemeral sessions from secondary collection', async () => {
     const now = Date.now();
     const ephemeralSessions = new Map([
-      ['session-b', createSession({ isEphemeral: true })]
+      ['session-b', { isEphemeral: true }]
     ]);
 
-    const result = buildNowPlayingSessions(new Map(), ephemeralSessions, { now });
+    const audioClient = createMockAudioClient({
+      'session-b': {
+        currentTrack: { identifier: 'track-b', length: 200 },
+        trackStartTime: now - 5000,
+        audioClients: 1
+      }
+    });
+
+    const result = await buildNowPlayingSessions(new Map(), ephemeralSessions, { now, audioClient });
     expect(result).toHaveLength(1);
     expect(result[0].isEphemeral).toBe(true);
   });
 
-  test('skips sessions without connected clients', () => {
+  test('skips sessions without connected clients', async () => {
     const audioSessions = new Map([
-      ['session-empty', createSession({
-        mixer: createMixer({ clients: new Set() })
-      })]
+      ['session-empty', { isEphemeral: false }]
     ]);
-    const result = buildNowPlayingSessions(audioSessions, new Map());
+
+    const audioClient = createMockAudioClient({
+      'session-empty': {
+        currentTrack: { identifier: 'track-c', length: 200 },
+        trackStartTime: Date.now() - 5000,
+        audioClients: 0
+      }
+    });
+
+    const result = await buildNowPlayingSessions(audioSessions, new Map(), { audioClient });
     expect(result).toHaveLength(0);
   });
 });

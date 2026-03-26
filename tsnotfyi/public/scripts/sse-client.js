@@ -82,41 +82,8 @@ export function connectSSE() {
 
     const currentTrack = heartbeat.currentTrack;
     const currentTrackId = currentTrack.identifier || null;
-    // Compare against what the server last told us, not what the card shows.
-    // latestCurrentTrack tracks the CARD (updated by sentinel), _serverCurrentTrack tracks the SERVER.
-    const previousServerTrackId = state._serverCurrentTrack?.identifier || state.latestCurrentTrack?.identifier || null;
-    const trackChanged = Boolean(currentTrackId && previousServerTrackId && currentTrackId !== previousServerTrackId);
 
-    if (trackChanged) {
-      const clientBuffer = getBufferDelaySecs();
-      syncLog.info(`🔄 Heartbeat track change: ${previousTrackId?.substring(0, 8)} → ${currentTrackId?.substring(0, 8)} (clientBuffer: ${clientBuffer.toFixed(1)}s)`);
-
-      // Update internal state so subsequent heartbeats are steady-state, not repeated changes.
-      // This does NOT update the card — the sentinel owns card presentation timing.
-      state.playbackDurationSeconds = newDurationSeconds;
-      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
-      // Store the server's track as the known current — card display may lag behind
-      state._serverCurrentTrack = newTrackState;
-
-      // Record to session history and cache metadata for history display
-      if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
-      if (!state.sessionTrackHistory.includes(currentTrackId)) {
-        state.sessionTrackHistory.push(currentTrackId);
-        // Cache metadata so history cards have album art
-        if (!state.trackMetadataCache) state.trackMetadataCache = {};
-        state.trackMetadataCache[currentTrackId] = newTrackState;
-        if (typeof cacheTrackMeta === 'function') {
-          cacheTrackMeta(currentTrackId, newTrackState);
-        }
-        syncLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
-        // Update history stack visual
-        if (typeof window.renderSessionHistory === 'function') {
-          window.renderSessionHistory();
-        }
-      }
-    }
-
-    // Compute duration and start time
+    // Compute duration and start time first (needed by trackChanged block)
     let newDurationSeconds = 0;
     if (Number.isFinite(currentTrack.durationMs)) {
       newDurationSeconds = Math.max(currentTrack.durationMs / 1000, 0);
@@ -131,18 +98,74 @@ export function connectSSE() {
       newStartTimestamp = Date.now() - heartbeat.timing.elapsedMs;
     }
 
-    // Preserve client-side loved/hated state — heartbeat carries stale KD-tree values
-    const prevLoved = state.latestCurrentTrack?.loved;
-    const prevHated = state.latestCurrentTrack?.hated;
+    // Track change detection
+    const previousServerTrackId = state._serverCurrentTrack?.identifier || state.latestCurrentTrack?.identifier || null;
+    const trackChanged = Boolean(currentTrackId && previousServerTrackId && currentTrackId !== previousServerTrackId);
+
+    if (trackChanged) {
+      const clientBuffer = getBufferDelaySecs();
+      syncLog.info(`🔄 Heartbeat track change: ${previousServerTrackId?.substring(0, 8)} → ${currentTrackId?.substring(0, 8)} (clientBuffer: ${clientBuffer.toFixed(1)}s)`);
+    }
+
+    // Resolve metadata from cache — heartbeat now only carries identifier + timing.
+    // Priority: existing card state > localStorage cache > in-memory cache
+    const cachedMeta = (typeof getCachedTrackMeta === 'function' ? getCachedTrackMeta(currentTrackId) : null)
+      || state.trackMetadataCache?.[currentTrackId]
+      || {};
+    const prevState = state.latestCurrentTrack;
+    const prevLoved = prevState?.loved;
+    const prevHated = prevState?.hated;
+
     const newTrackState = {
-      ...state.latestCurrentTrack,
-      ...currentTrack,
-      duration: newDurationSeconds || currentTrack.duration || currentTrack.length || null,
-      length: newDurationSeconds || currentTrack.duration || currentTrack.length || null
+      identifier: currentTrackId,
+      title: currentTrack.title || cachedMeta.title || prevState?.title || '',
+      artist: currentTrack.artist || cachedMeta.artist || prevState?.artist || '',
+      album: currentTrack.album || cachedMeta.album || prevState?.album || '',
+      albumCover: currentTrack.albumCover || cachedMeta.albumCover || prevState?.albumCover || '/images/albumcover.png',
+      duration: newDurationSeconds || currentTrack.duration || cachedMeta.duration || null,
+      length: newDurationSeconds || currentTrack.duration || cachedMeta.duration || null,
+      startTime: currentTrack.startTime || null,
+      durationMs: currentTrack.durationMs || null
     };
-    if (prevLoved !== undefined && currentTrack.identifier === state.latestCurrentTrack?.identifier) {
+    if (prevLoved !== undefined && currentTrackId === prevState?.identifier) {
       newTrackState.loved = prevLoved;
       newTrackState.hated = prevHated;
+    }
+
+    // Update server state and history on track change
+    if (trackChanged) {
+      state.playbackDurationSeconds = newDurationSeconds;
+      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
+      state._serverCurrentTrack = newTrackState;
+
+      // Cache metadata — history push happens in updateNowPlayingCard (single writer)
+      if (!state.trackMetadataCache) state.trackMetadataCache = {};
+      state.trackMetadataCache[currentTrackId] = newTrackState;
+      if (typeof cacheTrackMeta === 'function') cacheTrackMeta(currentTrackId, newTrackState);
+      if (typeof window.renderSessionHistory === 'function') window.renderSessionHistory();
+    }
+
+    // Backfill: if cache has no metadata for this track, fetch from server
+    if (!cachedMeta.title && !(prevState?.title && prevState?.identifier === currentTrackId) && currentTrackId) {
+      fetch(`/track/${currentTrackId}/meta`).then(r => r.ok ? r.json() : null).then(data => {
+        if (data?.track) {
+          if (!state.trackMetadataCache) state.trackMetadataCache = {};
+          state.trackMetadataCache[currentTrackId] = data.track;
+          if (typeof cacheTrackMeta === 'function') cacheTrackMeta(currentTrackId, data.track);
+          // Update card if this is still the current track
+          if (state.latestCurrentTrack?.identifier === currentTrackId) {
+            Object.assign(state.latestCurrentTrack, {
+              title: data.track.title || state.latestCurrentTrack.title,
+              artist: data.track.artist || state.latestCurrentTrack.artist,
+              album: data.track.album || state.latestCurrentTrack.album,
+              albumCover: data.track.albumCover || state.latestCurrentTrack.albumCover
+            });
+            if (typeof window.updateNowPlayingCard === 'function') {
+              window.updateNowPlayingCard(state.latestCurrentTrack, null);
+            }
+          }
+        }
+      }).catch(() => {});
     }
 
     // === STEADY-STATE: apply state for non-track-change heartbeats ===
@@ -151,8 +174,9 @@ export function connectSSE() {
     // the sentinel will fire at the exact audio boundary.
 
     if (!trackChanged) {
-      state.playbackDurationSeconds = newDurationSeconds;
-      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
+      if (newDurationSeconds) state.playbackDurationSeconds = newDurationSeconds;
+      // Only set start timestamp if not already tracking — don't reset mid-track
+      if (newStartTimestamp && !state.playbackStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
       state.latestCurrentTrack = newTrackState;
       window.state.latestCurrentTrack = state.latestCurrentTrack;
       state.lastTrackUpdateTs = Date.now();
@@ -182,28 +206,8 @@ export function connectSSE() {
       state._deferredPlaylistPopTimer = setTimeout(() => {
         state._deferredPlaylistPopTimer = null;
 
-        const cardAlreadyUpdated = state.latestCurrentTrack?.identifier === currentTrackId;
-
-        // Update card if sentinel didn't handle it — but respect sentinel lock
-        const sentinelLocked = state._sentinelPromotionLockUntil && Date.now() < state._sentinelPromotionLockUntil;
-        if (!cardAlreadyUpdated && !sentinelLocked) {
-          syncLog.info(`🎵 Heartbeat fallback: sentinel didn't handle track change to ${currentTrackId.substring(0, 8)} — promoting now`);
-          state.playbackDurationSeconds = fallbackDurationSeconds;
-          if (fallbackStartTimestamp) state.playbackStartTimestamp = fallbackStartTimestamp;
-          state.latestCurrentTrack = fallbackTrackState;
-          window.state.latestCurrentTrack = fallbackTrackState;
-          state.lastTrackUpdateTs = Date.now();
-          state.currentTrackDirection = heartbeat.currentTrackDirection || null;
-
-          if (typeof window.updateNowPlayingCard === 'function') {
-            window.updateNowPlayingCard(fallbackTrackState, fallbackDriftState);
-          }
-        } else if (sentinelLocked && !cardAlreadyUpdated) {
-          syncLog.info(`🎵 Heartbeat fallback: suppressed by sentinel lock (${Math.round((state._sentinelPromotionLockUntil - Date.now()) / 1000)}s remaining)`);
-        }
-
-        // Pop playlist head if it matches — even if sentinel updated the card,
-        // the sentinel may have missed the pop (fragile sentinel detection)
+        // Sentinel owns card updates. Fallback only handles playlist pop.
+        // Pop playlist head if it matches
         if (playlistHasItems()) {
           const head = getPlaylistNext();
           if (head && head.trackId === currentTrackId) {
@@ -226,14 +230,11 @@ export function connectSSE() {
         }
       }, Math.max(30000, Math.round(getBufferDelaySecs() * 1000) + 5000));
 
-      if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
-      if (!state.sessionTrackHistory.includes(currentTrackId)) {
-        state.sessionTrackHistory.push(currentTrackId);
-      }
+      // History push handled by updateNowPlayingCard (single writer)
     }
 
     // === FIRST-TRACK DETECTION (no sentinel for the very first track) ===
-    const isFirstTrack = !previousTrackId && currentTrackId;
+    const isFirstTrack = !previousServerTrackId && currentTrackId;
     if (isFirstTrack) {
       state.playbackDurationSeconds = newDurationSeconds;
       if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
@@ -244,11 +245,7 @@ export function connectSSE() {
       state.pendingSnapshotTrackId = currentTrackId;
       armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-first-track' });
 
-      if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
-      if (!state.sessionTrackHistory.includes(currentTrackId)) {
-        state.sessionTrackHistory.push(currentTrackId);
-        sseLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
-      }
+      // History push handled by updateNowPlayingCard (single writer)
 
       state.currentTrackDirection = heartbeat.currentTrackDirection || null;
 
@@ -333,17 +330,17 @@ export function connectSSE() {
       // Don't restart from 0 on steady-state heartbeats — causes clock reset loop.
     }
 
-    // Update tray head readiness indicator
+    // Track crossfade readiness in state (survives DOM rebuilds)
     if (playlistHasItems()) {
-      const trayHead = document.querySelector('.playlist-strip .playlist-cover');
-      if (trayHead) {
-        const reason = heartbeat.reason || '';
-        const nextReady = reason.includes('next-prepared') || heartbeat.nextTrack;
-        if (nextReady) {
-          trayHead.classList.remove('xfade-pending');
-          trayHead.classList.add('xfade-ready');
-        } else if (!trayHead.classList.contains('xfade-ready')) {
-          trayHead.classList.add('xfade-pending');
+      const reason = heartbeat.reason || '';
+      const nextReady = reason.includes('next-prepared') || !!heartbeat.nextTrack;
+      if (nextReady !== state._trayHeadReady) {
+        state._trayHeadReady = nextReady;
+        // Update the DOM class directly — no full re-render needed
+        const trayHead = document.querySelector('.playlist-strip .playlist-cover');
+        if (trayHead) {
+          trayHead.classList.toggle('xfade-pending', !nextReady);
+          trayHead.classList.toggle('xfade-ready', nextReady);
         }
       }
     }
@@ -635,12 +632,37 @@ export function connectSSE() {
 
     // Eagerly fetch current track — don't wait for the first heartbeat (up to 10s away)
     if (!state.latestCurrentTrack?.identifier) {
-      fetch('/current-track').then(r => r.ok ? r.json() : null).then(data => {
+      fetch('/current-track').then(r => r.ok ? r.json() : null).then(async (data) => {
         if (data?.currentTrack && !state.latestCurrentTrack?.identifier) {
-          sseLog.info(`🎵 Eager current-track: ${data.currentTrack.identifier?.substring(0, 8)}`);
+          const trackId = data.currentTrack.identifier;
+          sseLog.info(`🎵 Eager current-track: ${trackId?.substring(0, 8)}`);
+
+          // Fetch metadata before handling heartbeat so the card renders with title/artist
+          try {
+            const metaResp = await fetch(`/track/${trackId}/meta`);
+            if (metaResp.ok) {
+              const metaData = await metaResp.json();
+              if (metaData?.track) {
+                Object.assign(data.currentTrack, metaData.track);
+                if (!state.trackMetadataCache) state.trackMetadataCache = {};
+                state.trackMetadataCache[trackId] = metaData.track;
+                if (typeof cacheTrackMeta === 'function') cacheTrackMeta(trackId, metaData.track);
+              }
+            }
+          } catch (e) {
+            sseLog.warn('🎵 Eager metadata fetch failed:', e?.message || e);
+          }
+
           handleHeartbeat(data);
+
+          // Trigger explorer fetch
+          if (trackId && !state.latestExplorerData?.directions) {
+            armExplorerSnapshotTimer(trackId, { reason: 'eager-first-track' });
+          }
         }
-      }).catch(() => {});
+      }).catch((err) => {
+        sseLog.error('🎵 Eager current-track failed:', err?.message || err);
+      });
     }
   };
 

@@ -154,6 +154,7 @@ function int16ToFloat32(uint8Array) {
           for (let j = 0; j < restoreCount && i - (restoreCount - 1 - j) >= 0; j++) {
             float32[i - (restoreCount - 1 - j)] = sentinelHeldValues[j] / 32768;
           }
+          log.warn(`🔔 Sentinel false positive: ${restoreCount} held values restored (not a pattern)`);
         }
         sentinelHeldValues = [];
       }
@@ -163,6 +164,9 @@ function int16ToFloat32(uint8Array) {
         const restoreCount = sentinelHeldValues.length;
         for (let j = 0; j < restoreCount && i - (restoreCount - j) >= 0; j++) {
           float32[i - (restoreCount - j)] = sentinelHeldValues[j] / 32768;
+        }
+        if (restoreCount >= 2) {
+          log.warn(`🔔 Sentinel false alarm: ${restoreCount} held values restored (run broken by non-sentinel)`);
         }
         sentinelHeldValues = [];
       }

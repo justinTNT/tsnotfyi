@@ -251,17 +251,7 @@ class MusicalKDTree {
         this.buildTree();
         console.log('KD-tree constructed');
 
-        // Text search index — built lazily on first search request
-        this._textSearch = null;
-    }
-
-    getTextSearch() {
-        if (!this._textSearch) {
-            const TextSearchIndex = require('./services/text-search');
-            this._textSearch = new TextSearchIndex();
-            this._textSearch.buildIndex(this.tracks);
-        }
-        return this._textSearch;
+        // Text search moved to Web server — API server is pure math
     }
 
     async loadTracks() {

@@ -77,7 +77,7 @@ function getRouterStack() {
   return router && Array.isArray(router.stack) ? router.stack : [];
 }
 
-function invokeRoute(method, path, reqOverrides = {}) {
+async function invokeRoute(method, path, reqOverrides = {}) {
   const stack = getRouterStack();
   const layer = stack.find(
     (entry) => entry.route && entry.route.path === path && Boolean(entry.route.methods[method])
@@ -103,7 +103,7 @@ function invokeRoute(method, path, reqOverrides = {}) {
     }
   };
 
-  handler(req, res);
+  await handler(req, res);
 
   return { statusCode, jsonBody };
 }
@@ -118,7 +118,7 @@ describe('GET /sessions/now-playing', () => {
     console.log('app keys', Object.keys(app));
     const stack = getRouterStack().map(layer => layer && layer.route && layer.route.path).filter(Boolean);
     console.log('routes registered', stack);
-    const { statusCode, jsonBody } = invokeRoute('get', '/sessions/now-playing');
+    const { statusCode, jsonBody } = await invokeRoute('get', '/sessions/now-playing');
 
     expect(statusCode).toBe(200);
     expect(jsonBody).toMatchObject({

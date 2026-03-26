@@ -74,39 +74,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ─── Text Search ────────────────────────────────────────────────────────────
-
-app.get('/search', (req, res) => {
-  const query = (req.query.q || '').trim();
-  if (query.length < 2) {
-    return res.json({ results: [], query, total: 0, hasMore: false });
-  }
-  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-
-  const textSearch = radialSearch.kdTree?.getTextSearch?.();
-  if (!textSearch) {
-    return res.status(503).json({ error: 'Search index not ready' });
-  }
-
-  const results = textSearch.search(query, limit).map(({ track, score }) => {
-    const pathStr = track.path || '';
-    const directory = pathStr.replace(/\/[^/]+$/, '');
-    return {
-      md5: track.identifier,
-      identifier: track.identifier,
-      title: track.title || '',
-      artist: track.artist || '',
-      album: track.album || '',
-      albumCover: track.albumCover || '/images/albumcover.png',
-      directory,
-      path: pathStr,
-      displayText: `${track.artist || ''} - ${track.title || ''}`.replace(/^ - | - $/g, ''),
-      score
-    };
-  });
-
-  res.json({ results, query, total: results.length, hasMore: results.length === limit });
-});
+// Text search moved to Web server — API server is pure math
 
 // ─── Track Lookup ───────────────────────────────────────────────────────────
 
@@ -125,19 +93,11 @@ app.get('/internal/track-index', (req, res) => {
     return res.status(503).json({ error: 'KD-tree not ready' });
   }
 
+  // Audio server only needs identifier + path + length for playback
   const tracks = radialSearch.kdTree.tracks.map(t => ({
     identifier: t.identifier,
     path: t.path,
-    title: t.title,
-    artist: t.artist,
-    album: t.album,
-    albumCover: t.albumCover,
-    length: t.length,
-    loved: t.loved || false,
-    track: t.track || null,
-    disc: t.disc || null,
-    features: t.features,
-    pca: t.pca
+    length: t.length
   }));
 
   res.json({ trackCount: tracks.length, tracks });
@@ -157,6 +117,73 @@ app.post('/internal/track-loved', (req, res) => {
 });
 
 // ─── Explorer ───────────────────────────────────────────────────────────────
+
+/**
+ * Strip explorer response to pure IDs + distances.
+ * The API server is a spatial index — numbers in, numbers out.
+ * Metadata enrichment happens on the Web server.
+ */
+function purifyExplorerResponse(explorerData) {
+  if (!explorerData) return explorerData;
+
+  const purifiedDirections = {};
+  for (const [key, direction] of Object.entries(explorerData.directions || {})) {
+    const purifiedSamples = (direction.sampleTracks || []).map(entry => {
+      const track = entry.track || entry;
+      return {
+        identifier: track.identifier,
+        distance: entry.distance || track.distance || null
+      };
+    });
+
+    // Keep opposite direction samples too (ID + distance only)
+    let purifiedOpposite = null;
+    if (direction.oppositeDirection) {
+      const oppSamples = (direction.oppositeDirection.sampleTracks || []).map(entry => {
+        const track = entry.track || entry;
+        return {
+          identifier: track.identifier,
+          distance: entry.distance || track.distance || null
+        };
+      });
+      purifiedOpposite = {
+        key: direction.oppositeDirection.key || direction.oppositeDirection.direction,
+        direction: direction.oppositeDirection.direction,
+        sampleTracks: oppSamples,
+        trackCount: oppSamples.length
+      };
+    }
+
+    purifiedDirections[key] = {
+      direction: direction.direction,
+      description: direction.description,
+      domain: direction.domain,
+      component: direction.component,
+      polarity: direction.polarity,
+      trackCount: direction.trackCount,
+      diversityScore: direction.diversityScore,
+      sampleTracks: purifiedSamples,
+      hasOpposite: direction.hasOpposite || !!purifiedOpposite,
+      oppositeDirection: purifiedOpposite
+    };
+  }
+
+  const nextTrack = explorerData.nextTrack;
+  const nextTrackObj = nextTrack ? (nextTrack.track || nextTrack) : null;
+  const purifiedNext = nextTrackObj ? {
+    identifier: nextTrackObj.identifier,
+    distance: nextTrack.distance || nextTrackObj.distance || null,
+    directionKey: nextTrack.directionKey,
+    direction: nextTrack.direction
+  } : null;
+
+  return {
+    directions: purifiedDirections,
+    nextTrack: purifiedNext,
+    neighborhood: explorerData.neighborhood,
+    diagnostics: explorerData.diagnostics
+  };
+}
 
 app.post('/explorer', async (req, res) => {
   const { trackId, sessionContext, config: explorerConfig } = req.body;
@@ -178,7 +205,7 @@ app.post('/explorer', async (req, res) => {
     );
 
     res.json({
-      explorerData: result.explorerData,
+      explorerData: purifyExplorerResponse(result.explorerData),
       radiusUsed: result.radiusUsed,
       neighborhoodSize: result.neighborhoodSize,
       dynamicRadiusState: result.dynamicRadiusState,

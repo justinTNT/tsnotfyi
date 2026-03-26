@@ -7,11 +7,11 @@ import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractN
 import { setDeckStaleFlag, clearExplorerSnapshotTimer, armExplorerSnapshotTimer } from './deck-state.js';
 import { setCardVariant, getDeckFrameBuilder, runDeckFrameBuild, initDeckRenderWorker, requestDeckRenderFrame, resolveTrackColorAssignment, cacheTrackColorAssignment } from './deck-render.js';
 import { safelyExitCardsDormantState, ensureDeckHydratedAfterTrackChange, exitCardsDormantState } from './card-state.js';
-import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, formatTimecode, startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction } from './progress-ui.js';
+import { startProgressAnimation, clearPendingProgressStart, renderProgressBar, formatTimecode, startProgressAnimationFromPosition, maybeApplyDeferredNextTrack, getVisualProgressFraction, isPlaylistHeadLocked } from './progress-ui.js';
 import { sendNextTrack, scheduleHeartbeat, fullResync, createNewJourneySession, verifyExistingSessionOrRestart, requestSSERefresh, manualRefresh, setupManualRefreshButton } from './sync-manager.js';
 import { connectSSE } from './sse-client.js';
 import { fetchExplorer, fetchExplorerWithPlaylist, getPlaylistTrackIds } from './explorer-fetch.js';
-import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, getPlaylistTail, clearPlaylist, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray, getCachedTrackMeta, cacheTrackMeta } from './playlist-tray.js';
+import { addToPlaylist, unwindPlaylist, popPlaylistHead, getPlaylistNext, playlistHasItems, getPlaylistTail, clearPlaylist, skipPlaylistHead, undoSkipPlaylistHead, initPlaylistTray, renderPlaylistTray, promoteCenterCardToTray, getCachedTrackMeta, cacheTrackMeta } from './playlist-tray.js';
 import { cancelPackAwayAnimation } from './clock-animation.js';
 import { getDisplayTitle, photoStyle, renderReverseIcon, updateCardWithTrackDetails, cycleStackContents, applyDirectionStackIndicator, createNextTrackCardStack, clearStackedPreviewLayer, ensureStackedPreviewLayer, renderStackedPreviews, packUpStackCards, packAwayDirectionStack, hideDirectionKeyOverlay, resolveOppositeBorderColor, resolveOppositeDirectionKey, redrawDimensionCardsWithNewNext, hasActualOpposite } from './helpers.js';
 import { setSelection, clearSelection, isUserSelection } from './selection.js';
@@ -153,9 +153,11 @@ let nextTrackPreviewFadeTimer = null;
       if (!container) return;
 
       const history = state.sessionTrackHistory || [];
-      const currentId = state.latestCurrentTrack?.identifier || state._serverCurrentTrack?.identifier;
-      // Show played tracks (exclude current), most recent first
-      const played = history.filter(id => id !== currentId);
+      // Only exclude the track currently showing on the card — it's the "now playing" track.
+      // Don't exclude _serverCurrentTrack — it may be ahead of the card during sentinel delay,
+      // and filtering it would hide a track we just pushed to history.
+      const cardId = state.latestCurrentTrack?.identifier;
+      const played = history.filter(id => id !== cardId);
 
       container.innerHTML = '';
 
@@ -183,6 +185,7 @@ let nextTrackPreviewFadeTimer = null;
 
           if (meta) {
               card.style.pointerEvents = 'auto';
+              card.style.cursor = 'pointer';
               card.addEventListener('mouseenter', () => {
                   if (typeof window.showTrackTooltip === 'function') {
                       const dur = meta.duration || meta.length;
@@ -192,6 +195,28 @@ let nextTrackPreviewFadeTimer = null;
               });
               card.addEventListener('mouseleave', () => {
                   if (typeof window.hideTrackTooltip === 'function') window.hideTrackTooltip();
+              });
+              // Click to re-queue: insert into playlist
+              card.addEventListener('click', () => {
+                  const insertPos = isPlaylistHeadLocked() ? 1 : 0;
+                  if (insertPos > 0 && (!state.playlist || state.playlist.length === 0)) return; // can't insert after head if no head
+                  if (!Array.isArray(state.playlist)) state.playlist = [];
+                  // Don't insert if already in playlist
+                  if (state.playlist.some(p => p.trackId === trackId)) return;
+                  state.playlist.splice(insertPos, 0, {
+                      trackId,
+                      albumCover: meta.albumCover || '/images/albumcover.png',
+                      directionKey: null,
+                      title: meta.title || '',
+                      artist: meta.artist || '',
+                      album: meta.album || '',
+                      addedAt: Date.now()
+                  });
+                  renderPlaylistTray();
+                  if (!isPlaylistHeadLocked() && typeof window.sendNextTrack === 'function') {
+                      window.sendNextTrack(trackId, null, 'user');
+                  }
+                  deckLog2.info(`🎵 History click: inserted ${trackId.substring(0, 8)} at position ${insertPos}`);
               });
           }
 
@@ -220,18 +245,31 @@ let nextTrackPreviewFadeTimer = null;
       // Restart progress bar when the now-playing card changes to a different track.
       // This is the single source of truth for progress bar restarts on track change.
       if (newId && prevId !== newId) {
-          // Cache metadata for history display
+          deckLog2.info(`🎵 Card track change: ${prevId?.substring(0, 8) || 'none'} → ${newId.substring(0, 8)}`);
+          // Push the previous track into history (if it existed and isn't already there)
+          if (prevId) {
+              if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
+              if (!state.sessionTrackHistory.includes(prevId)) {
+                  state.sessionTrackHistory.push(prevId);
+              }
+              // Cache previous track metadata for history display
+              if (prev && prev.title) {
+                  if (!state.trackMetadataCache) state.trackMetadataCache = {};
+                  state.trackMetadataCache[prevId] = prev;
+                  if (typeof cacheTrackMeta === 'function') cacheTrackMeta(prevId, prev);
+              }
+          }
+          // Cache new track metadata
           if (!state.trackMetadataCache) state.trackMetadataCache = {};
           state.trackMetadataCache[newId] = trackData;
           renderSessionHistory();
+          // Always reset clock to 0 on track change
           const newDuration = trackData.durationMs
             ? trackData.durationMs / 1000
             : (trackData.duration || trackData.length || 0);
-          if (newDuration > 0) {
-              state.playbackDurationSeconds = newDuration;
-              state.playbackStartTimestamp = Date.now();
-              startProgressAnimationFromPosition(newDuration, 0, { resync: false, trackChanged: true, trackId: newId });
-          }
+          state.playbackDurationSeconds = newDuration;
+          state.playbackStartTimestamp = Date.now();
+          startProgressAnimationFromPosition(newDuration || 1, 0, { resync: false, trackChanged: true, trackId: newId });
       }
 
       if (state.pendingResyncCheckTimer) {
@@ -720,15 +758,11 @@ async function initializeApp() {
         }
       }
 
-      // === Session history ===
-      if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
-      if (!state.sessionTrackHistory.includes(currentTrackId)) {
-        state.sessionTrackHistory.push(currentTrackId);
-        if (!state.trackMetadataCache) state.trackMetadataCache = {};
-        state.trackMetadataCache[currentTrackId] = newTrackState;
-        if (typeof cacheTrackMeta === 'function') cacheTrackMeta(currentTrackId, newTrackState);
-        audioLog.info(`🎵 Added to session history: ${currentTrackId.substring(0, 8)} (${state.sessionTrackHistory.length} total)`);
-      }
+      // Session history is populated by updateNowPlayingCard (single writer).
+      // Cache metadata for this track so the history visual can display it.
+      if (!state.trackMetadataCache) state.trackMetadataCache = {};
+      state.trackMetadataCache[currentTrackId] = newTrackState;
+      if (typeof cacheTrackMeta === 'function') cacheTrackMeta(currentTrackId, newTrackState);
       renderSessionHistory();
 
       // === Direction ===
@@ -2021,133 +2055,37 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
 
           case 'Tab':
               if (e.shiftKey) {
-                  // Shift+Tab: recover tracks. First from tray history (Tab-shifted, never played),
-                  // then from session history (actually played — requires inserting current track as bridge).
-                  const currentId = state.latestCurrentTrack?.identifier;
-                  const trayIds = new Set((state.playlist || []).map(p => p.trackId));
-                  if (!Array.isArray(state.playlist)) state.playlist = [];
-
-                  // Try tray history first (shifted off but never played)
-                  const trayHistory = state._trayShiftHistory || [];
-                  let rewoundTrackId = null;
-                  let fromPlaybackHistory = false;
-
-                  for (let i = trayHistory.length - 1; i >= 0; i--) {
-                      const hid = trayHistory[i];
-                      if (hid !== currentId && !trayIds.has(hid)) {
-                          rewoundTrackId = hid;
-                          trayHistory.splice(i, 1);
-                          break;
-                      }
+                  // Shift+Tab: restore last skipped item to head
+                  if (isPlaylistHeadLocked()) {
+                      deckLog2.info('⏪ Shift+Tab blocked: danger zone');
+                      e.preventDefault();
+                      break;
                   }
-
-                  // Fall through to session history (actually played tracks)
-                  if (!rewoundTrackId) {
-                      const history = state.sessionTrackHistory || [];
-                      for (let i = history.length - 1; i >= 0; i--) {
-                          const hid = history[i];
-                          if (hid !== currentId && !trayIds.has(hid)) {
-                              rewoundTrackId = hid;
-                              history.splice(i, 1);
-                              fromPlaybackHistory = true;
-                              break;
-                          }
-                      }
-                  }
-
-                  if (rewoundTrackId) {
-                      // Always insert current track as bridge so it stays in the playlist order
-                      if (currentId && !trayIds.has(currentId)) {
-                          const curTrack = state.latestCurrentTrack;
-                          const curCached = state.trackMetadataCache?.[currentId];
-                          state.playlist.unshift({
-                              trackId: currentId,
-                              albumCover: curTrack?.albumCover || curCached?.albumCover || '/images/albumcover.png',
-                              directionKey: null,
-                              title: curTrack?.title || curCached?.title || '',
-                              artist: curTrack?.artist || curCached?.artist || '',
-                              album: curTrack?.album || curCached?.album || '',
-                              folderLabel: '',
-                              addedAt: Date.now()
-                          });
-                          deckLog2.info(`⏪ Shift+Tab: included current track ${currentId.substring(0, 8)} as bridge (rewinding into played history)`);
-                      }
-
-                      const cached = state.trackMetadataCache?.[rewoundTrackId]
-                          || (typeof getCachedTrackMeta === 'function' ? getCachedTrackMeta(rewoundTrackId) : null);
-                      deckLog2.info(`⏪ Shift+Tab: recovering ${rewoundTrackId.substring(0, 8)} (${fromPlaybackHistory ? 'played' : 'shifted'})`);
-                      state.playlist.unshift({
-                          trackId: rewoundTrackId,
-                          albumCover: cached?.albumCover || '/images/albumcover.png',
-                          directionKey: null,
-                          title: cached?.title || '',
-                          artist: cached?.artist || '',
-                          album: cached?.album || '',
-                          folderLabel: '',
-                          addedAt: Date.now()
-                      });
-                      // Backfill metadata from server if cache missed
-                      if (!cached?.title) {
-                          fetch(`/track/${rewoundTrackId}/meta`).then(r => r.ok ? r.json() : null).then(data => {
-                              if (!data?.track) return;
-                              if (!state.trackMetadataCache) state.trackMetadataCache = {};
-                              state.trackMetadataCache[rewoundTrackId] = data.track;
-                              // Update the playlist item we just inserted
-                              const item = state.playlist.find(p => p.trackId === rewoundTrackId);
-                              if (item) {
-                                  item.title = data.track.title || item.title;
-                                  item.artist = data.track.artist || item.artist;
-                                  item.album = data.track.album || item.album;
-                                  item.albumCover = data.track.albumCover || item.albumCover;
-                                  if (typeof window.renderPlaylistTray === 'function') window.renderPlaylistTray();
-                              }
-                          }).catch(() => {});
-                      }
-
-                      if (typeof window.renderPlaylistTray === 'function') {
-                          window.renderPlaylistTray();
-                      }
-                      if (typeof window.sendNextTrack === 'function') {
-                          window.sendNextTrack(rewoundTrackId, null, 'user');
-                      }
+                  const restored = undoSkipPlaylistHead();
+                  if (!restored) {
+                      deckLog2.info('⏪ Shift+Tab: nothing to undo');
                   } else {
-                      deckLog2.info('⏪ Shift+Tab: no more history to rewind');
+                      deckLog2.info(`⏪ Shift+Tab: restored ${restored.trackId.substring(0, 8)}`);
+                      if (typeof window.sendNextTrack === 'function') {
+                          window.sendNextTrack(restored.trackId, restored.directionKey, 'user');
+                      }
                   }
               } else {
-                  // Tab: drop the head, stash in history, advance the tray
-                  if (typeof window.popPlaylistHead === 'function' && typeof window.playlistHasItems === 'function' && window.playlistHasItems()) {
-                      const popped = window.popPlaylistHead();
-                      if (popped) {
-                          deckLog2.info(`🎵 Tab: dropped tray head ${popped.trackId.substring(0, 8)}`);
-                          // Stash in tray shift history (never-played, recoverable via Shift+Tab)
-                          if (!state._trayShiftHistory) state._trayShiftHistory = [];
-                          if (!state._trayShiftHistory.includes(popped.trackId)) {
-                              state._trayShiftHistory.push(popped.trackId);
-                          }
-                          // Cache metadata for hydration on Shift+Tab
-                          if (!state.trackMetadataCache) state.trackMetadataCache = {};
-                          state.trackMetadataCache[popped.trackId] = {
-                              title: popped.title,
-                              artist: popped.artist,
-                              album: popped.album,
-                              albumCover: popped.albumCover
-                          };
-                          // If the new head is the current track, auto-skip it
-                          // Don't stash in _trayShiftHistory — it's the playing track, not a shifted track.
-                          // Shift+Tab handles the current track as a bridge insertion separately.
-                          let newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
-                          const currentId = state.latestCurrentTrack?.identifier;
-                          if (newHead && currentId && newHead.trackId === currentId) {
-                              deckLog2.info(`🎵 Tab: auto-skipping current track ${currentId.substring(0, 8)} at head`);
-                              window.popPlaylistHead();
-                              if (typeof window.renderPlaylistTray === 'function') {
-                                  window.renderPlaylistTray();
-                              }
-                              newHead = typeof window.getPlaylistNext === 'function' ? window.getPlaylistNext() : null;
-                          }
-                          if (newHead && typeof window.sendNextTrack === 'function') {
-                              window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
-                          }
+                  // Tab: skip playlist head (pop + stash for undo)
+                  if (isPlaylistHeadLocked()) {
+                      deckLog2.info('🎵 Tab blocked: danger zone');
+                      e.preventDefault();
+                      break;
+                  }
+                  if (!playlistHasItems()) {
+                      e.preventDefault();
+                      break;
+                  }
+                  const newHead = skipPlaylistHead();
+                  if (newHead) {
+                      deckLog2.info(`🎵 Tab: skipped to ${newHead.trackId.substring(0, 8)}`);
+                      if (typeof window.sendNextTrack === 'function') {
+                          window.sendNextTrack(newHead.trackId, newHead.directionKey, 'user');
                       }
                   }
               }
@@ -2165,18 +2103,10 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                   break;
               }
               deckLog2.info('🎮 Delete: skipping to crossfade');
-              // Record current track in history before skipping — otherwise it's lost
+              // Cache metadata for the skipped track — history push happens
+              // naturally in updateNowPlayingCard when the new track arrives.
               const skippedId = state.latestCurrentTrack?.identifier;
               if (skippedId) {
-                  if (!state.sessionTrackHistory) state.sessionTrackHistory = [];
-                  if (!state.sessionTrackHistory.includes(skippedId)) {
-                      state.sessionTrackHistory.push(skippedId);
-                  }
-                  if (!state._trayShiftHistory) state._trayShiftHistory = [];
-                  if (!state._trayShiftHistory.includes(skippedId)) {
-                      state._trayShiftHistory.push(skippedId);
-                  }
-                  // Cache metadata for Shift+Tab recovery
                   if (!state.trackMetadataCache) state.trackMetadataCache = {};
                   state.trackMetadataCache[skippedId] = state.latestCurrentTrack;
                   if (typeof cacheTrackMeta === 'function') {
@@ -2788,6 +2718,10 @@ if (typeof window !== 'undefined') {
       }
       if (typeof hideStackSizeIndicator === 'function') {
           hideStackSizeIndicator(card);
+      }
+      // Animate direction stack siblings away (they're siblings, not children)
+      if (typeof packAwayDirectionStack === 'function') {
+          packAwayDirectionStack(directionKey);
       }
 
       // Set trackMd5 immediately so heartbeats can find the card during animation
