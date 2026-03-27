@@ -612,9 +612,20 @@ async function getSearchIndex() {
   }
   _searchIndexBuilding = true;
   try {
-    const tracks = await db.getAllTracksForSearch();
-    _searchIndex = new TextSearchIndex();
-    _searchIndex.buildIndex(tracks);
+    // Try pre-built blob first, fall back to DB
+    const fs = require('fs');
+    const blobPath = require('path').join(__dirname, 'blobs', 'search.json');
+    if (fs.existsSync(blobPath)) {
+      console.log('📥 Loading search index from blob...');
+      const startTime = Date.now();
+      _searchIndex = new TextSearchIndex();
+      _searchIndex.loadFromBlob(blobPath);
+      console.log(`📥 Search index loaded from blob in ${Date.now() - startTime}ms`);
+    } else {
+      const tracks = await db.getAllTracksForSearch();
+      _searchIndex = new TextSearchIndex();
+      _searchIndex.buildIndex(tracks);
+    }
     return _searchIndex;
   } finally {
     _searchIndexBuilding = false;

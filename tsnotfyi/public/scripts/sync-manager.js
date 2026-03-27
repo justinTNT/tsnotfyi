@@ -1,7 +1,7 @@
 // Sync manager - heartbeat, server communication, session recovery
 import { state, elements, audioHealth, connectionHealth } from './globals.js';
 import { createLogger } from './log.js';
-import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint } from './session-utils.js';
+import { composeStreamEndpoint } from './session-utils.js';
 import { setDeckStaleFlag } from './deck-state.js';
 import { extractNextTrackIdentifier, extractNextTrackDirection } from './explorer-utils.js';
 import { startProgressAnimationFromPosition, startProgressAnimation, isPlaylistHeadLocked } from './progress-ui.js';
@@ -35,21 +35,13 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         state.heartbeatTimeout = null;
     }
 
-    const hasValidFingerprint = state.streamFingerprint && !state.streamFingerprint.startsWith('unknown@');
-    if (!hasValidFingerprint) {
-        log.warn('⚠️ sendNextTrack: No valid fingerprint yet; waiting for SSE to bind');
-        const ready = await waitForFingerprint(5000);
-
-        if (!ready || !state.streamFingerprint) {
-            log.warn('⚠️ sendNextTrack: Fingerprint still missing after wait; restarting session');
-            await createNewJourneySession('missing_fingerprint');
-
-            const fallbackReady = await waitForFingerprint(5000);
-            if (!fallbackReady || !state.streamFingerprint) {
-                log.error('❌ sendNextTrack: Aborting call - fingerprint unavailable');
-                scheduleHeartbeat(10000);
-                return;
-            }
+    if (!state.sessionId) {
+        log.warn('⚠️ sendNextTrack: No sessionId yet; restarting session');
+        await createNewJourneySession('missing_session');
+        if (!state.sessionId) {
+            log.error('❌ sendNextTrack: Aborting call - sessionId unavailable');
+            scheduleHeartbeat(10000);
+            return;
         }
     }
 
@@ -199,7 +191,6 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
                 direction: dirToSend,
                 source,
                 seedOverride,
-                fingerprint: state.streamFingerprint,
                 sessionId: state.sessionId,
                 clientBufferSecs: getBufferDelaySecs()
             })
@@ -210,13 +201,6 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
         const data = await response.json();
         window.state = window.state || {};
         window.state.lastHeartbeatResponse = data;
-
-        if (data.fingerprint) {
-            if (state.streamFingerprint !== data.fingerprint) {
-                log.info(`🔄 /next-track updated fingerprint to ${data.fingerprint}`);
-            }
-            applyFingerprint(data.fingerprint);
-        }
 
         if (source === 'user' && md5ToSend) {
             setSelection(md5ToSend, 'user');
@@ -242,11 +226,6 @@ export async function sendNextTrack(trackMd5 = null, direction = null, source = 
 
 function analyzeAndAct(data, source, sentMd5) {
     const { nextTrack, currentTrack, duration, remaining } = data;
-
-    if (data.fingerprint && state.streamFingerprint !== data.fingerprint) {
-        log.debug(`🔄 Server response rotated fingerprint to ${data.fingerprint.substring(0, 6)}…`);
-        applyFingerprint(data.fingerprint);
-    }
 
     if (!data || !currentTrack) {
         log.warn('⚠️ Invalid server response');
@@ -482,9 +461,6 @@ export async function fullResync() {
 
     try {
         const payload = {};
-        if (state.streamFingerprint) {
-            payload.fingerprint = state.streamFingerprint;
-        }
         if (state.sessionId) {
             payload.sessionId = state.sessionId;
         }
@@ -496,20 +472,16 @@ export async function fullResync() {
         });
 
         if (response.status === 404) {
-            log.error('🚨 Session not found on server - session was destroyed (likely server restart)');
-            log.info('🔄 Reloading page to get new session...');
-            window.location.reload();
+            log.error('🚨 Session not found on server — will re-bootstrap (no page reload)');
+            try {
+                await createNewJourneySession('session_lost_404');
+            } catch (e) {
+                log.error('🚨 Re-bootstrap failed:', e.message);
+            }
             return;
         }
 
         const result = await response.json();
-
-        if (result.fingerprint && !result.fingerprint.startsWith('unknown@')) {
-            if (state.streamFingerprint !== result.fingerprint) {
-                log.info(`🔄 Resync payload updated fingerprint to ${result.fingerprint}`);
-            }
-            applyFingerprint(result.fingerprint);
-        }
 
         if (result.ok) {
             log.info('✅ Resync broadcast triggered, waiting for SSE update...');
@@ -533,8 +505,12 @@ export async function fullResync() {
             log.warn('⚠️ Resync failed:', result.reason);
 
             if (result.error === 'Session not found' || result.error === 'Master session not found') {
-                log.info('🔄 Session lost, reloading page...');
-                window.location.reload();
+                log.error('🚨 Session lost — will re-bootstrap (no page reload)');
+                try {
+                    await createNewJourneySession('session_lost_resync');
+                } catch (e) {
+                    log.error('🚨 Re-bootstrap failed:', e.message);
+                }
                 return;
             }
 
@@ -565,10 +541,9 @@ export async function createNewJourneySession(reason = 'unknown') {
             }
         }
 
-        clearFingerprint({ reason: `new_session_${reason}` });
         state.sessionId = null;
 
-        const newStreamUrl = composeStreamEndpoint(null, Date.now());
+        const newStreamUrl = composeStreamEndpoint(Date.now());
         state.streamUrl = newStreamUrl;
         window.streamUrl = newStreamUrl;
 
@@ -639,14 +614,11 @@ export async function createNewJourneySession(reason = 'unknown') {
 
 export async function verifyExistingSessionOrRestart(reason = 'unknown', options = {}) {
     const { escalate = true } = options;
-    if (!state.streamFingerprint) {
-        const ready = await waitForFingerprint(3000);
-        if (!ready || !state.streamFingerprint) {
-            if (escalate) {
-                await createNewJourneySession(reason);
-            }
-            return false;
+    if (!state.sessionId) {
+        if (escalate) {
+            await createNewJourneySession(reason);
         }
+        return false;
     }
 
     try {
@@ -682,13 +654,9 @@ export async function verifyExistingSessionOrRestart(reason = 'unknown', options
 
 export async function requestSSERefresh(options = {}) {
     const { escalate = true, stage = 'rebroadcast' } = options;
-    if (!state.streamFingerprint) {
-        log.warn('⚠️ requestSSERefresh: No fingerprint yet; waiting for SSE handshake');
-        const ready = await waitForFingerprint(4000);
-        if (!ready || !state.streamFingerprint) {
-            log.warn('⚠️ requestSSERefresh: Aborting refresh - fingerprint unavailable');
-            return false;
-        }
+    if (!state.sessionId) {
+        log.warn('⚠️ requestSSERefresh: No sessionId yet; aborting refresh');
+        return false;
     }
 
     try {
@@ -697,7 +665,6 @@ export async function requestSSERefresh(options = {}) {
             reason: 'zombie_session_recovery',
             clientTime: Date.now(),
             lastTrackStart: state.latestCurrentTrack?.startTime || null,
-            fingerprint: state.streamFingerprint,
             sessionId: state.sessionId,
             stage
         };
@@ -719,13 +686,6 @@ export async function requestSSERefresh(options = {}) {
             log.info('✅ SSE refresh request successful:', result);
 
             state.lastRefreshSummary = result;
-
-            if (result.fingerprint && !result.fingerprint.startsWith('unknown@')) {
-                if (state.streamFingerprint !== result.fingerprint) {
-                    log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
-                }
-                applyFingerprint(result.fingerprint);
-            }
 
             if (result.ok === false) {
                 const reason = result.reason || 'unknown';
@@ -769,10 +729,6 @@ export async function requestSSERefresh(options = {}) {
                 log.info(`🔄 Backend reports active session with track: ${result.currentTrack.title} by ${result.currentTrack.artist}`);
                 log.info(`🔄 Duration: ${result.currentTrack.duration}s, Broadcasting to ${result.clientCount} clients`);
 
-                if (result.fingerprint && !result.fingerprint.startsWith('unknown@') && state.streamFingerprint !== result.fingerprint) {
-                    log.info(`🔄 SSE refresh updated fingerprint to ${result.fingerprint}`);
-                    applyFingerprint(result.fingerprint);
-                }
 
                 if (typeof window.updateNowPlayingCard === 'function') {
                     window.updateNowPlayingCard(result.currentTrack, null);
@@ -855,14 +811,10 @@ export async function manualRefresh() {
         log.warn('🔄 Explorer refresh returned no directions');
     }
 
-    if (!state.streamFingerprint) {
-        overrideLog.warn('🛰️ Manual refresh: no fingerprint yet; waiting before attempting rebroadcast');
-        const ready = await waitForFingerprint(4000);
-        if (!ready || !state.streamFingerprint) {
-            overrideLog.warn('🛰️ Manual refresh: fingerprint still missing; escalating to new session');
-            await createNewJourneySession('manual_refresh_stage3_no_fingerprint');
-            return 'new_session';
-        }
+    if (!state.sessionId) {
+        overrideLog.warn('🛰️ Manual refresh: no sessionId; escalating to new session');
+        await createNewJourneySession('manual_refresh_stage3_no_session');
+        return 'new_session';
     }
 
     const rebroadcastOk = await requestSSERefresh({ escalate: false, stage: 'rebroadcast' });

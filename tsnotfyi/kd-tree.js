@@ -206,14 +206,27 @@ class MusicalKDTree {
             return;
         }
 
+        // Try blob first for tracks, fall back to PostgreSQL
+        const fs = require('fs');
+        const path = require('path');
+        const blobPath = path.join(__dirname, 'blobs', 'features.json');
+        const hasBlob = fs.existsSync(blobPath);
+
         this.db = await openDatabase(this.connectionString);
         console.log('Connected to PostgreSQL musical database');
 
-        await Promise.all([
-            this.loadTracks(),
+        // Calibration and PCA transforms are small — always from DB
+        const dbLoads = [
             this.loadCalibrationSettings(),
             this.loadPCATransformations()
-        ]);
+        ];
+
+        if (hasBlob) {
+            await this.loadTracksFromBlob(blobPath);
+            await Promise.all(dbLoads);
+        } else {
+            await Promise.all([this.loadTracks(), ...dbLoads]);
+        }
 
         console.log(`Loaded ${this.tracks.length} tracks`);
         this.ensureCalibrationAvailability();
@@ -252,6 +265,55 @@ class MusicalKDTree {
         console.log('KD-tree constructed');
 
         // Text search moved to Web server — API server is pure math
+    }
+
+    async loadTracksFromBlob(blobPath) {
+        const fs = require('fs');
+        console.log(`📥 Loading tracks from blob: ${blobPath}...`);
+        const startTime = Date.now();
+
+        const raw = JSON.parse(fs.readFileSync(blobPath, 'utf8'));
+        const header = raw[0];
+        // Build column index map: name → position
+        const col = {};
+        header.forEach((name, i) => { col[name] = i; });
+
+        this.tracks = [];
+        for (let i = 1; i < raw.length; i++) {
+            const r = raw[i];
+            const track = {
+                identifier: r[col.identifier],
+                features: {},
+                loved: r[col.loved] === 1,
+                playCount: r[col.play_count] || 0,
+                pca: {
+                    primary_d: r[col.primary_d],
+                    tonal: [r[col.tonal_pc1], r[col.tonal_pc2], r[col.tonal_pc3]],
+                    spectral: [r[col.spectral_pc1], r[col.spectral_pc2], r[col.spectral_pc3]],
+                    rhythmic: [r[col.rhythmic_pc1], r[col.rhythmic_pc2], r[col.rhythmic_pc3]]
+                },
+                vae: {
+                    latent: [
+                        r[col.vae_latent_0], r[col.vae_latent_1], r[col.vae_latent_2], r[col.vae_latent_3],
+                        r[col.vae_latent_4], r[col.vae_latent_5], r[col.vae_latent_6], r[col.vae_latent_7]
+                    ].every(v => v !== null && v !== undefined) ? [
+                        r[col.vae_latent_0], r[col.vae_latent_1], r[col.vae_latent_2], r[col.vae_latent_3],
+                        r[col.vae_latent_4], r[col.vae_latent_5], r[col.vae_latent_6], r[col.vae_latent_7]
+                    ] : null,
+                    model_version: null,
+                    computed_at: null
+                }
+            };
+
+            for (const dim of this.dimensions) {
+                track.features[dim] = r[col[dim]] || 0;
+            }
+
+            this.tracks.push(track);
+        }
+
+        const elapsed = Date.now() - startTime;
+        console.log(`📥 Loaded ${this.tracks.length} tracks from blob in ${elapsed}ms`);
     }
 
     async loadTracks() {

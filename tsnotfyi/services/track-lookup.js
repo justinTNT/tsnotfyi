@@ -23,7 +23,7 @@ class TrackLookup {
   }
 
   /**
-   * Load track index from API server.
+   * Load track index from API server (legacy).
    * @param {string} apiUrl - API server base URL (e.g. http://localhost:3001)
    */
   async loadFromApi(apiUrl) {
@@ -46,6 +46,34 @@ class TrackLookup {
     this._loaded = true;
     const elapsed = Date.now() - startTime;
     console.log(`📥 Track index loaded: ${this._index.size} tracks in ${elapsed}ms`);
+  }
+
+  /**
+   * Load track index from blob file (array-of-arrays with header row).
+   * @param {string} blobPath - Path to tracks.json
+   */
+  async loadFromBlob(blobPath) {
+    const fs = require('fs');
+    console.log(`📥 Loading track index from blob: ${blobPath}...`);
+    const startTime = Date.now();
+
+    const raw = JSON.parse(fs.readFileSync(blobPath, 'utf8'));
+    const header = raw[0]; // ['identifier', 'path']
+    const idCol = header.indexOf('identifier');
+    const pathCol = header.indexOf('path');
+
+    this._index.clear();
+    for (let i = 1; i < raw.length; i++) {
+      const row = raw[i];
+      this._index.set(row[idCol], {
+        identifier: row[idCol],
+        path: row[pathCol]
+      });
+    }
+
+    this._loaded = true;
+    const elapsed = Date.now() - startTime;
+    console.log(`📥 Track index loaded from blob: ${this._index.size} tracks in ${elapsed}ms`);
   }
 
   // loadFromRadialSearch removed — embedded mode is gone

@@ -1,7 +1,7 @@
 // SSE client - Server-Sent Events connection and message handling
 import { state, connectionHealth, audioHealth, TRACK_SWITCH_PROGRESS_THRESHOLD } from './globals.js';
 import { createLogger } from './log.js';
-import { composeEventsEndpoint, syncEventsEndpoint, applyFingerprint, normalizeResolution } from './session-utils.js';
+import { composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
 import { requestSSERefresh, createNewJourneySession, scheduleHeartbeat } from './sync-manager.js';
 import { armExplorerSnapshotTimer, clearExplorerSnapshotTimer, setDeckStaleFlag } from './deck-state.js';
 import { exitCardsDormantState, ensureDeckHydratedAfterTrackChange } from './card-state.js';
@@ -16,16 +16,11 @@ const syncLog = createLogger('sync');
 
 // Smart SSE connection with health monitoring and reconnection
 export function connectSSE() {
-  const fingerprint = state.streamFingerprint;
-  const eventsUrl = composeEventsEndpoint(fingerprint);
-  syncEventsEndpoint(fingerprint);
+  const eventsUrl = composeEventsEndpoint();
+  syncEventsEndpoint();
   state.awaitingSSE = false;
 
-  if (fingerprint) {
-    sseLog.info(`🔌 Connecting SSE to fingerprint: ${fingerprint}`);
-  } else {
-    sseLog.info('🔌 Connecting SSE (awaiting fingerprint from audio stream)');
-  }
+  sseLog.info(`🔌 Connecting SSE (session: ${state.sessionId || 'pending'})`);
 
   connectionHealth.sse.status = 'connecting';
   updateConnectionHealthUI();
@@ -39,8 +34,8 @@ export function connectSSE() {
   connectionHealth.currentEventSource = eventSource;
 
   const handleSseStuck = async () => {
-    if (!state.streamFingerprint) {
-      sseLog.warn('📡 SSE stuck but fingerprint not yet assigned; waiting for audio session');
+    if (!state.sessionId) {
+      sseLog.warn('📡 SSE stuck but sessionId not yet assigned; waiting for session');
       return true;
     }
 
@@ -66,18 +61,14 @@ export function connectSSE() {
     }, 60000);
   };
 
-  const simpleBody = state.streamFingerprint
-    ? { fingerprint: state.streamFingerprint, sessionId: state.sessionId }
+  const simpleBody = state.sessionId
+    ? { sessionId: state.sessionId }
     : null;
 
   const handleHeartbeat = (heartbeat) => {
     if (!heartbeat || !heartbeat.currentTrack) {
       syncLog.warn('⚠️ Heartbeat missing currentTrack payload');
       return;
-    }
-
-    if (heartbeat.fingerprint && state.streamFingerprint !== heartbeat.fingerprint) {
-      applyFingerprint(heartbeat.fingerprint);
     }
 
     const currentTrack = heartbeat.currentTrack;
@@ -179,9 +170,23 @@ export function connectSSE() {
       // Only set start timestamp if not already tracking — don't reset mid-track
       if (newStartTimestamp && !state.playbackStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
       // Don't update latestCurrentTrack here — it's owned by updateNowPlayingCard.
-      // Updating it here would make updateNowPlayingCard unable to detect track changes
-      // (prevId would already match newId when the sentinel fires).
       state.lastTrackUpdateTs = Date.now();
+
+      // If duration is still 0 or 1 (missing from heartbeat), fetch from metadata
+      if (state.playbackDurationSeconds <= 1 && currentTrackId && !state._durationFetchInFlight) {
+        state._durationFetchInFlight = currentTrackId;
+        fetch(`/track/${currentTrackId}/meta`).then(r => (r.ok && r.status !== 204) ? r.json() : null).then(data => {
+          if (data?.track?.duration && state.latestCurrentTrack?.identifier === currentTrackId) {
+            syncLog.info(`🎵 Duration resolved from meta: ${data.track.duration.toFixed(1)}s`);
+            state.playbackDurationSeconds = data.track.duration;
+            if (state.latestCurrentTrack) {
+              state.latestCurrentTrack.duration = data.track.duration;
+              state.latestCurrentTrack.length = data.track.duration;
+            }
+            startProgressAnimationFromPosition(data.track.duration, 0, { resync: true, trackId: currentTrackId });
+          }
+        }).catch(() => {}).finally(() => { state._durationFetchInFlight = null; });
+      }
     }
 
     // === IMMEDIATE BOOKKEEPING on track change (no visual effect) ===
@@ -239,30 +244,38 @@ export function connectSSE() {
     // Only fire if we genuinely have no track showing — not on SSE reconnects
     const isFirstTrack = !previousServerTrackId && currentTrackId && !state.latestCurrentTrack?.identifier;
     if (isFirstTrack) {
-      state.playbackDurationSeconds = newDurationSeconds;
-      if (newStartTimestamp) state.playbackStartTimestamp = newStartTimestamp;
-      state.latestCurrentTrack = newTrackState;
-      window.state.latestCurrentTrack = state.latestCurrentTrack;
-      state.lastTrackUpdateTs = Date.now();
-
       state.pendingSnapshotTrackId = currentTrackId;
       armExplorerSnapshotTimer(currentTrackId, { reason: 'heartbeat-first-track' });
-
-      // History push handled by updateNowPlayingCard (single writer)
-
       state.currentTrackDirection = heartbeat.currentTrackDirection || null;
 
-      // Show now-playing card immediately — don't wait for explorer data.
-      // The clock/direction cards appear when explorer data arrives.
+      // Show now-playing card — updateNowPlayingCard detects the track change
+      // (prevId=null → newId), pushes history, and starts progress.
+      // Don't set latestCurrentTrack before the call — it reads it as "prev".
       state.awaitingInitialExplorer = true;
       sseLog.info(`🎵 First track detected — showing card now, explorer loading in background`);
+
       if (typeof window.updateNowPlayingCard === 'function') {
         window.updateNowPlayingCard(newTrackState, null);
       }
 
-      const durationSeconds = newDurationSeconds || currentTrack.duration || currentTrack.length || 0;
-      if (durationSeconds > 0 && !state.progressAnimation) {
-        startProgressAnimationFromPosition(durationSeconds, 0, { resync: false, trackId: currentTrackId });
+      // If duration is missing, fetch metadata and re-update card with real duration
+      if (!newTrackState.duration && currentTrackId) {
+        fetch(`/track/${currentTrackId}/meta`).then(r => (r.ok && r.status !== 204) ? r.json() : null).then(data => {
+          if (data?.track?.duration && state.latestCurrentTrack?.identifier === currentTrackId) {
+            sseLog.info(`🎵 First track enriched: duration=${data.track.duration}s`);
+            Object.assign(state.latestCurrentTrack, {
+              title: data.track.title || state.latestCurrentTrack.title,
+              artist: data.track.artist || state.latestCurrentTrack.artist,
+              album: data.track.album || state.latestCurrentTrack.album,
+              albumCover: data.track.albumCover || state.latestCurrentTrack.albumCover,
+              duration: data.track.duration,
+              length: data.track.duration
+            });
+            // Restart progress with real duration
+            state.playbackDurationSeconds = data.track.duration;
+            startProgressAnimationFromPosition(data.track.duration, 0, { resync: false, trackChanged: true, trackId: currentTrackId });
+          }
+        }).catch(err => { sseLog.error(`🎵 First track meta fetch failed: ${err.message}`); });
       }
     }
 
@@ -401,10 +414,6 @@ export function connectSSE() {
 
     state.lastSSEMessageTime = Date.now();
     state.lastExplorerPayload = cloneExplorerData(snapshot);
-
-    if (snapshot.fingerprint && state.streamFingerprint !== snapshot.fingerprint) {
-      applyFingerprint(snapshot.fingerprint);
-    }
 
     const previousTrackId = state.latestCurrentTrack?.identifier || null;
     const snapshotTrackId = snapshot.currentTrack?.identifier || null;
@@ -624,7 +633,7 @@ export function connectSSE() {
 
     // Eagerly fetch current track — don't wait for the first heartbeat (up to 10s away)
     if (!state.latestCurrentTrack?.identifier) {
-      fetch('/current-track').then(r => r.ok ? r.json() : null).then(async (data) => {
+      fetch('/current-track').then(r => (r.ok && r.status !== 204) ? r.json() : null).then(async (data) => {
         if (data?.currentTrack && !state.latestCurrentTrack?.identifier) {
           const trackId = data.currentTrack.identifier;
           sseLog.info(`🎵 Eager current-track: ${trackId?.substring(0, 8)}`);
@@ -685,19 +694,19 @@ export function connectSSE() {
         sseLog.error('📡 SSE reported error payload:', data.message);
         if (audioHealth.isHealthy) {
           eventSource.close();
-          if (data.message === 'fingerprint_not_found') {
-            sseLog.info('🔄 SSE fingerprint missing; requesting refresh');
+          if (data.message === 'fingerprint_not_found' || data.message === 'session_not_found') {
+            sseLog.info('🔄 SSE session missing; requesting refresh');
             requestSSERefresh({ escalate: false })
               .then((ok) => {
                 if (ok) {
                   connectSSE();
                 } else {
-                  sseLog.warn('⚠️ Fingerprint refresh failed; bootstrapping new stream');
-                  createNewJourneySession('fingerprint_not_found');
+                  sseLog.warn('⚠️ Session refresh failed; bootstrapping new stream');
+                  createNewJourneySession('session_not_found');
                 }
               })
               .catch((err) => {
-                sseLog.error('❌ Fingerprint refresh request failed:', err);
+                sseLog.error('❌ Session refresh request failed:', err);
                 setTimeout(() => connectSSE(), 2000);
               });
           } else {
@@ -723,20 +732,12 @@ export function connectSSE() {
           }
         }
 
-        if (data.fingerprint) {
-          applyFingerprint(data.fingerprint);
-        }
       }
 
       // Ignore events from other sessions (legacy safety)
       if (state.sessionId && data.session && data.session.sessionId && data.session.sessionId !== state.sessionId) {
         sseLog.info(`🚫 Ignoring event from different session: ${data.session.sessionId} (mine: ${state.sessionId})`);
         return;
-      }
-
-      if (state.streamFingerprint && data.fingerprint && data.fingerprint !== state.streamFingerprint) {
-        sseLog.info(`🔄 Updating fingerprint from ${state.streamFingerprint} → ${data.fingerprint}`);
-        applyFingerprint(data.fingerprint);
       }
 
       if (data.type === 'heartbeat') {

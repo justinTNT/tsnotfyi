@@ -30,7 +30,6 @@ const audioCallbacks = {
   clearPendingProgressStart: null,
   verifyExistingSessionOrRestart: null,
   createNewJourneySession: null,
-  clearFingerprint: null,
   composeStreamEndpoint: null,
   fullResync: null,
   onSentinel: null
@@ -1163,9 +1162,6 @@ export function handleDeadAudioSession(reason = 'unknown') {
   clearAudioLoadPending('dead-session');
 
   state.sessionId = null;
-  if (audioCallbacks.clearFingerprint) {
-    audioCallbacks.clearFingerprint({ reason: 'audio_restart' });
-  }
   state.awaitingSSE = false;
 
   if (connectionHealth.currentEventSource) {
@@ -1182,8 +1178,11 @@ export function handleDeadAudioSession(reason = 'unknown') {
     audioHealth.handlingRestart = false;
 
     if (!recovered) {
-      log.error('Audio recovery failed; reloading page as last resort');
-      window.location.reload();
+      log.error('Audio recovery failed — retrying soft reconnect in 10s (no page reload)');
+      setTimeout(() => {
+        audioHealth.handlingRestart = false;
+        handleDeadAudioSession('retry-after-failed-recovery');
+      }, 10000);
       return;
     }
 
@@ -1281,7 +1280,7 @@ export function rebuildAudioElement(reason = 'unknown') {
   state.audioElementRebuilds = (state.audioElementRebuilds || 0) + 1;
 
   if (state.isStarted && audioCallbacks.composeStreamEndpoint) {
-    const streamUrl = audioCallbacks.composeStreamEndpoint(state.streamFingerprint, Date.now());
+    const streamUrl = audioCallbacks.composeStreamEndpoint(Date.now());
     const ctx = new AudioContext({ sampleRate: 44100 });
 
     const afterRebuild = () => {

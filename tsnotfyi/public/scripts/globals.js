@@ -86,7 +86,6 @@ export const state = {
   baseDirectionKey: null,
   currentOppositeDirectionKey: null,
   sessionId: null,
-  streamFingerprint: null,
   streamUrl: STREAM_ENDPOINT_BASE,
   eventsEndpoint: EVENTS_ENDPOINT_BASE,
   streamUrlBase: STREAM_ENDPOINT_BASE,

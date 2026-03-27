@@ -38,8 +38,7 @@ export async function fetchExplorer(trackId, options = {}) {
   const requestBody = {
     trackId,
     playlistTrackIds,
-    sessionId: state.sessionId || null,
-    fingerprint: state.streamFingerprint || null
+    sessionId: state.sessionId || null
   };
 
   console.log(`🎯 Fetching explorer for ${trackId.substring(0, 8)}... (playlist: ${playlistTrackIds.length} tracks)`);

@@ -1,4 +1,4 @@
-// Session utilities - fingerprint management, endpoint composition
+// Session utilities - endpoint composition
 // Dependencies: globals.js (state)
 
 import { state } from './globals.js';
@@ -9,119 +9,43 @@ export function normalizeResolution(resolution) {
   if (value === 'magnifying_glass' || value === 'magnifying') {
     return 'magnifying';
   }
-  if (value === 'microscope' || value === 'binoculars') {
-    return value;
-  }
   return value;
 }
 
-export function composeStreamEndpoint(fingerprint, cacheBust = false) {
+export function composeStreamEndpoint(cacheBust = false) {
   const base = state.streamUrlBase || '/stream';
   const params = [];
-  // When connecting directly to Audio server, include sessionId
   if (state.sessionId) {
     params.push(`sessionId=${encodeURIComponent(state.sessionId)}`);
-  }
-  if (fingerprint) {
-    params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
   }
   if (cacheBust !== false) {
     const value = cacheBust === true ? Date.now() : cacheBust;
     params.push(`t=${value}`);
   }
-  if (!params.length) {
-    return base;
-  }
-  return `${base}?${params.join('&')}`;
+  return params.length ? `${base}?${params.join('&')}` : base;
 }
 
-export function composeEventsEndpoint(fingerprint) {
+export function composeEventsEndpoint() {
   const base = state.eventsEndpointBase || '/events';
   const params = [];
   if (state.sessionId) {
     params.push(`sessionId=${encodeURIComponent(state.sessionId)}`);
   }
-  if (fingerprint) {
-    params.push(`fingerprint=${encodeURIComponent(fingerprint)}`);
-  }
-  if (!params.length) return base;
-  return `${base}?${params.join('&')}`;
+  return params.length ? `${base}?${params.join('&')}` : base;
 }
 
-export function syncStreamEndpoint(fingerprint, { cacheBust = false } = {}) {
-  const url = composeStreamEndpoint(fingerprint, cacheBust);
+export function syncStreamEndpoint({ cacheBust = false } = {}) {
+  const url = composeStreamEndpoint(cacheBust);
   state.streamUrl = url;
   window.streamUrl = url;
   return url;
 }
 
-export function syncEventsEndpoint(fingerprint) {
-  const url = composeEventsEndpoint(fingerprint);
+export function syncEventsEndpoint() {
+  const url = composeEventsEndpoint();
   state.eventsEndpoint = url;
   window.eventsUrl = url;
   return url;
-}
-
-const fingerprintWaiters = [];
-
-function notifyFingerprintWaiters() {
-  if (!fingerprintWaiters.length) {
-    return;
-  }
-
-  const waiters = fingerprintWaiters.splice(0, fingerprintWaiters.length);
-  for (const entry of waiters) {
-    clearTimeout(entry.timer);
-    entry.resolve(true);
-  }
-}
-
-export function applyFingerprint(fingerprint) {
-  if (!fingerprint) {
-    return;
-  }
-  // Reject stale unknown@ fingerprints — these come from the SSE proxy
-  // before the real fingerprint is assigned. Don't let them overwrite a valid one.
-  if (fingerprint.startsWith('unknown@') && state.streamFingerprint && !state.streamFingerprint.startsWith('unknown@')) {
-    return;
-  }
-
-  state.streamFingerprint = fingerprint;
-  syncEventsEndpoint(fingerprint);
-  notifyFingerprintWaiters();
-}
-
-export function clearFingerprint({ reason = 'unknown' } = {}) {
-  if (state.streamFingerprint) {
-    console.log(`🧹 Clearing fingerprint (${reason})`);
-  }
-
-  state.streamFingerprint = null;
-  syncEventsEndpoint(null);
-  syncStreamEndpoint(null, { cacheBust: false });
-}
-
-export function waitForFingerprint(timeoutMs = 8000) {
-  if (state.streamFingerprint) {
-    return Promise.resolve(true);
-  }
-
-  return new Promise((resolve) => {
-    const entry = {
-      resolve,
-      timer: null
-    };
-
-    entry.timer = setTimeout(() => {
-      const index = fingerprintWaiters.indexOf(entry);
-      if (index !== -1) {
-        fingerprintWaiters.splice(index, 1);
-      }
-      resolve(false);
-    }, timeoutMs);
-
-    fingerprintWaiters.push(entry);
-  });
 }
 
 // Expose globally for cross-module access
@@ -131,7 +55,4 @@ if (typeof window !== 'undefined') {
   window.composeEventsEndpoint = composeEventsEndpoint;
   window.syncStreamEndpoint = syncStreamEndpoint;
   window.syncEventsEndpoint = syncEventsEndpoint;
-  window.applyFingerprint = applyFingerprint;
-  window.clearFingerprint = clearFingerprint;
-  window.waitForFingerprint = waitForFingerprint;
 }

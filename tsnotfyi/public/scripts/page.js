@@ -1,6 +1,6 @@
 // Main page orchestrator - imports from all other modules
 import { state, elements, connectionHealth, audioHealth, rootElement, PANEL_VARIANTS, getCardBackgroundColor, initializeElements } from './globals.js';
-import { applyFingerprint, clearFingerprint, waitForFingerprint, composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
+import { composeStreamEndpoint, composeEventsEndpoint, syncEventsEndpoint, normalizeResolution } from './session-utils.js';
 import { initializeAudioManager, setAudioCallbacks, startAudioHealthMonitoring, updateConnectionHealthUI, initPCMPipeline, getBufferDelaySecs, flushAudioBuffer } from './audio-manager.js';
 import { getDirectionType, formatDirectionName, isNegativeDirection, getOppositeDirection, hasOppositeDirection, getDirectionColor, variantFromDirectionType, hsl } from './tools.js';
 import { cloneExplorerData, findTrackInExplorer, explorerContainsTrack, extractNextTrackIdentifier, extractNextTrackDirection, pickPanelVariant, colorsForVariant, consolidateDirectionsForDeck, normalizeSamplesToTracks, resolveCanonicalDirectionKey } from './explorer-utils.js';
@@ -44,7 +44,10 @@ const _hydrationReady = (async function hydrateStateFromLocation() {
     if (resp.ok) {
       const health = await resp.json();
       if (health.audioServer?.url) {
-        const directUrl = health.audioServer.url.replace(/^http:/, 'https:');
+        // Only upgrade to HTTPS if the page is served over HTTPS
+        const directUrl = window.location.protocol === 'https:'
+          ? health.audioServer.url.replace(/^http:/, 'https:')
+          : health.audioServer.url;
         const probe = await fetch(`${directUrl}/health`, { signal: AbortSignal.timeout(3000) });
         if (probe.ok) {
           audioServerUrl = directUrl;
@@ -177,7 +180,7 @@ function demoteNextTrackCardToTray(card, onComplete = () => {}, options = {}) {
   }, 500);
 }
 
-// Fingerprint/session utilities moved to session-utils.js
+// Session utilities in session-utils.js
 
 let nextTrackPreviewFadeTimer = null;
 
@@ -323,10 +326,6 @@ let nextTrackPreviewFadeTimer = null;
       const currentDirectionKey = (driftState && driftState.currentDirection)
           ? driftState.currentDirection
           : (state.currentTrackDirection || null);
-      const directionText = currentDirectionKey
-          ? formatDirectionName(currentDirectionKey)
-          : 'Journey';
-      document.getElementById('cardDirection').textContent = directionText;
 
       document.getElementById('cardTitle').textContent = getDisplayTitle(trackData);
       document.getElementById('cardArtist').textContent = trackData.artist || 'Unknown Artist';
@@ -608,7 +607,6 @@ async function initializeApp() {
     clearPendingProgressStart,
     verifyExistingSessionOrRestart,
     createNewJourneySession,
-    clearFingerprint,
     composeStreamEndpoint,
     fullResync,
     onSentinel: async (type, { bufferDelaySecs = 0 } = {}) => {
@@ -695,9 +693,9 @@ async function initializeApp() {
 
       // === Phase 1: Pre-fetch during buffer delay (overlap network + buffer wait) ===
       let data = null;
-      const fetchUrl = state.streamFingerprint
-        ? `/current-track?fingerprint=${encodeURIComponent(state.streamFingerprint)}`
-        : '/current-track';
+      const params = new URLSearchParams();
+      if (state.sessionId) params.set('sessionId', state.sessionId);
+      const fetchUrl = `/current-track?${params.toString()}`;
 
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
@@ -726,18 +724,29 @@ async function initializeApp() {
       const currentTrack = data.currentTrack;
       const currentTrackId = currentTrack.identifier || null;
 
-      if (currentTrackId === previousTrackId) {
+      const promotionActive = state._sentinelPromotionLockUntil && Date.now() < state._sentinelPromotionLockUntil;
+      if (currentTrackId === previousTrackId || promotionActive) {
         // Crossfade-start already promoted this track — but it may have had
         // incomplete metadata (playlist head only). Update the card with the
         // full server data, and start progress if endCrossfadeWipe killed it.
-        const serverTrackState = {
-          ...data.currentTrack,
-          identifier: currentTrackId
-        };
-        if (typeof window.updateNowPlayingCard === 'function') {
-          // This will be a same-track update (prevId === newId), so it won't
-          // push history or restart progress — just refreshes the card DOM.
-          window.updateNowPlayingCard(serverTrackState, data.driftState || null);
+        // Enrich the current card with server metadata — but DON'T call
+        // updateNowPlayingCard, which could detect a spurious track change
+        // (if server returns the old track due to lag, prevId !== newId → wrong history push).
+        // Instead, update latestCurrentTrack in place and refresh the DOM directly.
+        const enrichedId = state.latestCurrentTrack?.identifier || currentTrackId;
+        if (state.latestCurrentTrack && data.currentTrack) {
+          Object.assign(state.latestCurrentTrack, {
+            title: data.currentTrack.title || state.latestCurrentTrack.title,
+            artist: data.currentTrack.artist || state.latestCurrentTrack.artist,
+            album: data.currentTrack.album || state.latestCurrentTrack.album,
+            albumCover: data.currentTrack.albumCover || state.latestCurrentTrack.albumCover,
+            duration: data.currentTrack.duration || data.currentTrack.length || state.latestCurrentTrack.duration,
+            durationMs: data.currentTrack.durationMs || state.latestCurrentTrack.durationMs
+          });
+          // Refresh card DOM without triggering track-change logic
+          if (typeof window.updateNowPlayingCard === 'function') {
+            window.updateNowPlayingCard(state.latestCurrentTrack, data.driftState || null);
+          }
         }
         if (!state.progressAnimation) {
           const fallbackDur = data.currentTrack.durationMs
@@ -1819,7 +1828,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               if (!track) {
                   overrideLog.warn(`${ICON} ACTION selection-track-missing`, {
                       selection: state.selection.trackId,
-                      cardDirection: directionKey,
                       cardTrack: cardTrackMd5
                   });
                   return;
@@ -1847,7 +1855,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
               // Show full track details
               const directionName = direction?.isOutlier ? "Outlier" : formatDirectionName(directionKey);
               labelDiv.innerHTML = `
-                  <h2>${directionName}</h2>
                   <h3>${resolvedTitle}</h3>
                   <h4>${resolvedArtist || 'Unknown Artist'}</h4>
                   <h5>${resolvedAlbum || ''}</h5>
@@ -1898,7 +1905,7 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
           elements.clickCatcher.style.display = 'none';
       }, 800);
 
-      const streamUrl = composeStreamEndpoint(state.streamFingerprint, Date.now());
+      const streamUrl = composeStreamEndpoint(Date.now());
       state.streamUrl = streamUrl;
       window.streamUrl = streamUrl;
       audioLog.info(`🎵 Audio connecting to ${streamUrl}`);
@@ -2226,7 +2233,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                           direction: playlistHead.directionKey,
                           source: 'user',
                           origin: 'skip',
-                          fingerprint: state.streamFingerprint
                       })
                     }).then(r => r.json()).catch(() => null)
                   : Promise.resolve(null);
@@ -2239,7 +2245,6 @@ function applyDeckRenderFrame(explorerData, options = {}, renderContext = {}) {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({
-                          fingerprint: state.streamFingerprint,
                           sessionId: state.sessionId
                       })
                   });
@@ -2929,7 +2934,6 @@ if (typeof window !== 'undefined') {
 
           const directionName = direction.isOutlier ? "Outlier" : formatDirectionName(direction.key);
           labelContent = `
-              <h2>${directionName}</h2>
               <h3>${getDisplayTitle(track)}</h3>
               <h4>${track.artist || 'Unknown Artist'}</h4>
               <h5>${albumName}</h5>
@@ -3775,9 +3779,7 @@ async function checkStreamEndpoint() {
     try {
         audioLog.info('🔍 Checking stream endpoint connectivity...');
 
-        const targetUrl = state.streamFingerprint
-            ? composeStreamEndpoint(state.streamFingerprint, Date.now())
-            : (state.streamUrl || '/stream');
+        const targetUrl = composeStreamEndpoint(Date.now());
 
         const response = await fetch(targetUrl, {
             method: 'HEAD',

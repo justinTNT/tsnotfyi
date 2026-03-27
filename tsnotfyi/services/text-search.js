@@ -81,6 +81,40 @@ class TextSearchIndex {
   }
 
   /**
+   * Load pre-built search index from blob file.
+   * The blob contains { sortedTokens, postings, tracks }.
+   */
+  loadFromBlob(blobPath) {
+    const fs = require('fs');
+    const startMs = Date.now();
+    const data = JSON.parse(fs.readFileSync(blobPath, 'utf8'));
+
+    this.sortedTokens = data.sortedTokens;
+    this.tracks = data.tracks;
+
+    // Convert posting arrays to Uint32Array
+    this.postings = new Map();
+    for (const token of this.sortedTokens) {
+      this.postings.set(token, new Uint32Array(data.postings[token]));
+    }
+
+    // Rebuild fieldTokens from tracks (needed for scoring)
+    this.fieldTokens = new Array(this.tracks.length);
+    for (let i = 0; i < this.tracks.length; i++) {
+      const t = this.tracks[i];
+      this.fieldTokens[i] = {
+        title: this._tokenize(t.title),
+        artist: this._tokenize(t.artist),
+        album: this._tokenize(t.album),
+        path: new Set() // path not stored in search blob tracks
+      };
+    }
+
+    const elapsedMs = Date.now() - startMs;
+    console.log(`🔍 TextSearchIndex loaded from blob: ${this.tracks.length} tracks, ${this.sortedTokens.length} tokens in ${elapsedMs}ms`);
+  }
+
+  /**
    * Binary search for the first token in sortedTokens that starts with prefix.
    * Returns the index, or -1 if no match.
    */

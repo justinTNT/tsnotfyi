@@ -3,12 +3,12 @@
   const TUBE_RADIUS = 0.005;
   let RADIUS_SCALE = 0.8;
   let RADIUS_SCALE_TARGET = 0.6;
-  const SPARKLE_COUNT = 124;
+  const SPARKLE_COUNT = 62;
   const NUM_LONG = 60;
   const NUM_LAT = 80;
   const NUM_LAT_OTHER = 69;
   const PATH_RES = 123;
-const RADIAL_SEG = 53;
+const RADIAL_SEG = 37;
 const BASE_PULSE_HZ = 0.23;
 const SEL_PULSE_HZ = 1.23;
 

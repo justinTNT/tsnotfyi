@@ -375,13 +375,12 @@ function buildNextTrackSummary(mixer) {
  * Build a heartbeat payload from mixer state.
  * @param {object} mixer — the mixer instance (duck-typed)
  * @param {string} reason
- * @param {object} deps — external dependencies: { fingerprintRegistry, cloneAndSanitizeBeetsMeta,
+ * @param {object} deps — external dependencies: { cloneAndSanitizeBeetsMeta,
  *   HEARTBEAT_DIVERGENCE_THRESHOLD_MS, HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS }
  * @returns {object|null}
  */
 function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
   const {
-    fingerprintRegistry: fpRegistry,
     cloneAndSanitizeBeetsMeta: sanitizeBeets,
     HEARTBEAT_DIVERGENCE_THRESHOLD_MS = 2000,
     HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS = 4000
@@ -504,17 +503,10 @@ function buildHeartbeatPayload(mixer, reason = 'status', deps = {}) {
     durationMs
   };
 
-  const fingerprint = mixer.currentFingerprint
-    || (fpRegistry && typeof fpRegistry.getFingerprintForSession === 'function'
-      ? fpRegistry.getFingerprintForSession(mixer.state.sessionId)
-      : null)
-    || null;
-
   return {
     type: 'heartbeat',
     timestamp: now,
     reason,
-    fingerprint,
     currentTrack: currentTrackPayload,
     timing: {
       elapsedMs,

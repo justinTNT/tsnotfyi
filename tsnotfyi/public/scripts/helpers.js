@@ -922,7 +922,6 @@ import { setSelection } from './selection.js';
               <span class="rim"></span>
               ${lovedHeart}
               <div class="label">
-                  <h2>${directionName}</h2>
                   <h3>${getDisplayTitle(track)}</h3>
                   <h4>${track.artist || 'Unknown Artist'}</h4>
                   <h5>${albumName}</h5>

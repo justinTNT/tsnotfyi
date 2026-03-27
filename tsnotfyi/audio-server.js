@@ -17,7 +17,7 @@ const TrackLookup = require('./services/track-lookup');
 const ExplorerCache = require('./services/explorer-cache');
 const SessionState = require('./services/session-state');
 const { SSEManager } = require('./services/sse-manager');
-const fingerprintRegistry = require('./fingerprint-registry');
+// fingerprintRegistry removed — Worker uses sessionId directly
 const serverLogger = require('./server-logger');
 const { ExplorerResponse, validateOrWarn } = require('./contracts-zod');
 
@@ -570,13 +570,20 @@ app.get('/events', async (req, res) => {
 let serverInstance = null;
 
 async function start() {
-  // Load track index from API server
+  // Load track index: prefer blob, fall back to API server
+  const path = require('path');
+  const blobPath = path.join(__dirname, 'blobs', 'tracks.json');
   try {
-    await trackLookup.loadFromApi(apiUrl);
-  } catch (err) {
-    startupLog.error(`❌ Failed to load track index from API server: ${err.message}`);
-    startupLog.error('Make sure the API server is running on ' + apiUrl);
-    process.exit(1);
+    await trackLookup.loadFromBlob(blobPath);
+  } catch (blobErr) {
+    startupLog.info(`📥 No blob at ${blobPath}, falling back to API server...`);
+    try {
+      await trackLookup.loadFromApi(apiUrl);
+    } catch (apiErr) {
+      startupLog.error(`❌ Failed to load track index: ${apiErr.message}`);
+      startupLog.error('Provide blobs/tracks.json or ensure API server is running on ' + apiUrl);
+      process.exit(1);
+    }
   }
 
   // Audio server stays HTTP — inter-server traffic doesn't need TLS.

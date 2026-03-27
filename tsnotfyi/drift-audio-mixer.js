@@ -4,7 +4,7 @@ const path = require('path');
 const { setImmediate: setImmediatePromise } = require('timers/promises');
 const DirectionalDriftPlayer = require('./directional-drift-player');
 const AdvancedAudioMixer = require('./advanced-audio-mixer');
-const fingerprintRegistry = require('./fingerprint-registry');
+// fingerprint-registry removed — Worker uses sessionId directly
 const { getTrackTitle } = require('./schemas/track-definitions');
 const { MixerMetadata, validate } = require('./contracts-zod');
 const ep = require('./services/explorer-pipeline');
@@ -310,18 +310,7 @@ class DriftAudioMixer {
         return;
       }
 
-      // Rotate fingerprint FIRST so heartbeat has correct fingerprint
-      const identifier = this.state.currentTrack.identifier || null;
-      if (identifier) {
-        const fingerprint = fingerprintRegistry.rotateFingerprint(
-          this.state.sessionId,
-          {
-            trackId: identifier,
-            startTime: this.state.trackStartTime
-          }
-        );
-        this.currentFingerprint = fingerprint;
-      }
+      // fingerprint rotation removed — sessionId is the sole identity
 
       // Broadcast immediately — the client uses sentinels as the source of truth
       // for visual track changes. The heartbeat arrives early but the client stashes
@@ -2326,7 +2315,6 @@ class DriftAudioMixer {
 
   buildHeartbeatPayload(reason = 'status') {
     return mb.buildHeartbeatPayload(this, reason, {
-      fingerprintRegistry,
       cloneAndSanitizeBeetsMeta,
       HEARTBEAT_DIVERGENCE_THRESHOLD_MS,
       HEARTBEAT_ELAPSED_OVERSHOOT_WARN_MS
@@ -2339,9 +2327,6 @@ class DriftAudioMixer {
       return;
     }
 
-    if (this.currentFingerprint) {
-      fingerprintRegistry.touch(this.currentFingerprint);
-    }
 
     const payload = this.buildHeartbeatPayload(reason);
     if (!payload) {
@@ -2382,10 +2367,6 @@ class DriftAudioMixer {
     if (!displayTrack) {
       console.log('📡 No current track available for snapshot');
       return;
-    }
-
-    if (this.currentFingerprint) {
-      fingerprintRegistry.touch(this.currentFingerprint);
     }
 
     const displayStartTime = this.getDisplayTrackStartTime();
@@ -2566,7 +2547,6 @@ class DriftAudioMixer {
         type: 'explorer_snapshot',
         timestamp: Date.now(),
         reason,
-        fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.state.sessionId) || null,
         currentTrack: currentTrackPayload,
         nextTrack: sanitizedNextTrack || null,
         sessionHistory: this.state.sessionHistory.slice(-10).map(entry => ({
@@ -2630,8 +2610,7 @@ class DriftAudioMixer {
           type: 'explorer_snapshot',
           timestamp: Date.now(),
           reason,
-          fingerprint: this.currentFingerprint || fingerprintRegistry.getFingerprintForSession(this.state.sessionId) || null,
-          currentTrack: fallbackCurrent,
+            currentTrack: fallbackCurrent,
           explorer: { error: true, message: error.message },
           session: {
             id: this.state.sessionId,
@@ -3542,7 +3521,7 @@ class DriftAudioMixer {
     console.log(`🧹 Destroying drift mixer for session: ${this.state.sessionId}`);
     this.stopStreaming();
 
-    fingerprintRegistry.removeBySession(this.state.sessionId);
+    // fingerprint cleanup removed — sessionId is the sole identity
 
     if (this._deferredBroadcastTimer) {
       clearTimeout(this._deferredBroadcastTimer);
