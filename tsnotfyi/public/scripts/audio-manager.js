@@ -492,6 +492,11 @@ function handlePipelineEvent(msg) {
       break;
     }
 
+    case 'discontinuity': {
+      log.warn(`🔊 Audio discontinuity #${msg.count} at frame ${msg.frame}: ΔL=${msg.deltaL.toFixed(3)} ΔR=${msg.deltaR.toFixed(3)} (${msg.prevL.toFixed(3)}→${msg.curL.toFixed(3)}, ${msg.prevR.toFixed(3)}→${msg.curR.toFixed(3)})`);
+      break;
+    }
+
     case 'overflow': {
       log.warn(`🔴 Ring buffer overflow #${msg.count}: dropped ${msg.dropped} frames (buffered: ${msg.buffered}/${msg.capacity})`);
       break;

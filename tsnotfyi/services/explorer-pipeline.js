@@ -272,27 +272,48 @@ function selectStrategicSamples(candidates, targetTrack, maxSamples) {
 
   const dealt = new Set();
   const result = [];
-
+  const artistCounts = {};
   const currentIdentifier = targetTrack?.identifier || null;
 
-  const tryDeal = (arr, idx) => {
+  const tryDeal = (arr, idx, strictMode) => {
     if (idx < 0 || idx >= arr.length) return false;
     const c = arr[idx];
-    const id = c.track?.identifier || c.identifier;
+    const track = c.track || c;
+    const id = track.identifier || c.identifier;
+    
     if (!id) return false;
     if (currentIdentifier && id === currentIdentifier) return false; // Never surface the current track in suggestion stacks
     if (dealt.has(id)) return false;
+
+    const artist = track.artist || 'Unknown Artist';
+    
+    // 🛡️ Intra-Stack Diversity: Max 2 tracks per artist in the highly-visible zone
+    if (strictMode && (artistCounts[artist] || 0) >= 2) {
+      return false;
+    }
+
     dealt.add(id);
+    artistCounts[artist] = (artistCounts[artist] || 0) + 1;
     result.push(c);
     return true;
   };
 
-  // Interleave: front of byDir, back of byDir, front of byPri, back of byPri
-  for (let i = 0; result.length < candidates.length && i < Math.max(byDir.length, byPri.length); i++) {
-    tryDeal(byDir, i);                    // Closest by direction
-    tryDeal(byDir, byDir.length - 1 - i); // Furthest by direction
-    tryDeal(byPri, i);                    // Closest by primary
-    tryDeal(byPri, byPri.length - 1 - i); // Furthest by primary
+  const limit = maxSamples || candidates.length;
+
+  // Pass 1: Strict Mode (Interleave while enforcing artist diversity)
+  for (let i = 0; result.length < limit && i < Math.max(byDir.length, byPri.length); i++) {
+    tryDeal(byDir, i, true);                    // Closest by direction
+    tryDeal(byDir, byDir.length - 1 - i, true); // Furthest by direction
+    tryDeal(byPri, i, true);                    // Closest by primary
+    tryDeal(byPri, byPri.length - 1 - i, true); // Furthest by primary
+  }
+
+  // Pass 2: Fill remainder (If strict mode couldn't fulfill the limit, add the duplicates at the end)
+  for (let i = 0; result.length < limit && i < Math.max(byDir.length, byPri.length); i++) {
+    tryDeal(byDir, i, false);
+    tryDeal(byDir, byDir.length - 1 - i, false);
+    tryDeal(byPri, i, false);
+    tryDeal(byPri, byPri.length - 1 - i, false);
   }
 
   return result;

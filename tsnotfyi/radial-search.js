@@ -574,17 +574,34 @@ class RadialSearchService {
             }
 
             // Filter by PCA direction and make sure we never include the center track itself
-            const candidates = neighborhood.filter(result => {
-                if (!result?.track?.identifier) {
-                    return false;
-                }
-
-                if (result.track.identifier === currentTrack.identifier) {
-                    return false;
-                }
-
+            let candidates = neighborhood.filter(result => {
+                if (!result?.track?.identifier) return false;
+                if (result.track.identifier === currentTrack.identifier) return false;
                 return this.isInPCADirection(currentTrack, result.track, pcaDomain, pcaComponent, direction);
             });
+
+            // 🛡️ Neighborhood Quota (Mastering Density fix) 
+            const maxPerArtist = 5;
+            const maxPerAlbum = 3;
+            const artistCounts = {};
+            const albumCounts = {};
+            const filteredCandidates = [];
+
+            for (const c of candidates) {
+                const track = c.track;
+                
+                const artist = track.artist || 'Unknown Artist';
+                const album = track.album || track.albumName || 'Unknown Album';
+                const albumKey = `${artist}-${album}`;
+
+                artistCounts[artist] = (artistCounts[artist] || 0) + 1;
+                albumCounts[albumKey] = (albumCounts[albumKey] || 0) + 1;
+
+                if (artistCounts[artist] <= maxPerArtist && albumCounts[albumKey] <= maxPerAlbum) {
+                    filteredCandidates.push(c);
+                }
+            }
+            candidates = filteredCandidates;
 
             // Sort and limit
             candidates.sort((a, b) => a.distance - b.distance);

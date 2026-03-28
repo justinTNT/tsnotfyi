@@ -1006,6 +1006,8 @@ class MusicalKDTree {
         }
 
         // First get musical neighborhood using scaled distance
+        // Artist/album diversity quotas are applied in the Worker's enrichment layer,
+        // not here — the API server is pure math with no metadata.
         const neighborhood = this.radiusSearch(currentTrack, searchRadius, weights, 500);
 
         // Filter by direction
@@ -1530,8 +1532,7 @@ class MusicalKDTree {
                 : 0;
             const delta = candidateValue - currentValue;
             const relative = referenceDistance > this.epsilon ? 1 : null;
-
-            console.log(`📐 PCA contribution ${labelPrefix}.primary_d: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+            if (VERBOSE_KD_TREE) console.log(`📐 PCA contribution ${labelPrefix}.primary_d: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
 
             slices.push({
                 key: 'primary_d',
@@ -1585,8 +1586,7 @@ class MusicalKDTree {
                 const delta = candidateValue - currentValue;
                 const relative = referenceDistance > this.epsilon ? 1 : null;
                 const label = `${domain}_pc${referenceIndex + 1}`;
-
-                console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+                if (VERBOSE_KD_TREE) console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
 
                 slices.push({
                     key: label,
@@ -1631,8 +1631,7 @@ class MusicalKDTree {
                 ? sliceDistance / referenceDistance
                 : null;
 
-            const label = `${domain}_pc${index + 1}`;
-            console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
+            const label = `${domain}_pc${index + 1}`;            if (VERBOSE_KD_TREE) console.log(`📐 PCA contribution ${labelPrefix}.${label}: value=${candidateValue}, delta=${delta}, fraction=${fraction.toFixed(4)}, relative=${relative !== null ? relative.toFixed(4) : 'n/a'}`);
 
             slices.push({
                 key: label,

@@ -204,6 +204,22 @@ app.post('/explorer', async (req, res) => {
       explorerConfig || {}
     );
 
+    // Save full explorer payload to disk for offline analysis
+    try {
+      if (sessionContext && sessionContext.sessionId) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fileName = `${sessionContext.sessionId}_${timestamp}_explorerData.json`;
+        const logDir = path.join(__dirname, 'logs', 'explorer_sessions');
+        if (!fs.existsSync(logDir)) {
+          fs.mkdirSync(logDir, { recursive: true });
+        }
+        // Save the raw, unpurified result so we can analyze underlying track clusters
+        fs.writeFileSync(path.join(logDir, fileName), JSON.stringify(result.explorerData, null, 2), 'utf8');
+      }
+    } catch (logErr) {
+      serverLog.warn(`⚠️ Failed to wrirte explorer session json: ${logErr.message}`);
+    }
+
     res.json({
       explorerData: purifyExplorerResponse(result.explorerData),
       radiusUsed: result.radiusUsed,

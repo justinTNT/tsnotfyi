@@ -1,0 +1,45 @@
+name = "tsnotfyi"
+main = "worker/index.js"
+compatibility_date = "2024-01-01"
+
+workers_dev = true
+
+# Custom domain — routes tsnot.fyi to this Worker
+routes = [
+  { pattern = "tsnot.fyi/*", zone_name = "tsnot.fyi" }
+]
+
+[vars]
+AUDIO_SERVER_URL = "https://audio.tsnot.fyi"
+API_SERVER_URL = "https://api.tsnot.fyi"
+COVERS_URL = "https://covers.tsnot.fyi"
+
+# Serve static files from public/ (local dev + edge)
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+# R2 bucket for library blobs (features, tracks, search index)
+[[r2_buckets]]
+binding = "LIBRARY"
+bucket_name = "tsnotfyi-library"
+remote = true
+
+# KV namespace for metadata (per-track key-value lookups)
+[[kv_namespaces]]
+binding = "METADATA"
+id = "74b769eee0c8486db6b534acf5bc7770"
+remote = true
+
+# KV namespace for sessions and fingerprints (ephemeral)
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "cc2b5752208248369b807d5fb4d642d0"
+remote = true
+
+# D1 database for user data (ratings, playlists, play stats)
+[[d1_databases]]
+binding = "DB"
+database_name = "tsnotfyi"
+database_id = "effda426-2e07-4084-8344-0a662c740bbe"
+remote = true

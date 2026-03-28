@@ -1075,11 +1075,11 @@ audio {
     }
     45% {
         opacity: 0.65;
-        transform: translate(-95%, -20%) translateZ(-600px) scale(0.6);
+        transform: translate(-5%, -80%) translateZ(-600px) scale(0.6);
     }
     100% {
         opacity: 0;
-        transform: translate(-180%, -160%) translateZ(-1900px) scale(0.35);
+        transform: translate(80%, 60%) translateZ(-1900px) scale(0.35);
     }
 }
 
@@ -1137,15 +1137,7 @@ audio {
     pointer-events: none;
 }
 
-:root.deck-stale #dimensionCards .dimension-card {
-    opacity: 0.55;
-    filter: saturate(0.55);
-    transition: opacity 0.3s ease;
-}
-
-:root.deck-stale #dimensionCards .dimension-card .label {
-    opacity: 0.85;
-}
+/* Stale deck: no visual change — cards are still valid */
 
 .stacked-preview-layer {
     position: absolute;

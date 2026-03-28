@@ -1,0 +1,11 @@
+tunnel: 7f919aef-b20c-4121-8bdc-78919ac99f09
+credentials-file: /Users/tsnotfyi/.cloudflared/7f919aef-b20c-4121-8bdc-78919ac99f09.json
+
+ingress:
+  - hostname: audio.tsnot.fyi
+    service: http://localhost:3002
+  - hostname: api.tsnot.fyi
+    service: http://localhost:3003
+  - hostname: covers.tsnot.fyi
+    service: http://localhost:3004
+  - service: http_status:404

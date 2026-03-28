@@ -704,7 +704,8 @@ import { setSelection } from './selection.js';
       const samples = Array.isArray(direction.sampleTracks) ? direction.sampleTracks : [];
       const maxStackCards = 4;
 
-      for (let i = 0; i < Math.min(lineCount, maxStackCards); i++) {
+      const stackLimit = Math.min(lineCount, maxStackCards);
+      for (let i = 0; i < stackLimit; i++) {
           const sample = samples[i + 1]; // skip first (it's the front card)
           const track = sample?.track || sample;
           const stackCard = document.createElement('div');
@@ -716,7 +717,8 @@ import { setSelection } from './selection.js';
           const currentTransform = card.style.transform || '';
           const cardZ = parseInt(card.style.zIndex || '0');
           stackCard.style.zIndex = `${cardZ - i - 1}`;
-          stackCard.style.opacity = card.style.opacity;
+          // Last card in stack fades toward the background
+          stackCard.style.opacity = (i === stackLimit - 1) ? '0.5' : card.style.opacity;
 
           // Start at card's position (no offset)
           stackCard.style.transform = `${currentTransform} translate(0px, 0px)`;
@@ -1184,6 +1186,10 @@ import { setSelection } from './selection.js';
           preview.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
           const zIndex = previews.length - index;
           preview.style.zIndex = `${zIndex}`;
+          // Last card in stack fades toward the background
+          if (index === previews.length - 1) {
+              preview.style.opacity = '0.5';
+          }
 
           const panel = document.createElement('div');
           panel.className = 'preview-panel';

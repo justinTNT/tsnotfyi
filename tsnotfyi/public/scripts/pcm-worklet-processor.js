@@ -18,6 +18,9 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     this._readySent = false;
     this._underrunReported = false;
     this._overflowCount = 0;
+    this._prevL = 0;
+    this._prevR = 0;
+    this._discontinuityCount = 0;
     // Use half-second intervals for position reporting
     this._halfSecondFrames = Math.floor(sampleRate / 2);
     // Buffer 6 seconds before reporting ready — gives headroom for main-thread
@@ -166,6 +169,28 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
           return true;
         }
       }
+
+      // Discontinuity detector: flag jumps > 0.5 in a single sample
+      const dl = Math.abs(l - this._prevL);
+      const dr = Math.abs(r - this._prevR);
+      if ((dl > 0.5 || dr > 0.5) && this._framesRendered > sampleRate) {
+        this._discontinuityCount++;
+        if (this._discontinuityCount <= 20) {
+          this.port.postMessage({
+            type: 'discontinuity',
+            frame: this._framesRendered + i,
+            deltaL: dl,
+            deltaR: dr,
+            prevL: this._prevL,
+            prevR: this._prevR,
+            curL: l,
+            curR: r,
+            count: this._discontinuityCount
+          });
+        }
+      }
+      this._prevL = l;
+      this._prevR = r;
 
       left[i] = l;
       right[i] = r;
